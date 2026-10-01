@@ -1,3 +1,24 @@
+## Maka-maintained fork
+
+This repository is a fork of [trycua/cua](https://github.com/trycua/cua), maintained
+by [maka-agent](https://github.com/maka-agent) for Maka's Computer Use integration.
+It is not the official upstream distribution. Upstream history, contributor
+attribution, and component licenses are preserved.
+
+- `main` retains the upstream snapshot and is the branch used for upstream sync.
+- `maka` is the default branch for our maintained patches. Maka pins an immutable
+  commit from this branch rather than tracking its moving tip.
+
+Our patches currently cover cursor rendering acknowledgements and reduced motion,
+X11 cursor badge layout, and macOS menu observation, exact-window activation, and
+shortcut modifier delivery. The upstream project documentation follows below.
+
+本仓库是 [trycua/cua](https://github.com/trycua/cua) 的分支，由 `maka-agent` 维护，
+用于 Maka 的 Computer Use 集成。`main` 保留上游快照，`maka` 是维护补丁的默认分支；
+Maka 依赖固定提交，保留上游历史、作者归属和各组件许可证。
+
+---
+
 <div align="center">
   <a href="https://cua.ai" target="_blank" rel="noopener noreferrer">
     <picture>
