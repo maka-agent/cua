@@ -302,10 +302,11 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
             return false;
         };
         let core = cursor.core_mut();
-        if !(core.cfg.enabled && core.pos.0 < -50.0) {
+        if !(core.cfg.enabled && !core.positioned) {
             return false;
         }
         core.pos = seed_position(target_x, target_y, frame);
+        core.positioned = true;
         true
     }
 
@@ -361,6 +362,7 @@ mod tests {
     fn placed<'a>(map: &'a mut Map, key: &str) -> &'a mut RenderStateCore {
         let core = map.cursor_mut(key).unwrap();
         core.pos = (100.0, 100.0);
+        core.positioned = true;
         core
     }
 
@@ -500,6 +502,29 @@ mod tests {
         assert!(!map.cursor_or_default("sessA").unwrap().visible);
         map.cursor_mut("sessA");
         assert!(map.cursor_or_default("sessA").unwrap().visible);
+    }
+
+    #[test]
+    fn negative_display_position_is_not_an_uninitialized_cursor() {
+        let mut map = Map::new(CursorConfig::default(), ());
+        let frame = Some(ScreenFrame::new(-1470.0, -800.0, 1280.0, 800.0));
+        assert!(map.seed_start_if_sentinel("negative", -200.0, -200.0, frame));
+        let core = map.cursors.get_mut("negative").unwrap();
+        core.apply_command_base(
+            OverlayCommand::SnapTo {
+                x: -200.0,
+                y: -200.0,
+                heading_radians: None,
+            },
+            true,
+            true,
+        );
+        assert!(core.is_revealed());
+        let mut pixels = tiny_skia::Pixmap::new(256, 256).unwrap();
+        crate::paint_cursor(&mut pixels, core, -320.0, -320.0, None, 1.0);
+        assert!(pixels.pixels().iter().any(|pixel| pixel.alpha() > 0));
+        assert!(!map.seed_start_if_sentinel("negative", -600.0, -500.0, frame));
+        assert_eq!(map.cursors["negative"].pos, (-200.0, -200.0));
     }
 
     #[test]

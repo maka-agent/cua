@@ -59,6 +59,9 @@ pub struct AXNode {
     /// Kept separate from `title` so `_find_calc_button("2")` can find
     /// Calculator buttons where AXTitle="" but AXDescription="2".
     pub description: Option<String>,
+    /// Collected during the bounded walk, never re-read by renderers.
+    pub subrole: Option<String>,
+    pub focused: Option<bool>,
     pub identifier: Option<String>,
     pub help: Option<String>,
     pub actions: Vec<String>,
@@ -458,7 +461,11 @@ unsafe fn walk_element(
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
-    let enabled = if !actions.is_empty() || value_settable {
+    let enabled = if !actions.is_empty()
+        || value_settable
+        || role_supports_value_addressing(&role)
+        || role == "AXButton"
+    {
         copy_bool_attr(element, "AXEnabled")
     } else {
         None
@@ -484,6 +491,16 @@ unsafe fn walk_element(
         return;
     }
 
+    let subrole = if role == "AXButton" {
+        copy_string_attr(element, "AXSubrole")
+    } else {
+        None
+    };
+    let focused = if is_actionable {
+        copy_bool_attr(element, "AXFocused")
+    } else {
+        None
+    };
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
     // Structured `elements` only contains actionable nodes. Keep all new AX
@@ -527,6 +544,8 @@ unsafe fn walk_element(
             } else {
                 Some(visible_description.clone())
             },
+            subrole: subrole.clone(),
+            focused,
             identifier: identifier.clone(),
             help: help.clone(),
             actions: actions.clone(),
@@ -561,6 +580,8 @@ unsafe fn walk_element(
             } else {
                 Some(visible_description.clone())
             },
+            subrole: subrole.clone(),
+            focused,
             identifier: identifier.clone(),
             help: help.clone(),
             actions: vec![],
@@ -572,7 +593,7 @@ unsafe fn walk_element(
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
-            enabled: control_state.enabled,
+            enabled,
             selected: control_state.selected,
             in_web_content,
         }

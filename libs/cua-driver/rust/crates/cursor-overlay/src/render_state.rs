@@ -54,6 +54,9 @@ pub struct RenderStateCore {
     pub motion: MotionConfig,
     /// Current rendered position in screen / overlay-window coordinates.
     pub pos: (f64, f64),
+    /// Whether a position has been assigned. Negative coordinates are valid
+    /// on displays left of or above the primary display.
+    pub positioned: bool,
     /// Visual heading in radians (tip direction = motion_dir + π).
     pub heading: f64,
     /// In-flight planned path; `None` = at rest.
@@ -132,6 +135,7 @@ impl RenderStateCore {
             theme,
             theme_fallback,
             pos: (-200.0, -200.0),
+            positioned: false,
             heading: std::f64::consts::FRAC_PI_4,
             path: None,
             dist: 0.0,
@@ -155,7 +159,7 @@ impl RenderStateCore {
     /// Whether the cursor currently paints pixels: user-visible, placed on
     /// screen (not the `(-200, -200)` sentinel), and not fully idle-faded.
     pub fn is_revealed(&self) -> bool {
-        self.visible && self.pos.0 >= -100.0 && self.idle_alpha >= 0.004
+        self.visible && self.positioned && self.idle_alpha >= 0.004
     }
 
     /// Whether a revealed cursor keeps changing pixels while it rests.
@@ -197,7 +201,7 @@ impl RenderStateCore {
     pub fn idle_fade_in_progress(&self) -> bool {
         self.motion.idle_hide_ms > 0.0
             && self.visible
-            && self.pos.0 >= -100.0
+            && self.positioned
             && self.idle_secs >= self.motion.idle_hide_ms / 1000.0
             && self.idle_alpha >= 0.004
     }
@@ -225,7 +229,7 @@ impl RenderStateCore {
     /// the fade has already started.
     pub fn idle_fade_wait(&self) -> Option<std::time::Duration> {
         if !self.visible
-            || self.pos.0 < -100.0
+            || !self.positioned
             || self.motion.idle_hide_ms <= 0.0
             || self.path.is_some()
             || self.spring.is_some()
@@ -665,13 +669,14 @@ impl RenderStateCore {
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
-                if move_to_snap_sentinel && self.pos.0 < -50.0 {
+                if move_to_snap_sentinel && !self.positioned {
                     self.pos = (tx, ty);
                 }
                 if self.visual.reduced_motion == crate::ReducedMotion::On {
                     self.pos = (tx, ty);
                     self.heading = end_heading_radians;
                 }
+                self.positioned = true;
                 let (x0, y0) = self.pos;
                 let th0 = self.heading + std::f64::consts::PI;
                 let th1 = end_heading_radians + std::f64::consts::PI;
@@ -703,6 +708,7 @@ impl RenderStateCore {
             } => {
                 let reveal_badge = !self.is_revealed();
                 self.pos = (x, y);
+                self.positioned = true;
                 if let Some(heading) = heading_radians {
                     self.heading = heading;
                 }
@@ -730,7 +736,7 @@ impl RenderStateCore {
                 if click_pulse_sentinel_only {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
-                    if self.pos.0 < -50.0 {
+                    if !self.positioned {
                         // Apply same click offset so tip lands at click point.
                         const CLICK_OFFSET: f64 = 16.0;
                         let angle = std::f64::consts::FRAC_PI_4;
@@ -742,6 +748,7 @@ impl RenderStateCore {
                 } else {
                     self.pos = (x, y);
                 }
+                self.positioned = true;
                 self.click_t = Some(0.0);
                 if matches!(
                     self.visual.resolved_action,
@@ -945,7 +952,7 @@ pub fn paint_cursor_in_viewport(
 ) {
     if !core.visible
         || core.pinned_target_off_workspace
-        || core.pos.0 < -100.0
+        || !core.positioned
         || core.idle_alpha < 0.004
     {
         return;
@@ -972,8 +979,8 @@ pub fn paint_cursor_in_viewport(
         let (cr, cg, cb) = (0x5Eu8, 0xC0u8, 0xE8u8);
 
         if let Some(rect) = tiny_skia::Rect::from_xywh(
-            (fx * s) as f32,
-            (fy * s) as f32,
+            ((fx - origin_x) * s) as f32,
+            ((fy - origin_y) * s) as f32,
             (fw * s) as f32,
             (fh * s) as f32,
         ) {
@@ -1081,6 +1088,7 @@ mod glide_duration_tests {
         core.motion.glide_duration_ms = glide_ms;
         core.motion.idle_hide_ms = 0.0;
         core.pos = (0.0, 0.0);
+        core.positioned = true;
         // Aligned headings → an effectively straight path of length ~dist_pts.
         core.path = Some(PathPlanner::plan(
             0.0, 0.0, 0.0, dist_pts, 0.0, 0.0, 0.0, 80.0,
@@ -1111,6 +1119,7 @@ mod glide_duration_tests {
             let mut core = RenderStateCore::new(CursorConfig::default());
             core.visual.reduced_motion = crate::ReducedMotion::On;
             core.pos = (20.0, 30.0);
+            core.positioned = true;
             let heading = std::f64::consts::FRAC_PI_4;
             core.apply_command_base(
                 OverlayCommand::MoveTo {
@@ -1269,6 +1278,7 @@ mod session_badge_and_action_tests {
     fn hardware_pointer_hover_reveals_only_while_over_cursor() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.pos = (300.0, 240.0);
+        core.positioned = true;
         core.apply_command_base(
             OverlayCommand::SetSessionLabel("Research".into()),
             false,
@@ -1294,6 +1304,7 @@ mod session_badge_and_action_tests {
         for action in [CursorAction::Text, CursorAction::Click] {
             let mut core = RenderStateCore::new(CursorConfig::default());
             core.pos = (20.0, 20.0);
+            core.positioned = true;
             core.apply_command_base(
                 OverlayCommand::BeginAction {
                     action,
@@ -1341,6 +1352,7 @@ mod session_badge_and_action_tests {
     fn modifiers_live_in_the_badge_then_fade_after_action_completion() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.pos = (200.0, 200.0);
+        core.positioned = true;
         core.apply_command_base(
             OverlayCommand::BeginAction {
                 action: CursorAction::Click,
@@ -1444,6 +1456,7 @@ mod backing_scale_tests {
         // idle-fade so the arrow paints at full alpha regardless of timing.
         let centre = logical_size as f64 / 2.0;
         core.pos = (centre, centre);
+        core.positioned = true;
         core.idle_alpha = 1.0;
         core.visible = true;
 
@@ -1460,6 +1473,7 @@ mod backing_scale_tests {
     fn cursor_pinned_to_an_off_workspace_window_paints_nothing() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.pos = (32.0, 32.0);
+        core.positioned = true;
         core.idle_alpha = 1.0;
         core.visible = true;
         core.pinned_target_off_workspace = true;

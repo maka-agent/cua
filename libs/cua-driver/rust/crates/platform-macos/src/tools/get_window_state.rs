@@ -1138,6 +1138,8 @@ mod tests {
             title: title.map(|s| s.to_string()),
             value: None,
             description: None,
+            subrole: None,
+            focused: None,
             identifier: None,
             help: None,
             actions,

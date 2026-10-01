@@ -1590,6 +1590,7 @@ async fn collect_visited_bounded_opts<'a>(
         let mut actions: Vec<String> = Vec::new();
         let mut value: Option<String> = None;
         let mut text_content = String::new();
+        let mut text_observed = false;
         if has_action || has_value || has_text {
             if let Some(Ok(proxies)) = call(acc.proxies()).await {
                 if has_action {
@@ -1622,14 +1623,15 @@ async fn collect_visited_bounded_opts<'a>(
                 // lives; `name` is usually empty for such widgets.
                 if has_text {
                     if let Some(Ok(tp)) = call(proxies.text()).await {
-                        let count = call(tp.character_count())
-                            .await
-                            .and_then(|r| r.ok())
-                            .unwrap_or(0);
-                        if count > 0 {
-                            let end = count.min(4096);
-                            if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
-                                text_content = t;
+                        if let Some(Ok(count)) = call(tp.character_count()).await {
+                            if count == 0 {
+                                text_observed = true;
+                            } else if count > 0 {
+                                let end = count.min(4096);
+                                if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
+                                    text_content = t;
+                                    text_observed = true;
+                                }
                             }
                         }
                     }
@@ -1641,8 +1643,9 @@ async fn collect_visited_bounded_opts<'a>(
         // name — for text widgets. A value control (GtkSpinButton implements
         // AtkText with its formatted number) would otherwise be named after
         // its own value, and four spin buttons then all read "0.0".
-        if name.trim().is_empty() && !text_content.trim().is_empty() && !has_value {
-            name = text_content;
+        if name.trim().is_empty() && !text_content.trim().is_empty() && !has_value && !has_editable
+        {
+            name = text_content.clone();
         }
 
         // AT-SPI `Description` for controls (one `Get` per actionable node,
@@ -1664,6 +1667,17 @@ async fn collect_visited_bounded_opts<'a>(
             if let Some(label) = labelled_by_name(conn, &acc).await {
                 name = label;
             }
+        }
+
+        // A Text interface is independent from Accessible.Name. Preserve the
+        // entered text and named label contents so an observer can verify a
+        // successful write/submit, including a value cleared to empty. Numeric
+        // Value controls retain their own formatting and actuation interface.
+        if text_observed
+            && !has_value
+            && (has_editable || (!name.is_empty() && name != text_content))
+        {
+            value = Some(text_content);
         }
 
         // Children inherit web-document context, plus this node's own role.
@@ -2063,7 +2077,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
             }
             let act_str = v.actions.join(",");
             let val_part = match &v.value {
-                Some(val) if !val.is_empty() => format!(" value=\"{val}\""),
+                Some(val) => format!(" value={}", serde_json::json!(val)),
                 _ => String::new(),
             };
             let description_shown = (!v.description.is_empty() && v.description != name)

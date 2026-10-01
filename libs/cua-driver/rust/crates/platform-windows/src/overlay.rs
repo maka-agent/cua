@@ -296,7 +296,7 @@ pub fn is_visible_for_session(key: &str) -> bool {
                     rs.core.cfg.enabled
                         && rs.core.visible
                         && rs.core.idle_alpha >= 0.004
-                        && rs.core.pos.0 >= -100.0
+                        && rs.core.positioned
                 })
         })
         .unwrap_or(false)
@@ -382,7 +382,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && rs.core.pos.0 > -50.0 => true,
+            Some(rs) if rs.core.cfg.enabled && rs.core.positioned => true,
             _ => false,
         }
     };
@@ -492,7 +492,7 @@ impl RenderState {
             && self.core.click_t.is_none()
             && self.core.motion.idle_hide_ms > 0.0
             && self.core.visible
-            && self.core.pos.0 >= -100.0
+            && self.core.positioned
             && self.core.idle_alpha >= 1.0
     }
 }
@@ -868,7 +868,7 @@ fn composite_dirty(map: &RenderMap) -> Option<DirtyRect> {
         // (mirrors paint_cursor's own visibility early-return).
         let mut current: Option<DirtyRect> = None;
         for rs in map.cursors.values() {
-            if !rs.core.visible || rs.core.pos.0 < -100.0 || rs.core.idle_alpha < 0.004 {
+            if !rs.core.visible || !rs.core.positioned || rs.core.idle_alpha < 0.004 {
                 continue;
             }
             let cx = (rs.core.pos.0 - screen.virt_x as f64).round() as i32;

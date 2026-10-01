@@ -1814,6 +1814,8 @@ mod tests {
             title: title.map(str::to_owned),
             value: value.map(str::to_owned),
             description: None,
+            subrole: None,
+            focused: None,
             identifier: None,
             help: None,
             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
