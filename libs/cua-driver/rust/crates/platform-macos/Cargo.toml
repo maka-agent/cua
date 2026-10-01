@@ -32,7 +32,9 @@ foreign-types = "0.5"
 libc = "0.2"
 block2 = "0.5"
 # objc2 and its AppKit/CoreFoundation bindings
-objc2 = "0.5"
+# Swift-backed NSScreen arrays can encode count as signed NSInteger. The
+# ABI is identical to NSUInteger; retain all other message encoding checks.
+objc2 = { version = "0.5", features = ["relax-sign-encoding"] }
 objc2-foundation = { version = "0.2", features = [
     "NSArray", "NSString", "NSDictionary", "NSRunLoop",
     "NSThread", "NSObject", "NSValue",

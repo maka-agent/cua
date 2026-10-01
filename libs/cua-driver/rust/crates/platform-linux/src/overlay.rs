@@ -3537,7 +3537,10 @@ mod tests {
         // before sending MoveTo; mirror that valid on-screen starting state.
         cursor.core.pos = (100.0, 100.0);
         cursor.core.positioned = true;
-        cursor.core.motion.idle_hide_ms = 500.0;
+        // The opaque delay must outlast the default Navigate one-shot.
+        // At 500ms that animation is still rendering while idle hide already
+        // fades; expecting alpha=1 in that case contradicts both clocks.
+        cursor.core.motion.idle_hide_ms = 5_000.0;
         cursor.core.visual.reduced_motion = cursor_overlay::ReducedMotion::On;
         cursor.apply_command(OverlayCommand::MoveTo {
             x: 250.0,
