@@ -699,7 +699,7 @@ fn build_element_entry(
     // otherwise hide the text from a caller reading the structured side,
     // leaving it only in tree_markdown. See the macOS get_window_state builder
     // for the rationale.
-    if let Some(value) = n.value.clone().filter(|v| !v.is_empty()) {
+    if let Some(value) = n.value.clone() {
         entry["value"] = json!(value);
     }
     if let Some(enabled) = n.enabled {

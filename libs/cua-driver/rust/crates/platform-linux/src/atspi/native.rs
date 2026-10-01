@@ -2119,7 +2119,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 } else {
                     Some(name)
                 },
-                value: v.value.clone().filter(|s| !s.is_empty()),
+                value: v.value.clone(),
                 checked: v.checked,
                 enabled: v.enabled,
                 selected: v.selected,
@@ -2135,10 +2135,15 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
             idx += 1;
         } else if emit && !v.name.is_empty() && v.showing {
             md.push_str(&format!(
-                "{indent}- {role} = \"{name}\"{marker}
+                "{indent}- {role} = \"{name}\"{value}{marker}
 ",
                 role = v.role,
                 name = v.name,
+                value = v
+                    .value
+                    .as_ref()
+                    .map(|value| format!(" value={}", serde_json::json!(value)))
+                    .unwrap_or_default(),
                 marker = passive_marker(&v.role, !v.actions.is_empty(), v.has_component, v.enabled),
             ));
         }
