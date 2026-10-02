@@ -4,7 +4,7 @@
 //!
 //! 1. **Start Menu shortcuts**: walks `[CSIDL_COMMON_PROGRAMS]\` and
 //!    `[CSIDL_PROGRAMS]\` recursively, resolves each `.lnk` via
-//!    `IShellLinkW::GetPath`, and emits one entry per `.exe` target.
+//!    `IShellLinkW::GetPath`, and emits one entry per launch command.
 //!
 //! 2. **UWP / packaged apps**: queries WinRT
 //!    `PackageManager::FindPackagesByUserSecurityIdWithPackageTypes("", Main)` for
@@ -70,12 +70,16 @@ pub fn list_installed_apps() -> Vec<InstalledApp> {
     tracing::debug!(target: "installed_apps", "scan_uwp_packages: {} entries ({}ms)", uwp.len(), t1.elapsed().as_millis());
     out.extend(uwp);
 
-    // Dedupe by (kind, bundle_id) — Start Menu may list both a per-user and a
-    // machine-wide shortcut for the same .exe target.
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|a| seen.insert((a.kind.clone(), a.bundle_id.clone())));
+    deduplicate_launchers(&mut out);
     out.sort_by(app_sort_key);
     out
+}
+
+fn deduplicate_launchers(apps: &mut Vec<InstalledApp>) {
+    // User and machine-wide shortcuts may duplicate a launch command. Preserve
+    // distinct arguments: the same executable can expose different profiles.
+    let mut seen = std::collections::HashSet::new();
+    apps.retain(|a| seen.insert((a.kind.clone(), a.launch_path.clone())));
 }
 
 fn app_sort_key(a: &InstalledApp, b: &InstalledApp) -> std::cmp::Ordering {
@@ -586,6 +590,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
+
+    #[test]
+    fn launcher_deduplication_preserves_distinct_arguments() {
+        let first = InstalledApp {
+            name: "First profile".into(),
+            bundle_id: r"C:\app.exe".into(),
+            kind: "desktop".into(),
+            launch_path: r"C:\app.exe --profile=first".into(),
+            last_used: None,
+        };
+        let second = InstalledApp {
+            name: "Second profile".into(),
+            launch_path: r"C:\app.exe --profile=second".into(),
+            ..first.clone()
+        };
+        let mut apps = vec![first.clone(), second.clone(), first];
+        deduplicate_launchers(&mut apps);
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].name, "First profile");
+        assert_eq!(apps[1].launch_path, second.launch_path);
+    }
 
     #[test]
     fn wedged_uwp_scan_has_bounded_worker_growth_and_recovers() {
