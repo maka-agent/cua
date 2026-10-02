@@ -6099,6 +6099,13 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if args.get("by").and_then(Value::as_str) == Some("pixel") {
+            return ToolResult::error(
+                "unsupported: pixel-unit input is unavailable on this native adapter",
+            )
+            .with_structured(serde_json::json!({"code":"unsupported"}));
+        }
+
         let cursor_id = resolve_cursor_key(&args);
         let modifiers: Vec<String> = args.str_array("modifier");
 

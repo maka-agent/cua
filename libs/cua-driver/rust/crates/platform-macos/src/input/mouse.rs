@@ -214,6 +214,21 @@ pub fn scroll_wheel_desktop(
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
+    scroll_wheel_desktop_units(x, y, delta_y_per_tick, delta_x_per_tick, ticks, false)
+}
+
+pub fn scroll_pixels_desktop(x: f64, y: f64, delta_y: i32, delta_x: i32) -> anyhow::Result<()> {
+    scroll_wheel_desktop_units(x, y, delta_y, delta_x, 1, true)
+}
+
+fn scroll_wheel_desktop_units(
+    x: f64,
+    y: f64,
+    delta_y_per_tick: i32,
+    delta_x_per_tick: i32,
+    ticks: usize,
+    precise: bool,
+) -> anyhow::Result<()> {
     use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
 
     move_cursor_desktop(x, y)?;
@@ -224,8 +239,16 @@ pub fn scroll_wheel_desktop(
         // PIXEL units, a null source, and scales each logical wheel notch to ten
         // pixels. Keep that exact controller convention instead of attaching
         // synthetic source state unrelated to the physical pointer we warped.
-        let wheel_y = (delta_y_per_tick / 12).clamp(-100, 100);
-        let wheel_x = (delta_x_per_tick / 12).clamp(-100, 100);
+        let wheel_y = if precise {
+            delta_y_per_tick
+        } else {
+            (delta_y_per_tick / 12).clamp(-100, 100)
+        };
+        let wheel_x = if precise {
+            delta_x_per_tick
+        } else {
+            (delta_x_per_tick / 12).clamp(-100, 100)
+        };
         let event_ref = unsafe {
             CGEventCreateScrollWheelEvent2(
                 std::ptr::null_mut(),
@@ -1552,6 +1575,55 @@ pub fn scroll_wheel_at_xy(
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
+    scroll_wheel_at_xy_units(
+        pid,
+        screen_x,
+        screen_y,
+        window_local,
+        wid,
+        delta_y_per_tick,
+        delta_x_per_tick,
+        ticks,
+        false,
+    )
+}
+
+/// Deliver one Quartz PIXEL-unit delta at the live, exact window point.
+#[allow(clippy::too_many_arguments)]
+pub fn scroll_pixels_at_xy(
+    pid: i32,
+    screen_x: f64,
+    screen_y: f64,
+    window_local: Option<(f64, f64)>,
+    wid: Option<u32>,
+    delta_y: i32,
+    delta_x: i32,
+) -> anyhow::Result<()> {
+    scroll_wheel_at_xy_units(
+        pid,
+        screen_x,
+        screen_y,
+        window_local,
+        wid,
+        delta_y,
+        delta_x,
+        1,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scroll_wheel_at_xy_units(
+    pid: i32,
+    screen_x: f64,
+    screen_y: f64,
+    window_local: Option<(f64, f64)>,
+    wid: Option<u32>,
+    delta_y_per_tick: i32,
+    delta_x_per_tick: i32,
+    ticks: usize,
+    precise: bool,
+) -> anyhow::Result<()> {
     use core_graphics::event::ScrollEventUnit;
 
     // Prime AppKit/WebKit's tracking state at the target before the wheel
@@ -1583,11 +1655,29 @@ pub fn scroll_wheel_at_xy(
         // wheel_count = 2 → both axes carried (vertical = wheel1/axis-1,
         // horizontal = wheel2/axis-2). Convert the driver's pixel-tuned step
         // into a bounded line delta for the event API.
-        let wheel_y = (delta_y_per_tick / 120).clamp(-10, 10);
-        let wheel_x = (delta_x_per_tick / 120).clamp(-10, 10);
-        let event =
-            CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, wheel_y, wheel_x, 0)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
+        let wheel_y = if precise {
+            delta_y_per_tick
+        } else {
+            (delta_y_per_tick / 120).clamp(-10, 10)
+        };
+        let wheel_x = if precise {
+            delta_x_per_tick
+        } else {
+            (delta_x_per_tick / 120).clamp(-10, 10)
+        };
+        let event = CGEvent::new_scroll_event(
+            source,
+            if precise {
+                ScrollEventUnit::PIXEL
+            } else {
+                ScrollEventUnit::LINE
+            },
+            2,
+            wheel_y,
+            wheel_x,
+            0,
+        )
+        .map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
 
         let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
 
@@ -1613,7 +1703,11 @@ pub fn scroll_wheel_at_xy(
 
         // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
         // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+        // Exact pixel deltas must be delivered once. Posting both routes can
+        // coalesce two copies into a doubled AppKit scrollingDelta.
+        if !precise {
+            crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+        }
         event.post_to_pid(pid as libc::pid_t);
 
         std::thread::sleep(std::time::Duration::from_millis(30));

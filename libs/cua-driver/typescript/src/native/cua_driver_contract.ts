@@ -4459,7 +4459,8 @@ const FfiConverterTypeScrollDirection = (() => {
 
 export enum ScrollBy {
     Line,
-    Page
+    Page,
+    Pixel
 }
 
 const FfiConverterTypeScrollBy = (() => {
@@ -4470,6 +4471,7 @@ const FfiConverterTypeScrollBy = (() => {
             switch (ordinalConverter.read(from)) {
                 case 1: return ScrollBy.Line;
                 case 2: return ScrollBy.Page;
+                case 3: return ScrollBy.Pixel;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -4477,6 +4479,7 @@ const FfiConverterTypeScrollBy = (() => {
             switch (value) {
                 case ScrollBy.Line: return ordinalConverter.write(1, into);
                 case ScrollBy.Page: return ordinalConverter.write(2, into);
+                case ScrollBy.Pixel: return ordinalConverter.write(3, into);
             }
         }
         allocationSize(value: TypeName): number {

@@ -30,9 +30,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Install latest stable Rust toolchain
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # pinned action; latest stable selected below
         with:
+          toolchain: stable
           components: rustfmt
       - name: Check Rust formatting
         working-directory: libs/cua-driver/rust

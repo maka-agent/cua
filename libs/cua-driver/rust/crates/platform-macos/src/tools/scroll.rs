@@ -80,14 +80,14 @@ fn def() -> &'static ToolDef {
                 },
                 "by": {
                     "type": "string",
-                    "enum": ["line", "page"],
-                    "description": "Scroll granularity. Default: line."
+                    "enum": ["line", "page", "pixel"],
+                    "description": "Scroll granularity. Pixel delivers a Quartz pixel-unit input delta, requiring a live point or element. Default: line."
                 },
                 "amount": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 50,
-                    "description": "Pixel-wheel path: number of wheel notches. Keystroke path: number of keystroke repetitions. Default: 3."
+                    "maximum": 20000,
+                    "description": "Pixel amount: 1–20000 input pixels. Line/page amount: 1–50 repetitions. Default: 3."
                 },
                 "window_id": { "type": "integer" },
                 "element_index": cua_driver_core::tool_schema::element_index_schema(),
@@ -126,8 +126,15 @@ impl Tool for ScrollTool {
             let (x, y) = (input.x, input.y);
             let direction = input.direction.as_str();
             let by = input.by.unwrap_or(ScrollBy::Line).as_str();
-            let amount = input.amount.unwrap_or(3).clamp(1, 50) as usize;
-            let step = if input.by == Some(ScrollBy::Page) {
+            let amount = input.amount.unwrap_or(3);
+            let precise = input.by == Some(ScrollBy::Pixel);
+            if amount == 0 || amount > if precise { 20000 } else { 50 } {
+                return ToolResult::error("scroll amount out of range");
+            }
+            let amount = amount as usize;
+            let step = if precise {
+                amount as i32
+            } else if input.by == Some(ScrollBy::Page) {
                 WHEEL_STEP_PAGE_PX
             } else {
                 WHEEL_STEP_LINE_PX
@@ -140,7 +147,11 @@ impl Tool for ScrollTool {
             };
             let (x, y) = super::desktop_screenshot_point(x, y).await;
             let result = tokio::task::spawn_blocking(move || {
-                crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
+                if precise {
+                    crate::input::mouse::scroll_pixels_desktop(x, y, delta_y, delta_x)
+                } else {
+                    crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
+                }
             })
             .await;
             return match result {
@@ -177,7 +188,15 @@ impl Tool for ScrollTool {
             Err(e) => return e,
         };
         let by = args.str_or("by", "line");
-        let amount = args.u64_or("amount", 3) as usize;
+        let amount = args.u64_or("amount", 3);
+        let precise = by == "pixel";
+        if !matches!(by.as_str(), "line" | "page" | "pixel")
+            || amount == 0
+            || amount > if precise { 20000 } else { 50 }
+        {
+            return ToolResult::error("scroll granularity or amount out of range");
+        }
+        let amount = amount as usize;
         // Surface 6: element_token / element_index precedence.
         let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
@@ -205,7 +224,7 @@ impl Tool for ScrollTool {
         // AppKit exposes vertical scroll-bar buttons beneath the text area's
         // AXScrollArea parent. Pressing those controls is a true
         // background-safe scroll: no activation, z-order change, or cursor move.
-        if matches!(direction.as_str(), "up" | "down") {
+        if !precise && matches!(direction.as_str(), "up" | "down") {
             if let (Some(element_guard), Some(wid)) = (pre_focus_guard.clone(), window_id) {
                 if !delivery_mode.is_foreground() {
                     if let Some(lease) = _mutation_lease.as_ref() {
@@ -311,7 +330,9 @@ impl Tool for ScrollTool {
         // Per-notch step + direction→delta mapping (sign convention lives
         // here; the mouse primitive stays sign-agnostic). macOS: +y reveals
         // content ABOVE, -y reveals BELOW; +x reveals LEFT, -x reveals RIGHT.
-        let step = if by == "page" {
+        let step = if precise {
+            amount as i32
+        } else if by == "page" {
             WHEEL_STEP_PAGE_PX
         } else {
             WHEEL_STEP_LINE_PX
@@ -525,16 +546,22 @@ impl Tool for ScrollTool {
                 || async move {
                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
-                            crate::input::mouse::scroll_wheel_at_xy(
-                                pid,
-                                screen_x,
-                                screen_y,
-                                win_local,
-                                wid,
-                                delta_y,
-                                delta_x,
-                                amount_ticks,
-                            )
+                            if precise {
+                                crate::input::mouse::scroll_pixels_at_xy(
+                                    pid, screen_x, screen_y, win_local, wid, delta_y, delta_x,
+                                )
+                            } else {
+                                crate::input::mouse::scroll_wheel_at_xy(
+                                    pid,
+                                    screen_x,
+                                    screen_y,
+                                    win_local,
+                                    wid,
+                                    delta_y,
+                                    delta_x,
+                                    amount_ticks,
+                                )
+                            }
                         };
                         // Foreground rung: brief front → wheel → restore prior frontmost.
                         match (fg, wid) {
@@ -575,6 +602,11 @@ impl Tool for ScrollTool {
             };
         }
 
+        if precise {
+            return ToolResult::error(
+                "pixel scroll requires an exact window point or retained element",
+            );
+        }
         let key = match (by.as_str(), direction.as_str()) {
             ("page", "down") | (_, "down") if by == "page" => "pagedown",
             ("page", "up") | (_, "up") if by == "page" => "pageup",

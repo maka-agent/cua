@@ -1046,11 +1046,14 @@ fn build_element_entry(
     // (a ValuePattern edit holding typed content) would otherwise hide the
     // text from a caller reading the structured side. See the macOS
     // get_window_state builder for the rationale.
-    if let Some(value) = n.value.clone().filter(|v| !v.is_empty()) {
+    if let Some(value) = n.value.clone() {
         entry["value"] = json!(value);
     }
     if let Some(enabled) = n.enabled {
         entry["enabled"] = json!(enabled);
+    }
+    if let Some(focused) = n.focused {
+        entry["focused"] = json!(focused);
     }
     if let Some(selected) = n.selected {
         entry["selected"] = json!(selected);
@@ -6024,6 +6027,13 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if args.get("by").and_then(Value::as_str) == Some("pixel") {
+            return ToolResult::error(
+                "unsupported: pixel-unit input is unavailable on this native adapter",
+            )
+            .with_structured(serde_json::json!({"code":"unsupported"}));
+        }
+
         use crate::input::delivery::{DeliveryMode, EventKind};
         use cua_driver_core::tool_args::ArgsExt;
         // ── Window-less screen-absolute branch (desktop target) ───────────────
@@ -6140,8 +6150,8 @@ impl Tool for ScrollTool {
 
         // WebView2/Tauri hosts can expose the indexed scroll container through
         // UIA while their top-level HWND ignores WM_VSCROLL. Prefer the
-        // accessibility channel for an indexed target; the message path below
-        // remains the fallback for native Win32 scrollbars.
+        // accessibility channel for an indexed target. Whole-window scrolling
+        // below is only authorized when no indexed target was requested.
         if delivery == DeliveryMode::Background && crate::input::is_chromium_target_window(hwnd) {
             return crate::input::delivery::background_unavailable_error(
                 hwnd,
@@ -6164,6 +6174,7 @@ impl Tool for ScrollTool {
                 None
             };
             let direction_for_uia = direction.clone();
+            let by_for_uia = by.clone();
             let uia_result = tokio::task::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
@@ -6175,10 +6186,11 @@ impl Tool for ScrollTool {
                         anyhow::bail!("element [{idx}] is not a UIA scroll element");
                     }
                     unsafe {
-                        crate::uia::scroll::scroll_element(
+                        crate::uia::scroll::scroll_element_by(
                             retained.as_ptr(),
                             &direction_for_uia,
                             amount,
+                            &by_for_uia,
                         )
                     }
                 }
@@ -6212,14 +6224,22 @@ impl Tool for ScrollTool {
                     }
                 }
                 return ToolResult::text(format!(
-                    "Scrolled {direction} {amount} ticks via UIA (delivery_mode:background)."
+                    "Scrolled {direction} {amount} {by} units via UIA."
                 ))
                 .with_structured(serde_json::json!({
                     "path": "uia",
+                    "effect": "unverifiable",
                     "verified": false,
-                    "delivery_mode": "background"
+                    "delivery_mode": if delivery.is_foreground() { "foreground" } else { "background" }
                 }));
             }
+            // An indexed target never falls through to the whole-window wheel:
+            // UIA failure does not authorize scrolling a different region.
+            return match uia_result {
+                Ok(Err(error)) => ToolResult::error(error.to_string()),
+                Err(error) => ToolResult::error(format!("UIA scroll task failed: {error}")),
+                Ok(Ok(())) => unreachable!(),
+            };
         }
 
         if delivery == DeliveryMode::Background

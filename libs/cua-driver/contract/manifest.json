@@ -3809,14 +3809,15 @@
         "additionalProperties": false,
         "properties": {
           "amount": {
-            "maximum": 50,
+            "maximum": 20000,
             "minimum": 1,
             "type": "integer"
           },
           "by": {
             "enum": [
               "line",
-              "page"
+              "page",
+              "pixel"
             ],
             "type": "string"
           },

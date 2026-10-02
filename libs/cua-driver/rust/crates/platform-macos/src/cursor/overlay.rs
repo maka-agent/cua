@@ -31,7 +31,10 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use cursor_overlay::{
@@ -70,6 +73,10 @@ fn arrival_fire(key: &CursorKey) {
 
 /// Drop a removed session's waiter; the dropped sender releases its await.
 fn arrival_cancel(key: &CursorKey) {
+    PENDING_PRESENTATIONS
+        .lock()
+        .unwrap()
+        .retain(|(pending, _)| pending != key);
     if let Ok(mut guard) = ARRIVAL_TX.lock() {
         if let Some(map) = guard.as_mut() {
             map.remove(key);
@@ -79,9 +86,18 @@ fn arrival_cancel(key: &CursorKey) {
 
 // ── Global overlay state ──────────────────────────────────────────────────
 
-static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new();
+enum MacMsg {
+    Overlay(OverlayMsg),
+    Redraw,
+}
+static TOPOLOGY: AtomicU64 = AtomicU64::new(0);
+static RECONCILING: AtomicBool = AtomicBool::new(false);
+static PENDING_PRESENTATIONS: Mutex<Vec<(CursorKey, tokio::sync::oneshot::Sender<()>)>> =
+    Mutex::new(Vec::new());
+
+static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<MacMsg>> = OnceLock::new();
 // Single-consumer slot; receiver is moved into run_on_main_thread().
-static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
+static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<MacMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 static OVERLAY_WINDOW_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -95,16 +111,18 @@ pub(crate) fn is_overlay_window(window_id: u32) -> bool {
 /// Screen-global geometry kept beside the shared keyed render map
 /// ([`cursor_overlay::RenderMap`], which owns the per-session lifecycle:
 /// lazy creation, stable z-order, tombstones, revival, and the default guard).
-/// Written once in `run_appkit`.
+/// Reconciled on the AppKit main queue when display geometry changes.
 #[derive(Default)]
 struct MacScreen {
     surfaces: Vec<Surface>,
+    generation: u64,
 }
 
 // Each NSScreen has its own AppKit backing scale. A union-sized window loses
 // that relationship on mixed-DPI desktops and allocates pixels for gaps.
 #[derive(Clone, Copy)]
 struct Surface {
+    display_id: u32,
     frame: ScreenFrame,
     backing_scale: f64,
     layer_ptr: usize,
@@ -140,6 +158,12 @@ type RenderMap = cursor_overlay::RenderMap<RenderState, MacScreen>;
 
 /// Drain one message into the shared map, releasing a removed session's
 /// arrival waiter. Returns the commanded key for z-order pinning.
+fn apply_mac_msg(map: &mut RenderMap, msg: MacMsg) -> Option<CursorKey> {
+    let MacMsg::Overlay(msg) = msg else {
+        return None;
+    };
+    apply_msg(map, msg)
+}
 fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
     let outcome = map.apply_msg(msg);
     if let MsgOutcome::Removed { key, .. } = &outcome {
@@ -206,7 +230,10 @@ pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
         return;
     }
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
+        let _ = tx.try_send(MacMsg::Overlay(OverlayMsg::Cmd(KeyedOverlayCommand {
+            key,
+            cmd,
+        })));
     }
 }
 
@@ -249,7 +276,7 @@ pub fn remove_cursor(key: CursorKey) {
         return;
     }
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(OverlayMsg::Remove(key));
+        let _ = tx.try_send(MacMsg::Overlay(OverlayMsg::Remove(key)));
     }
 }
 
@@ -260,7 +287,7 @@ pub fn revive_cursor(key: CursorKey) {
         return;
     }
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(OverlayMsg::Revive(key));
+        let _ = tx.try_send(MacMsg::Overlay(OverlayMsg::Revive(key)));
     }
 }
 
@@ -524,10 +551,9 @@ impl RenderEntry for RenderState {
 
 // ── AppKit / CGImage plumbing ─────────────────────────────────────────────
 
-unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
+unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<MacMsg>) {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
-    use objc2_foundation::NSRect;
 
     // ---- NSApplication ----
     // Verify main thread (MainThreadMarker is a zero-size compile-time token).
@@ -541,99 +567,8 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // Finish launching without presenting a UI (needed for NSApp.run())
     let _: () = msg_send![app, finishLaunching];
 
-    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-    let count: usize = msg_send![screens, count];
-    if count == 0 {
-        return;
-    }
-    // The first NSScreen is the primary display; mainScreen follows the key
-    // window and is therefore unsuitable as the fixed CG coordinate origin.
-    let primary: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
-    let primary_frame: NSRect = msg_send![primary, frame];
-    let primary_top = primary_frame.origin.y + primary_frame.size.height;
-    let mut surfaces = Vec::new();
-    for index in 0..count {
-        let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
-        let screen_frame: NSRect = msg_send![screen, frame];
-        let mut backing_scale: f64 = msg_send![screen, backingScaleFactor];
-        if !backing_scale.is_finite() || backing_scale < 1.0 {
-            backing_scale = 1.0;
-        }
-        // ---- NSWindow: single alloc + initWithContentRect:... ----
-        let win: *mut AnyObject = {
-            let allocated: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-            // NSWindowStyleMaskBorderless = 0
-            // NSBackingStoreBuffered = 2
-            let w: *mut AnyObject = msg_send![allocated,
-                initWithContentRect: screen_frame
-                styleMask: 0u64
-                backing: 2u64
-                defer: false
-            ];
-            w
-        };
-        if win.is_null() {
-            continue;
-        }
-
-        let _: () = msg_send![win, setOpaque: false];
-        let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-        let _: () = msg_send![win, setBackgroundColor: clear];
-        let _: () = msg_send![win, setHasShadow: false];
-        let _: () = msg_send![win, setIgnoresMouseEvents: true];
-        // NSWindowSharingReadOnly = 1. AppKit documents this as the default, but
-        // set it explicitly for the transparent agent overlay so ScreenCaptureKit
-        // includes browser-session cursors in Cua Driver recordings. Tahoe can
-        // otherwise show the overlay live while omitting it from an in-process
-        // display recording.
-        let _: () = msg_send![win, setSharingType: 1u64];
-        // NSNormalWindowLevel = 0.  The overlay lives at the normal window level so
-        // it appears in CGWindowList layer=0 results (which agents inspect via
-        // list_windows).  Z-ordering above the target is managed dynamically via
-        // orderWindow:relativeTo: (see dispatch_pin_above / render_loop repin).
-        let _: () = msg_send![win, setLevel: 0i64];
-        // NSWindowCollectionBehaviorCanJoinAllSpaces(1<<0) | FullScreenAuxiliary(1<<8) | Stationary(1<<4)
-        let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1<<8) | (1<<4))];
-        let _: () = msg_send![win, setReleasedWhenClosed: false];
-        let _: () = msg_send![win, setHidesOnDeactivate: false];
-
-        // ---- Layer-backed content view ----
-        let content_view: *mut AnyObject = msg_send![win, contentView];
-        let _: () = msg_send![content_view, setWantsLayer: true];
-        let layer: *mut AnyObject = msg_send![content_view, layer];
-
-        // Set layer geometry. contentsScale tells Core Animation that the CGImage
-        // we hand to setContents: is already at retina (`backing_scale`×) pixel
-        // density — without this, CA would treat our physical-pixel pixmap as a
-        // 1× asset and bilinear-downsample it back to logical pixels on screen,
-        // re-introducing the blur this pipeline exists to eliminate.
-        let _: () = msg_send![layer, setContentsScale: backing_scale];
-        // kCAGravityTopLeft — the string literal "topLeft"
-        let gravity_ns: *mut AnyObject = msg_send![class!(NSString),
-            stringWithUTF8String: c"topLeft".as_ptr().cast::<u8>()
-        ];
-        let _: () = msg_send![layer, setContentsGravity: gravity_ns];
-
-        let window_number: isize = msg_send![win, windowNumber];
-        surfaces.push(Surface {
-            frame: ScreenFrame::new(
-                screen_frame.origin.x,
-                primary_top - screen_frame.origin.y - screen_frame.size.height,
-                screen_frame.size.width,
-                screen_frame.size.height,
-            ),
-            backing_scale,
-            layer_ptr: layer as usize,
-            win_ptr: win as usize,
-            window_id: u32::try_from(window_number).unwrap_or(0),
-        });
-        let _: () = msg_send![win, orderFrontRegardless];
-    }
-    *OVERLAY_WINDOW_IDS.lock().unwrap() =
-        surfaces.iter().map(|surface| surface.window_id).collect();
-    if let Some(map) = RENDER.lock().unwrap().as_mut() {
-        map.platform = MacScreen { surfaces };
-    }
+    reconcile_surfaces();
+    install_screen_observers();
     std::thread::spawn(move || render_loop(rx));
 
     // ---- NSApplication run loop (blocks until process exits) ----
@@ -641,11 +576,227 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     OVERLAY_WINDOW_IDS.lock().unwrap().clear();
 }
 
-fn render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
+// AppKit objects are created, updated and retired exclusively on the main queue.
+// Render workers carry only raw addresses plus a topology generation; queued
+// callbacks validate that generation before ever dereferencing an address.
+unsafe fn create_surface(
+    screen_frame: objc2_foundation::NSRect,
+    backing_scale: f64,
+) -> (
+    *mut objc2::runtime::AnyObject,
+    *mut objc2::runtime::AnyObject,
+) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    // ---- NSWindow: single alloc + initWithContentRect:... ----
+    let win: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        // NSWindowStyleMaskBorderless = 0
+        // NSBackingStoreBuffered = 2
+        let w: *mut AnyObject = msg_send![allocated,
+        initWithContentRect: screen_frame
+        styleMask: 0u64
+        backing: 2u64
+        defer: false
+        ];
+        w
+    };
+    if win.is_null() {
+        return (win, std::ptr::null_mut());
+    }
+
+    let _: () = msg_send![win, setOpaque: false];
+    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![win, setBackgroundColor: clear];
+    let _: () = msg_send![win, setHasShadow: false];
+    let _: () = msg_send![win, setIgnoresMouseEvents: true];
+    // NSWindowSharingReadOnly = 1. AppKit documents this as the default, but
+    // set it explicitly for the transparent agent overlay so ScreenCaptureKit
+    // includes browser-session cursors in Cua Driver recordings. Tahoe can
+    // otherwise show the overlay live while omitting it from an in-process
+    // display recording.
+    let _: () = msg_send![win, setSharingType: 1u64];
+    // NSNormalWindowLevel = 0.  The overlay lives at the normal window level so
+    // it appears in CGWindowList layer=0 results (which agents inspect via
+    // list_windows).  Z-ordering above the target is managed dynamically via
+    // orderWindow:relativeTo: (see dispatch_pin_above / render_loop repin).
+    let _: () = msg_send![win, setLevel: 0i64];
+    // NSWindowCollectionBehaviorCanJoinAllSpaces(1<<0) | FullScreenAuxiliary(1<<8) | Stationary(1<<4)
+    let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1<<8) | (1<<4))];
+    let _: () = msg_send![win, setReleasedWhenClosed: false];
+    let _: () = msg_send![win, setHidesOnDeactivate: false];
+
+    // ---- Layer-backed content view ----
+    let content_view: *mut AnyObject = msg_send![win, contentView];
+    let _: () = msg_send![content_view, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![content_view, layer];
+
+    // Set layer geometry. contentsScale tells Core Animation that the CGImage
+    // we hand to setContents: is already at retina (`backing_scale`×) pixel
+    // density — without this, CA would treat our physical-pixel pixmap as a
+    // 1× asset and bilinear-downsample it back to logical pixels on screen,
+    // re-introducing the blur this pipeline exists to eliminate.
+    let _: () = msg_send![layer, setContentsScale: backing_scale];
+    // kCAGravityTopLeft — the string literal "topLeft"
+    let gravity_ns: *mut AnyObject = msg_send![class!(NSString),
+        stringWithUTF8String: c"topLeft".as_ptr().cast::<u8>()
+    ];
+    let _: () = msg_send![layer, setContentsGravity: gravity_ns];
+
+    (win, layer)
+}
+
+unsafe fn reconcile_surfaces() {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSRect;
+    if RECONCILING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    struct ReconcileGuard;
+    impl Drop for ReconcileGuard {
+        fn drop(&mut self) {
+            RECONCILING.store(false, Ordering::Release);
+        }
+    }
+    let _guard = ReconcileGuard;
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let count: usize = msg_send![screens, count];
+    let primary_top = if count > 0 {
+        let primary: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        let frame: NSRect = msg_send![primary, frame];
+        frame.origin.y + frame.size.height
+    } else {
+        0.0
+    };
+    let old = RENDER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|map| map.platform.surfaces.clone())
+        .unwrap_or_default();
+    let mut descriptors = Vec::new();
+    for index in 0..count {
+        let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
+        let native_frame: NSRect = msg_send![screen, frame];
+        let mut scale: f64 = msg_send![screen, backingScaleFactor];
+        if !scale.is_finite() || scale < 1.0 {
+            scale = 1.0;
+        }
+        let description: *mut AnyObject = msg_send![screen, deviceDescription];
+        let key: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: c"NSScreenNumber".as_ptr().cast::<u8>()];
+        let number: *mut AnyObject = msg_send![description, objectForKey: key];
+        if number.is_null() {
+            continue;
+        }
+        let display_id: u32 = msg_send![number, unsignedIntValue];
+        let frame = ScreenFrame::new(
+            native_frame.origin.x,
+            primary_top - native_frame.origin.y - native_frame.size.height,
+            native_frame.size.width,
+            native_frame.size.height,
+        );
+        descriptors.push((display_id, native_frame, frame, scale));
+    }
+    if descriptors.len() == old.len()
+        && descriptors
+            .iter()
+            .zip(&old)
+            .all(|((id, _, frame, scale), surface)| {
+                *id == surface.display_id
+                    && *frame == surface.frame
+                    && *scale == surface.backing_scale
+            })
+    {
+        return;
+    }
+    // Invalidates every queued native callback before any old window is retired.
+    let generation = TOPOLOGY.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut surfaces = Vec::new();
+    for (display_id, native_frame, frame, scale) in descriptors {
+        let (win, layer) =
+            if let Some(surface) = old.iter().find(|surface| surface.display_id == display_id) {
+                let win = surface.win_ptr as *mut AnyObject;
+                let layer = surface.layer_ptr as *mut AnyObject;
+                let _: () = msg_send![win, setFrame: native_frame display: false];
+                let _: () = msg_send![layer, setContentsScale: scale];
+                (win, layer)
+            } else {
+                create_surface(native_frame, scale)
+            };
+        if win.is_null() {
+            continue;
+        }
+        let window_number: isize = msg_send![win, windowNumber];
+        surfaces.push(Surface {
+            display_id,
+            frame,
+            backing_scale: scale,
+            layer_ptr: layer as usize,
+            win_ptr: win as usize,
+            window_id: u32::try_from(window_number).unwrap_or(0),
+        });
+    }
+    *OVERLAY_WINDOW_IDS.lock().unwrap() =
+        surfaces.iter().map(|surface| surface.window_id).collect();
+    if let Some(map) = RENDER.lock().unwrap().as_mut() {
+        map.platform = MacScreen {
+            surfaces: surfaces.clone(),
+            generation,
+        };
+    }
+    for surface in old {
+        if !surfaces
+            .iter()
+            .any(|current| current.display_id == surface.display_id)
+        {
+            let win = surface.win_ptr as *mut AnyObject;
+            let _: () = msg_send![win, close];
+            drop(objc2::rc::Retained::<AnyObject>::from_raw(win));
+        }
+    }
+    request_redraw();
+}
+
+fn request_redraw() {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.try_send(MacMsg::Redraw);
+    }
+}
+
+unsafe fn install_screen_observers() {
+    use block2::RcBlock;
+    use objc2_app_kit::{
+        NSApplicationDidChangeScreenParametersNotification,
+        NSWindowDidChangeBackingPropertiesNotification,
+    };
+    use objc2_foundation::{NSNotification, NSNotificationCenter, NSOperationQueue};
+    let center = NSNotificationCenter::defaultCenter();
+    let queue = NSOperationQueue::mainQueue();
+    for name in [
+        NSApplicationDidChangeScreenParametersNotification,
+        NSWindowDidChangeBackingPropertiesNotification,
+    ] {
+        let block = RcBlock::new(|_: std::ptr::NonNull<NSNotification>| unsafe {
+            reconcile_surfaces();
+        });
+        let token = center.addObserverForName_object_queue_usingBlock(
+            Some(name),
+            None,
+            Some(&queue),
+            &block,
+        );
+        // This singleton overlay and its observers live until helper-process exit.
+        std::mem::forget(token);
+    }
+}
+
+fn render_loop(rx: std::sync::mpsc::Receiver<MacMsg>) {
     let target_frame_ms = Duration::from_millis(16); // ~60 fps while pixels can change
     let hover_poll_ms = Duration::from_millis(80);
     let mut last_tick = Instant::now();
     let mut frame_tick_needed = false;
+    let mut last_generation = 0;
     let mut hover_poll_needed = false;
     // Repin bookkeeping: track last pinned wid and a frame counter for
     // the periodic defensive-repin (every ~60 active frames ≈ 1 s).
@@ -692,6 +843,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
             raise_unpinned,
             arrived,
             surfaces,
+            generation,
             had_msg,
             hover_changed,
             next_frame_tick_needed,
@@ -706,13 +858,13 @@ fn render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
                     let mut had_msg = false;
                     if let Some(msg) = first_msg {
                         had_msg = true;
-                        if let Some(k) = apply_msg(map, msg) {
+                        if let Some(k) = apply_mac_msg(map, msg) {
                             last_key = Some(k);
                         }
                     }
                     while let Ok(msg) = rx.try_recv() {
                         had_msg = true;
-                        if let Some(k) = apply_msg(map, msg) {
+                        if let Some(k) = apply_mac_msg(map, msg) {
                             last_key = Some(k);
                         }
                     }
@@ -760,6 +912,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
                         raise_unpinned,
                         arrived,
                         map.platform.surfaces.clone(),
+                        map.platform.generation,
                         had_msg,
                         hover_changed,
                         next_frame_tick_needed,
@@ -775,23 +928,34 @@ fn render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
         // until the next command wakes the loop.
         if frame_tick_needed || had_msg {
             repin_frames += 1;
+            let topology_changed = generation != last_generation;
+            last_generation = generation;
             let pin_changed = pinned_wid != last_pinned;
             last_pinned = pinned_wid;
-            if pinned_wid.is_some() && (pin_changed || repin_frames >= 60) {
+            if pinned_wid.is_some() && (pin_changed || topology_changed || repin_frames >= 60) {
                 for surface in &surfaces {
                     MacZOrderEnforcer {
                         win_ptr: surface.win_ptr,
+                        generation,
                     }
                     .reassert(pinned_wid);
                 }
                 repin_frames = 0;
-            } else if raise_unpinned {
+            } else if raise_unpinned
+                || (topology_changed && pinned_wid.is_none() && {
+                    RENDER
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|map| map.cursors.values().any(cursor_is_externally_visible))
+                })
+            {
                 // A direct move_cursor has no target window to pin against.
                 // Raise the normal-level, click-through overlay without
                 // activating the driver so a later foreground application
                 // cannot cover a standalone session cursor.
                 for surface in &surfaces {
-                    dispatch_order_front(surface.win_ptr);
+                    dispatch_order_front(surface.win_ptr, generation);
                 }
                 repin_frames = 0;
             } else if repin_frames >= 60 {
@@ -859,10 +1023,10 @@ fn render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
                 let mut guard = ARRIVAL_TX.lock().unwrap();
                 arrived
                     .iter()
-                    .filter_map(|key| guard.as_mut()?.remove(key))
+                    .filter_map(|key| Some((key.clone(), guard.as_mut()?.remove(key)?)))
                     .collect()
             };
-            dispatch_set_layer_contents(frames, arrivals);
+            dispatch_set_layer_contents(frames, arrivals, generation);
         }
 
         frame_tick_needed = next_frame_tick_needed;
@@ -901,7 +1065,8 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
 /// of the given `CALayer` via `dispatch_async(main_queue, ...)`.
 fn dispatch_set_layer_contents(
     frames: Vec<(usize, tiny_skia::Pixmap)>,
-    arrivals: Vec<tokio::sync::oneshot::Sender<()>>,
+    arrivals: Vec<(CursorKey, tokio::sync::oneshot::Sender<()>)>,
+    generation: u64,
 ) {
     let mut images = Vec::new();
     for (layer, pixmap) in frames {
@@ -913,11 +1078,13 @@ fn dispatch_set_layer_contents(
                         CGImageRelease(image as *mut c_void);
                     }
                 }
+                PENDING_PRESENTATIONS.lock().unwrap().extend(arrivals);
+                request_redraw();
                 return;
             }
         }
     }
-    let payload = Box::new((images, arrivals));
+    let payload = Box::new((images, arrivals, generation));
 
     // GCD symbols from libdispatch (part of the macOS system library stubs).
     // `dispatch_get_main_queue()` is an inline C function; the underlying
@@ -936,8 +1103,25 @@ fn dispatch_set_layer_contents(
     }
 
     unsafe extern "C" fn set_contents_cb(ctx: *mut c_void) {
-        let (images, arrivals): (Vec<(usize, usize)>, Vec<tokio::sync::oneshot::Sender<()>>) =
-            *Box::from_raw(ctx as *mut _);
+        let (images, mut arrivals, generation): (
+            Vec<(usize, usize)>,
+            Vec<(CursorKey, tokio::sync::oneshot::Sender<()>)>,
+            u64,
+        ) = *Box::from_raw(ctx as *mut _);
+        let stale = generation != TOPOLOGY.load(Ordering::Acquire);
+        if stale || images.is_empty() {
+            PENDING_PRESENTATIONS.lock().unwrap().extend(arrivals);
+            for (_, image) in images {
+                CGImageRelease(image as *mut c_void);
+            }
+            // With no displays, keep the waiter until a real screen change.
+            // Scheduling another empty frame would spin the main queue.
+            if stale {
+                request_redraw();
+            }
+            return;
+        }
+        arrivals.extend(PENDING_PRESENTATIONS.lock().unwrap().drain(..));
         for (layer_ptr, image) in &images {
             let layer = *layer_ptr as *mut objc2::runtime::AnyObject;
             let cg_id = *image as *mut objc2::runtime::AnyObject;
@@ -946,7 +1130,7 @@ fn dispatch_set_layer_contents(
         let _: () = objc2::msg_send![objc2::class!(CATransaction), flush];
         // A path-end notification belongs to the applied frame, not to an
         // earlier model tick or merely scheduling this callback.
-        for arrival in arrivals {
+        for (_, arrival) in arrivals {
             let _ = arrival.send(());
         }
         // Release the CGImage ref we retained in pixmap_to_cgimage.
@@ -975,7 +1159,7 @@ fn dispatch_set_layer_contents(
 /// This is used only for an externally visible cursor with no target window.
 /// Target-bound actions continue to use [`dispatch_pin_above`] so background
 /// delivery remains below unrelated foreground applications.
-fn dispatch_order_front(win_ptr: usize) {
+fn dispatch_order_front(win_ptr: usize, generation: u64) {
     use std::ffi::c_void;
 
     #[link(name = "System", kind = "framework")]
@@ -989,12 +1173,15 @@ fn dispatch_order_front(win_ptr: usize) {
     }
 
     unsafe extern "C" fn order_front_cb(ctx: *mut c_void) {
-        let win_ptr = *Box::from_raw(ctx as *mut usize);
+        let (win_ptr, generation): (usize, u64) = *Box::from_raw(ctx as *mut _);
+        if generation != TOPOLOGY.load(Ordering::Acquire) {
+            return;
+        }
         let win = win_ptr as *mut objc2::runtime::AnyObject;
         let _: () = objc2::msg_send![win, orderFrontRegardless];
     }
 
-    let payload = Box::new(win_ptr);
+    let payload = Box::new((win_ptr, generation));
     unsafe {
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(
@@ -1039,7 +1226,7 @@ fn target_is_frontmost_visible_window(
         .is_some_and(|window| u64::from(window.window_id) == target_wid)
 }
 
-fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
+fn dispatch_pin_above(win_ptr: usize, target_wid: u64, generation: u64) {
     use std::ffi::c_void;
 
     #[link(name = "System", kind = "framework")]
@@ -1053,8 +1240,11 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     }
 
     unsafe extern "C" fn reorder_cb(ctx: *mut c_void) {
-        let (win_ptr, target_wid, raise_front): (usize, u64, bool) =
-            *Box::from_raw(ctx as *mut (usize, u64, bool));
+        let (win_ptr, target_wid, raise_front, generation): (usize, u64, bool, u64) =
+            *Box::from_raw(ctx as *mut _);
+        if generation != TOPOLOGY.load(Ordering::Acquire) {
+            return;
+        }
         let win = win_ptr as *mut objc2::runtime::AnyObject;
         // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit)
         let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
@@ -1073,7 +1263,7 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     let windows = crate::windows::visible_windows();
     let raise_front =
         target_is_frontmost_visible_window(target_wid, crate::apps::frontmost_pid(), &windows);
-    let payload = Box::new((win_ptr, target_wid, raise_front));
+    let payload = Box::new((win_ptr, target_wid, raise_front, generation));
     unsafe {
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(
@@ -1097,12 +1287,13 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
 /// responsible only for target-relative ordering.
 struct MacZOrderEnforcer {
     win_ptr: usize,
+    generation: u64,
 }
 
 impl ZOrderEnforcer for MacZOrderEnforcer {
     fn reassert(&self, target: Option<u64>) {
         if let Some(wid) = target {
-            dispatch_pin_above(self.win_ptr, wid);
+            dispatch_pin_above(self.win_ptr, wid, self.generation);
         }
         // target = None → no-op; see struct doc comment.
     }
@@ -1252,7 +1443,9 @@ mod tests {
                     layer_ptr: 0,
                     win_ptr: 0,
                     window_id: 0,
+                    display_id: 0,
                 }],
+                generation: 0,
             },
         )
     }

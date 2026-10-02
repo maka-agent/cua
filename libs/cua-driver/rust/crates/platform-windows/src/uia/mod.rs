@@ -20,8 +20,8 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern, ToggleState_Off, ToggleState_On,
     TreeScope, TreeScope_Children, TreeScope_Element, TreeScope_Subtree,
     UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-    UIA_ExpandCollapsePatternId, UIA_HelpTextPropertyId, UIA_InvokePatternId,
-    UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_NamePropertyId,
+    UIA_ExpandCollapsePatternId, UIA_HasKeyboardFocusPropertyId, UIA_HelpTextPropertyId,
+    UIA_InvokePatternId, UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_NamePropertyId,
     UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
     UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId, UIA_TextPatternId,
     UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId,
@@ -65,6 +65,8 @@ pub struct UiaNode {
     /// Enabled state reported by UIA. `None` is reserved for fallback
     /// backends that cannot establish it.
     pub enabled: Option<bool>,
+    /// Keyboard focus from the same bounded UIA snapshot.
+    pub focused: Option<bool>,
     /// Toggle/selection state when the element exposes one of those patterns.
     pub selected: Option<bool>,
     /// Raw COM pointer (IUIAutomationElement for UIA path, IAccessible for
@@ -680,6 +682,7 @@ unsafe fn node_cache_request(
         UIA_AutomationIdPropertyId,
         UIA_HelpTextPropertyId,
         UIA_IsEnabledPropertyId,
+        UIA_HasKeyboardFocusPropertyId,
         UIA_IsOffscreenPropertyId,
         UIA_BoundingRectanglePropertyId,
         UIA_ToggleToggleStatePropertyId,
@@ -817,6 +820,7 @@ fn emit_cached_node(
     let automation_id = read_cached_bstr(element, UIA_AutomationIdPropertyId);
     let help_text = read_cached_bstr(element, UIA_HelpTextPropertyId);
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
+    let focused = read_cached_bool(element, UIA_HasKeyboardFocusPropertyId);
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.
     let is_enabled = enabled.unwrap_or(true);
@@ -852,6 +856,7 @@ fn emit_cached_node(
                 help_text: help_text.clone(),
                 actions: actions.clone(),
                 enabled,
+                focused,
                 selected,
                 element_ptr: ptr,
                 center_x,
@@ -872,6 +877,7 @@ fn emit_cached_node(
                 help_text: help_text.clone(),
                 actions: vec![],
                 enabled,
+                focused,
                 selected,
                 element_ptr: ptr,
                 center_x: 0,
@@ -913,7 +919,21 @@ fn read_cached_bstr_name(element: &IUIAutomationElement) -> Option<String> {
 }
 
 fn read_cached_bstr_value(element: &IUIAutomationElement) -> Option<String> {
-    read_cached_bstr(element, UIA_ValueValuePropertyId)
+    // UIA returns an empty default even for unsupported Value properties.
+    // Only a proven ValuePattern turns that empty BSTR into observed data.
+    unsafe {
+        element.GetCachedPattern(UIA_ValuePatternId).ok()?;
+        let variant = element
+            .GetCachedPropertyValue(UIA_ValueValuePropertyId)
+            .ok()?;
+        if variant.as_raw().Anonymous.Anonymous.vt != 8 {
+            return None;
+        }
+        let bstr = BSTR::from_raw(variant.as_raw().Anonymous.Anonymous.Anonymous.bstrVal);
+        let value = bstr.to_string();
+        std::mem::forget(bstr);
+        Some(value)
+    }
 }
 
 fn read_cached_bstr(
@@ -1124,6 +1144,16 @@ pub(crate) fn format_node_line(node: &UiaNode) -> String {
             s.push_str(&format!(" = \"{}\"", v));
         }
     }
+    if node.enabled == Some(false) {
+        s.push_str(" [disabled]");
+    }
+    if node.focused == Some(true) {
+        s.push_str(" [focused]");
+    }
+    if let Some(selected) = node.selected {
+        s.push_str(&format!(" [selected={selected}]"));
+    }
+
     s
 }
 

@@ -6066,6 +6066,8 @@ class ScrollBy(enum.Enum):
 
     PAGE = 1
 
+    PIXEL = 2
+
 
 
 class _UniffiFfiConverterTypeScrollBy(_UniffiConverterRustBuffer):
@@ -6076,6 +6078,8 @@ class _UniffiFfiConverterTypeScrollBy(_UniffiConverterRustBuffer):
             return ScrollBy.LINE
         if variant == 2:
             return ScrollBy.PAGE
+        if variant == 3:
+            return ScrollBy.PIXEL
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -6083,6 +6087,8 @@ class _UniffiFfiConverterTypeScrollBy(_UniffiConverterRustBuffer):
         if value == ScrollBy.LINE:
             return
         if value == ScrollBy.PAGE:
+            return
+        if value == ScrollBy.PIXEL:
             return
         raise ValueError(value)
 
@@ -6092,6 +6098,8 @@ class _UniffiFfiConverterTypeScrollBy(_UniffiConverterRustBuffer):
             buf.write_i32(1)
         if value == ScrollBy.PAGE:
             buf.write_i32(2)
+        if value == ScrollBy.PIXEL:
+            buf.write_i32(3)
 
 
 

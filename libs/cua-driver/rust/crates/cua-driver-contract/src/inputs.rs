@@ -116,7 +116,7 @@ fn drag_steps_schema(_: &mut SchemaGenerator) -> Schema {
 }
 
 fn scroll_amount_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({ "type": "integer", "minimum": 1, "maximum": 50 })
+    json_schema!({ "type": "integer", "minimum": 1, "maximum": 20000 })
 }
 
 fn cursor_theme_id_schema(_: &mut SchemaGenerator) -> Schema {
@@ -291,6 +291,7 @@ impl ScrollDirection {
 pub enum ScrollBy {
     Line,
     Page,
+    Pixel,
 }
 
 impl ScrollBy {
@@ -298,6 +299,7 @@ impl ScrollBy {
         match self {
             Self::Line => "line",
             Self::Page => "page",
+            Self::Pixel => "pixel",
         }
     }
 }

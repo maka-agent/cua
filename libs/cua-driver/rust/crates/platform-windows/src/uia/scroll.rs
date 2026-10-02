@@ -56,9 +56,8 @@ pub unsafe fn element_is_offscreen(element_ptr: usize) -> Option<bool> {
         return None;
     }
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let elem: IUIAutomationElement = IUIAutomationElement::from_raw(element_ptr as *mut _);
+    let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     let result = elem.CurrentIsOffscreen().ok().map(|value| value.as_bool());
-    std::mem::forget(elem);
     result
 }
 
@@ -77,7 +76,7 @@ pub unsafe fn element_is_offscreen(element_ptr: usize) -> Option<bool> {
 /// `element_ptr` must be a live `IUIAutomationElement` vtable pointer. Callers
 /// hold it alive through a `RetainedElement` guard (its COM `AddRef`) for the
 /// duration of this call. We borrow the pointer without consuming the cache's
-/// refcount (the constructed handle is `forget`-ten before return).
+/// refcount (the borrowed handle is wrapped in `ManuallyDrop`).
 pub unsafe fn scroll_into_view_and_recenter(
     host_hwnd: u64,
     element_ptr: usize,
@@ -93,7 +92,7 @@ pub unsafe fn scroll_into_view_and_recenter(
     // RPC_E_CHANGED_MODE, which the `let _ =` swallows.
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-    let elem: IUIAutomationElement = IUIAutomationElement::from_raw(element_ptr as *mut _);
+    let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
 
     // A recentred point only counts if it actually lands inside the host window
     // - otherwise the coordinate tap would still miss. This mirrors the caller's
@@ -116,7 +115,6 @@ pub unsafe fn scroll_into_view_and_recenter(
         .or_else(|| scroll_ancestors_into_view(host_hwnd, &elem).and_then(actionable));
 
     // Don't Release the cache's ref - the RetainedElement guard owns it.
-    std::mem::forget(elem);
     result
 }
 
@@ -131,11 +129,30 @@ pub unsafe fn scroll_element(
     direction: &str,
     amount: u32,
 ) -> anyhow::Result<()> {
+    scroll_element_by(element_ptr, direction, amount, "page")
+}
+
+/// Scroll the retained container using UIA's native line/page units.
+/// Pixel input is a separate native input path and cannot be approximated here.
+///
+/// # Safety
+/// `element_ptr` must remain a live, retained `IUIAutomationElement` pointer.
+pub unsafe fn scroll_element_by(
+    element_ptr: usize,
+    direction: &str,
+    amount: u32,
+    by: &str,
+) -> anyhow::Result<()> {
+    let (decrement, increment) = match by {
+        "line" => (ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement),
+        "page" => (ScrollAmount_LargeDecrement, ScrollAmount_LargeIncrement),
+        other => anyhow::bail!("UIA does not support scroll unit {other:?}"),
+    };
     if element_ptr == 0 {
         anyhow::bail!("cached UIA scroll element is null");
     }
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let elem: IUIAutomationElement = IUIAutomationElement::from_raw(element_ptr as *mut _);
+    let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     let pattern = elem
         .GetCurrentPattern(UIA_ScrollPatternId)
         .map_err(|e| anyhow::anyhow!("UIA ScrollPattern unavailable: {e}"))?;
@@ -143,10 +160,8 @@ pub unsafe fn scroll_element(
         .cast::<IUIAutomationScrollPattern>()
         .map_err(|e| anyhow::anyhow!("UIA ScrollPattern cast failed: {e}"))?;
     let vertical = match direction {
-        "up" => ScrollAmount_LargeDecrement,
-        "down" => ScrollAmount_LargeIncrement,
-        "left" => ScrollAmount_LargeDecrement,
-        "right" => ScrollAmount_LargeIncrement,
+        "up" | "left" => decrement,
+        "down" | "right" => increment,
         other => anyhow::bail!("unknown scroll direction {other:?}"),
     };
     let horizontal = matches!(direction, "left" | "right");
@@ -158,7 +173,6 @@ pub unsafe fn scroll_element(
         };
         result.map_err(|e| anyhow::anyhow!("UIA scroll failed: {e}"))?;
     }
-    std::mem::forget(elem);
     Ok(())
 }
 

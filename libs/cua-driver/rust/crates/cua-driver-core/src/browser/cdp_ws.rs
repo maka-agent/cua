@@ -253,13 +253,51 @@ impl Drop for CdpConnection {
     }
 }
 
+// Cancelled sends may leave partial frames; cancelled replies may hide an
+// applied mutation. Retire the connection so neither can be reused or replayed.
+struct PendingCall<'a> {
+    connection: &'a CdpConnection,
+    id: u64,
+    replied: bool,
+}
+
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        self.connection
+            .demux
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&self.id);
+        if !self.replied {
+            self.connection.reader.abort();
+            self.connection.demux.close();
+        }
+    }
+}
+
 impl CdpConnection {
     pub async fn connect(ws_url: &str) -> anyhow::Result<Self> {
+        Self::connect_bounded(ws_url, 64 * 1024 * 1024).await
+    }
+
+    /// Reuse the shared event/session demultiplexer with a host's observation
+    /// byte budget. The bound is enforced by the WebSocket before JSON parsing.
+    pub async fn connect_bounded(ws_url: &str, max_message_bytes: usize) -> anyhow::Result<Self> {
+        if max_message_bytes == 0 {
+            anyhow::bail!("CDP message budget must be positive");
+        }
         validate_loopback_ws_url(ws_url).map_err(|e| anyhow::anyhow!(e))?;
-        let (ws, _resp) =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
-                .await
-                .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+            max_message_size: Some(max_message_bytes),
+            ..Default::default()
+        };
+        let (ws, _resp) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_with_config(ws_url, Some(config), false),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
         let (write, read) = ws.split();
         let demux = Arc::new(Demux {
             pending: StdMutex::new(HashMap::new()),
@@ -368,6 +406,11 @@ impl CdpConnection {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.demux.pending.lock().unwrap().insert(id, tx);
+        let mut pending = PendingCall {
+            connection: self,
+            id,
+            replied: false,
+        };
         // Close can race the initial check. If the reader cleared the
         // pending map just before this insertion, remove the orphaned
         // sender now instead of waiting for the call timeout.
@@ -380,30 +423,33 @@ impl CdpConnection {
         if let Some(sid) = session_id {
             msg["sessionId"] = Value::String(sid.to_owned());
         }
-        let sent = {
-            let mut writer = self.writer.lock().await;
-            writer.send(Message::Text(msg.to_string())).await
-        };
-        if let Err(e) = sent {
-            self.demux.pending.lock().unwrap().remove(&id);
-            anyhow::bail!("CDP send failed during {method}: {e}");
-        }
-
-        match tokio::time::timeout(CALL_TIMEOUT, rx).await {
-            Err(_) => {
-                self.demux.pending.lock().unwrap().remove(&id);
-                anyhow::bail!("CDP {method} timed out after {CALL_TIMEOUT:?}")
+        let outcome = tokio::time::timeout(CALL_TIMEOUT, async {
+            {
+                let mut writer = self.writer.lock().await;
+                if self.is_closed() {
+                    anyhow::bail!("CDP socket closed before sending {method}");
+                }
+                writer
+                    .send(Message::Text(msg.to_string()))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("CDP send failed during {method}: {e}"))?;
             }
-            Ok(Err(_)) => anyhow::bail!("CDP socket closed during {method}"),
-            Ok(Ok(CallOutcome::Result(v))) => Ok(v),
-            Ok(Ok(CallOutcome::Error {
+            rx.await
+                .map_err(|_| anyhow::anyhow!("CDP socket closed during {method}"))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("CDP {method} timed out after {CALL_TIMEOUT:?}"))??;
+        pending.replied = true;
+        match outcome {
+            CallOutcome::Result(v) => Ok(v),
+            CallOutcome::Error {
                 code: Some(code),
                 message,
-            })) => anyhow::bail!("CDP {method} failed ({code}): {message}"),
-            Ok(Ok(CallOutcome::Error {
+            } => anyhow::bail!("CDP {method} failed ({code}): {message}"),
+            CallOutcome::Error {
                 code: None,
                 message,
-            })) => anyhow::bail!("CDP {method} failed: {message}"),
+            } => anyhow::bail!("CDP {method} failed: {message}"),
         }
     }
 }
@@ -684,6 +730,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["echoed"]["x"], 7);
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_is_bounded_and_retires_the_connection() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        let _writer = conn.writer.lock().await;
+        let error = tokio::time::timeout(
+            CALL_TIMEOUT + Duration::from_secs(2),
+            conn.call(None, "Input.insertText", json!({ "text": "once" })),
+        )
+        .await
+        .expect("the command deadline must also cover waiting for the writer")
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(conn.is_closed());
+        assert!(conn.demux.pending.lock().unwrap().is_empty());
+        assert!(conn.call(None, "Echo.params", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_removes_pending_and_retires_the_connection() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        let _writer = conn.writer.lock().await;
+        let mut call = Box::pin(conn.call(None, "Input.insertText", json!({ "text": "once" })));
+        tokio::select! {
+            _ = &mut call => panic!("call must wait for the held writer"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(conn.demux.pending.lock().unwrap().len(), 1);
+        drop(call);
+        assert!(conn.is_closed());
+        assert!(conn.demux.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -260,8 +260,9 @@ jobs:
             VERSION="${{ inputs.version }}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # pinned action; latest stable selected below
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - uses: actions/cache@v4
         with:
@@ -352,8 +353,9 @@ jobs:
             VERSION="${{ inputs.version }}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # pinned action; latest stable selected below
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # rustup can drop non-host std components while updating an existing
       # stable toolchain. Install the requested cross target explicitly and
@@ -684,8 +686,9 @@ jobs:
             exit 1
           fi
           echo "Imported $CERT_COUNT Developer ID Application certificate(s)"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # pinned action; latest stable selected below
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - name: Ensure Rust targets are installed
         working-directory: libs/cua-driver/rust

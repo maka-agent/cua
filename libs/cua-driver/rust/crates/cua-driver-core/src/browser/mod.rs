@@ -69,6 +69,7 @@ pub use platform::{
     PrepareProfileMode, PrepareRequest, PrepareSideEffects, PrepareStrategy,
 };
 pub use refusal::{BrowserRefusal, BrowserRefusalCode};
+pub use semantic::{semantic_ax_tree, SEMANTIC_COMPUTED_STYLES};
 pub use setup_descriptor::{
     existing_profile_setup_descriptor, BrowserSetupDescriptor, EXISTING_PROFILE_SETUP_READY_TIMEOUT,
 };

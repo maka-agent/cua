@@ -487,6 +487,7 @@ mod tests {
             help_text: None,
             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
             enabled: None,
+            focused: None,
             selected: None,
             element_ptr: 0,
             center_x: 0,

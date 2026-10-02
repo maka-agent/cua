@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::store::{BrowserActionKind, BrowserVisibility, FrameRef, RefEntry};
 
-pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
+pub const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
     "display",
     "visibility",
     "opacity",
@@ -605,6 +605,89 @@ fn apply_page_occlusion(nodes: &mut [SemanticNode], dom: &DomIndex, layout: &Lay
             node.visibility = BrowserVisibility::PageOccluded;
         }
     }
+}
+
+/// Compose CDP-shaped accessibility nodes with the shared bounded DOM/layout
+/// semantics. This is observation data, not an authorization or mutation ref;
+/// embedding hosts must separately retain and revalidate frame/document identity.
+pub fn semantic_ax_tree(
+    ax_tree: &Value,
+    dom_tree: &Value,
+    layout_snapshot: &Value,
+    metrics: &Value,
+    frame: FrameRef,
+) -> Value {
+    let dom = build_dom_index(dom_tree.get("root").unwrap_or(dom_tree));
+    let layout = build_layout_index(layout_snapshot);
+    let viewport = parse_viewport(metrics);
+    let document = compose_accessibility_tree(ax_tree, &dom, &layout, &viewport, frame);
+    let mut nodes = ax_tree
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for node in &document.nodes {
+        if node.actions.is_empty()
+            || matches!(
+                node.visibility,
+                BrowserVisibility::CssHidden | BrowserVisibility::PageOccluded
+            )
+        {
+            continue;
+        }
+        if let Some(existing) = nodes
+            .iter_mut()
+            .find(|existing| existing["nodeId"] == node.ax_id)
+        {
+            existing["actions"] = serde_json::json!(node.actions);
+            if node.role == "generic"
+                && existing["name"]["value"].as_str().is_none_or(str::is_empty)
+            {
+                if let Some(name) = node
+                    .backend_node_id
+                    .and_then(|backend| dom.nodes.get(&backend))
+                    .and_then(|meta| {
+                        ["aria-label", "title", "id"]
+                            .iter()
+                            .find_map(|key| meta.attrs.get(*key))
+                    })
+                {
+                    existing["name"] = serde_json::json!({"value":name});
+                }
+            }
+        }
+    }
+    for node in document
+        .nodes
+        .iter()
+        .filter(|node| node.ax_id.starts_with("dom-"))
+    {
+        let value = serde_json::json!({
+            "nodeId": node.ax_id,
+            "parentId": node.parent_ax_id,
+            "backendDOMNodeId": node.backend_node_id,
+            "role": {"value": node.role},
+            "name": {"value": node.name.as_deref().unwrap_or("")},
+            "value": {"value": node.value},
+            "actions": node.actions,
+            "properties": node.states.iter().map(|(name, value)| serde_json::json!({"name":name,"value":{"value":value}})).collect::<Vec<_>>()
+        });
+        if let Some(parent) = node
+            .parent_ax_id
+            .as_deref()
+            .and_then(|id| nodes.iter_mut().find(|parent| parent["nodeId"] == id))
+        {
+            if !parent.get("childIds").is_some_and(Value::is_array) {
+                parent["childIds"] = serde_json::json!([]);
+            }
+            parent["childIds"]
+                .as_array_mut()
+                .unwrap()
+                .push(Value::String(node.ax_id.clone()));
+        }
+        nodes.push(value);
+    }
+    serde_json::json!({"nodes":nodes})
 }
 
 fn supplement_dom_actions(

@@ -1097,7 +1097,7 @@ impl CaptureService {
         clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, CaptureStoreError> {
         let runtime_generation = NEXT_RUNTIME_GENERATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current != 0 && current != u64::MAX).then_some(current + 1)
             })
             .map_err(|_| CaptureStoreError::IdExhausted)?;
