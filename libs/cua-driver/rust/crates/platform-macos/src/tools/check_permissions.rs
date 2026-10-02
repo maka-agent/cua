@@ -302,13 +302,11 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
-        // Matches Swift `CheckPermissionsTool.swift` description verbatim.
         name: "check_permissions".into(),
         description: "Report TCC permission status for Accessibility and Screen Recording. \
-            By default also raises the system permission dialogs for any missing grants — \
-            Apple's request APIs are no-ops when the grant is already active, so this is \
-            safe to call repeatedly. Pass {\"prompt\": false} for a purely read-only \
-            status check.\n\n\
+            By default performs a purely read-only status check. The trusted setup host may \
+            explicitly pass {\"prompt\": true} to request missing grants; embedded hosts \
+            own permission setup and cannot prompt through this tool.\n\n\
             Returns: `accessibility` + `screen_recording` (booleans from the TCC \
             preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit \
             probe when `prompt` is true; null on read-only calls), \

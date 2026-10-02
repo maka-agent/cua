@@ -76,6 +76,70 @@ fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
     COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+// One visible agent cursor cannot represent overlapping actions at different
+// targets. Admit its full operation, not just its animation, so a second
+// platform or browser route cannot supersede a pending presentation signal.
+fn active_cursor_actions() -> &'static Mutex<HashSet<String>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct CursorActionAdmission {
+    key: String,
+}
+
+impl Drop for CursorActionAdmission {
+    fn drop(&mut self) {
+        active_cursor_actions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
+}
+
+fn try_admit_cursor_action(
+    name: &str,
+    args: &Value,
+    read_only: bool,
+) -> Result<Option<CursorActionAdmission>, ToolResult> {
+    if read_only {
+        return Ok(None);
+    }
+    use cua_driver_contract::{classify_cursor_semantics, CursorAction};
+    let action = classify_cursor_semantics(name, args).map(|semantics| semantics.action);
+    let mutates_cursor = matches!(
+        action,
+        Some(
+            CursorAction::Click
+                | CursorAction::Drag
+                | CursorAction::Scroll
+                | CursorAction::Text
+                | CursorAction::Key
+                | CursorAction::Navigate
+                | CursorAction::App
+        )
+    ) || matches!(
+        name,
+        "set_agent_cursor_enabled" | "set_agent_cursor_motion" | "set_agent_cursor_theme"
+    );
+    if !mutates_cursor {
+        return Ok(None);
+    }
+    let Some(key) = crate::tool_args::session_key(args) else {
+        return Ok(None);
+    };
+    let mut active = active_cursor_actions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !active.insert(key.clone()) {
+        return Err(protected_refusal(
+            "input_busy",
+            "another action still owns this agent cursor; await its completion before starting the next action",
+        ));
+    }
+    Ok(Some(CursorActionAdmission { key }))
+}
+
 fn active_text_input_pids() -> &'static Mutex<HashSet<i64>> {
     static ACTIVE: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -1317,7 +1381,6 @@ impl ToolRegistry {
             args["_session_id"] = Value::String(implicit.clone());
             args["_transport_session_id"] = Value::String(implicit);
         }
-        evidence.record_input_origin(&args);
         let runtime_session = args
             .get("_session_id")
             .and_then(Value::as_str)
@@ -1701,6 +1764,15 @@ impl ToolRegistry {
                 None
             };
 
+        let _cursor_action =
+            match try_admit_cursor_action(resolved_name, &args, tool.def().read_only) {
+                Ok(guard) => guard,
+                Err(refusal) => return refusal,
+            };
+
+        // Rejected overlap must not change the current action's input origin.
+        evidence.record_input_origin(&args);
+
         // Capture start time for recording timestamps only after validation.
         let launch_snapshot = if resolved_name == "launch_app" {
             self.snapshot_running_pids().await
@@ -1842,6 +1914,7 @@ impl ToolRegistry {
             }
         }
         crate::cursor_events::end_tool(cursor_event);
+        drop(_cursor_action);
         // Coordinate the physical action itself, not post-action evidence
         // capture or result shaping. Keeping the global desktop lock through
         // recording/PiP screenshots would unnecessarily block an unrelated
@@ -5379,6 +5452,177 @@ resources:
                 ..
             }
         ));
+    }
+
+    struct CursorOperationProbe {
+        def: super::ToolDef,
+        entered: tokio::sync::mpsc::UnboundedSender<String>,
+        release: Option<Arc<tokio::sync::Semaphore>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for CursorOperationProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn protected_resource_ownership(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> super::ProtectedResourceOwnership {
+            super::ProtectedResourceOwnership::DriverOwned
+        }
+
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            self.entered.send(self.def.name.clone()).unwrap();
+            if let Some(release) = &self.release {
+                release.acquire().await.unwrap().forget();
+            }
+            ToolResult::text("operation settled")
+        }
+    }
+
+    // Exercise the real shared dispatch boundary: the browser route has no
+    // physical-desktop lock, but must not replace the native route's pending
+    // cursor arrival. No platform renderer or desktop input is involved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_admission_spans_native_and_browser_actuation_and_releases_on_cancel() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut registry = super::ToolRegistry::new();
+            for name in [
+                "click",
+                "browser_click",
+                "browser_pointer",
+                "list_windows",
+                "set_agent_cursor_enabled",
+            ] {
+                registry.register(Box::new(CursorOperationProbe {
+                    def: super::ToolDef {
+                        name: name.into(),
+                        description: "hermetic cursor dispatch probe".into(),
+                        input_schema: serde_json::json!({"type":"object"}),
+                        read_only: name == "list_windows",
+                        destructive: false,
+                        idempotent: false,
+                        open_world: false,
+                    },
+                    entered: entered.clone(),
+                    release: (name == "click").then(|| release.clone()),
+                }));
+            }
+            let registry = Arc::new(registry);
+            let context = unrestricted_context();
+            let args = serde_json::json!({"session":"cursor-overlap-owner"});
+            let spawn_native = || {
+                let registry = registry.clone();
+                let context = context.clone();
+                let args = args.clone();
+                tokio::spawn(
+                    async move { registry.invoke_with_context("click", args, context).await },
+                )
+            };
+            let first = spawn_native();
+            assert_eq!(entries.recv().await.as_deref(), Some("click"));
+            for name in ["browser_click", "set_agent_cursor_enabled"] {
+                let result = registry
+                    .invoke_with_context(name, args.clone(), context.clone())
+                    .await;
+                assert_eq!(result.is_error, Some(true), "{result:?}");
+                assert_eq!(
+                    result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|v| v.pointer("/refusal/code"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("input_busy"),
+                    "{result:?}"
+                );
+            }
+            let human_overlap = registry
+                .invoke_with_context_and_evidence(
+                    "browser_click",
+                    args.clone(),
+                    context.clone(),
+                    super::TrustedInvocationEvidence {
+                        input_origin: Some(crate::agent_cursor::InputOrigin::Human),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(
+                human_overlap
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v.pointer("/refusal/code"))
+                    .and_then(serde_json::Value::as_str),
+                Some("input_busy"),
+                "{human_overlap:?}"
+            );
+            let key = format!(
+                "__cua_runtime_{}:cursor-overlap-owner",
+                context.runtime_scope_key()
+            );
+            assert_eq!(
+                crate::agent_cursor::input_origin(&key),
+                crate::agent_cursor::InputOrigin::Agent
+            );
+            for action in ["hover", "right_click", "double_click", "scroll", "drag"] {
+                let mut pointer_args = args.clone();
+                pointer_args["action"] = serde_json::json!(action);
+                let result = registry
+                    .invoke_with_context("browser_pointer", pointer_args, context.clone())
+                    .await;
+                assert_eq!(
+                    result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|v| v.pointer("/refusal/code"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("input_busy"),
+                    "{result:?}"
+                );
+            }
+            assert!(matches!(
+                entries.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let observation = registry
+                .invoke_with_context("list_windows", args.clone(), context.clone())
+                .await;
+            assert_ne!(observation.is_error, Some(true), "{observation:?}");
+            assert_eq!(entries.recv().await.as_deref(), Some("list_windows"));
+            let other = registry
+                .invoke_with_context(
+                    "browser_click",
+                    serde_json::json!({"session":"cursor-overlap-independent"}),
+                    context.clone(),
+                )
+                .await;
+            assert_ne!(other.is_error, Some(true), "{other:?}");
+            assert_eq!(entries.recv().await.as_deref(), Some("browser_click"));
+            release.add_permits(1);
+            let first = first.await.unwrap();
+            assert_ne!(first.is_error, Some(true), "{first:?}");
+            let next = registry
+                .invoke_with_context("browser_click", args.clone(), context.clone())
+                .await;
+            assert_ne!(next.is_error, Some(true), "{next:?}");
+            assert_eq!(entries.recv().await.as_deref(), Some("browser_click"));
+            let cancelled = spawn_native();
+            assert_eq!(entries.recv().await.as_deref(), Some("click"));
+            cancelled.abort();
+            assert!(cancelled.await.unwrap_err().is_cancelled());
+            let after_cancel = registry
+                .invoke_with_context("browser_click", args, context)
+                .await;
+            assert_ne!(after_cancel.is_error, Some(true), "{after_cancel:?}");
+            assert_eq!(entries.recv().await.as_deref(), Some("browser_click"));
+        })
+        .await
+        .expect("cursor dispatch probe completes without a blocked operation");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

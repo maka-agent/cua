@@ -60,17 +60,6 @@ fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) {
     }
 }
 
-#[cfg(test)]
-fn arrival_fire(key: &CursorKey) {
-    if let Ok(mut guard) = ARRIVAL_TX.lock() {
-        if let Some(map) = guard.as_mut() {
-            if let Some(tx) = map.remove(key) {
-                let _ = tx.send(());
-            }
-        }
-    }
-}
-
 /// Drop a removed session's waiter; the dropped sender releases its await.
 fn arrival_cancel(key: &CursorKey) {
     PENDING_PRESENTATIONS

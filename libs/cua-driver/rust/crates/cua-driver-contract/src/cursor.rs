@@ -224,6 +224,14 @@ pub fn classify_cursor_semantics(name: &str, args: &Value) -> Option<CursorSeman
         | "browser_double_click"
         | "browser_right_click" => CursorAction::Click,
 
+        "browser_pointer" => match args.get("action").and_then(Value::as_str)? {
+            "hover" => CursorAction::Navigate,
+            "right_click" | "double_click" => CursorAction::Click,
+            "scroll" => CursorAction::Scroll,
+            "drag" => CursorAction::Drag,
+            _ => return None,
+        },
+
         "drag" | "browser_drag" => CursorAction::Drag,
         "scroll" | "browser_scroll" => CursorAction::Scroll,
         "type_text" | "set_value" | "browser_type" | "browser_fill" => CursorAction::Text,
