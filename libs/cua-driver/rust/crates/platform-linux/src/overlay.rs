@@ -89,6 +89,20 @@ fn arrival_fire(key: &CursorKey) {
     }
 }
 
+/// Arrival hook for the native Wayland renderer (`wayland::overlay`), which
+/// fires once the frame at the glide target is committed.
+#[cfg(target_os = "linux")]
+pub(crate) fn fire_arrival(key: &CursorKey) {
+    arrival_fire(key);
+}
+
+/// Unblock every waiting pointer action; the renderer that would have fired
+/// their arrivals is gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn release_arrivals() {
+    release_all_arrivals();
+}
+
 fn arrival_cancel(key: &CursorKey) {
     if let Ok(mut guard) = ARRIVAL_TX.lock() {
         if let Some(map) = guard.as_mut() {
@@ -118,6 +132,47 @@ fn try_send_x11_message(
 
 fn should_start_x11_overlay(wayland_display_present: bool) -> bool {
     !wayland_display_present
+}
+
+/// Set while the X11 owner thread is running its render loop over a mapped
+/// overlay window; only then can a desktop capture ask it to hide.
+static X11_OVERLAY_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an X11 overlay window exists that a desktop capture must hide.
+pub(crate) fn x11_overlay_live() -> bool {
+    X11_OVERLAY_LIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Wake the X11 owner thread so it services a capture hold now instead of on
+/// its next maintenance tick.
+pub(crate) fn wake_x11_overlay() {
+    let _ = try_send_x11_message(CMD_TX.get(), OverlayMsg::Wake);
+}
+
+/// The explicit limitation for Driver desktop captures on a Wayland session
+/// whose agent cursor is drawn by the compositor (layer-shell surface or
+/// GNOME Shell helper). `None` when no Wayland overlay is active.
+pub(crate) fn wayland_capture_limitation() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if !crate::wayland::is_wayland() {
+            return None;
+        }
+        let backend = match WAYLAND_OVERLAY_BACKEND.get() {
+            Some(WaylandOverlayBackend::LayerShell) => "layer-shell surface",
+            Some(WaylandOverlayBackend::SemanticShellHelper)
+            | Some(WaylandOverlayBackend::LegacyShellHelper) => "GNOME Shell helper",
+            Some(WaylandOverlayBackend::None) | None => return None,
+        };
+        Some(format!(
+            "on Wayland the agent cursor is drawn by the compositor ({backend}) into the same \
+             output the desktop capture reads, and the Driver cannot leave it out"
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,15 +345,23 @@ pub fn send_command(cmd: OverlayCommand) {
     send_command_for("default".to_owned(), cmd);
 }
 
+/// Whether commands for `key` reach a renderer: not the empty no-cursor key,
+/// and not a human-origin session, whose client draws the human's own cursor
+/// (see `cua_driver_core::agent_cursor`).
+pub(crate) fn draws_cursor(key: &str) -> bool {
+    !key.is_empty() && !cua_driver_core::agent_cursor::overlay_suppressed(key)
+}
+
 pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     let _ = try_send_command_for(key, cmd);
 }
 
-/// Dispatch to exactly one Linux overlay backend. The result reports only
-/// whether the X11 owner accepted the command and can fire `ARRIVAL_TX`; the
-/// Wayland backends do not currently publish arrival notifications.
+/// Dispatch to exactly one Linux overlay backend. The result reports whether
+/// a renderer that fires `ARRIVAL_TX` accepted the command: the X11 owner or
+/// the native layer-shell overlay. The shell-helper backends publish no
+/// arrivals.
 fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
-    if key.is_empty() {
+    if !draws_cursor(&key) {
         return false;
     }
     let msg = OverlayMsg::Cmd(KeyedOverlayCommand {
@@ -318,12 +381,103 @@ fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
         );
     }
     #[cfg(target_os = "linux")]
-    {
-        if native_wayland {
-            dispatch_wayland_overlay_message(&msg);
+    let layer_shell_queued = native_wayland
+        && dispatch_wayland_overlay_message(&msg) == WaylandOverlayBackend::LayerShell;
+    #[cfg(not(target_os = "linux"))]
+    let layer_shell_queued = false;
+    x11_queued || layer_shell_queued
+}
+
+/// How long a pointer action waits for the native Wayland glide to arrive
+/// before acting anyway. The layer-shell renderer connects lazily and paints
+/// in software, so its first glide can lag the planned duration; a renderer
+/// that failed mid-glide must not stall input.
+#[cfg(target_os = "linux")]
+fn wayland_arrival_budget(glide_duration_ms: f64) -> Duration {
+    let glide = if glide_duration_ms.is_finite() {
+        glide_duration_ms.clamp(0.0, 5_000.0)
+    } else {
+        0.0
+    };
+    Duration::from_millis(glide as u64 + 3_000)
+}
+
+/// The GNOME Shell helper draws a single compositor cursor, so the shared
+/// single-surface rules decide what reaches it: the session that drew last
+/// owns it, only that session's end hides it, and it hides after the shared
+/// agent idle timeout (the helper has no idle fade of its own).
+#[cfg(target_os = "linux")]
+static SHELL_HELPER_SURFACE: Mutex<Option<cua_driver_core::agent_cursor::SharedCursorSurface>> =
+    Mutex::new(None);
+#[cfg(target_os = "linux")]
+static SHELL_HELPER_IDLE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Apply one overlay message to the shell-helper surface. Returns whether it
+/// reaches the helper: `true` draws a command, or hides for `Remove`.
+#[cfg(target_os = "linux")]
+fn shell_helper_surface_event(msg: &OverlayMsg, now: Instant) -> bool {
+    use cua_driver_core::agent_cursor::{SharedCursorSurface, SharedSurfaceAction};
+    let mut guard = SHELL_HELPER_SURFACE.lock().unwrap();
+    let surface = guard.get_or_insert_with(SharedCursorSurface::new);
+    let reach = match msg {
+        OverlayMsg::Cmd(command) => matches!(
+            surface.on_command(&command.key, now),
+            SharedSurfaceAction::Draw { .. }
+        ),
+        OverlayMsg::Remove(key) => surface.on_session_end(key) == SharedSurfaceAction::Hide,
+        OverlayMsg::Revive(key) => {
+            surface.on_session_revive(key);
+            false
         }
+        OverlayMsg::Wake => false,
+    };
+    drop(guard);
+    if reach && matches!(msg, OverlayMsg::Cmd(_)) {
+        start_shell_helper_idle_watch();
+        SHELL_HELPER_IDLE.notify_all();
     }
-    x11_queued
+    reach
+}
+
+/// Hide the shell-helper cursor once its owner has been idle for the shared
+/// agent idle timeout. One parked thread, started on the first draw.
+#[cfg(target_os = "linux")]
+fn start_shell_helper_idle_watch() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("cua-shell-cursor-idle".into())
+            .spawn(|| {
+                use cua_driver_core::agent_cursor::{
+                    SharedSurfaceAction, AGENT_CURSOR_IDLE_TIMEOUT,
+                };
+                let mut guard = SHELL_HELPER_SURFACE.lock().unwrap();
+                loop {
+                    let deadline = guard
+                        .as_ref()
+                        .and_then(|surface| surface.idle_deadline(AGENT_CURSOR_IDLE_TIMEOUT));
+                    guard = match deadline {
+                        None => SHELL_HELPER_IDLE.wait(guard).unwrap(),
+                        Some(deadline) => {
+                            let wait = deadline.saturating_duration_since(Instant::now());
+                            SHELL_HELPER_IDLE.wait_timeout(guard, wait).unwrap().0
+                        }
+                    };
+                    let hide = guard.as_mut().is_some_and(|surface| {
+                        surface.poll_idle(Instant::now(), AGENT_CURSOR_IDLE_TIMEOUT)
+                            == SharedSurfaceAction::Hide
+                    });
+                    if hide {
+                        drop(guard);
+                        crate::wayland::shell_helper::hide_cursor();
+                        guard = SHELL_HELPER_SURFACE.lock().unwrap();
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!("overlay: shell-helper idle watch did not start: {error}");
+        }
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -332,12 +486,12 @@ fn dispatch_wayland_overlay_message(msg: &OverlayMsg) -> WaylandOverlayBackend {
     match backend {
         WaylandOverlayBackend::SemanticShellHelper | WaylandOverlayBackend::LegacyShellHelper => {
             let semantic = backend == WaylandOverlayBackend::SemanticShellHelper;
-            match msg {
-                OverlayMsg::Cmd(command) => {
+            if shell_helper_surface_event(msg, Instant::now()) {
+                if let OverlayMsg::Cmd(command) = msg {
                     dispatch_shell_helper_command(&command.key, &command.cmd, semantic);
+                } else {
+                    crate::wayland::shell_helper::hide_cursor();
                 }
-                OverlayMsg::Remove(_) => crate::wayland::shell_helper::hide_cursor(),
-                OverlayMsg::Revive(_) => {}
             }
         }
         WaylandOverlayBackend::LayerShell if !crate::wayland::overlay::forward(msg) => {
@@ -488,7 +642,7 @@ pub async fn animate_cursor_to(x: f64, y: f64) {
 }
 
 pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
-    if key.is_empty() {
+    if !draws_cursor(&key) {
         return;
     }
     seed_start_if_sentinel(&key, x, y);
@@ -520,6 +674,15 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
         return;
     }
 
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland() {
+        let budget = wayland_arrival_budget(current_motion_for(&key).glide_duration_ms);
+        if tokio::time::timeout(budget, rx).await.is_err() {
+            tracing::debug!(key = %key, "overlay: Wayland glide arrival timed out");
+            arrival_cancel(&key);
+        }
+        return;
+    }
     if ARRIVAL_DEGRADED.load(std::sync::atomic::Ordering::Relaxed) {
         // The renderer already failed to report one arrival. Keep the glide
         // fire-and-forget until it proves itself again rather than charging
@@ -557,12 +720,14 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
-    let msg = OverlayMsg::Remove(key);
+    let msg = OverlayMsg::Remove(key.clone());
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(msg.clone());
     }
     #[cfg(target_os = "linux")]
     if crate::wayland::is_wayland() {
+        // The Wayland renderer drops the cursor without an arrival.
+        arrival_cancel(&key);
         dispatch_wayland_overlay_message(&msg);
     }
 }
@@ -1108,7 +1273,7 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
 
     // Set window title (identifies our overlay, matches Windows convention).
     // `Cua.` namespace mirrors the Windows class-name + install-path
-    // convention; was `TropeCUA.` (leaked codename from an early C# ref).
+    // convention.
     let title = format!("Cua.AgentCursorOverlay.{}", cfg.cursor_id);
     conn.change_property8(
         PropMode::REPLACE,
@@ -1170,10 +1335,13 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // sees no pixels of ours. (A previous overlay instance torn down moments
     // earlier can still be on screen; that resolves itself as soon as the
     // cursor vacates the rect and its owner repaints.)
-    let mut backdrop = X11BackdropCache::default();
-    // Startup probe result; a property of the server, not of the compositor,
-    // so it is never re-sampled when a compositing manager comes or goes.
-    backdrop.readback_untrusted = readback_untrusted;
+    let mut backdrop = X11BackdropCache {
+        // Startup probe result; a property of the server, not of the
+        // compositor, so it is never re-sampled when a compositing manager
+        // comes or goes.
+        readback_untrusted,
+        ..X11BackdropCache::default()
+    };
     if readback_untrusted {
         tracing::warn!(
             "X11 overlay: root reads cannot see this window's own pixels; \
@@ -1188,6 +1356,13 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         win,
         root,
     };
+    // Whether the last paint left a non-empty bounding shape on screen, so a
+    // desktop capture knows there is something to hide and wait for.
+    let mut overlay_shaped = false;
+    // A Driver desktop capture is reading the root: paint nothing.
+    let mut capture_held = false;
+    let mut repaint_after_capture = false;
+    let _live = X11OverlayLiveGuard::start();
 
     loop {
         // Idle fast path: no Pixmap allocation, RGBA→BGRA copy, XShape update,
@@ -1350,17 +1525,55 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
             z_enforcer.reassert(pinned_wid);
         }
 
+        // A Driver desktop capture wants the overlay out of the root image:
+        // empty the shape, confirm the server applied it, and report what the
+        // capture needs to find pixels a slow window has not repainted yet.
+        if let Some(generation) = crate::overlay_capture::CAPTURE_HOLD.unanswered_request() {
+            use crate::overlay_capture::{HiddenOverlay, HoldAnswer};
+            let answer = if overlay_shaped {
+                match blank_x11_overlay_shape(&conn, win, true) {
+                    Ok(()) => {
+                        overlay_shaped = false;
+                        HoldAnswer::Hidden(HiddenOverlay {
+                            was_shown: true,
+                            composited: compositor_present,
+                            residual: backdrop.residual_patches(Instant::now()),
+                        })
+                    }
+                    Err(e) => HoldAnswer::Failed(format!("{e:#}")),
+                }
+            } else {
+                HoldAnswer::Hidden(HiddenOverlay {
+                    was_shown: false,
+                    composited: compositor_present,
+                    residual: Vec::new(),
+                })
+            };
+            capture_held = matches!(answer, HoldAnswer::Hidden(_));
+            crate::overlay_capture::CAPTURE_HOLD.answer(generation, answer);
+        }
+        if capture_held && !crate::overlay_capture::CAPTURE_HOLD.is_requested() {
+            capture_held = false;
+            repaint_after_capture = true;
+        }
+
         // Render after a command, during an active animation/fade, and once
         // more as the final active state settles. This leaves the X11 window in
         // its completed/cleared state before the next blocking receive.
         let mut paint_deferred = false;
-        if had_msg
+        if capture_held {
+            // Held for a capture: the frame is owed, so keep ticking and let
+            // arrivals wait until it is actually on screen.
+            paint_deferred = true;
+        } else if had_msg
             || screen_changed
             || compositor_changed
             || hover_changed
             || frame_tick_needed
             || next_frame_tick_needed
+            || repaint_after_capture
         {
+            repaint_after_capture = false;
             let tiles = {
                 let guard = RENDER.lock().unwrap();
                 guard.as_ref().map(render_x11_tiles)
@@ -1379,7 +1592,12 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
                     screen_changed,
                     &mut backdrop,
                 ) {
-                    Ok(outcome) => paint_deferred = outcome == X11PaintOutcome::Deferred,
+                    Ok(outcome) => {
+                        paint_deferred = outcome == X11PaintOutcome::Deferred;
+                        if outcome == X11PaintOutcome::Painted {
+                            overlay_shaped = !tiles.is_empty();
+                        }
+                    }
                     Err(e) => {
                         // A broken X11 connection cannot recover inside this
                         // owner thread. Exit instead of spinning at frame cadence
@@ -1422,6 +1640,27 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
 
     conn.free_gc(gc_id).ok();
     conn.flush().ok();
+}
+
+/// Publishes [`X11_OVERLAY_LIVE`] for the render loop's lifetime, however the
+/// loop ends, and releases a capture waiting on a hold that will never be
+/// answered.
+#[cfg(target_os = "linux")]
+struct X11OverlayLiveGuard;
+
+#[cfg(target_os = "linux")]
+impl X11OverlayLiveGuard {
+    fn start() -> Self {
+        X11_OVERLAY_LIVE.store(true, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for X11OverlayLiveGuard {
+    fn drop(&mut self) {
+        X11_OVERLAY_LIVE.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 // ── Z-order enforcer (Linux impl of cursor_overlay::ZOrderEnforcer) ──────
@@ -1874,6 +2113,24 @@ impl X11BackdropCache {
             }
             self.frames.pop_back();
         }
+    }
+
+    /// Every retained painted rect, newest first, for a desktop capture to
+    /// find pixels a window has not repainted since the overlay hid.
+    fn residual_patches(&self, now: Instant) -> Vec<crate::overlay_capture::ResidualPatch> {
+        self.frames
+            .iter()
+            .filter(|frame| !frame.expired(now))
+            .flat_map(|frame| frame.saved.iter())
+            .map(|saved| crate::overlay_capture::ResidualPatch {
+                x: i32::from(saved.bounds.x),
+                y: i32::from(saved.bounds.y),
+                width: usize::from(saved.bounds.width),
+                height: usize::from(saved.bounds.height),
+                under: saved.under.clone(),
+                uploaded: saved.uploaded.clone(),
+            })
+            .collect()
     }
 
     fn record_frame(
@@ -2702,6 +2959,42 @@ fn bgra_and_visible_shape(
 mod tests {
     use super::*;
 
+    /// A human-origin session (a Cua Spaces viewer's relayed input) never
+    /// reaches the X11, layer-shell or shell-helper renderers, including the
+    /// Wayland glide; an agent's session does. The rule itself lives in
+    /// `cua_driver_core::agent_cursor`.
+    #[test]
+    fn human_origin_sessions_draw_no_agent_cursor() {
+        use cua_driver_core::agent_cursor::{set_input_origin, InputOrigin};
+        let human = "overlay-test-human-origin-session";
+        assert!(draws_cursor(human));
+        set_input_origin(human, InputOrigin::Human);
+        assert!(!draws_cursor(human));
+        assert!(!try_send_command_for(
+            human.to_owned(),
+            OverlayCommand::SetEnabled(true)
+        ));
+        assert!(draws_cursor("overlay-test-agent-session"));
+        assert!(!draws_cursor(""));
+        set_input_origin(human, InputOrigin::Agent);
+        assert!(draws_cursor(human));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_arrival_wait_is_bounded_above_the_glide() {
+        use super::wayland_arrival_budget;
+        assert_eq!(wayland_arrival_budget(0.0), Duration::from_secs(3));
+        assert_eq!(wayland_arrival_budget(400.0), Duration::from_millis(3_400));
+        // Hostile motion settings cannot turn the wait into a stall.
+        assert_eq!(
+            wayland_arrival_budget(f64::INFINITY),
+            Duration::from_secs(3)
+        );
+        assert_eq!(wayland_arrival_budget(1.0e12), Duration::from_secs(8));
+        assert_eq!(wayland_arrival_budget(-5.0), Duration::from_secs(3));
+    }
+
     #[test]
     fn wayland_display_does_not_start_legacy_x11_overlay() {
         assert!(!should_start_x11_overlay(true));
@@ -2985,6 +3278,205 @@ mod tests {
         );
         wait_for_bounding_shape(&conn, overlay, false, "RandR repair")?;
         assert_click_through(&conn, root, overlay, target, "RandR repair")?;
+        Ok(())
+    }
+
+    /// D-WL5: a desktop capture taken while the cursor and its session pill
+    /// rest over a control must not contain them, while the screen (and any
+    /// external capture) keeps showing them before and after.
+    #[test]
+    #[ignore = "requires a live X11 server (run under xvfb-run)"]
+    fn x11_desktop_capture_hides_the_resting_overlay_and_restores_it() -> anyhow::Result<()> {
+        use cursor_overlay::capture_exclusion::{
+            capture_excluding_overlays, AgentOverlayCaptureStatus,
+        };
+        use x11rb::connection::Connection;
+        use x11rb::protocol::shape::{ConnectionExt as ShapeConnectionExt, SK};
+        use x11rb::protocol::xproto::{
+            AtomEnum, ConnectionExt as XprotoConnectionExt, CreateWindowAux, ImageFormat, Window,
+            WindowClass,
+        };
+
+        const BACKGROUND: u32 = 0x00c8_c8c8;
+        const PROBE: (i16, i16, u16, u16) = (120, 120, 240, 120);
+
+        fn find_named_window(
+            conn: &impl Connection,
+            root: Window,
+            expected_name: &[u8],
+        ) -> anyhow::Result<Window> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                for window in conn.query_tree(root)?.reply()?.children {
+                    let name = conn
+                        .get_property(
+                            false,
+                            window,
+                            AtomEnum::WM_NAME,
+                            AtomEnum::STRING,
+                            0,
+                            u32::MAX,
+                        )?
+                        .reply()?;
+                    if name.value == expected_name {
+                        return Ok(window);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            anyhow::bail!("timed out waiting for the overlay window")
+        }
+
+        fn wait_for_shape(
+            conn: &impl Connection,
+            overlay: Window,
+            phase: &str,
+        ) -> anyhow::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if !conn
+                    .shape_get_rectangles(overlay, SK::BOUNDING)?
+                    .reply()?
+                    .rectangles
+                    .is_empty()
+                {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            anyhow::bail!("overlay bounding shape stayed empty during {phase}")
+        }
+
+        /// Pixels in the probe rect of a root-sized BGRX/RGBA buffer that are
+        /// not the target window's background.
+        fn foreign_pixels(pixel: impl Fn(usize, usize) -> [u8; 3]) -> usize {
+            let (x0, y0, w, h) = PROBE;
+            let mut count = 0;
+            for y in y0 as usize..y0 as usize + h as usize {
+                for x in x0 as usize..x0 as usize + w as usize {
+                    if pixel(x, y) != [0xc8, 0xc8, 0xc8] {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
+        fn live_foreign_pixels(conn: &impl Connection, root: Window) -> anyhow::Result<usize> {
+            let (x0, y0, w, h) = PROBE;
+            let image = conn
+                .get_image(ImageFormat::Z_PIXMAP, root, x0, y0, w, h, !0u32)?
+                .reply()?;
+            let stride = usize::from(w) * 4;
+            Ok(foreign_pixels(|x, y| {
+                let offset = (y - y0 as usize) * stride + (x - x0 as usize) * 4;
+                let bgrx = &image.data[offset..offset + 3];
+                [bgrx[2], bgrx[1], bgrx[0]]
+            }))
+        }
+
+        let (conn, screen_num) = x11rb::connect(None)?;
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let target = conn.generate_id()?;
+        conn.create_window(
+            screen.root_depth,
+            target,
+            root,
+            0,
+            0,
+            480,
+            360,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &CreateWindowAux::new()
+                .background_pixel(BACKGROUND)
+                .override_redirect(1u32),
+        )?
+        .check()?;
+        conn.map_window(target)?.check()?;
+        conn.flush()?;
+        anyhow::ensure!(
+            live_foreign_pixels(&conn, root)? == 0,
+            "the probe rect is not a solid target background before the cursor shows"
+        );
+
+        let cursor_id = "d-wl5-capture-exclusion-probe";
+        init(CursorConfig {
+            cursor_id: cursor_id.to_owned(),
+            ..CursorConfig::default()
+        });
+        run_on_thread();
+        let overlay = find_named_window(
+            &conn,
+            root,
+            format!("Cua.AgentCursorOverlay.{cursor_id}").as_bytes(),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !crate::overlay::x11_overlay_live() {
+            anyhow::ensure!(Instant::now() < deadline, "overlay loop never went live");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        send_command(OverlayCommand::SetEnabled(true));
+        send_command(OverlayCommand::SetSessionLabel(
+            "ga-r5-window-772012bf".into(),
+        ));
+        send_command(OverlayCommand::SnapTo {
+            x: 200.0,
+            y: 160.0,
+            heading_radians: None,
+        });
+        wait_for_shape(&conn, overlay, "cursor show")?;
+        // Let the arrival and the pill settle into their resting frame.
+        std::thread::sleep(Duration::from_millis(400));
+        conn.configure_window(
+            overlay,
+            &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+        )?;
+        conn.flush()?;
+        let visible_before = live_foreign_pixels(&conn, root)?;
+        anyhow::ensure!(
+            visible_before >= 50,
+            "the resting cursor and pill are not visible on screen ({visible_before} pixels)"
+        );
+
+        let (png, report) =
+            capture_excluding_overlays(&crate::overlay_capture::OverlayExcluder, |hidden| {
+                let png = crate::capture::screenshot_display_bytes()?;
+                Ok::<_, anyhow::Error>(crate::overlay_capture::verify_hidden_capture(png, hidden))
+            })?;
+        anyhow::ensure!(
+            report.status == AgentOverlayCaptureStatus::Excluded,
+            "desktop capture did not exclude the overlay: {report:?}"
+        );
+        let image = image::load_from_memory(&png)?.to_rgba8();
+        let in_capture = foreign_pixels(|x, y| {
+            let [r, g, b, _] = image.get_pixel(x as u32, y as u32).0;
+            [r, g, b]
+        });
+        eprintln!("visible_before={visible_before} in_capture={in_capture} report={report:?}");
+        anyhow::ensure!(
+            in_capture == 0,
+            "desktop capture still contains {in_capture} overlay pixels over the target"
+        );
+
+        wait_for_shape(&conn, overlay, "restore after capture")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let visible_after = live_foreign_pixels(&conn, root)?;
+            if visible_after >= 50 {
+                eprintln!("visible_after={visible_after}");
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the cursor did not come back after the capture ({visible_after} pixels)"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 
@@ -3668,7 +4160,10 @@ mod tests {
         assert!(arrived.is_empty());
         assert!(had_msg);
         let cursor = &map.cursors["default"].core;
-        assert_eq!(cursor.pos, (40.0, 50.0));
+        assert_eq!(
+            cursor.pos,
+            cursor_overlay::anchor_for_pointer(40.0, 50.0, cursor.heading)
+        );
         assert_eq!(cursor.click_t, Some(0.0));
     }
 
@@ -4135,8 +4630,10 @@ mod tests {
     #[test]
     fn untrusted_readback_serves_the_save_under_on_mismatch() {
         let tile = tile_bounds(0, 0, 4, 1);
-        let mut cache = X11BackdropCache::default();
-        cache.readback_untrusted = true;
+        let mut cache = X11BackdropCache {
+            readback_untrusted: true,
+            ..X11BackdropCache::default()
+        };
         let now = Instant::now();
         cache.record_frame(
             now,
@@ -4676,3 +5173,46 @@ mod tests {
 
 #[cfg(not(target_os = "linux"))]
 fn run_overlay_thread(_cfg: CursorConfig, _rx: std::sync::mpsc::Receiver<OverlayMsg>) {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod shell_helper_surface_tests {
+    use super::*;
+
+    fn cmd(key: &str) -> OverlayMsg {
+        OverlayMsg::Cmd(KeyedOverlayCommand {
+            key: key.to_owned(),
+            cmd: OverlayCommand::SnapTo {
+                x: 10.0,
+                y: 10.0,
+                heading_radians: None,
+            },
+        })
+    }
+
+    /// The GNOME Shell helper has one cursor: another session ending must not
+    /// hide the agent that is drawing, and a late command from an ended
+    /// session must not take the cursor back.
+    #[test]
+    fn only_the_drawing_session_ending_hides_the_shell_helper_cursor() {
+        let now = Instant::now();
+        let a = "shell-surface-test-a";
+        let b = "shell-surface-test-b";
+        assert!(shell_helper_surface_event(&cmd(a), now));
+        assert!(!shell_helper_surface_event(
+            &OverlayMsg::Remove(b.to_owned()),
+            now
+        ));
+        assert!(!shell_helper_surface_event(&cmd(b), now));
+        assert!(shell_helper_surface_event(&cmd(a), now));
+        assert!(shell_helper_surface_event(
+            &OverlayMsg::Remove(a.to_owned()),
+            now
+        ));
+        assert!(!shell_helper_surface_event(&cmd(a), now));
+        assert!(!shell_helper_surface_event(
+            &OverlayMsg::Revive(b.to_owned()),
+            now
+        ));
+        assert!(shell_helper_surface_event(&cmd(b), now));
+    }
+}

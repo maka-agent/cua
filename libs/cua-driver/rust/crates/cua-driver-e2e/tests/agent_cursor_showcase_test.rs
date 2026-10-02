@@ -13,12 +13,11 @@ use image::RgbaImage;
 
 const CELL_ID: &str = "desktop-agent-cursor-showcase-px";
 const SESSION: &str = "Cursor showcase";
-// MoveTo offsets the artwork centre by a 16-point vector at 45 degrees so the
-// cursor tip lands on the requested coordinate. Each axis moves by 16/sqrt(2),
-// and the session badge follows that artwork centre.
-const CURSOR_ANCHOR_OFFSET_MAGNITUDE: f64 = 16.0;
+// MoveTo anchors the artwork `POINTER_ANCHOR_OFFSET` points from the requested
+// coordinate at 45 degrees so the cursor tip lands on it. Each axis moves by
+// that offset over sqrt(2), and the session badge follows the anchor.
 const CURSOR_ANCHOR_OFFSET_PER_AXIS: f64 =
-    CURSOR_ANCHOR_OFFSET_MAGNITUDE * std::f64::consts::FRAC_1_SQRT_2;
+    cursor_overlay::POINTER_ANCHOR_OFFSET * std::f64::consts::FRAC_1_SQRT_2;
 const POINTER_ORACLE_RADIUS: f64 = 24.0;
 const BADGE_CURSOR_EXCLUSION: f64 = 34.0;
 
@@ -118,6 +117,18 @@ fn semantic_cursor_showcase_records_session_and_action_states() {
         std::fs::write(&screenshot_path, cursor_png).expect("write cursor oracle screenshot");
         evidence.screenshot = Some(screenshot_path.display().to_string());
 
+        // The cursor and pill keep resting there, yet the capture the Driver
+        // hands the agent must not contain them (D-WL5).
+        assert_driver_capture_excludes_overlay(
+            &mut driver,
+            &baseline,
+            &cursor_frame,
+            center_x - 180.0,
+            center_y - 80.0,
+            width,
+            height,
+        );
+
         call_ok(
             &mut driver,
             "click",
@@ -177,6 +188,262 @@ fn semantic_cursor_showcase_records_session_and_action_states() {
 
         Observation::delivered(vec![OracleKind::Pixels], Evidence::default())
     });
+}
+
+const KEYBOARD_FIRST_CELL_ID: &str = "window-agent-cursor-keyboard-first-placement";
+/// Largest distance, per axis and in screen units, between the reported cursor
+/// point and the centre of the window's `list_windows` bounds. Each platform
+/// reads the centre from its own native geometry (Windows `GetWindowRect`
+/// includes the invisible resize border that the DWM frame bounds leave out),
+/// so the two can differ by a few units; a cursor left at the pointer, at a
+/// stale session point, or unplaced is far outside it.
+const WINDOW_CENTRE_TOLERANCE: f64 = 12.0;
+
+/// A named session whose first action is an untargeted `press_key` shows its
+/// agent cursor on the target window before the key is delivered: no element,
+/// no pixel target, and no remembered position leave the shared keyboard
+/// placement policy with the window centre.
+#[test]
+#[ignore]
+fn keyboard_first_session_places_its_cursor_on_the_target_window() {
+    let fixture = native_fixture();
+    let case = CaseSpec::delivered(
+        KEYBOARD_FIRST_CELL_ID,
+        fixture.toolkit,
+        fixture.toolkit,
+        "press_key_cursor_placement",
+        Targeting::NotApplicable,
+        Delivery::Foreground,
+        Scope::Window,
+        platform_route(),
+        vec![OracleKind::Protocol],
+    );
+    execute_case(case, |evidence| {
+        let mut driver = spawn_driver_named(KEYBOARD_FIRST_CELL_ID);
+        *evidence = recording_evidence(driver.recording_dir());
+        let (pid, window_id) = launch_native_fixture(&mut driver, &fixture);
+
+        // A per-run name keeps a long-lived daemon from handing this row a
+        // cursor position that an earlier run left behind.
+        let session = format!("Keyboard-first cursor {}", std::process::id());
+        call_ok(
+            &mut driver,
+            "start_session",
+            serde_json::json!({"session": session}),
+        );
+        call_ok(
+            &mut driver,
+            "set_agent_cursor_enabled",
+            serde_json::json!({"session": session, "enabled": true}),
+        );
+        let before = agent_cursor_state(&mut driver, &session);
+        assert!(
+            before["position"].is_null(),
+            "the session cursor must start unplaced so press_key is its first placement: {before}"
+        );
+
+        driver.start_behavior_recording();
+        call_ok(
+            &mut driver,
+            "press_key",
+            serde_json::json!({
+                "session": session,
+                "pid": pid,
+                "window_id": window_id,
+                "key": "escape",
+                "delivery_mode": "foreground"
+            }),
+        );
+
+        let after = agent_cursor_state(&mut driver, &session);
+        assert_eq!(
+            after["enabled"], true,
+            "keyboard-first cursor is hidden: {after}"
+        );
+        let (Some(x), Some(y)) = (
+            after["position"]["x"].as_f64(),
+            after["position"]["y"].as_f64(),
+        ) else {
+            panic!("a keyboard-first press_key left the session cursor unplaced: {after}");
+        };
+        let (centre_x, centre_y) = window_centre(&mut driver, pid, window_id);
+        assert!(
+            (x - centre_x).abs() <= WINDOW_CENTRE_TOLERANCE
+                && (y - centre_y).abs() <= WINDOW_CENTRE_TOLERANCE,
+            "keyboard-first cursor landed at ({x:.1}, {y:.1}), expected the target window \
+             centre ({centre_x:.1}, {centre_y:.1}) within {WINDOW_CENTRE_TOLERANCE}: {after}"
+        );
+
+        call_ok(
+            &mut driver,
+            "end_session",
+            serde_json::json!({"session": session}),
+        );
+        Observation::delivered(vec![OracleKind::Protocol], Evidence::default())
+    });
+}
+
+fn agent_cursor_state(driver: &mut McpDriver, session: &str) -> serde_json::Value {
+    let response = driver.call(
+        "get_agent_cursor_state",
+        serde_json::json!({"session": session}),
+    );
+    assert!(
+        !response.is_error(),
+        "get_agent_cursor_state failed: {}",
+        response.text()
+    );
+    response.structured().clone()
+}
+
+/// Centre of the target window's `list_windows` bounds.
+fn window_centre(driver: &mut McpDriver, pid: u32, window_id: u64) -> (f64, f64) {
+    let windows = driver.call("list_windows", serde_json::json!({"pid": pid}));
+    let window = windows.structured()["windows"]
+        .as_array()
+        .and_then(|windows| {
+            windows
+                .iter()
+                .find(|window| window["window_id"].as_u64() == Some(window_id))
+        })
+        .unwrap_or_else(|| panic!("target window {window_id} is not listed: {}", windows.raw))
+        .clone();
+    let bounds = &window["bounds"];
+    let (Some(x), Some(y), Some(width), Some(height)) = (
+        bounds["x"].as_f64(),
+        bounds["y"].as_f64(),
+        bounds["width"].as_f64(),
+        bounds["height"].as_f64(),
+    ) else {
+        panic!("target window has no bounds: {window}");
+    };
+    assert!(
+        width > 0.0 && height > 0.0,
+        "target window is empty: {window}"
+    );
+    (x + width / 2.0, y + height / 2.0)
+}
+
+/// The repo-local native harness the platform's native lane stages.
+struct NativeFixture {
+    toolkit: &'static str,
+    executable: std::path::PathBuf,
+    title: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+fn native_fixture() -> NativeFixture {
+    let app = std::env::var("HARNESS_APPKIT_APP")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| {
+            cua_driver_testkit::harness_app("harness-appkit", "CuaTestHarness.AppKit.app")
+        });
+    NativeFixture {
+        toolkit: "appkit",
+        executable: app.join("Contents/MacOS/CuaTestHarness.AppKit"),
+        title: "CuaTestHarness AppKit",
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn native_fixture() -> NativeFixture {
+    NativeFixture {
+        toolkit: "wpf",
+        executable: cua_driver_testkit::harness_app("harness-wpf", "CuaTestHarness.Wpf.exe"),
+        title: "CuaTestHarness WPF",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn native_fixture() -> NativeFixture {
+    NativeFixture {
+        toolkit: "gtk3",
+        executable: std::env::var("HARNESS_GTK3_EXE")
+            .map(std::path::PathBuf::from)
+            .ok()
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| {
+                cua_driver_testkit::harness_app("harness-gtk3", "CuaTestHarness.Gtk3")
+            }),
+        title: "CuaTestHarness GTK3",
+    }
+}
+
+/// Launch the fixture and return the pid and id of its main window.
+fn launch_native_fixture(driver: &mut McpDriver, fixture: &NativeFixture) -> (u32, u64) {
+    assert!(
+        fixture.executable.exists(),
+        "required {} harness is missing at {:?}; run the fixture build",
+        fixture.toolkit,
+        fixture.executable
+    );
+    let listed_window_ids = |driver: &mut McpDriver| -> std::collections::HashSet<u64> {
+        driver
+            .call("list_windows", serde_json::json!({}))
+            .structured()["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|window| window["window_id"].as_u64())
+            .collect()
+    };
+    let earlier_windows = listed_window_ids(driver);
+    let child = cua_driver_testkit::spawn_in_job(
+        std::process::Command::new(&fixture.executable)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .unwrap_or_else(|error| panic!("launch {} harness: {error}", fixture.toolkit));
+    driver.reaper().push(child);
+
+    // Take the new window with the fixture title, whatever process owns it:
+    // a toolkit launcher can hand the window to another process, and an
+    // earlier fixture window must not be mistaken for this one.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let windows = driver.call("list_windows", serde_json::json!({}));
+        let found = windows.structured()["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|window| {
+                window["title"]
+                    .as_str()
+                    .is_some_and(|title| title.contains(fixture.title))
+                    && window["window_id"]
+                        .as_u64()
+                        .is_some_and(|id| !earlier_windows.contains(&id))
+            })
+            .and_then(|window| {
+                Some((
+                    u32::try_from(window["pid"].as_u64()?).ok()?,
+                    window["window_id"].as_u64()?,
+                ))
+            });
+        if let Some((pid, window_id)) =
+            found.filter(|(pid, window_id)| *pid != 0 && *window_id != 0)
+        {
+            driver.reaper().track_pid(pid);
+            #[cfg(target_os = "macos")]
+            while !cua_driver_testkit::observer::macos::application_presented(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "AppKit harness pid {pid} did not finish launching"
+                );
+                settle(50);
+            }
+            settle(500);
+            return (pid, window_id);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} harness window never appeared",
+            fixture.toolkit
+        );
+        settle(250);
+    }
 }
 
 fn assert_cursor_and_badge_pixels_changed(
@@ -349,7 +616,121 @@ fn changed_pixels_in_rect(
         .count()
 }
 
+/// Check the Driver's own desktop capture against the external cursor frame:
+/// every pixel the overlay changed on screen must show the desktop there.
+///
+/// Native Wayland compositors draw the cursor into the captured output; there
+/// the Driver must say so instead of claiming a clean capture.
+fn assert_driver_capture_excludes_overlay(
+    driver: &mut McpDriver,
+    baseline: &RgbaImage,
+    cursor_frame: &RgbaImage,
+    logical_x: f64,
+    logical_y: f64,
+    logical_width: f64,
+    logical_height: f64,
+) {
+    let (driver_png, _, _, report) = capture_desktop_png_with_report(driver);
+    let status = report["status"].as_str().unwrap_or("missing");
+    if wayland_session() {
+        assert_eq!(
+            status, "not_excluded",
+            "a Wayland desktop capture must report that it could not exclude the overlay: \
+             {report}"
+        );
+        return;
+    }
+    assert_eq!(
+        status, "excluded",
+        "desktop capture did not exclude the agent cursor overlay: {report}"
+    );
+    let driver_frame = image::load_from_memory(&driver_png)
+        .expect("decode driver-owned desktop screenshot")
+        .to_rgba8();
+    assert_eq!(
+        driver_frame.dimensions(),
+        cursor_frame.dimensions(),
+        "driver capture and cursor oracle are not in the same pixel frame"
+    );
+    let regions = cursor_oracle_regions(
+        baseline.width(),
+        baseline.height(),
+        logical_x,
+        logical_y,
+        logical_width,
+        logical_height,
+    );
+    let mut overlay_pixels = 0usize;
+    let mut desktop_pixels = 0usize;
+    for rect in [regions.pointer, regions.badge_left, regions.badge_right] {
+        let (overlay, desktop) =
+            overlay_pixels_resolved_to_desktop(baseline, cursor_frame, &driver_frame, rect);
+        overlay_pixels += overlay;
+        desktop_pixels += desktop;
+    }
+    assert!(
+        overlay_pixels >= 36,
+        "the cursor oracle no longer shows the overlay ({overlay_pixels} pixels)"
+    );
+    assert!(
+        desktop_pixels * 10 >= overlay_pixels * 9,
+        "driver desktop capture still shows the agent cursor overlay: only {desktop_pixels} \
+         of {overlay_pixels} overlay pixels show the desktop; report={report}"
+    );
+}
+
+/// Pixels in `rect` the overlay changed (baseline vs cursor frame), and how
+/// many of those the driver capture shows closer to the desktop than to the
+/// overlay. "Closer" keeps the check independent of small color differences
+/// between capture pipelines.
+fn overlay_pixels_resolved_to_desktop(
+    baseline: &RgbaImage,
+    cursor_frame: &RgbaImage,
+    driver_frame: &RgbaImage,
+    rect: PixelRect,
+) -> (usize, usize) {
+    let distance = |a: &image::Rgba<u8>, b: &image::Rgba<u8>| -> u16 {
+        a.0.iter()
+            .zip(b.0.iter())
+            .take(3)
+            .map(|(a, b)| u16::from(a.abs_diff(*b)))
+            .sum()
+    };
+    let x0 = rect.x0.clamp(0, i64::from(baseline.width())) as u32;
+    let x1 = rect.x1.clamp(0, i64::from(baseline.width())) as u32;
+    let y0 = rect.y0.clamp(0, i64::from(baseline.height())) as u32;
+    let y1 = rect.y1.clamp(0, i64::from(baseline.height())) as u32;
+    let mut overlay = 0;
+    let mut desktop = 0;
+    for pixel_y in y0..y1 {
+        for pixel_x in x0..x1 {
+            let before = baseline.get_pixel(pixel_x, pixel_y);
+            let on_screen = cursor_frame.get_pixel(pixel_x, pixel_y);
+            if distance(before, on_screen) < 80 {
+                continue;
+            }
+            overlay += 1;
+            let captured = driver_frame.get_pixel(pixel_x, pixel_y);
+            if distance(captured, before) < distance(captured, on_screen) {
+                desktop += 1;
+            }
+        }
+    }
+    (overlay, desktop)
+}
+
+fn wayland_session() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 fn capture_desktop_png(driver: &mut McpDriver) -> (Vec<u8>, f64, f64) {
+    let (png, width, height, _) = capture_desktop_png_with_report(driver);
+    (png, width, height)
+}
+
+fn capture_desktop_png_with_report(
+    driver: &mut McpDriver,
+) -> (Vec<u8>, f64, f64, serde_json::Value) {
     let response = driver.call("get_desktop_state", serde_json::json!({}));
     assert!(
         !response.is_error(),
@@ -378,7 +759,8 @@ fn capture_desktop_png(driver: &mut McpDriver) -> (Vec<u8>, f64, f64) {
         .as_f64()
         .or_else(|| response.structured()["screenshot_height"].as_f64())
         .expect("desktop capture returned no logical height");
-    (png, width, height)
+    let report = response.structured()["agent_overlay_capture"].clone();
+    (png, width, height, report)
 }
 
 fn capture_cursor_oracle_png(driver: &mut McpDriver, width: f64, height: f64) -> Vec<u8> {
@@ -426,10 +808,68 @@ fn capture_cursor_oracle_png(driver: &mut McpDriver, width: f64, height: f64) ->
         output.stdout
     }
 
-    #[cfg(not(target_os = "linux"))]
+    // The Driver's own desktop capture leaves the overlay out, so the oracle
+    // for what a user sees comes from another capture path: a BitBlt from this
+    // (different) process, which the overlay's temporary capture exclusion
+    // does not apply to.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (driver, width, height);
+        platform_windows::capture::screenshot_display_bytes()
+            .expect("external Windows display capture failed")
+    }
+
+    // Only the Driver holds Screen Recording permission on the macOS lanes.
+    // Its per-turn recording capture deliberately keeps the overlay, so the
+    // move's post-action screenshot is what a user saw.
+    #[cfg(target_os = "macos")]
     {
         let _ = (width, height);
-        capture_desktop_png(driver).0
+        recorded_turn_screenshot(driver, "move_cursor")
+    }
+}
+
+/// The newest recorded turn's post-action screenshot for `tool`.
+#[cfg(target_os = "macos")]
+fn recorded_turn_screenshot(driver: &McpDriver, tool: &str) -> Vec<u8> {
+    let recording_dir = driver
+        .recording_dir()
+        .expect("showcase recording directory")
+        .to_path_buf();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut turns: Vec<_> = std::fs::read_dir(&recording_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("turn-"))
+            })
+            .collect();
+        turns.sort();
+        for turn in turns.iter().rev() {
+            let Ok(action) = std::fs::read(turn.join("action.json")) else {
+                continue;
+            };
+            let Ok(action) = serde_json::from_slice::<serde_json::Value>(&action) else {
+                continue;
+            };
+            if action["tool"].as_str() != Some(tool) {
+                continue;
+            }
+            if let Ok(png) = std::fs::read(turn.join("after.png")) {
+                return png;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no recorded {tool} turn with an after.png under {}",
+            recording_dir.display()
+        );
+        settle(100);
     }
 }
 
@@ -440,6 +880,57 @@ fn call_ok(driver: &mut McpDriver, tool: &str, arguments: serde_json::Value) {
 
 fn settle(milliseconds: u64) {
     std::thread::sleep(Duration::from_millis(milliseconds));
+}
+
+fn spawn_driver() -> McpDriver {
+    spawn_driver_named(CELL_ID)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_driver_named(cell_id: &str) -> McpDriver {
+    McpDriver::spawn_macos_daemon_proxy_named(cell_id).expect("start installed macOS daemon proxy")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_driver_named(cell_id: &str) -> McpDriver {
+    McpDriver::spawn_named_with_overlay(cell_id)
+        .expect("start source-built driver with native cursor overlay")
+}
+
+#[cfg(target_os = "macos")]
+fn platform_toolkit() -> &'static str {
+    "appkit"
+}
+
+#[cfg(target_os = "windows")]
+fn platform_toolkit() -> &'static str {
+    "win32"
+}
+
+#[cfg(target_os = "linux")]
+fn platform_toolkit() -> &'static str {
+    "gtk3"
+}
+
+#[cfg(target_os = "macos")]
+fn platform_route() -> DriverRoute {
+    DriverRoute::Composite
+}
+
+#[cfg(target_os = "windows")]
+fn platform_route() -> DriverRoute {
+    DriverRoute::WindowsOverlay
+}
+
+#[cfg(target_os = "linux")]
+fn platform_route() -> DriverRoute {
+    if std::env::var_os("CUA_INJECT_SOCKET").is_some() {
+        DriverRoute::LinuxCuaCompositorInject
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        DriverRoute::LinuxWaylandVirtualPointer
+    } else {
+        DriverRoute::LinuxXTest
+    }
 }
 
 #[cfg(test)]
@@ -603,52 +1094,5 @@ mod pixel_oracle_tests {
                 image.put_pixel(x, y, Rgba([94, 192, 232, 255]));
             }
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn spawn_driver() -> McpDriver {
-    McpDriver::spawn_macos_daemon_proxy_named(CELL_ID).expect("start installed macOS daemon proxy")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn spawn_driver() -> McpDriver {
-    McpDriver::spawn_named_with_overlay(CELL_ID)
-        .expect("start source-built driver with native cursor overlay")
-}
-
-#[cfg(target_os = "macos")]
-fn platform_toolkit() -> &'static str {
-    "appkit"
-}
-
-#[cfg(target_os = "windows")]
-fn platform_toolkit() -> &'static str {
-    "win32"
-}
-
-#[cfg(target_os = "linux")]
-fn platform_toolkit() -> &'static str {
-    "gtk3"
-}
-
-#[cfg(target_os = "macos")]
-fn platform_route() -> DriverRoute {
-    DriverRoute::Composite
-}
-
-#[cfg(target_os = "windows")]
-fn platform_route() -> DriverRoute {
-    DriverRoute::WindowsOverlay
-}
-
-#[cfg(target_os = "linux")]
-fn platform_route() -> DriverRoute {
-    if std::env::var_os("CUA_INJECT_SOCKET").is_some() {
-        DriverRoute::LinuxCuaCompositorInject
-    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        DriverRoute::LinuxWaylandVirtualPointer
-    } else {
-        DriverRoute::LinuxXTest
     }
 }

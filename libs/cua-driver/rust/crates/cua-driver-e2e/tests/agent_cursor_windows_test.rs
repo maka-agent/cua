@@ -49,20 +49,26 @@ fn agent_cursor_overlay_obeys_untargeted_and_targeted_z_order() {
         bring_to_front(&mut driver, target);
         driver.start_behavior_recording();
         let (x, y) = window_center(target.native_id);
-        let cursor_id = "windows-agent-cursor-e2e";
         let foreground_before = unsafe { GetForegroundWindow() };
         assert_eq!(foreground_before.0 as u64, target.native_id);
         let real_cursor_before = real_cursor_position();
+        // The desktop under the cursor's resting point before any overlay
+        // pixel exists, for the capture-exclusion oracle below.
+        let baseline = image::load_from_memory(
+            &platform_windows::capture::screenshot_display_bytes()
+                .expect("baseline screenshot_display_bytes failed"),
+        )
+        .expect("decode baseline display screenshot")
+        .to_rgba8();
 
         for (tool, arguments) in [
             (
                 "set_agent_cursor_enabled",
-                serde_json::json!({"enabled": true, "cursor_id": cursor_id}),
+                serde_json::json!({"enabled": true}),
             ),
             (
                 "set_agent_cursor_motion",
                 serde_json::json!({
-                    "cursor_id": cursor_id,
                     "glide_duration_ms": 100,
                     "idle_hide_ms": 0
                 }),
@@ -71,8 +77,7 @@ fn agent_cursor_overlay_obeys_untargeted_and_targeted_z_order() {
                 "move_cursor",
                 serde_json::json!({
                     "x": x,
-                    "y": y,
-                    "cursor_id": cursor_id
+                    "y": y
                 }),
             ),
         ] {
@@ -132,6 +137,58 @@ fn agent_cursor_overlay_obeys_untargeted_and_targeted_z_order() {
             "agent cursor not visible at ({x:.0},{y:.0}): only {visible_pixels} qualifying pixels"
         );
 
+        // D-WL5: the cursor keeps resting over the target, yet the Driver's
+        // own desktop capture must not contain it, while the external capture
+        // above (another process) still does.
+        let capture_session = "windows-agent-cursor-desktop-capture";
+        let started = driver.call(
+            "start_session",
+            serde_json::json!({"session": capture_session, "capture_scope": "desktop"}),
+        );
+        assert!(
+            !started.is_error(),
+            "desktop capture session failed: {}",
+            started.text()
+        );
+        let capture_dir = tempfile::tempdir().expect("create desktop capture directory");
+        let capture_path = capture_dir.path().join("desktop.png");
+        let desktop = driver.call(
+            "get_desktop_state",
+            serde_json::json!({
+                "session": capture_session,
+                "screenshot_out_file": capture_path.to_string_lossy(),
+            }),
+        );
+        assert!(
+            !desktop.is_error(),
+            "get_desktop_state failed: {}",
+            desktop.text()
+        );
+        assert_eq!(
+            desktop.structured()["agent_overlay_capture"]["status"].as_str(),
+            Some("excluded"),
+            "desktop capture did not exclude the agent cursor overlay: {}",
+            desktop.text()
+        );
+        let driver_image = image::open(&capture_path)
+            .expect("decode Driver desktop capture")
+            .to_rgba8();
+        let overlay_box = (x0, y0, x1, y1);
+        let oracle = overlay_capture_oracle(&baseline, &image, &driver_image, overlay_box);
+        eprintln!("agent cursor capture-exclusion oracle: {oracle:?}");
+        assert!(
+            oracle.overlay_pixels >= 20,
+            "external capture barely differs from the baseline under the cursor: {oracle:?}"
+        );
+        assert!(
+            oracle.left_in_driver_capture * 10 <= oracle.overlay_pixels,
+            "Driver desktop capture still contains the agent cursor overlay: {oracle:?}"
+        );
+        assert!(
+            oracle.desktop_in_driver_capture * 10 >= oracle.overlay_pixels * 8,
+            "Driver desktop capture does not show the desktop under the cursor: {oracle:?}"
+        );
+
         // Capture the target while it is still foreground. Electron may prune
         // parts of its UIA tree once another full-size window covers it, but
         // the snapshot remains a stable handle for the later background click.
@@ -163,10 +220,8 @@ fn agent_cursor_overlay_obeys_untargeted_and_targeted_z_order() {
             serde_json::json!({
                 "pid": target.pid,
                 "window_id": target.native_id,
-                "element_index": button_index,
-                "snapshot_id": target_state.snapshot_id(),
-                "delivery_mode": "background",
-                "cursor_id": cursor_id
+                "element_token": target_state.element_token(button_index),
+                "delivery_mode": "background"
             }),
         );
         assert!(
@@ -203,7 +258,7 @@ fn agent_cursor_overlay_obeys_untargeted_and_targeted_z_order() {
 
         let disabled = driver.call(
             "set_agent_cursor_enabled",
-            serde_json::json!({"enabled": false, "cursor_id": cursor_id}),
+            serde_json::json!({"enabled": false}),
         );
         assert!(
             !disabled.is_error(),
@@ -254,18 +309,16 @@ fn agent_cursor_move_does_not_leak_input() {
         );
         let x = screen.structured()["width"].as_f64().unwrap_or(0.0) / 2.0;
         let y = screen.structured()["height"].as_f64().unwrap_or(0.0) / 2.0;
-        let cursor_id = "windows-agent-cursor-no-input-leak";
         let (_, passed) = sentinel
             .observe_desktop(|| {
                 for (tool, arguments) in [
                     (
                         "set_agent_cursor_enabled",
-                        serde_json::json!({"enabled": true, "cursor_id": cursor_id}),
+                        serde_json::json!({"enabled": true}),
                     ),
                     (
                         "set_agent_cursor_motion",
                         serde_json::json!({
-                            "cursor_id": cursor_id,
                             "glide_duration_ms": 100,
                             "idle_hide_ms": 0
                         }),
@@ -274,8 +327,7 @@ fn agent_cursor_move_does_not_leak_input() {
                         "move_cursor",
                         serde_json::json!({
                             "x": x,
-                            "y": y,
-                            "cursor_id": cursor_id
+                            "y": y
                         }),
                     ),
                 ] {
@@ -421,6 +473,60 @@ fn wait_for_overlay() -> HWND {
         },
     );
     overlay
+}
+
+/// Pixel accounting for one box: which pixels the overlay changed in an
+/// external capture, and what the Driver's own capture shows there.
+#[derive(Debug)]
+struct OverlayCaptureOracle {
+    /// Pixels where the external capture differs from the pre-cursor baseline.
+    overlay_pixels: usize,
+    /// Of those, pixels the Driver capture shows as the external one (overlay).
+    left_in_driver_capture: usize,
+    /// Of those, pixels the Driver capture shows as the baseline (desktop).
+    desktop_in_driver_capture: usize,
+}
+
+fn overlay_capture_oracle(
+    baseline: &image::RgbaImage,
+    external: &image::RgbaImage,
+    driver: &image::RgbaImage,
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+) -> OverlayCaptureOracle {
+    assert_eq!(baseline.dimensions(), external.dimensions());
+    assert_eq!(
+        baseline.dimensions(),
+        driver.dimensions(),
+        "Driver desktop capture is not in the external capture's pixel frame"
+    );
+    let near = |a: &image::Rgba<u8>, b: &image::Rgba<u8>| {
+        a.0.iter()
+            .zip(b.0.iter())
+            .take(3)
+            .all(|(a, b)| a.abs_diff(*b) <= 24)
+    };
+    let mut oracle = OverlayCaptureOracle {
+        overlay_pixels: 0,
+        left_in_driver_capture: 0,
+        desktop_in_driver_capture: 0,
+    };
+    for pixel_y in y0..y1 {
+        for pixel_x in x0..x1 {
+            let before = baseline.get_pixel(pixel_x, pixel_y);
+            let outside = external.get_pixel(pixel_x, pixel_y);
+            if near(before, outside) {
+                continue;
+            }
+            oracle.overlay_pixels += 1;
+            let inside = driver.get_pixel(pixel_x, pixel_y);
+            if near(inside, outside) {
+                oracle.left_in_driver_capture += 1;
+            } else if near(inside, before) {
+                oracle.desktop_in_driver_capture += 1;
+            }
+        }
+    }
+    oracle
 }
 
 fn window_center(window_id: u64) -> (f64, f64) {

@@ -100,12 +100,40 @@ static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<MacMsg>> = OnceLock::new();
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<MacMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 static OVERLAY_WINDOW_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// True while the render loop that fires arrival signals runs. Only
+/// [`run_on_main_thread`] (through `run_appkit`) starts it: a host that
+/// initializes the overlay but never hands it the main thread has no one to
+/// fire an arrival, so [`animate_cursor_to`] must not wait for one.
+static RENDER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn is_overlay_window(window_id: u32) -> bool {
     window_id != 0
         && OVERLAY_WINDOW_IDS
             .lock()
             .is_ok_and(|ids| ids.contains(&window_id))
+}
+
+/// Bind capture exclusion to one main display and topology generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OverlayCaptureTarget {
+    pub display_id: u32,
+    pub window_id: u32,
+    pub generation: u64,
+}
+
+pub(crate) fn overlay_capture_target() -> Option<OverlayCaptureTarget> {
+    let display_id = core_graphics::display::CGDisplay::main().id;
+    let guard = RENDER.lock().ok()?;
+    let screen = &guard.as_ref()?.platform;
+    screen
+        .surfaces
+        .iter()
+        .find(|surface| surface.display_id == display_id)
+        .map(|surface| OverlayCaptureTarget {
+            display_id,
+            window_id: surface.window_id,
+            generation: screen.generation,
+        })
 }
 
 /// Screen-global geometry kept beside the shared keyed render map
@@ -221,12 +249,18 @@ pub fn init(cfg: CursorConfig) {
     ));
 }
 
+/// Whether commands for `key` reach the renderer: not the empty no-cursor
+/// key (direct platform calls that bypass lifecycle dispatch), and not a
+/// human-origin session, whose client draws the human's own cursor (see
+/// `cua_driver_core::agent_cursor`).
+pub(crate) fn draws_cursor(key: &str) -> bool {
+    !key.is_empty() && !cua_driver_core::agent_cursor::overlay_suppressed(key)
+}
+
 /// Send a keyed command from any thread (MCP tool, etc.).  Non-blocking; drops
 /// if the channel is full (old commands are less important than new ones).
 pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
-    // Empty key is the explicit no-cursor sentinel for direct platform calls
-    // that bypass lifecycle dispatch.
-    if key.is_empty() {
+    if !draws_cursor(&key) {
         return;
     }
     if let Some(tx) = CMD_TX.get() {
@@ -398,8 +432,26 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         },
     );
 
-    // Await arrival signal (fired from render thread when Dubins path ends).
-    let _ = rx.await;
+    // Active overlays acknowledge only after the current-generation frame has
+    // been presented. The owning operation supplies cancellation and its budget;
+    // a fixed animation timeout must not permit input before presentation.
+    wait_for_arrival(rx, RENDER_LOOP_RUNNING.load(Ordering::Acquire)).await;
+}
+
+async fn wait_for_arrival(
+    rx: tokio::sync::oneshot::Receiver<()>,
+    render_loop_running: bool,
+) -> bool {
+    if !render_loop_running {
+        return false;
+    }
+    rx.await.is_ok()
+}
+
+/// Whether the overlay's render loop runs in this process (it fires the
+/// arrivals [`animate_cursor_to`] waits for).
+pub fn render_loop_running() -> bool {
+    RENDER_LOOP_RUNNING.load(Ordering::Acquire)
 }
 
 /// Block the calling thread (must be the OS main thread) running the AppKit
@@ -569,7 +621,11 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<MacMsg>) 
 
     reconcile_surfaces();
     install_screen_observers();
-    std::thread::spawn(move || render_loop(rx));
+    RENDER_LOOP_RUNNING.store(true, Ordering::Release);
+    std::thread::spawn(move || {
+        render_loop(rx);
+        RENDER_LOOP_RUNNING.store(false, Ordering::Release);
+    });
 
     // ---- NSApplication run loop (blocks until process exits) ----
     let _: () = msg_send![app, run];
@@ -1405,12 +1461,80 @@ fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A human-origin session (a Cua Spaces viewer's relayed input) never
+    /// reaches the renderer; an agent's session does. The rule itself lives
+    /// in `cua_driver_core::agent_cursor`.
+    #[test]
+    fn human_origin_sessions_draw_no_agent_cursor() {
+        use cua_driver_core::agent_cursor::{set_input_origin, InputOrigin};
+        let human = "overlay-test-human-origin-session";
+        assert!(draws_cursor(human));
+        set_input_origin(human, InputOrigin::Human);
+        assert!(!draws_cursor(human));
+        assert!(draws_cursor("overlay-test-agent-session"));
+        assert!(!draws_cursor(""));
+        set_input_origin(human, InputOrigin::Agent);
+        assert!(draws_cursor(human));
+    }
     use std::collections::HashMap;
 
     // The keyed lifecycle, sentinel seed, and shared frame-tick predicate are
     // covered once in `cursor_overlay::render_map`. These tests cover only the
     // macOS adapter: window ordering, external visibility, and the macOS
     // frame-tick terms layered on the shared predicate.
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    /// cua-spacesd `serve` initialized the overlay (a GUI session) but never
+    /// ran its AppKit loop, and the first animated click waited forever for
+    /// an arrival only the render loop fires, wedging the driver.
+    #[test]
+    fn animate_without_a_render_loop_never_waits() {
+        init(CursorConfig {
+            enabled: true,
+            ..CursorConfig::default()
+        });
+        assert!(!render_loop_running());
+        let done = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                animate_cursor_to("session-no-loop".to_owned(), 240.0, 180.0),
+            )
+            .await
+        });
+        assert!(
+            done.is_ok(),
+            "animate_cursor_to waited for a render loop that is not running"
+        );
+    }
+
+    #[test]
+    fn arrival_wait_requires_presentation_when_the_loop_runs() {
+        let rt = runtime();
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(!rt.block_on(wait_for_arrival(rx, false)));
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let mut arrival = Box::pin(wait_for_arrival(rx, true));
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                assert!(arrival.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tx.send(()).unwrap();
+            assert!(arrival.await);
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            drop(tx);
+            assert!(!wait_for_arrival(rx, true).await);
+        });
+    }
 
     fn window(window_id: u32, pid: i32, z_index: usize) -> crate::windows::WindowInfo {
         crate::windows::WindowInfo {
