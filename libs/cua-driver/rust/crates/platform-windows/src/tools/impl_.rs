@@ -10497,6 +10497,12 @@ pub fn build_registry_with_provider(
         Arc::new(pid_window_target_candidates),
         token_pid_resolver(state.clone()),
     );
+    r.register(pid_window_guarded(
+        crate::element_bounds::ElementBoundsTool {
+            snapshots: state.snapshots.clone(),
+        },
+        &pid_window_candidates,
+    ));
     r.register(pid_window_guarded(BringToFrontTool, &pid_window_candidates));
     r.register(Box::new(SetWindowFrameTool));
     r.register(Box::new(InvokeMenuTool));

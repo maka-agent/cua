@@ -125,6 +125,9 @@ mod capture_admission;
 #[cfg(target_os = "windows")]
 mod clipboard;
 
+#[cfg(any(target_os = "windows", test))]
+mod element_bounds;
+
 #[cfg(target_os = "windows")]
 pub mod wgc;
 
