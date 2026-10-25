@@ -1672,6 +1672,30 @@ impl CuaDriverSession {
 }
 
 impl CuaDriverSession {
+    /// Trusted Rust-host observation of this binding's current native audio.
+    ///
+    /// Completes only after the native capture has exited/stopped and settled
+    /// its output writes, or returns its actual failure. This does not stop,
+    /// retrieve, or clear the recording. The host must await its serialized
+    /// start before calling, and keep this exact binding alive until retirement.
+    /// Waiting releases runtime admission so `discard_audio` and shutdown can
+    /// still stop the capture. Canceling this observation does not stop it.
+    ///
+    /// This method is absent from UniFFI and public agent protocols. It refuses
+    /// disabled audio, an absent active capture, and unsupported backends.
+    pub async fn wait_audio_finished(&self) -> Result<(), DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(session) => session.wait_audio_finished().await,
+            SessionBackend::PrivateWorker { .. }
+            | SessionBackend::Service { .. }
+            | SessionBackend::Remote(_) => Err(DriverError::Protocol {
+                reason:
+                    "trusted audio completion observation is unavailable for this session backend"
+                        .into(),
+            }),
+        }
+    }
+
     /// Trusted Rust-host cleanup of this session's computer audio only.
     ///
     /// Waits for runtime read-admitted calls, stops/discards native capture and
@@ -1691,6 +1715,36 @@ impl CuaDriverSession {
             | SessionBackend::Service { .. }
             | SessionBackend::Remote(_) => Err(DriverError::Protocol {
                 reason: "trusted audio discard is unavailable for this session backend".into(),
+            }),
+        }
+    }
+
+    /// Invoke a coordinate click, drag, or scroll in native window pixels.
+    ///
+    /// The trusted Rust host supplies coordinates measured in the exact window,
+    /// without a screenshot. This changes only coordinate interpretation; the
+    /// immutable session authority, native ownership checks, cancellation and
+    /// execution records are identical to `call_tool`. One-shot capture IDs and
+    /// element targets are incompatible with this coordinate frame.
+    ///
+    /// This method is absent from UniFFI, C ABI and agent protocols. Backends
+    /// without this in-process trusted path refuse it before dispatch.
+    pub async fn call_tool_with_native_window_pixels(
+        &self,
+        name: String,
+        arguments_json: String,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = parse_arguments(&name, &arguments_json)?;
+        validate_native_window_pixel_call(&name, &arguments)?;
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                &name,
+                session
+                    .invoke_with_native_window_pixels(&name, arguments)
+                    .await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native window pixels require an embedded trusted session".into(),
             }),
         }
     }
@@ -1745,6 +1799,34 @@ impl CuaDriverSession {
         };
         normalize_result(name, raw)
     }
+}
+
+fn validate_native_window_pixel_call(name: &str, args: &Value) -> Result<(), DriverError> {
+    let coordinates: &[&str] = match name {
+        "click" | "scroll" => &["x", "y"],
+        "drag" => &["from_x", "from_y", "to_x", "to_y"],
+        _ => {
+            return Err(DriverError::InvalidArguments {
+                tool: name.into(),
+                reason: "native window pixels apply only to coordinate click, drag, or scroll"
+                    .into(),
+            })
+        }
+    };
+    if !coordinates.iter().all(|field| args.get(*field).is_some())
+        || ["element_token", "element_index", "capture_id"]
+            .iter()
+            .any(|field| args.get(*field).is_some())
+        || args.get("scope").and_then(Value::as_str) == Some("desktop")
+        || args.pointer("/target/kind").and_then(Value::as_str) == Some("desktop")
+        || args
+            .get("coordinate_frame")
+            .and_then(Value::as_str)
+            .is_some_and(|frame| frame != "window")
+    {
+        return Err(DriverError::InvalidArguments { tool: name.into(), reason: "native window pixels require window-local coordinates without an element target or capture_id".into() });
+    }
+    Ok(())
 }
 
 impl CuaDriver {

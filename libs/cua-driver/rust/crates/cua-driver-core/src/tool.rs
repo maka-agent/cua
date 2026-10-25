@@ -1105,6 +1105,16 @@ pub struct TrustedInvocationEvidence {
 }
 
 impl TrustedInvocationEvidence {
+    /// Native window coordinates measured by a trusted in-process host.
+    /// This claim is never deserialized from caller-owned tool arguments.
+    #[doc(hidden)]
+    pub fn native_window_pixels() -> Self {
+        Self {
+            native_window_pixels: true,
+            ..Self::default()
+        }
+    }
+
     #[doc(hidden)]
     pub fn extract_from_adapter_args(args: &mut Value) -> Self {
         let mut evidence = Self::default();

@@ -22,10 +22,58 @@ pub const MAX_DURATION_MS: u64 = 300_000;
 /// The backend result type, available to hosts implementing this interface.
 pub type AudioResult<T> = anyhow::Result<T>;
 
+/// Observation of one native capture's finalization. It carries no authority
+/// to stop the capture, read its WAV, or select another session.
+#[derive(Clone)]
+pub struct AudioCompletion {
+    receiver: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+
+pub struct AudioCompletionSender {
+    sender: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+}
+
+impl AudioCompletion {
+    pub fn channel() -> (Self, AudioCompletionSender) {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        (Self { receiver }, AudioCompletionSender { sender })
+    }
+
+    /// A duration deadline alone is not completion. The native owner reports
+    /// only after capture, callbacks and output writes have actually settled.
+    pub async fn wait(&self) -> AudioResult<()> {
+        let mut receiver = self.receiver.clone();
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            receiver
+                .changed()
+                .await
+                .context("computer audio worker ended without reporting finalization")?;
+        }
+    }
+}
+
+impl AudioCompletionSender {
+    pub fn finish(self, result: &AudioResult<()>) {
+        let _ = self.sender.send_replace(Some(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}")),
+        ));
+    }
+}
+
 /// An owned capture. `stop` settles native callbacks and writes before returning,
 /// including on failure. Dropping an unfinished backend must stop capture too.
 pub trait AudioBackend: Send {
     fn stop(self: Box<Self>) -> anyhow::Result<()>;
+
+    fn completion(&self) -> AudioResult<AudioCompletion> {
+        bail!("native audio completion observation is unavailable for this backend")
+    }
 }
 
 pub trait AudioBackendFactory: Send + Sync {
@@ -134,6 +182,25 @@ impl AudioRecordings {
         validate_wav(&bytes)?;
         owned.completed.push(active.directory);
         Ok(RecordedAudio { filepath, bytes })
+    }
+
+    /// Snapshot the current capture only. Waiting on this handle must happen
+    /// outside both the session mutex and the runtime lifecycle read guard so
+    /// host revocation can still stop/discard this same native capture.
+    pub fn completion(&self, session: &str) -> AudioResult<AudioCompletion> {
+        let owned = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .context("computer audio recording is not active")?;
+        let owned = owned.lock().unwrap();
+        match &owned.recording {
+            RecordingState::Active(active) => active.backend.completion(),
+            RecordingState::Idle => bail!("computer audio recording is not active"),
+            RecordingState::Closed => bail!("computer audio session is closed"),
+        }
     }
 
     pub fn close_session(&self, session: &str) -> anyhow::Result<()> {
@@ -455,6 +522,16 @@ fn validate_wav(bytes: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn missing_native_completion_report_is_a_failure() {
+        let (completion, completed) = AudioCompletion::channel();
+        drop(completed);
+        assert_eq!(
+            completion.wait().await.unwrap_err().to_string(),
+            "computer audio worker ended without reporting finalization"
+        );
+    }
 
     struct Factory(Arc<AtomicUsize>);
     struct Backend(PathBuf, Arc<AtomicUsize>);

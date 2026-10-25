@@ -104,6 +104,12 @@ impl RuntimeOptions {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordinateFrame {
+    Screenshot,
+    NativeWindow,
+}
+
 pub(crate) struct RuntimeSession {
     runtime: Arc<DriverRuntime>,
     authorization_registry: Arc<SessionAuthorizationRegistry>,
@@ -114,6 +120,29 @@ pub(crate) struct RuntimeSession {
 }
 
 impl RuntimeSession {
+    /// Observe the exact current native capture without retaining a lifecycle
+    /// read guard throughout its remaining duration. Host revocation/shutdown
+    /// must remain able to stop this same capture while the host waits.
+    pub(crate) async fn wait_audio_finished(&self) -> Result<(), String> {
+        let completion = {
+            let _admitted = self.runtime.lifecycle.read().await;
+            if !self.runtime.is_running() {
+                return Err("Cua Driver runtime has shut down".into());
+            }
+            let audio = self
+                .runtime
+                .audio
+                .clone()
+                .ok_or("computer audio is not enabled for this runtime")?;
+            let session = self.context.runtime_session_key(&self.public_session);
+            tokio::task::spawn_blocking(move || audio.completion(&session))
+                .await
+                .map_err(|error| format!("computer audio completion snapshot failed: {error}"))?
+                .map_err(|error| error.to_string())?
+        };
+        completion.wait().await.map_err(|error| error.to_string())
+    }
+
     /// Trusted resource cleanup for this immutable binding, not a model action
     /// or a new audio grant. The host must serialize admission and re-check its
     /// own approval before a later start.
@@ -137,7 +166,17 @@ impl RuntimeSession {
             .map_err(|error| format!("computer audio discard task failed: {error}"))?
     }
 
-    pub(crate) async fn invoke(&self, name: &str, mut args: Value) -> Option<CoreToolResult> {
+    pub(crate) async fn invoke(&self, name: &str, args: Value) -> Option<CoreToolResult> {
+        self.invoke_in_frame(name, args, CoordinateFrame::Screenshot)
+            .await
+    }
+
+    pub(crate) async fn invoke_in_frame(
+        &self,
+        name: &str,
+        mut args: Value,
+        frame: CoordinateFrame,
+    ) -> Option<CoreToolResult> {
         cua_driver_core::tool_args::sanitize_reserved_args(&mut args);
         let Some(arguments) = args.as_object_mut() else {
             return Some(permission_denied_result(
@@ -158,9 +197,17 @@ impl RuntimeSession {
             "session".to_owned(),
             Value::String(self.public_session.clone()),
         );
+        let evidence = match frame {
+            CoordinateFrame::Screenshot => {
+                cua_driver_core::tool::TrustedInvocationEvidence::default()
+            }
+            CoordinateFrame::NativeWindow => {
+                cua_driver_core::tool::TrustedInvocationEvidence::native_window_pixels()
+            }
+        };
         let result = self
             .runtime
-            .invoke_with_context(name, args, self.context.clone())
+            .invoke_with_context_and_evidence(name, args, self.context.clone(), evidence)
             .await;
         if name == "end_session"
             && result
@@ -814,6 +861,10 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) {
 #[cfg(test)]
 #[path = "runtime_audio_discard_tests.rs"]
 mod audio_discard_tests;
+
+#[cfg(test)]
+#[path = "runtime_native_pixels_tests.rs"]
+mod native_pixels_tests;
 
 #[cfg(test)]
 mod tests {

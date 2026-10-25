@@ -65,7 +65,7 @@ pub use native::LoopbackAudioBackendFactory;
 mod native {
     use super::{PcmTimeline, FRAME_BYTES, HNS_PER_SECOND, SAMPLE_RATE};
     use anyhow::{anyhow, Context, Result};
-    use cua_driver_core::audio::{AudioBackend, AudioBackendFactory};
+    use cua_driver_core::audio::{AudioBackend, AudioBackendFactory, AudioCompletion};
     use std::{
         path::Path,
         sync::mpsc::{self, Receiver, Sender},
@@ -99,42 +99,22 @@ mod native {
             let path = output_path.to_owned();
             let (stop, stopping) = mpsc::channel();
             let (ready, started) = mpsc::sync_channel(1);
+            let (completion, finished) = AudioCompletion::channel();
             let worker = thread::Builder::new()
                 .name("cua-audio-loopback".into())
                 .spawn(move || {
-                    // Every interface is created, consumed and released on
-                    // this thread, before its COM apartment is uninitialized.
-                    let _apartment = match Apartment::initialize() {
-                        Ok(apartment) => apartment,
-                        Err(error) => {
-                            let _ = ready.send(Err(format!("{error:#}")));
-                            return Err(error);
-                        }
-                    };
-                    let mut capture = match Capture::open() {
-                        Ok(capture) => capture,
-                        Err(error) => {
-                            let _ = ready.send(Err(format!("{error:#}")));
-                            return Err(error);
-                        }
-                    };
-                    let origin = match capture.start() {
-                        Ok(origin) => origin,
-                        Err(error) => {
-                            let _ = ready.send(Err(format!("{error:#}")));
-                            return Err(error);
-                        }
-                    };
-                    if ready.send(Ok(())).is_err() {
-                        return Err(anyhow!("audio start caller disconnected"));
-                    }
-                    capture.record(&path, origin, max_duration, stopping)
+                    let result = record_on_worker(&path, max_duration, stopping, ready);
+                    // The native scope has released Capture and its apartment;
+                    // the actual capture/write result is now safe to publish.
+                    finished.finish(&result);
+                    result
                 })
                 .context("could not start WASAPI capture thread")?;
             match started.recv() {
                 Ok(Ok(())) => Ok(Box::new(LoopbackAudioBackend {
                     stop,
                     worker: Some(worker),
+                    completion,
                 })),
                 Ok(Err(error)) => {
                     let _ = worker.join();
@@ -153,6 +133,7 @@ mod native {
     struct LoopbackAudioBackend {
         stop: Sender<()>,
         worker: Option<JoinHandle<Result<()>>>,
+        completion: AudioCompletion,
     }
 
     impl AudioBackend for LoopbackAudioBackend {
@@ -163,6 +144,10 @@ mod native {
                 .expect("owned capture thread")
                 .join()
                 .map_err(|_| anyhow!("WASAPI capture thread panicked"))?
+        }
+
+        fn completion(&self) -> Result<AudioCompletion> {
+            Ok(self.completion.clone())
         }
     }
 
@@ -175,6 +160,49 @@ mod native {
                 }
             }
         }
+    }
+
+    fn record_on_worker(
+        path: &Path,
+        max_duration: Duration,
+        stopping: Receiver<()>,
+        ready: mpsc::SyncSender<Result<(), String>>,
+    ) -> Result<()> {
+        // Every interface is created, consumed and released on this thread,
+        // before its COM apartment is uninitialized.
+        let apartment = match Apartment::initialize() {
+            Ok(apartment) => apartment,
+            Err(error) => {
+                let error = format!("{error:#}");
+                let _ = ready.send(Err(error.clone()));
+                return Err(anyhow!(error));
+            }
+        };
+        let result = (|| {
+            let mut capture = match Capture::open() {
+                Ok(capture) => capture,
+                Err(error) => {
+                    let _ = ready.send(Err(format!("{error:#}")));
+                    return Err(error);
+                }
+            };
+            let origin = match capture.start() {
+                Ok(origin) => origin,
+                Err(error) => {
+                    let _ = ready.send(Err(format!("{error:#}")));
+                    return Err(error);
+                }
+            };
+            if ready.send(Ok(())).is_err() {
+                return Err(anyhow!("audio start caller disconnected"));
+            }
+            capture.record(path, origin, max_duration, stopping)
+        })();
+        // Windows errors can retain IErrorInfo. Release those errors while the
+        // apartment is alive, retaining only owned text across this boundary.
+        let result = result.map_err(|error| anyhow!("{error:#}"));
+        drop(apartment);
+        result
     }
 
     struct Apartment;

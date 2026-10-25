@@ -885,6 +885,32 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
     out_operation: *mut *mut CuaDriverOperation,
     out_error: *mut CuaDriverBuffer,
 ) -> CuaDriverStatus {
+    session_invoke_in_frame(
+        handle,
+        name,
+        name_len,
+        arguments_json,
+        arguments_len,
+        callback,
+        context,
+        out_operation,
+        out_error,
+        crate::runtime::CoordinateFrame::Screenshot,
+    )
+}
+
+unsafe fn session_invoke_in_frame(
+    handle: *mut CuaDriverSessionHandle,
+    name: *const u8,
+    name_len: usize,
+    arguments_json: *const u8,
+    arguments_len: usize,
+    callback: Option<CuaDriverCompletionV1>,
+    context: *mut c_void,
+    out_operation: *mut *mut CuaDriverOperation,
+    out_error: *mut CuaDriverBuffer,
+    frame: crate::runtime::CoordinateFrame,
+) -> CuaDriverStatus {
     with_ffi_guard(out_error, || {
         let session = required_session_handle(handle)?;
         let callback = callback.ok_or_else(|| {
@@ -932,12 +958,15 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
         *out_operation = spawn_completion(
             executor,
             async move {
-                let result = session.invoke(&name, arguments).await.ok_or_else(|| {
-                    AbiFailure::new(
-                        CuaDriverStatus::Shutdown,
-                        "the owning Cua Driver runtime has been shut down",
-                    )
-                })?;
+                let result = session
+                    .invoke_in_frame(&name, arguments, frame)
+                    .await
+                    .ok_or_else(|| {
+                        AbiFailure::new(
+                            CuaDriverStatus::Shutdown,
+                            "the owning Cua Driver runtime has been shut down",
+                        )
+                    })?;
                 serde_json::to_string(&result)
                     .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
             },
@@ -1498,6 +1527,24 @@ unsafe impl Send for NativeAbiSession {}
 unsafe impl Sync for NativeAbiSession {}
 
 impl NativeAbiSession {
+    pub(crate) async fn wait_audio_finished(&self) -> Result<(), DriverError> {
+        let session = {
+            let handle = self.handle.lock().unwrap();
+            unsafe {
+                handle
+                    .cast::<CuaDriverSessionHandle>()
+                    .as_ref()
+                    .ok_or(DriverError::Shutdown)?
+                    .session
+                    .clone()
+            }
+        };
+        session
+            .wait_audio_finished()
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
     pub(crate) async fn discard_audio(&self) -> Result<(), DriverError> {
         let session = {
             // Retain the immutable binding while holding the same handle lock
@@ -1525,6 +1572,29 @@ impl NativeAbiSession {
     }
 
     pub(crate) async fn invoke(&self, name: &str, arguments: Value) -> Result<Value, DriverError> {
+        self.invoke_in_frame(name, arguments, crate::runtime::CoordinateFrame::Screenshot)
+            .await
+    }
+
+    pub(crate) async fn invoke_with_native_window_pixels(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, DriverError> {
+        self.invoke_in_frame(
+            name,
+            arguments,
+            crate::runtime::CoordinateFrame::NativeWindow,
+        )
+        .await
+    }
+
+    async fn invoke_in_frame(
+        &self,
+        name: &str,
+        arguments: Value,
+        frame: crate::runtime::CoordinateFrame,
+    ) -> Result<Value, DriverError> {
         let arguments = serde_json::to_vec(&arguments).map_err(|error| DriverError::Protocol {
             reason: format!("serialize {name} session ABI arguments: {error}"),
         })?;
@@ -1543,17 +1613,34 @@ impl NativeAbiSession {
             let mut operation = ptr::null_mut();
             let mut error = CuaDriverBuffer::empty();
             let status = unsafe {
-                ffi::session_invoke(
-                    *handle,
-                    name.as_ptr(),
-                    name.len(),
-                    arguments.as_ptr(),
-                    arguments.len(),
-                    Some(rust_completion),
-                    context,
-                    &mut operation,
-                    &mut error,
-                )
+                if frame == crate::runtime::CoordinateFrame::Screenshot {
+                    ffi::session_invoke(
+                        *handle,
+                        name.as_ptr(),
+                        name.len(),
+                        arguments.as_ptr(),
+                        arguments.len(),
+                        Some(rust_completion),
+                        context,
+                        &mut operation,
+                        &mut error,
+                    )
+                } else {
+                    session_invoke_in_frame(
+                        (*handle).cast(),
+                        name.as_ptr(),
+                        name.len(),
+                        arguments.as_ptr(),
+                        arguments.len(),
+                        Some(rust_completion),
+                        context,
+                        // The private entry allocates the same opaque operation
+                        // retained and released by the unchanged OperationGuard.
+                        (&mut operation as *mut *mut ffi::Operation).cast(),
+                        &mut error,
+                        frame,
+                    )
+                }
             };
             if status != CuaDriverStatus::Ok {
                 unsafe { drop(Box::from_raw(context.cast::<CallbackContext>())) };

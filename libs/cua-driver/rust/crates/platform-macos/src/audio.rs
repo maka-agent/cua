@@ -255,7 +255,9 @@ mod native {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use cua_driver_core::audio::{write_pcm16_stereo_wav, AudioBackend, AudioBackendFactory};
+    use cua_driver_core::audio::{
+        write_pcm16_stereo_wav, AudioBackend, AudioBackendFactory, AudioCompletion,
+    };
     use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt};
     use screencapturekit::prelude::{
         SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutputType,
@@ -276,13 +278,21 @@ mod native {
             let (stop, receiver) = mpsc::channel();
             let (started, readiness) = mpsc::sync_channel(1);
             let signal = stop.clone();
+            let (completion, completed) = AudioCompletion::channel();
             let worker = std::thread::Builder::new()
                 .name("cua-system-audio".into())
-                .spawn(move || capture(output_path, max_duration, receiver, signal, started))?;
+                .spawn(move || {
+                    // capture returns only after stopping/dropping the native
+                    // stream, closing callback admission, and writing the WAV.
+                    let result = capture(output_path, max_duration, receiver, signal, started);
+                    completed.finish(&result);
+                    result
+                })?;
             match readiness.recv() {
                 Ok(Ok(())) => Ok(Box::new(SckitAudioBackend {
                     stop: Some(stop),
                     worker: Some(worker),
+                    completion,
                 })),
                 Ok(Err(error)) => {
                     let _ = worker.join();
@@ -304,6 +314,7 @@ mod native {
     struct SckitAudioBackend {
         stop: Option<mpsc::Sender<()>>,
         worker: Option<JoinHandle<anyhow::Result<()>>>,
+        completion: AudioCompletion,
     }
 
     impl SckitAudioBackend {
@@ -323,6 +334,10 @@ mod native {
     impl AudioBackend for SckitAudioBackend {
         fn stop(mut self: Box<Self>) -> anyhow::Result<()> {
             self.finish()
+        }
+
+        fn completion(&self) -> anyhow::Result<AudioCompletion> {
+            Ok(self.completion.clone())
         }
     }
 

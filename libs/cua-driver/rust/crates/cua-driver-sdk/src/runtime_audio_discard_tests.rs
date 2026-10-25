@@ -1,7 +1,7 @@
 //! Resource cleanup races without capturing a desktop or an audio device.
 
 use super::*;
-use cua_driver_core::audio::{AudioBackend, AudioBackendFactory};
+use cua_driver_core::audio::{AudioBackend, AudioBackendFactory, AudioCompletion};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -87,7 +87,7 @@ impl Drop for Backend {
     }
 }
 
-fn runtime(factory: Arc<Factory>) -> Arc<DriverRuntime> {
+fn runtime(factory: Arc<dyn AudioBackendFactory>) -> Arc<DriverRuntime> {
     let ceiling = SessionModeCeiling::for_trusted_sessions(
         [PermissionMode::Standard],
         false,
@@ -290,4 +290,198 @@ async fn canceling_host_discard_await_does_not_release_native_cleanup_or_its_dra
         .unwrap();
     assert_eq!(factory.active.load(Ordering::SeqCst), 0);
     assert!(!factory.paths.lock().unwrap()[0].parent().unwrap().exists());
+}
+
+#[derive(Default)]
+struct CompletingFactory {
+    workers: Mutex<Vec<std::sync::mpsc::Sender<bool>>>,
+    active: Arc<AtomicUsize>,
+}
+
+struct CompletingBackend {
+    stop: std::sync::mpsc::Sender<bool>,
+    worker: Option<std::thread::JoinHandle<cua_driver_core::audio::AudioResult<()>>>,
+    completion: AudioCompletion,
+}
+
+impl AudioBackendFactory for CompletingFactory {
+    fn start(
+        &self,
+        path: &Path,
+        _: Duration,
+    ) -> cua_driver_core::audio::AudioResult<Box<dyn AudioBackend>> {
+        let path = path.to_owned();
+        let active = self.active.clone();
+        let (stop, stopping) = std::sync::mpsc::channel();
+        let (completion, completed) = AudioCompletion::channel();
+        active.fetch_add(1, Ordering::SeqCst);
+        let worker = std::thread::spawn(move || {
+            let result = if stopping.recv().unwrap() {
+                cua_driver_core::audio::write_pcm16_stereo_wav(&path, &[1, 0, 2, 0])
+            } else {
+                Err(std::io::Error::other("fixture native finalization failed").into())
+            };
+            active.fetch_sub(1, Ordering::SeqCst);
+            completed.finish(&result);
+            result
+        });
+        self.workers.lock().unwrap().push(stop.clone());
+        Ok(Box::new(CompletingBackend {
+            stop,
+            worker: Some(worker),
+            completion,
+        }))
+    }
+}
+
+impl CompletingBackend {
+    fn finish(&mut self) -> cua_driver_core::audio::AudioResult<()> {
+        let _ = self.stop.send(true);
+        self.worker.take().map_or(Ok(()), |worker| {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("fixture native worker panicked"))?
+        })
+    }
+}
+
+impl AudioBackend for CompletingBackend {
+    fn stop(mut self: Box<Self>) -> cua_driver_core::audio::AudioResult<()> {
+        self.finish()
+    }
+
+    fn completion(&self) -> cua_driver_core::audio::AudioResult<AudioCompletion> {
+        Ok(self.completion.clone())
+    }
+}
+
+impl Drop for CompletingBackend {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+async fn observing_audio(
+    runtime: &DriverRuntime,
+    session: Arc<RuntimeSession>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    use std::future::Future;
+    let mut wait = Box::pin(async move { session.wait_audio_finished().await });
+    // Poll once with no competing lifecycle lock: the observation enters its
+    // read-admitted snapshot before it awaits the blocking snapshot worker.
+    std::future::poll_fn(|cx| {
+        assert!(wait.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let wait = tokio::spawn(wait);
+    // Acquiring the writer proves the snapshot released admission. A waiter
+    // that retained its read guard until capture end would deadlock here.
+    let drained = tokio::time::timeout(Duration::from_secs(5), runtime.lifecycle.write())
+        .await
+        .expect("audio observation must release its lifecycle read guard");
+    drop(drained);
+    assert!(!wait.is_finished(), "native capture has not completed");
+    wait
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_wait_keeps_old_epoch_owned_until_native_completion_without_exposing_it_to_new_epoch()
+{
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let old = session(&runtime, "audio-old-epoch").await;
+    let new = session(&runtime, "audio-new-epoch").await;
+    invoke(&old, "start_audio_recording").await;
+    let waiting = observing_audio(&runtime, old.clone()).await;
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    let no_recording = new.invoke("stop_audio_recording", json!({})).await.unwrap();
+    assert_eq!(no_recording.is_error, Some(true));
+    let refusal = no_recording.structured_content.unwrap();
+    assert_eq!(refusal["refusal"]["code"], "audio_recording_unavailable");
+    assert_eq!(
+        refusal["refusal"]["message"],
+        "computer audio recording is not active"
+    );
+    // The fixture native owner finalizes on a channel, never on a test timer.
+    factory.workers.lock().unwrap()[0].send(true).unwrap();
+    waiting.await.unwrap().unwrap();
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    let duplicate = old
+        .invoke("start_audio_recording", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate.is_error,
+        Some(true),
+        "completion retains the active slot"
+    );
+    let stopped = invoke(&old, "stop_audio_recording").await;
+    let path = stopped.structured_content.unwrap()["filepath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        Path::new(&path).exists(),
+        "observation does not retrieve/delete the WAV"
+    );
+    old.discard_audio().await.unwrap();
+    assert!(!Path::new(&path).exists());
+    invoke(&new, "start_audio_recording").await;
+    invoke(&new, "stop_audio_recording").await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_discard_settles_a_native_completion_wait_without_deadlock() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let target = session(&runtime, "audio-wait-discard").await;
+    invoke(&target, "start_audio_recording").await;
+    let canceled = observing_audio(&runtime, target.clone()).await;
+    canceled.abort();
+    assert!(canceled.await.unwrap_err().is_cancelled());
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    let waiting = observing_audio(&runtime, target.clone()).await;
+    target.discard_audio().await.unwrap();
+    waiting.await.unwrap().unwrap();
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    invoke(&target, "get_session").await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_wait_reports_native_failure_and_refuses_an_absent_or_unsupported_capture() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let target = session(&runtime, "audio-wait-failure").await;
+    assert_eq!(
+        target.wait_audio_finished().await.unwrap_err(),
+        "computer audio recording is not active"
+    );
+    invoke(&target, "start_audio_recording").await;
+    let waiting = observing_audio(&runtime, target.clone()).await;
+    factory.workers.lock().unwrap()[0].send(false).unwrap();
+    assert_eq!(
+        waiting.await.unwrap().unwrap_err(),
+        "fixture native finalization failed"
+    );
+    // Native failure remains a failure when cleanup joins the same worker.
+    assert_eq!(
+        target.discard_audio().await.unwrap_err(),
+        "fixture native finalization failed"
+    );
+    runtime.shutdown().await;
+
+    let unsupported = self::runtime(Arc::new(Factory::default()));
+    let target = session(&unsupported, "audio-wait-unsupported").await;
+    invoke(&target, "start_audio_recording").await;
+    assert_eq!(
+        target.wait_audio_finished().await.unwrap_err(),
+        "native audio completion observation is unavailable for this backend"
+    );
+    unsupported.shutdown().await;
 }

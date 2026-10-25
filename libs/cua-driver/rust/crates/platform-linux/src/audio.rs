@@ -2,13 +2,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use cua_driver_core::audio::{AudioBackend, AudioBackendFactory};
+use cua_driver_core::audio::{AudioBackend, AudioBackendFactory, AudioCompletion};
 
 pub struct LoopbackAudioBackendFactory;
 
@@ -98,9 +98,25 @@ impl AudioBackendFactory for LoopbackAudioBackendFactory {
                 return Err(error.into());
             }
         };
-        let mut backend = FfmpegAudio {
+        let input = child.stdin.take();
+        // This guard also settles the process if spawning the native waiter
+        // fails: dropping an unstarted thread closure must not orphan FFmpeg.
+        let process = FfmpegProcess {
             child: Some(child),
             stderr: Some(stderr),
+        };
+        let (completion, completed) = AudioCompletion::channel();
+        let worker = std::thread::Builder::new()
+            .name("cua-audio-capture".into())
+            .spawn(move || {
+                let result = process.wait();
+                completed.finish(&result);
+                result
+            })?;
+        let mut backend = FfmpegAudio {
+            input,
+            worker: Some(worker),
+            completion,
         };
         if let Err(error) = readiness.recv().context("FFmpeg progress worker ended")? {
             let finalization = backend.finish();
@@ -117,35 +133,36 @@ impl AudioBackendFactory for LoopbackAudioBackendFactory {
 }
 
 struct FfmpegAudio {
+    input: Option<ChildStdin>,
+    worker: Option<JoinHandle<anyhow::Result<()>>>,
+    completion: AudioCompletion,
+}
+
+struct FfmpegProcess {
     child: Option<Child>,
     stderr: Option<JoinHandle<String>>,
 }
 
-impl FfmpegAudio {
-    fn finish(&mut self) -> anyhow::Result<()> {
-        let Some(mut child) = self.child.take() else {
-            return Ok(());
-        };
-        if let Some(mut input) = child.stdin.take() {
-            let _ = input.write_all(b"q\n");
-        }
+impl FfmpegProcess {
+    fn wait(mut self) -> anyhow::Result<()> {
+        let child = self.child.as_mut().expect("owned FFmpeg child");
         let status = match child.wait() {
             Ok(status) => status,
             Err(error) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                if child.wait().is_ok() {
+                    self.child.take();
+                }
                 return Err(error).context("wait for computer audio capture");
             }
         };
+        self.child.take();
         let stderr = self
             .stderr
             .take()
-            .map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|_| "FFmpeg progress worker panicked".into())
-            })
-            .unwrap_or_default();
+            .expect("owned FFmpeg progress worker")
+            .join()
+            .map_err(|_| anyhow::anyhow!("FFmpeg progress worker panicked"))?;
         if !status.success() {
             bail!(
                 "FFmpeg computer audio capture failed ({status}): {}",
@@ -156,13 +173,7 @@ impl FfmpegAudio {
     }
 }
 
-impl AudioBackend for FfmpegAudio {
-    fn stop(mut self: Box<Self>) -> anyhow::Result<()> {
-        self.finish()
-    }
-}
-
-impl Drop for FfmpegAudio {
+impl Drop for FfmpegProcess {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -171,5 +182,34 @@ impl Drop for FfmpegAudio {
         if let Some(worker) = self.stderr.take() {
             let _ = worker.join();
         }
+    }
+}
+
+impl FfmpegAudio {
+    fn finish(&mut self) -> anyhow::Result<()> {
+        if let Some(mut input) = self.input.take() {
+            let _ = input.write_all(b"q\n");
+        }
+        self.worker.take().map_or(Ok(()), |worker| {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("FFmpeg capture worker panicked"))?
+        })
+    }
+}
+
+impl AudioBackend for FfmpegAudio {
+    fn stop(mut self: Box<Self>) -> anyhow::Result<()> {
+        self.finish()
+    }
+
+    fn completion(&self) -> anyhow::Result<AudioCompletion> {
+        Ok(self.completion.clone())
+    }
+}
+
+impl Drop for FfmpegAudio {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }

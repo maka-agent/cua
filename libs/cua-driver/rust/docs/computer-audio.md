@@ -52,6 +52,29 @@ it preserves their state and does not promise to interrupt them. Tests cover
 admitted start/stop races, canceled discard awaits, foreign-session ownership,
 and reuse of the same session after discard.
 
+Rust hosts may also await `CuaDriverSession::wait_audio_finished()` on the
+current recording of an embedded binding. This observes the actual native
+capture finalization and propagates exit, close, and write errors. It does not
+stop capture, retrieve audio, or clear the active slot. Linux waits for the
+owned FFmpeg child exit and progress-reader close; macOS and Windows publish
+the result after their capture worker releases native resources and finishes
+its WAV write. The duration deadline by itself is never completion evidence.
+An unreported worker exit/panic is a failure. The snapshot releases runtime
+admission before awaiting finalization, allowing concurrent trusted discard or
+runtime shutdown to stop the same worker. Canceling this observation does not
+stop capture. Audio disabled, absent active recording, unsupported backends,
+and non-embedded transports are explicit errors.
+
+A host retaining recordings across its JavaScript-kernel reset must retain
+the old bound session until native completion or trusted discard. Each new
+host epoch needs a distinct native `public_session` in the same runtime:
+resource keys use the runtime generation and that public session, rather than
+the identity of the SDK handle. A fresh epoch then has no active recording to
+stop, while permission revocation can still discard the retained old binding.
+This host API adds no model operation or approval authority. Native completion
+notifications for macOS and Windows are source changes pending real native
+verification; no new cross-platform completion claim follows from them.
+
 Audio has its own reviewed `system_audio_output` observation adapter. Its
 scope names the trusted runtime, session, fixed default-output loopback, and
 absence of microphone or caller-selected device. Stop also authorizes the
