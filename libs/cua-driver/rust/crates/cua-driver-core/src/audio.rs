@@ -19,6 +19,9 @@ pub const CHANNELS: u16 = 2;
 pub const DEFAULT_DURATION_MS: u64 = 60_000;
 pub const MAX_DURATION_MS: u64 = 300_000;
 
+/// The backend result type, available to hosts implementing this interface.
+pub type AudioResult<T> = anyhow::Result<T>;
+
 /// An owned capture. `stop` settles native callbacks and writes before returning,
 /// including on failure. Dropping an unfinished backend must stop capture too.
 pub trait AudioBackend: Send {

@@ -29,6 +29,29 @@ shutdown drains accepted calls and awaits native audio cleanup. Synchronous
 native cleanup hooks execute off the async executor, including with a
 current-thread Tokio runtime.
 
+Trusted Rust hosts may call `CuaDriverSession::discard_audio().await` on an
+embedded binding to stop/discard just its audio and remove its WAV files. This
+does not end the session, change its capture policy, or reset unrelated native,
+browser, or JavaScript state. The method is absent from UniFFI, the C ABI, and
+model tools; remote, private-worker and service sessions refuse it until their
+transport implements trusted forwarding. The existing runtime write lock
+drains read-admitted operations before cleanup, and an owned cleanup task
+retains that drain through native settlement even if the host cancels its
+await. Discard returns no audio result. A read-admitted stop can finish before
+the drain; the embedding host must revalidate approval before exposing its
+result.
+
+This is resource cleanup, not another permission authority or a persistent
+audio denial. A later start works only after the host admits it under its own
+fresh approval. The host must serialize native invocation, cancellation
+settlement, and discard. Maka uses its existing Driver lock for that order.
+The SDK drain begins at `DriverRuntime` read admission: a C-ABI operation
+queued on its executor before taking that lock is outside the drained set.
+Discard can wait for unrelated read-admitted native calls on the same runtime;
+it preserves their state and does not promise to interrupt them. Tests cover
+admitted start/stop races, canceled discard awaits, foreign-session ownership,
+and reuse of the same session after discard.
+
 Audio has its own reviewed `system_audio_output` observation adapter. Its
 scope names the trusted runtime, session, fixed default-output loopback, and
 absence of microphone or caller-selected device. Stop also authorizes the

@@ -1498,6 +1498,27 @@ unsafe impl Send for NativeAbiSession {}
 unsafe impl Sync for NativeAbiSession {}
 
 impl NativeAbiSession {
+    pub(crate) async fn discard_audio(&self) -> Result<(), DriverError> {
+        let session = {
+            // Retain the immutable binding while holding the same handle lock
+            // used by close/invoke. This trusted Rust-host path adds no model
+            // tool or generated-language/C-ABI operation.
+            let handle = self.handle.lock().unwrap();
+            unsafe {
+                handle
+                    .cast::<CuaDriverSessionHandle>()
+                    .as_ref()
+                    .ok_or(DriverError::Shutdown)?
+                    .session
+                    .clone()
+            }
+        };
+        session
+            .discard_audio()
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
     pub(crate) fn close(&self) {
         let mut handle = self.handle.lock().unwrap();
         unsafe { ffi::session_destroy(&mut *handle) };

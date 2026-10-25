@@ -71,6 +71,7 @@ async fn loopback_audio_captures_generated_output_and_settles_its_session() {
             bounded_manifest_path: None,
         })
         .unwrap();
+    call(&session, "start_session", json!({"capture_scope":"window"})).await;
     // Start output before capture so Pulse render latency cannot consume this
     // short recording before the first generated sample reaches the monitor.
     struct GeneratedTone(Child);
@@ -228,6 +229,22 @@ async fn loopback_audio_captures_generated_output_and_settles_its_session() {
     )
     .await;
     assert_eq!(source_outputs(), 1);
+    session.discard_audio().await.unwrap();
+    assert_eq!(source_outputs(), 0);
+    assert!(!std::path::Path::new(audio["filepath"].as_str().unwrap()).exists());
+    let state = call(&session, "get_session_state", json!({})).await;
+    let lifecycle = call(&session, "get_session", json!({})).await;
+    assert_eq!(lifecycle["structuredContent"]["state"], "active");
+    assert_eq!(state["structuredContent"]["capture_scope"], "window");
+    // A later host-approved operation reuses the same session binding. The
+    // trusted cleanup API grants no permission of its own.
+    call(
+        &session,
+        "start_audio_recording",
+        json!({"max_duration_ms":5000}),
+    )
+    .await;
+    assert_eq!(source_outputs(), 1);
     call(&session, "end_session", json!({})).await;
     assert_eq!(source_outputs(), 0);
     assert!(!std::path::Path::new(audio["filepath"].as_str().unwrap()).exists());
@@ -261,7 +278,7 @@ async fn loopback_audio_captures_generated_output_and_settles_its_session() {
         json!({"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes)),
         "channels":2,"sample_rate":24000,"bits":16,"duration_seconds":duration,
         "tone_hz":frequency,"tone_correlation":tone_correlation,"identical_generated_stereo_channels":true,"duplicate_start_refused":true,"idle_stop_refused":true,"session_cleanup":true,
-        "sdk_session_close_cleanup":true,"start_seconds":start_seconds,"playback_seconds":playback_seconds,"completion_seconds":completion_seconds,"automatic_completion_observed":true})
+        "sdk_session_close_cleanup":true,"host_discard_cleanup":true,"same_session_restart_after_discard":true,"capture_policy_preserved_after_discard":true,"start_seconds":start_seconds,"playback_seconds":playback_seconds,"completion_seconds":completion_seconds,"automatic_completion_observed":true})
     );
     driver.shutdown().await.unwrap();
 }

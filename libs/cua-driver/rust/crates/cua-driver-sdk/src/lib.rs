@@ -1672,6 +1672,29 @@ impl CuaDriverSession {
 }
 
 impl CuaDriverSession {
+    /// Trusted Rust-host cleanup of this session's computer audio only.
+    ///
+    /// Waits for runtime read-admitted calls, stops/discards native capture and
+    /// removes its temporary WAVs. The bound session and unrelated resources
+    /// remain usable. This neither grants nor revokes host approval: the host
+    /// must serialize native admission with this call and obtain fresh approval
+    /// before starting another recording. An FFI future queued before its read
+    /// admission is outside the drained set. Caller cancellation does not
+    /// abandon cleanup once scheduled.
+    ///
+    /// This method is absent from UniFFI and public agent protocols. Backends
+    /// without a trusted cleanup forwarding path refuse it explicitly.
+    pub async fn discard_audio(&self) -> Result<(), DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(session) => session.discard_audio().await,
+            SessionBackend::PrivateWorker { .. }
+            | SessionBackend::Service { .. }
+            | SessionBackend::Remote(_) => Err(DriverError::Protocol {
+                reason: "trusted audio discard is unavailable for this session backend".into(),
+            }),
+        }
+    }
+
     async fn invoke_typed<T: ToolInput>(
         &self,
         name: &str,

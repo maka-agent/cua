@@ -114,6 +114,29 @@ pub(crate) struct RuntimeSession {
 }
 
 impl RuntimeSession {
+    /// Trusted resource cleanup for this immutable binding, not a model action
+    /// or a new audio grant. The host must serialize admission and re-check its
+    /// own approval before a later start.
+    pub(crate) async fn discard_audio(&self) -> Result<(), String> {
+        let runtime = self.runtime.clone();
+        let session = self.context.runtime_session_key(&self.public_session);
+        // Keep the existing write-drain owned even if the host cancels its
+        // await while native cleanup is running. Shutdown uses this same lock.
+        let cleanup = tokio::spawn(async move {
+            let _drained = runtime.lifecycle.write().await;
+            let Some(audio) = runtime.audio.clone() else {
+                return Ok(());
+            };
+            tokio::task::spawn_blocking(move || audio.close_session(&session))
+                .await
+                .map_err(|error| format!("computer audio cleanup worker failed: {error}"))?
+                .map_err(|error| error.to_string())
+        });
+        cleanup
+            .await
+            .map_err(|error| format!("computer audio discard task failed: {error}"))?
+    }
+
     pub(crate) async fn invoke(&self, name: &str, mut args: Value) -> Option<CoreToolResult> {
         cua_driver_core::tool_args::sanitize_reserved_args(&mut args);
         let Some(arguments) = args.as_object_mut() else {
@@ -787,6 +810,10 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_audio_discard_tests.rs"]
+mod audio_discard_tests;
 
 #[cfg(test)]
 mod tests {
