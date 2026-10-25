@@ -30,6 +30,8 @@ pub mod health_report;
 pub mod overlay;
 pub mod pip;
 pub mod recording_hooks;
+#[cfg(any(target_os = "windows", test))]
+mod scroll_pixels;
 pub mod terminal;
 pub mod tools;
 

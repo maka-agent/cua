@@ -109,9 +109,15 @@ clamped. This range is not a native pixel-distance limit. Platform-aware clients
 use the same runtime-discovered `scroll` tool through the generic call for
 native units: Linux X11 accepts a separate non-zero `pixels` integer through
 65535, exclusive with `by` and `amount`; macOS accepts `by: "pixel"` with its
-native `amount` range of 1–20000. Linux converts pixels to wheel detents rather
-than promising a viewport displacement. These native forms are outside the
-portable DTO, and must not be sent to a backend that does not advertise them.
+native `amount` range of 1–20000. Windows accepts finite `pixels` with x/y and
+foreground delivery, exclusive with `by`, `amount` and `element_token`. It signs
+the distance by direction, applies JavaScript `Math.round`, and submits raw wheel
+deltas bounded per axis to [-32768,32767] without a detent multiplier or cursor
+restoration. Rounded inputs must fit the supported signed 32-bit domain; the
+original native parser's larger-integer behavior remains unverified. Linux
+converts pixels to wheel detents. Neither route promises a viewport displacement.
+These native forms are outside the portable DTO, and must not be sent to a
+backend that does not advertise them.
 
 See [Action results and postcondition verification](../docs/action-result-contract.md)
 for the wire shape and 0.14 migration guidance.

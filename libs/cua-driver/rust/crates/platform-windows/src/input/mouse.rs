@@ -1147,6 +1147,54 @@ pub fn send_wheel_synthesized(sx: i32, sy: i32, ticks: i32, horizontal: bool) ->
     Ok(())
 }
 
+/// Counts returned by one raw coordinate-wheel submission. A partial count
+/// describes attempted input; callers must not report a pre-dispatch refusal.
+pub struct PixelWheelDispatch {
+    pub requested: u32,
+    pub inserted: u32,
+}
+
+/// Send bounded native wheel deltas at a screen point, leaving the cursor there.
+/// This route has no detent multiplier, delay, cursor restoration or activation.
+pub fn send_pixel_wheel_synthesized(
+    sx: i32,
+    sy: i32,
+    delta_x: i32,
+    delta_y: i32,
+) -> Result<PixelWheelDispatch> {
+    let events: Vec<INPUT> = crate::scroll_pixels::wheel_packets(delta_x, delta_y)
+        .into_iter()
+        .map(|packet| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: packet.delta as u32,
+                    dwFlags: if packet.horizontal {
+                        MOUSEEVENTF_HWHEEL
+                    } else {
+                        MOUSEEVENTF_WHEEL
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        })
+        .collect();
+    move_cursor_desktop(sx, sy)?;
+    let requested = events.len() as u32;
+    let inserted = if events.is_empty() {
+        0
+    } else {
+        unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) }
+    };
+    Ok(PixelWheelDispatch {
+        requested,
+        inserted,
+    })
+}
+
 /// Return the current foreground window for desktop-scope keyboard and drag
 /// operations, which intentionally target whatever the user can currently see.
 pub fn foreground_window() -> Result<u64> {

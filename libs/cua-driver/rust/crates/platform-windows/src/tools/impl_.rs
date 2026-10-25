@@ -6458,6 +6458,155 @@ pub struct ScrollTool {
 }
 static SCROLL_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+fn pixel_wheel_dispatch_result(
+    dispatch: crate::input::mouse::PixelWheelDispatch,
+    delta_x: i32,
+    delta_y: i32,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let complete = dispatch.inserted == dispatch.requested;
+    let mut details = json!({
+        "path":"SendInput", "verified":false,
+        "effect":if complete {"unverifiable"} else {"partial"},
+        "delivery_mode":"foreground",
+        "wheel_events_requested":dispatch.requested,
+        "wheel_events_inserted":dispatch.inserted,
+        "wheel_delta_x":delta_x.clamp(-32768,32767),
+        "wheel_delta_y":delta_y.clamp(-32768,32767)
+    });
+    let result = if complete {
+        ToolResult::text("Submitted native coordinate wheel input.").with_structured(details)
+    } else {
+        details["code"] = json!("input_outcome_unknown");
+        ToolResult::error(format!(
+            "SendInput inserted {} of {} wheel events after moving the pointer; inspect the target before retrying",
+            dispatch.inserted, dispatch.requested
+        )).with_structured(details)
+    };
+    match ActionExecutionRecord::builder(
+        if complete { ActionEffect::Unverifiable } else { ActionEffect::Partial },
+        ActionTransport::WindowsSendInput,
+        RequestedDelivery::Foreground,
+    )
+    .actual_delivery(ActualDelivery::Foreground)
+    .delivered_count(dispatch.inserted)
+    .detail(format!("SendInput inserted {} of {} native wheel events", dispatch.inserted, dispatch.requested))
+    .build() {
+        Ok(record) => result.with_action_record(record),
+        Err(error) => ToolResult::error(format!("Native wheel outcome record failed: {error:?}"))
+            .with_structured(json!({
+                "code":"input_outcome_unknown", "effect":"unverifiable", "path":"SendInput",
+                "wheel_events_requested":dispatch.requested, "wheel_events_inserted":dispatch.inserted
+            })),
+    }
+}
+
+impl ScrollTool {
+    async fn invoke_pixels(&self, args: &Value) -> ToolResult {
+        use cua_driver_core::tool_args::ArgsExt;
+
+        let refused = |message: &str| {
+            ToolResult::error(message).with_structured(json!({
+                "code":"invalid_arguments", "effect":"refused"
+            }))
+        };
+        if args.get("by").is_some() || args.get("amount").is_some() {
+            return refused("scroll: pixels is exclusive with by and amount");
+        }
+        if args
+            .get("element_token")
+            .is_some_and(|value| !value.is_null())
+        {
+            return refused("scroll: native pixels require a coordinate point, not element_token");
+        }
+        if !crate::input::delivery::DeliveryMode::from_args(args).is_foreground() {
+            return refused("scroll: native pixels require delivery_mode=\"foreground\"");
+        }
+        let Some(pixels) = args.get("pixels").and_then(Value::as_f64) else {
+            return refused("scroll: pixels must be a finite number");
+        };
+        let direction = args.get("direction").and_then(Value::as_str).unwrap_or("");
+        let (delta_x, delta_y) = match crate::scroll_pixels::directional_deltas(direction, pixels) {
+            Ok(deltas) => deltas,
+            Err(message) => return refused(message),
+        };
+        let point = ["x", "y"].map(|axis| {
+            args.get(axis)
+                .and_then(Value::as_f64)
+                .ok_or("scroll: native pixels require finite x and y")
+                .and_then(crate::scroll_pixels::js_round_i32)
+        });
+        let (x, y) = match point {
+            [Ok(x), Ok(y)] => (x, y),
+            [Err(message), _] | [_, Err(message)] => return refused(message),
+        };
+        let has_pid = args.get("pid").is_some_and(|value| !value.is_null());
+        let has_window = args.get("window_id").is_some_and(|value| !value.is_null());
+        let (x, y, window) = if !has_pid && !has_window {
+            if !is_windowless_desktop_action(args) {
+                return refused(
+                    "scroll: coordinates without pid/window_id require scope=\"desktop\"",
+                );
+            }
+            (x, y, None)
+        } else {
+            let pid = match args.require_u32("pid") {
+                Ok(pid) if pid > 0 => pid,
+                _ => return refused("scroll: native pixels require a positive pid"),
+            };
+            let hwnd = match args.require_u64("window_id") {
+                Ok(hwnd) if hwnd > 0 => hwnd,
+                _ => return refused("scroll: native pixels require an exact window_id"),
+            };
+            let (x, y) = match super::scroll_coordinates::window_bitmap_point(
+                &self.state.snapshots,
+                args,
+                pid,
+                hwnd,
+                f64::from(x),
+                f64::from(y),
+            ) {
+                Ok(point) => point,
+                Err(refusal) => return refusal,
+            };
+            (x, y, Some((pid, hwnd)))
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let (sx, sy) = if let Some((pid, hwnd)) = window {
+                exact_window_ownership_result(pid, hwnd, crate::win32::window_owner_pid(hwnd))?;
+                let point = bitmap_to_screen(hwnd, x, y);
+                exact_window_ownership_result(pid, hwnd, crate::win32::window_owner_pid(hwnd))?;
+                point
+            } else {
+                (x, y)
+            };
+            crate::input::mouse::send_pixel_wheel_synthesized(sx, sy, delta_x, delta_y).map_err(
+                |error| {
+                    ToolResult::error(error.to_string()).with_structured(json!({
+                        "path":"SendInput", "code":"input_outcome_unknown",
+                        "effect":"unverifiable", "verified":false,
+                        "wheel_events_inserted":0,
+                        "detail":"pointer positioning failed before wheel submission"
+                    }))
+                },
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(dispatch)) => pixel_wheel_dispatch_result(dispatch, delta_x, delta_y),
+            Ok(Err(result)) => result,
+            Err(error) => ToolResult::error(format!("Native wheel task failed: {error}"))
+                .with_structured(json!({
+                    "path":"SendInput", "code":"input_outcome_unknown",
+                    "effect":"unverifiable", "verified":false,
+                    "detail":"input task outcome is unknown; inspect the target before retrying"
+                })),
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for ScrollTool {
     fn def(&self) -> &ToolDef {
@@ -6473,8 +6622,13 @@ impl Tool for ScrollTool {
                 approaches reach backgrounded windows.\n\n\
                 Mapping: `by: \"page\"` → SB_PAGEDOWN/UP/LEFT/RIGHT × amount; \
                 `by: \"line\"` → SB_LINEDOWN/UP/LEFT/RIGHT × amount.\n\n\
-                Note: `element_token` is accepted for cross-platform parity but currently \
-                no-op on Windows (UIA SetFocus not wired up yet — same caveat as `press_key`).".into(),
+                Native coordinate scrolling: supply `pixels` with x,y and delivery_mode:\"foreground\" \
+                instead of by/amount. Values are signed by direction and rounded with JavaScript \
+                Math.round semantics, then sent as native wheel deltas. This route leaves the pointer \
+                at the target and does not convert pixels into detents. The rounded signed 32-bit \
+                domain is supported; original parser behavior outside it remains unverified.\n\n\
+                An `element_token` selects the retained UIA scroll surface for line/page input. \
+                Native pixels require a coordinate point and reject element_token.".into(),
             input_schema: json!({
                 "type":"object","required":["direction"],"properties":{
                     "session": cua_driver_core::tool_schema::session_schema(),
@@ -6483,9 +6637,10 @@ impl Tool for ScrollTool {
                     "by":{"type":"string","enum":["line","page"],"description":"Scroll granularity. Default: line."},
                     "amount":{"type":"integer","minimum":1,"maximum":50,
                         "description":"Number of scroll ticks. Default 3."},
+                    "pixels":{"type":"number","description":"Native coordinate wheel distance, exclusive with by/amount. Requires x,y, foreground delivery and no element_token. Direction signs this finite value before rounding; each native axis is bounded to [-32768,32767]. OS/application displacement is not a pixel guarantee."},
                     "x":{"type":"number","description":"With pid/window_id: window-local screenshot X used to target a nested scroll surface in foreground mode. Without pid/window_id: screen-absolute X for desktop scope. Must be paired with y."},
                     "y":{"type":"number","description":"With pid/window_id: window-local screenshot Y used to target a nested scroll surface in foreground mode. Without pid/window_id: screen-absolute Y for desktop scope. Must be paired with x."},
-                    "window_id":{"type":"integer","description":"HWND of the target window. Omit when element_token is supplied; otherwise auto-resolves the pid's first visible window."},
+                    "window_id":{"type":"integer","description":"Exact HWND of the target window. Omit when element_token supplies its retained window, or let pid-only target resolution select an eligible window."},
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window","description":"Use \"desktop\" with x,y and no pid/window_id for screen-absolute coordinates from get_desktop_state. Default \"window\"."},
                     "delivery_mode": crate::input::delivery::delivery_mode_schema()
@@ -6496,9 +6651,12 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if args.get("by").and_then(Value::as_str) == Some("pixel") || args.get("pixels").is_some() {
+        if args.get("pixels").is_some() {
+            return self.invoke_pixels(&args).await;
+        }
+        if args.get("by").and_then(Value::as_str) == Some("pixel") {
             return ToolResult::error(
-                "unsupported: pixel-unit input is unavailable on this native adapter",
+                "scroll: use the native pixels field instead of by=\"pixel\"",
             )
             .with_structured(serde_json::json!({"code":"unsupported"}));
         }
@@ -10662,6 +10820,9 @@ mod click_capture_id_schema_tests;
 
 #[cfg(test)]
 mod snapshot_coordinate_tests;
+
+#[cfg(test)]
+mod pixel_scroll_tests;
 
 #[cfg(test)]
 mod set_window_frame_geometry_tests;
