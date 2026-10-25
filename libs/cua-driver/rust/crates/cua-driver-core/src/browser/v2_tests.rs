@@ -3083,11 +3083,24 @@ async fn dom_event_click_bounds_stalled_readbacks() {
         )
         .await
         .expect("click must not wait for CALL_TIMEOUT");
-        assert!(result.content.iter().any(|content| matches!(
-            content,
-            Content::Text { text, .. }
-                if text.contains("semantic target readback was unavailable")
-        )));
+        assert!(
+            result.content.iter().any(|content| matches!(
+                content,
+                Content::Text { text, .. }
+                    if text.contains("semantic target readback was unavailable")
+            )),
+            "reads={reads}, result={result:?}"
+        );
+        assert_eq!(
+            recorded_calls(&f, "Runtime.callFunctionOn")
+                .iter()
+                .filter(|(_, params)| params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|declaration| declaration.contains("'pointerdown'")))
+                .count(),
+            1,
+            "a stalled observation must not suppress or replay the click"
+        );
         let public = result.action_record.unwrap().public_result().unwrap();
         let public = serde_json::to_value(public).unwrap();
         assert_eq!(public["effect"], "unverifiable");

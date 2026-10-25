@@ -253,12 +253,25 @@ impl Drop for CdpConnection {
     }
 }
 
-// Cancelled sends may leave partial frames; cancelled replies may hide an
-// applied mutation. Retire the connection so neither can be reused or replayed.
+#[derive(Clone, Copy)]
+enum ReplyDisposition {
+    Required,
+    Observation,
+}
+
+#[derive(Clone, Copy)]
+enum PendingCallPhase {
+    Sending,
+    AwaitingReply(ReplyDisposition),
+    Replied,
+}
+
+// A cancelled send may leave a partial frame, and an unanswered mutation may
+// have applied. Only a fully sent observation can abandon its reply safely.
 struct PendingCall<'a> {
     connection: &'a CdpConnection,
     id: u64,
-    replied: bool,
+    phase: PendingCallPhase,
 }
 
 impl Drop for PendingCall<'_> {
@@ -269,7 +282,11 @@ impl Drop for PendingCall<'_> {
             .lock()
             .unwrap()
             .remove(&self.id);
-        if !self.replied {
+        if !matches!(
+            self.phase,
+            PendingCallPhase::Replied
+                | PendingCallPhase::AwaitingReply(ReplyDisposition::Observation)
+        ) {
             self.connection.reader.abort();
             self.connection.demux.close();
         }
@@ -394,6 +411,29 @@ impl CdpConnection {
         method: &str,
         params: Value,
     ) -> anyhow::Result<Value> {
+        self.call_with_reply_disposition(session_id, method, params, ReplyDisposition::Required)
+            .await
+    }
+
+    /// Issue a known observation whose late reply can be discarded after its
+    /// complete request is sent. Callers must not use this for input or mutation.
+    pub(super) async fn call_observation(
+        &self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        self.call_with_reply_disposition(session_id, method, params, ReplyDisposition::Observation)
+            .await
+    }
+
+    async fn call_with_reply_disposition(
+        &self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+        reply_disposition: ReplyDisposition,
+    ) -> anyhow::Result<Value> {
         let policy = self.method_policy();
         if !policy.allows(method) {
             anyhow::bail!(
@@ -409,7 +449,7 @@ impl CdpConnection {
         let mut pending = PendingCall {
             connection: self,
             id,
-            replied: false,
+            phase: PendingCallPhase::Sending,
         };
         // Close can race the initial check. If the reader cleared the
         // pending map just before this insertion, remove the orphaned
@@ -433,13 +473,14 @@ impl CdpConnection {
                     .send(Message::Text(msg.to_string()))
                     .await
                     .map_err(|e| anyhow::anyhow!("CDP send failed during {method}: {e}"))?;
+                pending.phase = PendingCallPhase::AwaitingReply(reply_disposition);
             }
             rx.await
                 .map_err(|_| anyhow::anyhow!("CDP socket closed during {method}"))
         })
         .await
         .map_err(|_| anyhow::anyhow!("CDP {method} timed out after {CALL_TIMEOUT:?}"))??;
-        pending.replied = true;
+        pending.phase = PendingCallPhase::Replied;
         match outcome {
             CallOutcome::Result(v) => Ok(v),
             CallOutcome::Error {
@@ -1027,18 +1068,72 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_call_removes_pending_and_retires_the_connection() {
-        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
-        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
-        let _writer = conn.writer.lock().await;
-        let mut call = Box::pin(conn.call(None, "Input.insertText", json!({ "text": "once" })));
-        tokio::select! {
-            _ = &mut call => panic!("call must wait for the held writer"),
-            _ = tokio::task::yield_now() => {}
+        for observation in [false, true] {
+            let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+            let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+            let _writer = conn.writer.lock().await;
+            let mut call = Box::pin(async {
+                if observation {
+                    conn.call_observation(None, "DOM.getDocument", json!({}))
+                        .await
+                } else {
+                    conn.call(None, "Input.insertText", json!({ "text": "once" }))
+                        .await
+                }
+            });
+            tokio::select! {
+                _ = &mut call => panic!("call must wait for the held writer"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(conn.demux.pending.lock().unwrap().len(), 1);
+            drop(call);
+            assert!(conn.is_closed());
+            assert!(conn.demux.pending.lock().unwrap().is_empty());
         }
-        assert_eq!(conn.demux.pending.lock().unwrap().len(), 1);
-        drop(call);
-        assert!(conn.is_closed());
-        assert!(conn.demux.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_fully_sent_observation_can_abandon_its_reply() {
+        for observation in [false, true] {
+            let (received, mut seen) = mpsc::unbounded_channel();
+            let server = MockCdpServer::start(StdArc::new(move |call| {
+                if call.method == "Fixture.pending" {
+                    received.send(()).unwrap();
+                    let mut reply = MockReply::ok(json!({}));
+                    reply.suppress_response = true;
+                    reply
+                } else {
+                    MockReply::ok(json!({"echoed": call.params.clone()}))
+                }
+            }))
+            .await;
+            let conn = StdArc::new(CdpConnection::connect(&server.ws_url()).await.unwrap());
+            let active = conn.clone();
+            let call = tokio::spawn(async move {
+                if observation {
+                    active
+                        .call_observation(None, "Fixture.pending", json!({}))
+                        .await
+                } else {
+                    active.call(None, "Fixture.pending", json!({})).await
+                }
+            });
+            tokio::time::timeout(CALL_TIMEOUT, seen.recv())
+                .await
+                .expect("the peer must receive the complete request")
+                .expect("the fixture must report the received request");
+            assert_eq!(conn.demux.pending.lock().unwrap().len(), 1);
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+            assert!(conn.demux.pending.lock().unwrap().is_empty());
+            assert_eq!(conn.is_closed(), !observation);
+            let next = conn.call(None, "Echo.params", json!({"next": 7})).await;
+            if observation {
+                assert_eq!(next.unwrap()["echoed"]["next"], 7);
+            } else {
+                assert!(next.unwrap_err().to_string().contains("socket closed"));
+            }
+        }
     }
 
     #[tokio::test]

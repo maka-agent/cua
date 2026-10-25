@@ -92,7 +92,7 @@ async fn read_dom_click_state(
 ) -> Option<Value> {
     tokio::time::timeout(
         budget,
-        conn.call(
+        conn.call_observation(
             Some(cdp),
             "Runtime.callFunctionOn",
             json!({
