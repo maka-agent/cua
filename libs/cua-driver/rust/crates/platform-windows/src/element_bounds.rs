@@ -20,8 +20,9 @@ mod native {
 
     use async_trait::async_trait;
     use cua_driver_core::{
+        browser::platform::BrowserPlatform,
         element_token::ResolvedElement,
-        protocol::ToolResult,
+        protocol::{Content, ToolResult},
         tool::{Tool, ToolDef},
         tool_args::ArgsExt,
     };
@@ -66,6 +67,51 @@ mod native {
                 idempotent: true,
                 open_world: false,
             })
+        }
+
+        async fn protected_resource_scope(
+            &self,
+            adapter_id: &str,
+            args: &Value,
+        ) -> Result<Option<Value>, String> {
+            if adapter_id != "private_observation" {
+                return Ok(None);
+            }
+            let pid = args
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| {
+                    "element_bounds requires a positive Windows process id".to_owned()
+                })?;
+            let window_id = args
+                .get("window_id")
+                .and_then(Value::as_u64)
+                .filter(|window_id| *window_id > 0)
+                .ok_or_else(|| "element_bounds requires a positive window_id".to_owned())?;
+            match self
+                .snapshots
+                .resolve(pid as i32, args)
+                .map_err(scope_target_refusal)?
+            {
+                ResolvedElement::Element { .. } => {}
+                ResolvedElement::None => {
+                    return Err("element_bounds requires an element_token".to_owned())
+                }
+            }
+            validate_window_owner(pid, window_id).await?;
+            let fingerprint = crate::browser_platform::WindowsBrowserPlatform::default()
+                .process_fingerprint(i64::from(pid))
+                .await
+                .map_err(|error| error.message)?;
+            validate_window_owner(pid, window_id).await?;
+            Ok(Some(json!({
+                "kind":"window",
+                "pid":pid,
+                "window_id":window_id,
+                "fingerprint":fingerprint
+            })))
         }
 
         async fn invoke(&self, args: Value) -> ToolResult {
@@ -113,6 +159,34 @@ mod native {
 
     fn refused(code: &str, message: impl Into<String>) -> ToolResult {
         ToolResult::error(message).with_structured(json!({"code":code,"effect":"refused"}))
+    }
+
+    fn scope_target_refusal(result: ToolResult) -> String {
+        result
+            .content
+            .into_iter()
+            .filter_map(|content| match content {
+                Content::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn validate_window_owner(pid: u32, window_id: u64) -> Result<(), String> {
+        let owner_pid =
+            tokio::task::spawn_blocking(move || crate::win32::window_owner_pid(window_id))
+                .await
+                .map_err(|error| format!("element_bounds window ownership task failed: {error}"))?;
+        match owner_pid {
+            Some(owner) if owner == pid => Ok(()),
+            Some(owner) => Err(format!(
+                "window_id {window_id} belongs to pid {owner}, not pid {pid}"
+            )),
+            None => Err(format!(
+                "window_id {window_id} is closed, stale, or invalid"
+            )),
+        }
     }
 
     struct ComApartment;
@@ -181,6 +255,47 @@ mod native {
             assert_eq!(
                 result.structured_content.unwrap()["refusal"]["code"],
                 "stale_element_token"
+            );
+        }
+
+        #[tokio::test]
+        async fn private_observation_requires_exact_snapshot_target_before_native_lookup() {
+            let tool = ElementBoundsTool {
+                snapshots: Arc::new(Snapshots::new()),
+            };
+            for (args, expected) in [
+                (
+                    json!({"pid":0,"window_id":456,"element_token":"sdeadbeef:0"}),
+                    "element_bounds requires a positive Windows process id",
+                ),
+                (
+                    json!({"pid":123,"window_id":0,"element_token":"sdeadbeef:0"}),
+                    "element_bounds requires a positive window_id",
+                ),
+                (
+                    json!({"pid":123,"window_id":456}),
+                    "element_bounds requires an element_token",
+                ),
+                (
+                    json!({"pid":123,"window_id":456,"element_token":"malformed"}),
+                    "has invalid format",
+                ),
+                (
+                    json!({"pid":123,"window_id":456,"element_token":"sdeadbeef:0"}),
+                    "element_token is stale; call get_window_state again to refresh; pid 123 has no current snapshot",
+                ),
+            ] {
+                let error = tool
+                    .protected_resource_scope("private_observation", &args)
+                    .await
+                    .unwrap_err();
+                assert!(error.contains(expected), "{error:?} did not include {expected:?}");
+            }
+            assert_eq!(
+                tool.protected_resource_scope("process_control", &json!({}))
+                    .await
+                    .unwrap(),
+                None
             );
         }
     }
