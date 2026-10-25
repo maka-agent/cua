@@ -5681,6 +5681,55 @@ pub fn read_value_ref(object_ref: &ObjectRef) -> Result<Option<String>> {
     )
 }
 
+/// Resolve current bounds by the snapshot's exact AT-SPI identity. A different
+/// element at its former ordinal is never a pointer target.
+pub fn observed_element_bounds(
+    pid: u32,
+    xid: u64,
+    identity: &super::AtspiIdentity,
+) -> Result<(i32, i32, u32, u32)> {
+    bounded_for(
+        INDEX_RESOLVE_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let Collected {
+                visited,
+                scoped_frame,
+                truncation,
+            } = collect_visited_bounded(conn, pid, xid, None, None)
+                .await?
+                .ok_or_else(|| CachedElementGone("the observed application is gone".into()))?;
+            let index = visited
+                .iter()
+                .filter(|node| is_indexable(node))
+                .position(|node| node.identity.as_ref() == Some(identity));
+            let Some(index) = index else {
+                if truncation.is_some() {
+                    return Err(anyhow!(
+                        "accessibility walk incomplete; observed element could not be verified"
+                    ));
+                }
+                return Err(CachedElementGone(
+                    "the observed element is no longer in the application's accessibility tree"
+                        .into(),
+                )
+                .into());
+            };
+            let (bounds, _) = element_bounds_for_visited(&visited, pid, xid, scoped_frame).await;
+            bounds
+                .into_iter()
+                .find(|(candidate, ..)| *candidate == index)
+                .map(|(_, x, y, w, h)| (x, y, w, h))
+                .ok_or_else(|| anyhow!("observed element has no usable current bounds"))
+        },
+        || {
+            Err(anyhow!(
+                "observed element bounds lookup timed out for pid {pid}"
+            ))
+        },
+    )
+}
+
 pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
         let window = crate::wayland::hyprland::window_for_pid(pid)

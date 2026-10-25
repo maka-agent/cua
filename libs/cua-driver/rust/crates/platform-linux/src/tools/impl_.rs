@@ -19,6 +19,9 @@ use std::sync::{Arc, RwLock};
 use crate::atspi::Snapshots;
 use cursor_overlay::CursorRegistry;
 
+mod pixel_scroll;
+use pixel_scroll::PixelScroll;
+
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
     pid: u32,
@@ -2727,6 +2730,41 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
 fn input_error_result(e: anyhow::Error) -> ToolResult {
+    if let Some(progress) = e.downcast_ref::<crate::input::WheelDispatchError>() {
+        use cua_driver_core::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        let mut record = ActionExecutionRecord::builder(
+            if progress.completed > 0 {
+                ActionEffect::Partial
+            } else {
+                ActionEffect::Unverifiable
+            },
+            if progress.desktop {
+                ActionTransport::LinuxXTest
+            } else {
+                ActionTransport::LinuxXSendEvent
+            },
+            if progress.desktop {
+                RequestedDelivery::Foreground
+            } else {
+                RequestedDelivery::Background
+            },
+        )
+        .actual_delivery(ActualDelivery::Unknown)
+        .detail(e.to_string());
+        if progress.completed > 0 {
+            record = record.delivered_count(progress.completed);
+        }
+        let record = record
+            .build()
+            .expect("attempted wheel input preserves its outcome");
+        let mut public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+        public["code"] = json!("input_outcome_unknown");
+        return ToolResult::error(e.to_string())
+            .with_structured(public)
+            .with_action_record(record);
+    }
     let text = e.to_string();
     if crate::input::is_uinput_unavailable(&e) {
         // The focus-free real-input route exists but this process cannot open
@@ -9770,6 +9808,39 @@ pub struct ScrollTool {
     state: Arc<ToolState>,
 }
 
+fn native_wheel_result(detents: usize, desktop: bool) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let text = format!("Dispatched {detents} native X11 wheel detents; effect remains unverified.");
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        if desktop {
+            ActionTransport::LinuxXTest
+        } else {
+            ActionTransport::LinuxXSendEvent
+        },
+        if desktop {
+            RequestedDelivery::Foreground
+        } else {
+            RequestedDelivery::Background
+        },
+    )
+    .actual_delivery(if desktop {
+        ActualDelivery::Foreground
+    } else {
+        ActualDelivery::Background
+    })
+    .delivered_count(detents as u32)
+    .detail(text.clone())
+    .build()
+    .expect("completed native wheel dispatch has known transport and count");
+    let public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+    ToolResult::text(text)
+        .with_structured(public)
+        .with_action_record(record)
+}
+
 fn atspi_scroll_result(progress: crate::atspi::ScrollProgress, foreground: bool) -> ToolResult {
     use cua_driver_core::action_record::{
         ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
@@ -9872,6 +9943,7 @@ impl Tool for ScrollTool {
                     "direction":{"type":"string","enum":["up","down","left","right"],"description":"Scroll direction."},
                     "by":{"type":"string","enum":["line","page"],"description":"Scroll granularity. Default: line."},
                     "amount":{"type":"integer","minimum":1,"maximum":50,"description":"Number of scroll steps. Default: 3."},
+                    "pixels":{"type":"integer","minimum":1,"maximum":65535,"description":"Linux X11 native pixel distance; exclusive with by and amount. Converts to max(roundf(pixels/100),1) wheel detents."},
                     "window_id":{"type":"integer","description":"Window id from list_windows. Required with x/y; optional with element_token (the token carries it)."},
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
                     "x":{"type":"number","description":"Window-local screenshot-pixel X of the scroll target. Pass with y and without element_token."},
@@ -9887,6 +9959,21 @@ impl Tool for ScrollTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let cursor_id = resolve_cursor_key(&args);
+        let pixels = match PixelScroll::from_arguments(&args) {
+            Ok(pixels) => pixels,
+            Err(error) => return error,
+        };
+        let amount = match pixels {
+            Some(pixels) => pixels.detents,
+            None => match cua_driver_core::tool_args::parse_scroll_amount(&args) {
+                Ok(amount) => amount,
+                Err(error) => return error,
+            },
+        };
+        if pixels.is_some() && crate::wayland::is_wayland() {
+            return ToolResult::error("native pixel scroll requires an X11 desktop")
+                .with_structured(json!({"code":"pixel_scroll_unavailable","effect":"none"}));
+        }
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -9899,7 +9986,6 @@ impl Tool for ScrollTool {
             let (x, y) = (input.x, input.y);
             let x = x.round() as i32;
             let y = y.round() as i32;
-            let amount = input.amount.unwrap_or(3).clamp(1, 50) as usize;
             let display = direction.clone();
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_desktop" } else { "xtest" };
@@ -9927,11 +10013,15 @@ impl Tool for ScrollTool {
             })
             .await;
             return match result {
+                Ok(Ok(())) if pixels.is_some() => native_wheel_result(amount, true),
                 Ok(Ok(())) => ToolResult::text(format!("Scrolled desktop {display} × {amount}."))
                     .with_structured(
                         json!({"scope":"desktop","path":path,"effect":"unverifiable"}),
                     ),
-                Ok(Err(error)) => ToolResult::error(error.to_string()),
+                Ok(Err(error)) => input_error_result(error),
+                Err(error) if pixels.is_some() => input_error_result(
+                    crate::input::WheelDispatchError::worker_failed(true, error.into()).into(),
+                ),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
         }
@@ -9943,7 +10033,6 @@ impl Tool for ScrollTool {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let amount = args.u64_or("amount", 3).clamp(1, 50) as usize;
         let by = match serde_json::from_value::<cua_driver_contract::ScrollBy>(
             args.get("by").cloned().unwrap_or(json!("line")),
         ) {
@@ -10087,6 +10176,60 @@ impl Tool for ScrollTool {
                 );
                 reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, false).await;
             }
+        }
+
+        if pixels.is_some() {
+            let point = match token {
+                Some(mut element) => {
+                    let idx = element.index;
+                    let located = tokio::task::spawn_blocking(move || {
+                        element.observed.bounds =
+                            Some(crate::atspi::native::observed_element_bounds(
+                                pid,
+                                xid,
+                                &element.observed.identity,
+                            )?);
+                        checked_element_local_coords(pid, &element, Some(xid))
+                    })
+                    .await;
+                    match located {
+                        Ok(Ok((_, x, y))) => (x, y),
+                        Ok(Err(error)) => {
+                            return stale_observed_element("scroll", idx, &error)
+                                .unwrap_or_else(|| input_error_result(error));
+                        }
+                        Err(error) => {
+                            return ToolResult::error(format!("scroll bounds task failed: {error}"))
+                        }
+                    }
+                }
+                None => match pixel_target {
+                    Some(point) => point,
+                    None => {
+                        return invalid_pointer_arguments(
+                            "scroll",
+                            "pixel scrolling requires coordinates or element_token",
+                        )
+                    }
+                },
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                crate::input::send_scroll_window(
+                    xid,
+                    point.0.round() as i32,
+                    point.1.round() as i32,
+                    &direction,
+                    amount,
+                )
+            })
+            .await;
+            return match result {
+                Ok(Ok(())) => native_wheel_result(amount, false),
+                Ok(Err(error)) => input_error_result(error),
+                Err(error) => input_error_result(
+                    crate::input::WheelDispatchError::worker_failed(false, error.into()).into(),
+                ),
+            };
         }
 
         if !isolated_background {

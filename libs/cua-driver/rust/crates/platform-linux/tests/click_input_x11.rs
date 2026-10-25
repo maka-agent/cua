@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use platform_linux::input::{
     send_button_down, send_button_up, send_click_with_modifiers,
-    send_click_xtest_desktop_with_modifiers,
+    send_click_xtest_desktop_with_modifiers, send_scroll_window, send_scroll_xtest_desktop,
 };
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -147,6 +147,64 @@ fn background_clicks_deliver_spaced_pairs_without_changing_focus() -> Result<()>
             holds[2]
         );
         assert_eq!(conn.get_input_focus()?.reply()?.focus, sentinel);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an isolated X11 display with XTEST"]
+fn wheel_routes_preserve_buttons_coordinates_source_flags_and_36_ms_holds() -> Result<()> {
+    let (conn, screen) = x11rb::connect(None)?;
+    let root = conn.setup().roots[screen].root;
+    let target = input_window(&conn, root, 0)?;
+    let sentinel = input_window(&conn, root, 300)?;
+    conn.set_input_focus(InputFocus::PARENT, sentinel, x11rb::CURRENT_TIME)?
+        .check()?;
+    for desktop in [false, true] {
+        for (direction, button) in [("up", 4), ("down", 5), ("left", 6), ("right", 7)] {
+            let events = std::thread::scope(|scope| -> Result<_> {
+                let sender = scope.spawn(move || {
+                    if desktop {
+                        send_scroll_xtest_desktop(37, 41, direction, 5)
+                    } else {
+                        send_scroll_window(u64::from(target), 37, 41, direction, 5)
+                    }
+                });
+                let events = button_events(&conn, 10);
+                sender.join().expect("wheel sender panicked")?;
+                events
+            })?;
+            for pair in events.chunks_exact(2) {
+                assert!(pair[0].0 && !pair[1].0);
+                for (_, event, _) in pair {
+                    assert_eq!(event.event, target);
+                    assert_eq!(event.detail, button);
+                    assert_eq!((event.event_x, event.event_y), (37, 41));
+                    assert_eq!(event.response_type & 0x80 != 0, !desktop);
+                }
+                // Both paths now carry server timestamps; unlike observer
+                // wakeups these prove the delivered edges were held apart.
+                let held = pair[1].1.time.wrapping_sub(pair[0].1.time);
+                assert!(held >= 36, "{direction} desktop={desktop}: {held} ms");
+            }
+            let pairs: Vec<_> = events.chunks_exact(2).collect();
+            let mut gaps: Vec<_> = pairs
+                .windows(2)
+                .map(|pair| pair[1][0].1.time.wrapping_sub(pair[0][1].1.time))
+                .collect();
+            gaps.sort_unstable();
+            // Reference: 40 native gaps had median 0 ms, maximum 1 ms.
+            // Allow scheduling stalls, but reject another wheel-hold interval
+            // between detents (in particular the ordinary click's 80 ms gap).
+            assert!(gaps[gaps.len() / 2] < 36, "inter-detent gaps: {gaps:?}");
+            if !desktop {
+                assert_eq!(conn.get_input_focus()?.reply()?.focus, sentinel);
+            }
+            let pointer = conn.query_pointer(root)?.reply()?;
+            assert!(!pointer
+                .mask
+                .intersects(KeyButMask::BUTTON4 | KeyButMask::BUTTON5));
+        }
     }
     Ok(())
 }

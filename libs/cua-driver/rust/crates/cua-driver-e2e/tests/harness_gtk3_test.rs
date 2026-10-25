@@ -592,6 +592,19 @@ fn harness_gtk3_scroll_keeps_the_observed_identity_after_control_replacement() {
                 );
             }
 
+            if DisplayServer::current() == DisplayServer::X11 {
+                let refused_pixels = driver.call(
+                    "scroll",
+                    serde_json::json!({
+                        "pid":pid,"window_id":window_id,"element_token":original,
+                        "direction":"down","pixels":150,"delivery_mode":"background"
+                    }),
+                );
+                assert!(refused_pixels.is_error(), "{}", refused_pixels.text());
+                assert_eq!(refused_pixels.structured()["code"], "stale_element_token");
+                assert_eq!(refused_pixels.structured()["effect"], "none");
+            }
+
             let after = observe(driver);
             assert!(after.tree_text().contains("slider_replaced=True"));
             assert!(after.tree_text().contains("slider_value=0"));

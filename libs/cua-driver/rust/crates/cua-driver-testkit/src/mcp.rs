@@ -40,11 +40,18 @@ static RECORDING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // settle and keeps immediate-refusal trajectories from finalizing empty.
 const MIN_BEHAVIOR_RECORDING_DURATION: Duration = Duration::from_millis(750);
 // A recorded macOS action includes one synchronous window capture before and
-// after dispatch. Keep the ordinary timeout for every other platform and for
-// the recording controls themselves.
+// after dispatch. Recording controls keep the ordinary timeout.
 const MACOS_RECORDED_CALL_TIMEOUT: Duration = Duration::from_secs(CALL_TIMEOUT.as_secs() * 3);
+// The Linux native u16 maximum becomes 655 detents, each held for 36 ms.
+// Preserve the ordinary transport/I/O margin in addition to that action time.
+#[cfg(target_os = "linux")]
+const MAX_LINUX_NATIVE_SCROLL_HOLD: Duration = Duration::from_millis(655 * 36);
 
 fn call_timeout(recording_started: bool, tool: &str, is_macos: bool) -> Duration {
+    #[cfg(target_os = "linux")]
+    if !is_macos && tool == "scroll" {
+        return CALL_TIMEOUT + MAX_LINUX_NATIVE_SCROLL_HOLD;
+    }
     let recording_meta_tool = matches!(
         tool,
         "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
@@ -778,6 +785,17 @@ mod tests {
     #[test]
     fn non_macos_calls_keep_the_base_timeout_during_recording() {
         assert_eq!(call_timeout(true, "click", false), CALL_TIMEOUT);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_scroll_keeps_io_margin_above_the_native_maximum_hold_time() {
+        for recording in [false, true] {
+            assert_eq!(
+                call_timeout(recording, "scroll", false),
+                CALL_TIMEOUT + Duration::from_millis(655 * 36)
+            );
+        }
     }
 
     #[test]

@@ -57,7 +57,9 @@ impl BareClient {
             x11rb::COPY_FROM_PARENT,
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
-                .event_mask(EventMask::BUTTON_PRESS | EventMask::EXPOSURE),
+                .event_mask(
+                    EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::EXPOSURE,
+                ),
         )
         .expect("create bare X11 toplevel");
         conn.change_property8(
@@ -112,6 +114,288 @@ impl BareClient {
         }
         presses
     }
+
+    fn button_events(&self) -> Vec<(bool, x11rb::protocol::xproto::ButtonPressEvent)> {
+        self.conn.get_input_focus().unwrap().reply().unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = self.conn.poll_for_event().unwrap() {
+            match event {
+                Event::ButtonPress(event) => events.push((true, event)),
+                Event::ButtonRelease(event) => events.push((false, event)),
+                Event::Error(error) => panic!("X11 observer error: {error:?}"),
+                _ => {}
+            }
+        }
+        events
+    }
+}
+
+fn run_native_pixel_scroll(desktop: bool) {
+    let cell = if desktop {
+        "linux-xlib-native-pixel-scroll-px-desktop"
+    } else {
+        "linux-xlib-native-pixel-scroll-px-window"
+    };
+    let case = CaseSpec::delivered(
+        cell,
+        "x11-bare-client",
+        "xlib",
+        "native_pixel_scroll",
+        Targeting::Px,
+        if desktop {
+            Delivery::Foreground
+        } else {
+            Delivery::Background
+        },
+        if desktop {
+            Scope::Desktop
+        } else {
+            Scope::Window
+        },
+        if desktop {
+            DriverRoute::LinuxXTest
+        } else {
+            DriverRoute::LinuxXSendEvent
+        },
+        vec![OracleKind::FixtureState, OracleKind::Protocol],
+    );
+    execute_case(case, |evidence| {
+        let mut driver = McpDriver::spawn_named(cell).expect("source-built pixel scroll driver");
+        *evidence = recording_evidence(driver.recording_dir());
+        let client = BareClient::map();
+        let pid = std::process::id();
+        let window = u64::from(client.window);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if listed_record(&mut driver, serde_json::json!({}), window)
+                .is_some_and(|record| record["is_on_screen"].as_bool() == Some(true))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wheel observer window was not managed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        client
+            .conn
+            .configure_window(
+                client.window,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let root = client.conn.setup().roots[0].root;
+        let absolute = client
+            .conn
+            .translate_coordinates(client.window, root, 37, 41)
+            .unwrap()
+            .reply()
+            .unwrap();
+        client.button_events();
+        driver.start_behavior_recording();
+        for (pixels, direction, button, detents) in [
+            (1, "down", 5, 1),
+            (49, "down", 5, 1),
+            (149, "down", 5, 1),
+            (150, "down", 5, 2),
+            (250, "down", 5, 3),
+            (800, "down", 5, 8),
+            (5001, "down", 5, 50),
+            (5100, "down", 5, 51),
+            (65535, "down", 5, 655),
+            (100, "up", 4, 1),
+            (100, "left", 6, 1),
+            (100, "right", 7, 1),
+        ] {
+            let mut args = serde_json::json!({"direction":direction,"pixels":pixels});
+            if desktop {
+                args["target"] = serde_json::json!({"kind":"desktop","display_id":"primary"});
+                args["x"] = absolute.dst_x.into();
+                args["y"] = absolute.dst_y.into();
+            } else {
+                let snapshot = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid,"window_id":window,"include_accessibility_tree":false,
+                    }),
+                );
+                assert!(!snapshot.is_error(), "{}", snapshot.text());
+                args["target"] = serde_json::json!({"kind":"window","pid":pid,"window_id":window});
+                args["x"] = 37.into();
+                args["y"] = 41.into();
+            }
+            let response = driver.call("scroll", args);
+            assert!(
+                !response.is_error(),
+                "{direction}/{pixels}: {}",
+                response.text()
+            );
+            let public = response.structured();
+            assert_eq!(public["effect"], "unverifiable");
+            assert_eq!(
+                public["route"],
+                if desktop {
+                    "global_input"
+                } else {
+                    "synthetic_events"
+                }
+            );
+            assert_eq!(
+                public["delivery"]["mode"],
+                if desktop { "foreground" } else { "background" }
+            );
+            assert_eq!(public["delivery"]["delivered_count"], detents);
+            let events = client.button_events();
+            assert_eq!(events.len(), detents * 2, "{direction}/{pixels}");
+            for pair in events.chunks_exact(2) {
+                assert!(pair[0].0 && !pair[1].0);
+                for (_, event) in pair {
+                    assert_eq!(event.event, client.window);
+                    assert_eq!(event.detail, button);
+                    assert_eq!((event.event_x, event.event_y), (37, 41));
+                    assert_eq!(event.response_type & 0x80 != 0, !desktop);
+                }
+                assert!(pair[1].1.time.wrapping_sub(pair[0].1.time) >= 36);
+            }
+            if detents >= 8 {
+                let pairs: Vec<_> = events.chunks_exact(2).collect();
+                let mut gaps: Vec<_> = pairs
+                    .windows(2)
+                    .map(|pair| pair[1][0].1.time.wrapping_sub(pair[0][1].1.time))
+                    .collect();
+                gaps.sort_unstable();
+                assert!(gaps[gaps.len() / 2] < 36, "inter-detent gaps: {gaps:?}");
+            }
+        }
+        for mut args in [
+            serde_json::json!({"pixels":0}),
+            serde_json::json!({"pixels":-1}),
+            serde_json::json!({"pixels":0.1}),
+            serde_json::json!({"pixels":49.5}),
+            serde_json::json!({"pixels":149.5}),
+            serde_json::json!({"pixels":150.1}),
+            serde_json::json!({"pixels":65536}),
+            serde_json::json!({"pixels":800,"amount":3}),
+            serde_json::json!({"pixels":800,"by":"line"}),
+            serde_json::json!({"amount":0}),
+            serde_json::json!({"amount":51}),
+            serde_json::json!({"amount":1.5}),
+        ] {
+            args["direction"] = "down".into();
+            if desktop {
+                args["target"] = serde_json::json!({"kind":"desktop","display_id":"primary"});
+                args["x"] = absolute.dst_x.into();
+                args["y"] = absolute.dst_y.into();
+            } else {
+                args["target"] = serde_json::json!({"kind":"window","pid":pid,"window_id":window});
+                args["x"] = 37.into();
+                args["y"] = 41.into();
+            }
+            let response = driver.call("scroll", args.clone());
+            assert!(
+                response.is_error(),
+                "invalid distance {args} was accepted: {}",
+                response.text()
+            );
+            assert_eq!(response.structured()["code"], "invalid_arguments");
+            assert!(client.button_events().is_empty());
+        }
+        Observation::delivered_with_fixture_state(vec![OracleKind::Protocol])
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable X11 desktop with XTEST and a window manager"]
+fn x11_native_pixel_scroll_public_window_route_matches_raw_events() {
+    run_native_pixel_scroll(false);
+}
+
+#[test]
+#[ignore = "requires a disposable X11 desktop with XTEST and a window manager"]
+fn x11_native_pixel_scroll_public_desktop_route_matches_raw_events() {
+    run_native_pixel_scroll(true);
+}
+
+#[test]
+#[ignore = "requires a disposable X11 desktop and a window manager"]
+fn x11_native_pixel_scroll_reports_partial_input_when_the_target_disappears() {
+    let case = CaseSpec::delivered(
+        "linux-xlib-native-pixel-scroll-interrupted",
+        "x11-bare-client",
+        "xlib",
+        "native_pixel_scroll_interrupted",
+        Targeting::Px,
+        Delivery::Background,
+        Scope::Window,
+        DriverRoute::LinuxXSendEvent,
+        vec![OracleKind::FixtureState, OracleKind::Protocol],
+    );
+    execute_case(case, |evidence| {
+        let mut driver = McpDriver::spawn_named("native-wheel-interruption").unwrap();
+        *evidence = recording_evidence(driver.recording_dir());
+        let client = BareClient::map();
+        let pid = std::process::id();
+        let window = u64::from(client.window);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while listed_record(&mut driver, serde_json::json!({}), window).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "interruption fixture was not managed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        driver.start_behavior_recording();
+        let snapshot = driver.call(
+            "get_window_state",
+            serde_json::json!({
+                "pid":pid,"window_id":window,"include_accessibility_tree":false,
+            }),
+        );
+        assert!(!snapshot.is_error(), "{}", snapshot.text());
+        client.button_events();
+        let response = std::thread::scope(|scope| {
+            let call = scope.spawn(|| {
+                driver.call(
+                    "scroll",
+                    serde_json::json!({
+                        "target":{"kind":"window","pid":pid,"window_id":window},
+                        "x":37,"y":41,"direction":"down","pixels":5100,
+                    }),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match client.conn.poll_for_event().unwrap() {
+                    Some(Event::ButtonRelease(event)) if event.event == client.window => break,
+                    Some(_) => {}
+                    None => {
+                        assert!(Instant::now() < deadline, "no first wheel detent arrived");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            client
+                .conn
+                .destroy_window(client.window)
+                .unwrap()
+                .check()
+                .unwrap();
+            call.join().unwrap()
+        });
+        assert!(response.is_error(), "{}", response.text());
+        assert_eq!(response.structured()["code"], "input_outcome_unknown");
+        assert_eq!(response.structured()["effect"], "partial");
+        assert_eq!(response.structured()["delivery"]["mode"], "unknown");
+        let completed = response.structured()["delivery"]["delivered_count"]
+            .as_u64()
+            .unwrap();
+        assert!((1..51).contains(&completed), "completed={completed}");
+        Observation::delivered_with_fixture_state(vec![OracleKind::Protocol])
+    });
 }
 
 fn listed_record(

@@ -50,9 +50,87 @@ use x11rb::rust_connection::RustConnection;
 
 const CLICK_DELAY_MS: u64 = 35;
 const DOUBLE_CLICK_DELAY_MS: u64 = 50;
+const WHEEL_HOLD_MS: u64 = 36;
 const KEY_DELAY_MS: u64 = 10;
 const PING_TIMEOUT: Duration = Duration::from_secs(1);
 static PING_SERIAL: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Clone, Copy)]
+struct ButtonTiming {
+    hold_ms: u64,
+    gap_ms: u64,
+    native_wheel: bool,
+}
+
+#[derive(Debug)]
+pub struct WheelDispatchError {
+    pub completed: u32,
+    pub desktop: bool,
+    cause: anyhow::Error,
+}
+
+impl WheelDispatchError {
+    pub(crate) fn worker_failed(desktop: bool, cause: anyhow::Error) -> Self {
+        // A failed worker may already have sent an edge. Its progress cannot
+        // be recovered, so callers must observe before retrying.
+        Self {
+            completed: 0,
+            desktop,
+            cause,
+        }
+    }
+}
+
+impl std::fmt::Display for WheelDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "wheel input outcome is unknown after {} complete detents: {:#}",
+            self.completed, self.cause
+        )
+    }
+}
+impl std::error::Error for WheelDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+fn finish_button_sequence(
+    result: Result<()>,
+    native_wheel: bool,
+    attempted: bool,
+    completed: u32,
+    desktop: bool,
+) -> Result<()> {
+    result.map_err(|cause| {
+        if native_wheel && attempted {
+            WheelDispatchError {
+                completed,
+                desktop,
+                cause,
+            }
+            .into()
+        } else {
+            cause
+        }
+    })
+}
+
+fn native_wheel_clock() -> Result<(u32, Instant)> {
+    // Reuse the existing server-time probe. Native window wheel events use
+    // server time plus elapsed monotonic time, rather than CurrentTime(0).
+    unsafe {
+        let display = open_display()?;
+        let time = x_server_time(display) as u32;
+        let observed = Instant::now();
+        x11::xlib::XCloseDisplay(display);
+        if time == 0 {
+            bail!("X11 did not return a wheel event timestamp");
+        }
+        Ok((time, observed))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VirtualPointerDrag {
@@ -3337,61 +3415,137 @@ pub fn send_click_with_modifiers(
     button: u8,
     modifiers: &[&str],
 ) -> Result<()> {
+    send_click_with_timing(
+        xid,
+        x,
+        y,
+        count,
+        button,
+        modifiers,
+        ButtonTiming {
+            hold_ms: CLICK_DELAY_MS,
+            gap_ms: 80,
+            native_wheel: false,
+        },
+    )
+}
+
+fn send_click_with_timing(
+    xid: u64,
+    x: i32,
+    y: i32,
+    count: usize,
+    button: u8,
+    modifiers: &[&str],
+    timing: ButtonTiming,
+) -> Result<()> {
     let (conn, _) = connect_x11_for_input()?;
     let root = conn.setup().roots[0].root;
     let modifier_state = modifiers_to_state(modifiers);
+    let clock = timing.native_wheel.then(native_wheel_clock).transpose()?;
+    let timestamp = || {
+        clock.map_or(x11rb::CURRENT_TIME, |(base, observed)| {
+            base.wrapping_add(observed.elapsed().as_millis() as u32)
+        })
+    };
+    let mask = if timing.native_wheel {
+        EventMask::NO_EVENT
+    } else {
+        EventMask::BUTTON_PRESS
+    };
 
-    for _ in 0..count {
-        let target = resolve_click_event_target(&conn, xid, x, y)?;
-        let press = ButtonPressEvent {
-            response_type: BUTTON_PRESS_EVENT,
-            detail: button,
-            sequence: 0,
-            time: x11rb::CURRENT_TIME,
-            root,
-            event: target.window,
-            child: x11rb::NONE,
-            root_x: target.root_x,
-            root_y: target.root_y,
-            event_x: target.local_x,
-            event_y: target.local_y,
-            state: modifier_state,
-            same_screen: true,
-        };
+    let mut attempted = false;
+    let mut completed = 0;
+    let result = (|| -> Result<()> {
+        for _ in 0..count {
+            let target = if timing.native_wheel {
+                build_event_target(&conn, xid, x, y, xid as Window, x, y)?
+            } else {
+                resolve_click_event_target(&conn, xid, x, y)?
+            };
+            let press = ButtonPressEvent {
+                response_type: BUTTON_PRESS_EVENT,
+                detail: button,
+                sequence: 0,
+                time: timestamp(),
+                root,
+                event: target.window,
+                child: x11rb::NONE,
+                root_x: target.root_x,
+                root_y: target.root_y,
+                event_x: target.local_x,
+                event_y: target.local_y,
+                state: modifier_state,
+                same_screen: true,
+            };
 
-        let release = ButtonReleaseEvent {
-            response_type: BUTTON_RELEASE_EVENT,
-            detail: button,
-            sequence: 0,
-            time: x11rb::CURRENT_TIME,
-            root,
-            event: target.window,
-            child: x11rb::NONE,
-            root_x: target.root_x,
-            root_y: target.root_y,
-            event_x: target.local_x,
-            event_y: target.local_y,
-            state: KeyButMask::from(
-                u16::from(modifier_state) | u16::from(button_state_mask(button)),
-            ),
-            same_screen: true,
-        };
+            let mut release = ButtonReleaseEvent {
+                response_type: BUTTON_RELEASE_EVENT,
+                detail: button,
+                sequence: 0,
+                time: x11rb::CURRENT_TIME,
+                root,
+                event: target.window,
+                child: x11rb::NONE,
+                root_x: target.root_x,
+                root_y: target.root_y,
+                event_x: target.local_x,
+                event_y: target.local_y,
+                state: KeyButMask::from(
+                    u16::from(modifier_state) | u16::from(button_state_mask(button)),
+                ),
+                same_screen: true,
+            };
 
-        // The event mask selects recipients independently of the payload type.
-        // Select the press client for both payloads so a press-only toolkit
-        // binding (such as Tk's <Button-1>) receives one coherent click.
-        conn.send_event(false, target.window, EventMask::BUTTON_PRESS, press)?
-            .check()?;
-        sleep(Duration::from_millis(CLICK_DELAY_MS));
-        conn.send_event(false, target.window, EventMask::BUTTON_PRESS, release)?
-            .check()?;
+            // The event mask selects recipients independently of the payload type.
+            // Select the press client for both payloads so a press-only toolkit
+            // binding (such as Tk's <Button-1>) receives one coherent click.
+            attempted = true;
+            conn.send_event(timing.native_wheel, target.window, mask, press)?
+                .check()?;
+            sleep(Duration::from_millis(timing.hold_ms));
+            release.time = timestamp();
+            conn.send_event(timing.native_wheel, target.window, mask, release)?
+                .check()?;
+            completed += 1;
 
-        if count > 1 {
-            sleep(Duration::from_millis(80));
+            if count > 1 && timing.gap_ms > 0 {
+                sleep(Duration::from_millis(timing.gap_ms));
+            }
         }
-    }
+        Ok(())
+    })();
+    finish_button_sequence(result, timing.native_wheel, attempted, completed, false)?;
     settle_synthetic_events(&conn);
     Ok(())
+}
+
+/// Source-equivalent native Linux window wheel route: XSendEvent pairs with
+/// a 36 ms hold and no inter-detent click gap. Coordinates are client-local.
+pub fn send_scroll_window(xid: u64, x: i32, y: i32, direction: &str, detents: usize) -> Result<()> {
+    send_click_with_timing(
+        xid,
+        x,
+        y,
+        detents,
+        scroll_button(direction)?,
+        &[],
+        ButtonTiming {
+            hold_ms: WHEEL_HOLD_MS,
+            gap_ms: 0,
+            native_wheel: true,
+        },
+    )
+}
+
+fn scroll_button(direction: &str) -> Result<u8> {
+    match direction {
+        "up" => Ok(4),
+        "down" => Ok(5),
+        "left" => Ok(6),
+        "right" => Ok(7),
+        other => bail!("unknown scroll direction: {other}"),
+    }
 }
 
 /// Send a press-drag-release gesture via XSendEvent (ButtonPress + MotionNotify steps + ButtonRelease).
@@ -3923,6 +4077,28 @@ pub fn send_click_xtest_desktop_with_modifiers(
     count: usize,
     modifiers: &[&str],
 ) -> Result<()> {
+    send_click_xtest_desktop_with_timing(
+        x,
+        y,
+        button,
+        count,
+        modifiers,
+        ButtonTiming {
+            hold_ms: CLICK_DELAY_MS,
+            gap_ms: DOUBLE_CLICK_DELAY_MS,
+            native_wheel: false,
+        },
+    )
+}
+
+fn send_click_xtest_desktop_with_timing(
+    x: i32,
+    y: i32,
+    button: u8,
+    count: usize,
+    modifiers: &[&str],
+    timing: ButtonTiming,
+) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
@@ -3939,6 +4115,8 @@ pub fn send_click_xtest_desktop_with_modifiers(
     }
     let mut pressed = Vec::new();
     let mut button_pressed = false;
+    let mut attempted = false;
+    let mut completed = 0;
     let gesture_result = (|| -> Result<()> {
         for &keycode in &modifier_keycodes {
             conn.xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
@@ -3946,6 +4124,7 @@ pub fn send_click_xtest_desktop_with_modifiers(
         }
         // Absolute pointer warp (MotionNotify, detail=0 => absolute) so the
         // button events that follow are delivered at (x, y).
+        attempted = true;
         conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
         let count = count.max(1);
         for click_index in 0..count {
@@ -3954,13 +4133,14 @@ pub fn send_click_xtest_desktop_with_modifiers(
             // Confirm delivery before sleeping; buffering both edges produces a zero-ms click.
             press.check()?;
             button_pressed = true;
-            sleep(Duration::from_millis(CLICK_DELAY_MS));
+            sleep(Duration::from_millis(timing.hold_ms));
             conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, x as i16, y as i16, 0)?
                 .check()?;
             button_pressed = false;
-            if click_index + 1 < count {
+            completed += 1;
+            if click_index + 1 < count && timing.gap_ms > 0 {
                 // Keep the existing gap between completed click pairs.
-                sleep(Duration::from_millis(DOUBLE_CLICK_DELAY_MS));
+                sleep(Duration::from_millis(timing.gap_ms));
             }
         }
         Ok(())
@@ -3991,10 +4171,13 @@ pub fn send_click_xtest_desktop_with_modifiers(
         Ok(())
     })();
     drop(guards);
-    gesture_result?;
-    release_result?;
-    completion_result?;
-    Ok(())
+    finish_button_sequence(
+        gesture_result.and(release_result).and(completion_result),
+        timing.native_wheel,
+        attempted,
+        completed,
+        true,
+    )
 }
 
 /// Move the real X11 pointer to a screen-absolute desktop coordinate.
@@ -4011,24 +4194,18 @@ pub fn send_move_xtest_desktop(x: i32, y: i32) -> Result<()> {
 /// Scroll the window under a screen-absolute point via real XTest wheel-button
 /// events. X11 buttons 4/5 are vertical up/down and 6/7 horizontal left/right.
 pub fn send_scroll_xtest_desktop(x: i32, y: i32, direction: &str, amount: usize) -> Result<()> {
-    use x11rb::protocol::xtest::ConnectionExt as _;
-    let button = match direction {
-        "up" => 4,
-        "down" => 5,
-        "left" => 6,
-        "right" => 7,
-        other => anyhow::bail!("unknown desktop scroll direction: {other}"),
-    };
-    let (conn, screen_num) = connect_x11_for_input()?;
-    let root = conn.setup().roots[screen_num].root;
-    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
-    for _ in 0..amount.max(1) {
-        conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
-        conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, x as i16, y as i16, 0)?;
-    }
-    conn.flush()?;
-    let _ = conn.get_input_focus()?.reply();
-    Ok(())
+    send_click_xtest_desktop_with_timing(
+        x,
+        y,
+        scroll_button(direction)?,
+        amount,
+        &[],
+        ButtonTiming {
+            hold_ms: WHEEL_HOLD_MS,
+            gap_ms: 0,
+            native_wheel: true,
+        },
+    )
 }
 
 /// Screen-absolute drag via XTest. The caller activates the target first; XTest
