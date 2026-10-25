@@ -243,7 +243,7 @@ fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguratio
 /// when available — they preserve the NSURL exactly as LaunchServices
 /// hands it back, which is the only thing that reliably launches
 /// Cryptex-installed apps (Safari, etc).
-fn resolve_application_url(
+pub(super) fn resolve_application_url(
     ws: &NSWorkspace,
     app_ref: &str,
 ) -> Result<Retained<NSURL>, LaunchError> {

@@ -690,6 +690,38 @@ pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
     resolve_bundle_id_to_locator(name)
 }
 
+/// Read installed bundle identity before a launch or accessibility request.
+/// Runtime status retains installed-entry defaults; signatures are not verified.
+pub fn resolve_app_info(name: &str) -> anyhow::Result<AppInfo> {
+    let locator = locate_by_name(name).with_context(|| format!("application not found: {name}"))?;
+    let path = match locator {
+        AppLocator::Path(path) => std::path::PathBuf::from(path),
+        AppLocator::BundleId(bundle_id) => {
+            use objc2_app_kit::NSWorkspace;
+            let path = unsafe {
+                let workspace = NSWorkspace::sharedWorkspace();
+                let url = nsworkspace::resolve_application_url(&workspace, &bundle_id)?;
+                url.path()
+                    .context("resolved application has no filesystem path")?
+                    .to_string()
+            };
+            std::path::PathBuf::from(path)
+        }
+    };
+    let mut info = read_app_plist(&path.join("Contents/Info.plist"))
+        .context("application bundle has no readable identity metadata")?;
+    anyhow::ensure!(
+        info.bundle_id
+            .as_deref()
+            .is_some_and(|bundle_id| !bundle_id.trim().is_empty()),
+        "application bundle has no bundle identifier"
+    );
+    info.launch_path = Some(path.to_string_lossy().into_owned());
+    info.kind = Some("desktop".to_owned());
+    info.last_used = fs_last_used(&path);
+    Ok(info)
+}
+
 /// Read `CFBundleIdentifier` from an `.app` bundle's `Info.plist`.
 fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
     let path = std::path::Path::new(app_path).join("Contents/Info.plist");
@@ -1225,6 +1257,47 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert!(super::locate_by_name(&missing).is_none());
+    }
+
+    #[test]
+    fn resolve_app_info_reads_cold_bundle_metadata_outside_inventory_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("Cold Identity Fixture.app");
+        let contents = bundle.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let plist = contents.join("Info.plist");
+        let write_plist = |identity: &str| {
+            std::fs::write(
+                &plist,
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+                     \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\
+                     <plist version=\"1.0\"><dict>\
+                     <key>CFBundleDisplayName</key><string>Cold 文本</string>\
+                     {identity}</dict></plist>"
+                ),
+            )
+            .unwrap();
+        };
+        write_plist("<key>CFBundleIdentifier</key><string>dev.cua.cold-fixture</string>");
+        let expected = bundle.to_string_lossy().into_owned();
+        let info = super::resolve_app_info(&format!("{expected}/")).unwrap();
+        assert_eq!(info.name, "Cold 文本");
+        assert_eq!(info.bundle_id.as_deref(), Some("dev.cua.cold-fixture"));
+        assert_eq!(info.launch_path.as_deref(), Some(expected.as_str()));
+        assert_eq!(info.kind.as_deref(), Some("desktop"));
+
+        write_plist("");
+        assert_eq!(
+            super::resolve_app_info(&expected).unwrap_err().to_string(),
+            "application bundle has no readable identity metadata"
+        );
+        write_plist("<key>CFBundleIdentifier</key><string> </string>");
+        assert_eq!(
+            super::resolve_app_info(&expected).unwrap_err().to_string(),
+            "application bundle has no bundle identifier"
+        );
     }
 
     #[test]
