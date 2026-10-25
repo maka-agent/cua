@@ -61,7 +61,8 @@ async fn token_calls_are_recorded_and_refusals_are_not() {
     assert_eq!(e.len(), 1, "{e:?}");
     assert_eq!(e[0].body.via, "token");
     assert_eq!(e[0].body.who, "token");
-    assert_eq!(e[0].body.what, "SystemService");
+    // A capabilities probe is background, by its route.
+    assert_eq!(e[0].body.what, "SystemService/GetCapabilities (background)");
     let text = std::fs::read_to_string(ctx.config().access_log_path()).unwrap();
     assert!(!text.contains("s3cret"), "never the credential");
 
@@ -102,8 +103,8 @@ impl ExternalAuthenticator for Relay {
                 color: String::new(),
                 kind: 1,
             },
-            view_only: v == "viewer",
-            host_only: false,
+            view_only: v == "viewer" || v == "viewer-nodesktop",
+            host_only: v == "viewer-nodesktop" || v == "editor-nodesktop",
             account: None,
         }))
     }
@@ -227,6 +228,114 @@ async fn view_only_shares_are_refused_everything_but_watching() {
         e.iter().any(|e| e.body.who == "ada@example.test (acct-123)"
             && e.body.what == "refused ProcessService (view-only share)"),
         "{e:?}"
+    );
+}
+
+/// A view-only share honors the host's desktop sharing setting: with the
+/// desktop off it reaches no stream call; with it on it does.
+#[tokio::test]
+async fn view_only_shares_need_desktop_sharing_on() {
+    let (r, ctx, _d) = server(Some("s3cret"), true);
+    ctx.auth().set_external(std::sync::Arc::new(Relay));
+    let call = |who: &'static str, path: &str| {
+        let mut req = grpc(path, None);
+        req.headers_mut()
+            .insert("x-test-relay", http::HeaderValue::from_static(who));
+        req
+    };
+    let status = |resp: &http::Response<Body>| {
+        resp.headers()
+            .get("grpc-status")
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+    let stream = "/cua.env.v1.StreamService/OpenMedia";
+
+    // Desktop off: refused, with the daemon's disabled-desktop message.
+    let resp = r
+        .clone()
+        .oneshot(call("viewer-nodesktop", stream))
+        .await
+        .unwrap();
+    assert_eq!(status(&resp).as_deref(), Some("7"));
+    let message = percent_decode(
+        resp.headers()
+            .get("grpc-message")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    );
+    assert!(
+        message.starts_with("this computer does not share its desktop"),
+        "{message}"
+    );
+    // The capabilities probe still answers.
+    let resp = r
+        .clone()
+        .oneshot(call("viewer-nodesktop", CAPS))
+        .await
+        .unwrap();
+    assert_ne!(status(&resp).as_deref(), Some("7"));
+
+    // Desktop on: allowed (the call reaches the service).
+    let resp = r.clone().oneshot(call("viewer", stream)).await.unwrap();
+    assert_ne!(status(&resp).as_deref(), Some("7"));
+
+    // Owner (full access) is unchanged: reaches any service with desktop on,
+    // and the existing host-only restriction applies with it off.
+    let resp = r
+        .clone()
+        .oneshot(call("1", "/cua.env.v1.ProcessService/List"))
+        .await
+        .unwrap();
+    assert_ne!(status(&resp).as_deref(), Some("7"));
+    let resp = r
+        .clone()
+        .oneshot(call("editor-nodesktop", "/cua.env.v1.ProcessService/List"))
+        .await
+        .unwrap();
+    assert_eq!(status(&resp).as_deref(), Some("7"));
+}
+
+/// Background calls are classified by their route on the host: probes,
+/// status and presence are tagged `(background)`; a stream, a shell or
+/// files are recorded by service; a screenshot waits for its handler.
+/// Nothing the caller sends changes that.
+#[tokio::test]
+async fn calls_are_classified_by_route_not_by_the_caller() {
+    let (r, ctx, _d) = server(Some("s3cret"), true);
+    ctx.auth().set_external(std::sync::Arc::new(Relay));
+    let call = |path: &str| {
+        let mut req = grpc(path, None);
+        req.headers_mut()
+            .insert("x-test-relay", http::HeaderValue::from_static("1"));
+        // A client claiming its call is background changes nothing.
+        req.headers_mut().insert(
+            "x-cua-purpose",
+            http::HeaderValue::from_static("background"),
+        );
+        req
+    };
+    for path in [
+        "/cua.env.v1.SystemService/Health",
+        "/cua.env.v1.PresenceService/UpdateCursor",
+        "/cua.env.v1.HostSpacesService/GetHostSpaces",
+        "/cua.env.v1.StreamService/OpenMedia",
+        "/cua.env.v1.ProcessService/StartProcess",
+        "/cua.env.v1.ComputerService/Screenshot",
+    ] {
+        r.clone().oneshot(call(path)).await.unwrap();
+    }
+    let what: Vec<String> = entries(&ctx).into_iter().map(|e| e.body.what).collect();
+    assert_eq!(
+        what,
+        [
+            "SystemService/Health (background)",
+            "PresenceService/UpdateCursor (background)",
+            "HostSpacesService/GetHostSpaces (background)",
+            "StreamService",
+            "ProcessService",
+        ],
+        "the screenshot is recorded by its handler, with its size"
     );
 }
 

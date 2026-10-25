@@ -75,9 +75,19 @@ pub(super) async fn call(
 ) -> ToolOutcome {
     // A former tool name (`drive_ls`) runs as the tool it now is.
     let tool = cua_spaces_contract::canonical(tool);
+    let space = arguments
+        .get("space")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     match dispatch(spaces, tool, arguments, broker).await {
         Ok(outcome) => outcome,
         Err(e) => {
+            // A call cut because the Space's mesh connection went away
+            // says why, not just "broken pipe".
+            let e = match &space {
+                Some(space) => spaces.explain_mesh_cut(space, e).await,
+                None => e,
+            };
             tracing::debug!(tool, error = %e, "tool failed");
             ToolOutcome::error(&e)
         }
@@ -106,12 +116,15 @@ pub(super) async fn call_on(space: &Space, tool: &str, mut arguments: Value) -> 
 }
 
 /// One `phase` vocabulary for every provider (the client's `SpaceState`):
-/// `ready` once the Space answered its handshake (direct, relay), its claim
-/// bound (Fleet) or its instance runs (local); `starting` while a claim is
-/// pending or an instance is provisioning.
+/// `ready` once the Space answered its handshake (direct, relay) or its
+/// instance runs (local); `starting` while an instance is provisioning.
 pub const PHASE_READY: &str = "ready";
 /// See [`PHASE_READY`].
 pub const PHASE_STARTING: &str = "starting";
+/// A relay machine the relay cannot reach now (its `status`): a machine
+/// that is off or stopped sharing, or a Space that is gone and left its
+/// record (`relay_unregister_space` removes it).
+pub const PHASE_OFFLINE: &str = "offline";
 
 async fn dispatch(
     spaces: &Spaces,
@@ -154,7 +167,8 @@ async fn dispatch(
             Ok(ToolOutcome::json(&json!({"removed": info})))
         }
         "list_spaces" => {
-            let _: i::ListSpaces = args(tool, a)?;
+            let filter: i::ListSpaces = args(tool, a)?;
+            let want = filter.labels.unwrap_or_default();
             // `phase` is the state at the last handshake: a registered Space
             // answered GetCapabilities when it was added.
             // Includes the signed-in account's relay machines (refreshed).
@@ -171,7 +185,18 @@ async fn dispatch(
                 .list_all()
                 .await?
                 .iter()
-                .map(|info| with(info, row_extra(info, &direct_hosts, PHASE_READY)))
+                .filter(|info| want.iter().all(|(k, v)| info.labels.get(k) == Some(v)))
+                .map(|info| {
+                    // A relay machine the relay cannot reach is not ready (a
+                    // Space that is gone left its record; a host is off or
+                    // stopped sharing).
+                    let phase = if !info.status.is_empty() {
+                        PHASE_OFFLINE
+                    } else {
+                        PHASE_READY
+                    };
+                    with(info, row_extra(info, &direct_hosts, phase))
+                })
                 .collect();
             Ok(ToolOutcome::json(&rows))
         }
@@ -215,6 +240,10 @@ async fn dispatch(
                 command: a.workload.command.clone(),
                 env: a.workload.env.clone().unwrap_or_default(),
                 services: a.workload.services.clone().unwrap_or_default(),
+                durable: a.durable.unwrap_or(false),
+                instance_type: a.instance_type.clone(),
+                region: a.region.clone(),
+                labels: a.labels.clone().unwrap_or_default(),
                 ..Default::default()
             };
             let row = |created: SpaceCreated| match created {
@@ -304,7 +333,220 @@ async fn dispatch(
         "cloud_disconnect" => {
             let a: i::CloudDisconnect = args(tool, a)?;
             let c = spaces.sandboxes().clouds()?;
-            Ok(json_of(&c.disconnect(&a.provider).await?))
+            Ok(json_of(
+                &c.disconnect(&a.provider, a.delete.unwrap_or(false)).await?,
+            ))
+        }
+        // --- the elastic pool --------------------------------------------
+        "cloud_plan" => {
+            let a: i::CloudPlan = args(tool, a)?;
+            let caller = match a.caller.as_deref().map(str::trim) {
+                None | Some("") => {
+                    if a.count.unwrap_or(1) > 1 {
+                        cua_cluster::elastic::detect::Caller::Batch
+                    } else {
+                        cua_cluster::elastic::detect::Caller::Interactive
+                    }
+                }
+                Some("interactive") => cua_cluster::elastic::detect::Caller::Interactive,
+                Some("batch") => cua_cluster::elastic::detect::Caller::Batch,
+                Some("compat") => cua_cluster::elastic::detect::Caller::Compat,
+                Some("persistent_agent") => cua_cluster::elastic::detect::Caller::PersistentAgent,
+                Some(o) => {
+                    return Err(Error::invalid(format!(
+                        "caller {o:?}: interactive, batch, compat or persistent_agent"
+                    )));
+                }
+            };
+            let req = crate::elastic::ElasticRequest {
+                image: a.image.clone().unwrap_or_default(),
+                kind: a.kind.clone().unwrap_or_default(),
+                cpus: a.cpus,
+                memory_mb: a.memory_mb,
+                count: a.count.unwrap_or(1).clamp(1, 4096),
+                whole: a.together.unwrap_or(false),
+                caller,
+                duration_secs: a.duration_secs,
+                profile: String::new(),
+                pins: cua_cluster::elastic::Pins {
+                    provider: a.provider.clone().filter(|p| !p.trim().is_empty()),
+                    region: a.region.clone().filter(|p| !p.trim().is_empty()),
+                    type_name: a.instance_type.clone().filter(|p| !p.trim().is_empty()),
+                    new_hosts: a.hosts,
+                    no_scale: a.no_scale.unwrap_or(false),
+                    devices_only: a.devices_only.unwrap_or(false),
+                },
+                pin_host: String::new(),
+                arch: String::new(),
+                clouds_only: false,
+            };
+            let mut plan = spaces.elastic_plan(std::slice::from_ref(&req)).await?;
+            if let Some(cap) = a.max_usd_per_hour {
+                plan.pool.constraints.max_usd_per_hour = Some(cap);
+                plan.plan = cua_cluster::elastic::solve(
+                    &plan.groups,
+                    &plan.pool.hosts,
+                    &plan.pool.offers,
+                    &plan.pool.constraints,
+                );
+            }
+            let mut v = serde_json::to_value(&plan).unwrap_or(Value::Null);
+            if a.apply.unwrap_or(false) {
+                let added = spaces.elastic_apply(&plan.plan).await?;
+                v["added"] = json!(added.into_iter().flatten().collect::<Vec<_>>());
+            }
+            Ok(ToolOutcome::json(&v))
+        }
+        "cloud_hosts" => {
+            let _: i::CloudHosts = args(tool, a)?;
+            let c = spaces.sandboxes().clouds()?;
+            Ok(json_of(&c.hosts().await?))
+        }
+        "cloud_add_host" => {
+            let a: i::CloudAddHost = args(tool, a)?;
+            let n = a.count.unwrap_or(1);
+            if !(1..=10).contains(&n) {
+                return Err(Error::invalid("count is 1 to 10"));
+            }
+            let ttl = a.ttl_hours.unwrap_or(24);
+            if !(1..=168).contains(&ttl) {
+                return Err(Error::invalid("ttl_hours is 1 to 168"));
+            }
+            let c = spaces.sandboxes().clouds()?;
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let h = c
+                    .add_host(&cua_sandbox_core::byoc::AddHost {
+                        provider: a.provider.trim().to_ascii_lowercase(),
+                        type_name: a.instance_type.trim().to_string(),
+                        region: a.region.clone().unwrap_or_default(),
+                        name: String::new(),
+                        pinned: true,
+                        ttl_secs: u64::from(ttl) * 3600,
+                        prepull: vec![],
+                    })
+                    .await?;
+                crate::elastic::ledger_append(
+                    spaces.home_dir(),
+                    &crate::elastic::LedgerLine {
+                        at: h.started,
+                        event: "add".into(),
+                        host: h.name.clone(),
+                        provider: h.provider.clone(),
+                        type_name: h.type_name.clone(),
+                        region: h.region.clone(),
+                        usd_per_hour: h.usd_per_hour,
+                        billing_step_secs: h.billing_step_secs,
+                        billing_min_secs: h.billing_min_secs,
+                        reason: "added by hand".into(),
+                        count: 0,
+                    },
+                );
+                out.push(h);
+            }
+            Ok(json_of(&out))
+        }
+        "cloud_remove_host" => {
+            let a: i::CloudRemoveHost = args(tool, a)?;
+            let c = spaces.sandboxes().clouds()?;
+            let (mut removed, mut failed) = (Vec::new(), Vec::new());
+            let before = c.hosts().await.unwrap_or_default();
+            for name in &a.names {
+                match c.remove_host(name).await {
+                    Ok(()) => {
+                        for h in before.iter().filter(|h| &h.name == name) {
+                            spaces.forget_routing_host(&h.machine).await;
+                        }
+                        crate::elastic::ledger_append(
+                            spaces.home_dir(),
+                            &crate::elastic::LedgerLine {
+                                at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                                event: "remove".into(),
+                                host: name.clone(),
+                                reason: "removed by hand".into(),
+                                ..Default::default()
+                            },
+                        );
+                        removed.push(name.clone());
+                    }
+                    Err(e) => failed.push(json!({"name": name, "error": e.to_string()})),
+                }
+            }
+            Ok(ToolOutcome::json(
+                &json!({"removed": removed, "failed": failed}),
+            ))
+        }
+        "cloud_budget" => {
+            let a: i::CloudBudget = args(tool, a)?;
+            let mut p = spaces.elastic_policy();
+            if let Some(v) = a.max_usd_per_hour {
+                if !(v >= 0.0 && v.is_finite()) {
+                    return Err(Error::invalid("max_usd_per_hour is 0 or more"));
+                }
+                p.max_usd_per_hour = v;
+                p.budget_set = true;
+            }
+            if let Some(v) = a.monthly_usd {
+                if !(v >= 0.0 && v.is_finite()) {
+                    return Err(Error::invalid("monthly_usd is 0 or more"));
+                }
+                p.monthly_usd = v;
+                p.budget_set = true;
+            }
+            if let Some(v) = a.autoscale {
+                p.autoscale = v;
+            }
+            if let Some(v) = a.max_new_hosts {
+                p.max_new_hosts = v.min(100);
+            }
+            if let Some(v) = a.warm {
+                p.warm = v;
+            }
+            if let Some(v) = a.allow_metal {
+                p.allow_metal = v;
+            }
+            spaces.set_elastic_policy(&p)?;
+            let view = spaces.elastic_view().await?;
+            Ok(ToolOutcome::json(&json!({
+                "policy": p,
+                "month_usd": view.month_usd,
+                "running_usd_per_hour": view.constraints.running_usd_per_hour,
+                "hosts": view.cloud.iter().filter(|h| h.state != "gone").count(),
+            })))
+        }
+        "prewarm" => {
+            let a: i::Prewarm = args(tool, a)?;
+            let p = spaces
+                .prewarm(crate::prewarm::PrewarmRequest {
+                    image: a.image,
+                    count: a.count.unwrap_or(1),
+                    on: a.on,
+                    kind: a.kind,
+                    cpus: a.cpus,
+                    memory_mb: a.memory_mb,
+                    ttl_secs: a.ttl_secs,
+                    instance_type: a.instance_type,
+                    region: a.region,
+                })
+                .await?;
+            Ok(json_of(&p))
+        }
+        "prewarm_list" => {
+            let _: i::PrewarmList = args(tool, a)?;
+            Ok(json_of(&spaces.prewarms().await?))
+        }
+        "prewarm_remove" => {
+            let a: i::PrewarmRemove = args(tool, a)?;
+            let removed = spaces.remove_prewarm(&a.id).await?;
+            Ok(json_of(&serde_json::json!({ "removed": removed })))
+        }
+        "cloud_reconcile" => {
+            let _: i::CloudReconcile = args(tool, a)?;
+            let d = spaces.elastic_reconcile().await?;
+            Ok(json_of(&d))
         }
         "cloud_sweep" => {
             let a: i::CloudSweep = args(tool, a)?;
@@ -317,6 +559,12 @@ async fn dispatch(
                 )
                 .await?,
             ))
+        }
+        "cloud_audit" => {
+            let a: i::CloudAudit = args(tool, a)?;
+            let c = spaces.sandboxes().clouds()?;
+            let limit = a.limit.unwrap_or(50).clamp(1, 1000) as usize;
+            Ok(json_of(&c.audit(limit).await?))
         }
         // --- execution --------------------------------------------------------
         "space_bash" => {
@@ -695,6 +943,7 @@ fn cloud_target(t: i::CloudTarget) -> cua_sandbox_core::byoc::CloudTarget {
         zone: some(t.zone),
         project: some(t.project),
         environment: some(t.environment),
+        token: some(t.token),
     }
 }
 
@@ -712,14 +961,23 @@ fn extension_capability(tool: &str) -> Option<&'static str> {
 
 #[cfg(feature = "spaces-agents")]
 async fn agents(spaces: &Spaces, tool: &str, a: Value) -> Result<ToolOutcome> {
-    use crate::agents::{self as ag, McpServer, RunOptions};
+    use crate::agents as ag;
     let space_arg = a
         .get("space")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::invalid(format!("{tool}: `space` is required")))?
         .to_string();
     let s = space_for(spaces, tool, &space_arg).await?;
-    let agents = s.agents().await?;
+    let agents = match s.agents().await {
+        Ok(agents) => agents,
+        Err(e) => {
+            if tool == "agent_start" && a.get("home").is_none_or(Value::is_null) {
+                let harness = a.get("agent").and_then(Value::as_str).unwrap_or_default();
+                ag::telemetry::start_failed(harness, &s.id().to_string(), "spaces_tool", &e);
+            }
+            return Err(e);
+        }
+    };
     // Events without their raw ACP payload (the default for a model).
     let compact = |e: &ag::AgentEvent, raw: bool| {
         let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
@@ -752,43 +1010,50 @@ async fn agents(spaces: &Spaces, tool: &str, a: Value) -> Result<ToolOutcome> {
                 };
             }
             let a: i::AgentStart = args(tool, a)?;
-            let (host_env, missing) = ag::env_from_host(&a.env_from_host)?;
-            let mut env = a.env.clone();
-            env.extend(host_env);
-            let endpoint = a.base_url.map(|base_url| ag::Endpoint {
-                base_url,
-                wire: None,
-                model: a.model.clone(),
-            });
-            let started = agents
-                .start(
-                    &a.agent,
-                    &a.prompt,
-                    RunOptions {
-                        cwd: a.cwd,
-                        repo: a.repo,
-                        branch: a.branch,
-                        env,
-                        mcp_servers: a
-                            .mcp_servers
-                            .into_iter()
-                            .map(|m| McpServer {
-                                name: m.name,
-                                url: m.url,
-                                command: m.command,
-                                args: m.args,
-                                ..Default::default()
-                            })
-                            .collect(),
-                        endpoint,
-                        model: a.model,
-                        exit_when_idle: a.exit_when_idle.unwrap_or(false),
-                        ..Default::default()
-                    },
-                )
-                .await?;
+            // The caller's env, the env_from_host keys, and the keys saved
+            // in Cua Spaces that this harness reads.
+            let (opts, missing) = ag::start_options(&a)?;
+            let started = agents.start(&a.agent, &a.prompt, opts).await;
+            // The MCP `agent_start`, the SDKs' `Space.agent_start` and the
+            // Spaces app all arrive here.
+            let started = match started {
+                Ok(started) => {
+                    ag::telemetry::started(&agents, &s.id().to_string(), "spaces_tool", &started);
+                    started
+                }
+                Err(e) => {
+                    // A missing credential names the env_from_host keys
+                    // this server could not forward.
+                    let e = match e {
+                        cua_agents::Error::NoCredential(m) if !missing.is_empty() => {
+                            Error::Agent(format!(
+                                "{m}. Named in env_from_host but not set in this server's environment: {}",
+                                missing.join(", ")
+                            ))
+                        }
+                        e => Error::from(e),
+                    };
+                    ag::telemetry::start_failed(&a.agent, &s.id().to_string(), "spaces_tool", &e);
+                    return Err(e);
+                }
+            };
             if a.show.unwrap_or(false) {
                 show(&s, &started.run_dir, &started.run_id).await;
+            }
+            // The daemon notifies the user once when the run or a turn of
+            // it fails (persistent agents' runs have their own supervisor).
+            if let Some(ext) = spaces.extension_for(ag::WATCH_OP) {
+                let call = crate::extension::ToolCall {
+                    spaces,
+                    tool: ag::WATCH_OP,
+                    args: json!({"space": s.id().to_string(), "run_id": started.run_id,
+                                 "agent": started.harness}),
+                    broker: None,
+                    pinned: Some(&s),
+                };
+                if let Err(e) = ext.call_tool(call).await {
+                    tracing::warn!(run = %started.run_id, error = %e, "agent run not watched");
+                }
             }
             let mut notes = started.notes.clone();
             for m in missing {
@@ -824,6 +1089,7 @@ async fn agents(spaces: &Spaces, tool: &str, a: Value) -> Result<ToolOutcome> {
                 )
                 .await?;
             let st = agents.status(&a.run_id).await?;
+            ag::telemetry::observe(&st);
             Ok(ToolOutcome::json(&json!({
                 "run_id": a.run_id, "status": st.status, "phase": st.phase,
                 "events": page.events.iter().map(|e| compact(e, raw)).collect::<Vec<_>>(),
@@ -833,6 +1099,7 @@ async fn agents(spaces: &Spaces, tool: &str, a: Value) -> Result<ToolOutcome> {
         "agent_status" => {
             let a: i::AgentStatus = args(tool, a)?;
             let st = agents.status(&a.run_id).await?;
+            ag::telemetry::observe(&st);
             let result = agents.result(&a.run_id).await?;
             let tail = agents.events(&a.run_id, 0, 100_000).await?;
             Ok(ToolOutcome::json(&json!({
@@ -855,7 +1122,9 @@ async fn agents(spaces: &Spaces, tool: &str, a: Value) -> Result<ToolOutcome> {
         }
         "agent_stop" => {
             let a: i::AgentStop = args(tool, a)?;
+            ag::telemetry::before_stop(&agents, &a.run_id).await;
             let st = agents.stop(&a.run_id).await?;
+            ag::telemetry::stopped(&a.run_id);
             Ok(ToolOutcome::json(&json!({
                 "run_id": a.run_id, "stopped": st.alive == Some(false), "alive": st.alive,
                 "reason": match st.alive {
@@ -867,7 +1136,9 @@ async fn agents(spaces: &Spaces, tool: &str, a: Value) -> Result<ToolOutcome> {
         }
         _ => {
             let _: i::SpaceOnly = args(tool, a)?;
-            let runs: Vec<Value> = agents.list().await?.iter().map(list_row).collect();
+            let runs = agents.list().await?;
+            runs.iter().for_each(ag::telemetry::observe);
+            let runs: Vec<Value> = runs.iter().map(list_row).collect();
             Ok(ToolOutcome::json(
                 &json!({"space": s.id().to_string(), "runs": runs}),
             ))

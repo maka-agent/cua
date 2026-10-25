@@ -13,28 +13,71 @@ use std::sync::Arc;
 /// without cua-spacesd reports it missing.
 pub const SPACESD_FEATURE: &str = "spacesd";
 
+/// The cua-spacesd release to ask for when a driver does not report a
+/// feature the client requires: every published release from this one on
+/// reports it. (Some older builds report it too; one that does not report
+/// it at all predates it.) `None` for a feature without a known floor.
+pub fn spacesd_floor(feature: &str) -> Option<&'static str> {
+    match feature {
+        // `SystemService.AttachRelay`: sharing a Space, `relay_register`,
+        // and every Space a host provides.
+        "relay_attach" => Some("0.2.2"),
+        _ => None,
+    }
+}
+
+/// Whether the cua-spacesd version `version` is older than `floor`
+/// (`x.y.z`, a pre-release suffix ignored). An empty or unparseable
+/// version counts as older: a driver that does not say is not newer.
+pub fn spacesd_older_than(version: &str, floor: &str) -> bool {
+    fn parse(v: &str) -> Option<(u64, u64, u64)> {
+        let v = v.trim().trim_start_matches('v');
+        let core = v.split(['-', '+']).next()?;
+        let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+        let t = (it.next()??, it.next()??, it.next()??);
+        it.next().is_none().then_some(t)
+    }
+    match (parse(version), parse(floor)) {
+        (Some(v), Some(f)) => v < f,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// The limitation text for a feature a cua-spacesd of `version` does not
+/// report at all: names the release to update to when the feature has a
+/// floor this version is older than.
+pub fn unreported_feature_limitation(version: &str, feature: &str) -> String {
+    let shown = if version.trim().is_empty() {
+        "of an unknown version"
+    } else {
+        version
+    };
+    match spacesd_floor(feature) {
+        Some(floor) if spacesd_older_than(version, floor) => format!(
+            "its cua-spacesd {shown} is too old: cua-spacesd {floor} and newer report \
+             `{feature}`; update the Space's image (or its cua-spacesd) to one that ships \
+             cua-spacesd {floor} or newer"
+        ),
+        _ => format!("cua-spacesd {shown} does not report this feature"),
+    }
+}
+
 /// How a declared service is reached.
+// One value per declared service of a Space, never in a hot path: boxing the
+// sandbox variant would only move the size difference to the next variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ServiceSource {
     /// A sandbox service (local loopback or any other sandbox route).
-    Sandbox(cua_sandbox_core::Service),
-    /// A Fleet claim's service, through the gateway.
-    Fleet {
-        /// Client (mints the gateway bearer).
-        fleet: cua_fleet::FleetClient,
-        /// The claim.
-        bound: cua_fleet::BoundSandbox,
-        /// Service name.
-        service: String,
-    },
+    Sandbox(Box<cua_sandbox_core::Service>),
     /// A fixed URL and headers (a Space added by its MCP URL, or a `cua
     /// daemon` passthrough).
     Url(ServiceEndpoint),
 }
 
 /// A service a Space declares (an MCP server, a web app, ...), reachable
-/// through a protocol-transparent pipe: loopback locally, the Fleet gateway
-/// on Fleet, or a URL.
+/// through a protocol-transparent pipe: loopback locally, or a URL.
 #[derive(Clone)]
 pub struct SpaceService {
     /// How requests reach it.
@@ -52,25 +95,10 @@ impl std::fmt::Debug for SpaceService {
 }
 
 impl SpaceService {
-    /// Where the service is reachable from this process (URL and headers,
-    /// freshly minted for Fleet).
+    /// Where the service is reachable from this process (URL and headers).
     pub async fn endpoint(&self) -> Result<ServiceEndpoint> {
         match &self.source {
             ServiceSource::Sandbox(s) => Ok(s.endpoint().await?),
-            ServiceSource::Fleet {
-                fleet,
-                bound,
-                service,
-            } => {
-                let token = fleet.access_token(false).await?;
-                Ok(ServiceEndpoint {
-                    url: fleet.service_url(bound, service)?,
-                    headers: vec![
-                        ("authorization".into(), format!("Bearer {token}")),
-                        ("x-cua-fleet-claim".into(), bound.claim.clone()),
-                    ],
-                })
-            }
             ServiceSource::Url(e) => Ok(e.clone()),
         }
     }
@@ -81,14 +109,10 @@ impl SpaceService {
     }
 }
 
-/// Media / tunnel WebSockets through the Fleet gateway need the gateway's own
+/// Media / tunnel WebSockets through a gateway need the gateway's own
 /// credentials next to the ticket.
 #[derive(Clone)]
 pub(crate) enum Gateway {
-    Fleet {
-        fleet: cua_fleet::FleetClient,
-        claim: String,
-    },
     /// Fixed headers (a `cua daemon` env passthrough: its loopback bearer).
     Headers(Vec<(String, String)>),
 }
@@ -109,6 +133,21 @@ pub(crate) struct SpaceInner {
     pub(crate) image: std::sync::OnceLock<(String, String)>,
     /// `(kind, arch)` from the local sandbox's record, when it has one.
     pub(crate) platform: std::sync::OnceLock<(String, String)>,
+    /// Which way the spacesd connection goes ([`Space::route`]).
+    pub(crate) route: std::sync::OnceLock<crate::ChannelRoute>,
+    /// Why the connection took the relay's HTTPS path although the mesh
+    /// was wanted ([`Space::fallback_reason`]).
+    pub(crate) fallback: std::sync::OnceLock<String>,
+    /// Host file of the bulk lane its spacesd connection uses, once proven.
+    pub(crate) bulk: std::sync::OnceLock<std::path::PathBuf>,
+    /// What the connection needs kept alive (a routed Space's forward
+    /// through its host).
+    pub(crate) keepalive: std::sync::OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+    /// The image configuration of a Space made from a build.
+    pub(crate) image_config: std::sync::OnceLock<crate::build::ImageConfig>,
+    /// Why no cua-spacesd answered when this connected (`endpoint`,
+    /// `reason`), for a Space connected without one.
+    pub(crate) spacesd_unavailable: std::sync::OnceLock<(String, String)>,
 }
 
 /// A connected Space. Cheap to clone; every clone shares one spacesd
@@ -159,6 +198,12 @@ impl Space {
                 mcp: Default::default(),
                 image: Default::default(),
                 platform: Default::default(),
+                route: Default::default(),
+                fallback: Default::default(),
+                bulk: Default::default(),
+                keepalive: Default::default(),
+                image_config: Default::default(),
+                spacesd_unavailable: Default::default(),
             }),
         }
     }
@@ -220,7 +265,7 @@ impl Space {
             Err(shared) => {
                 let mut all = shared.services.clone();
                 all.extend(services);
-                Self::new(
+                let space = Self::new(
                     shared.id.clone(),
                     shared.name.clone(),
                     shared.env.clone(),
@@ -228,9 +273,89 @@ impl Space {
                     shared.token.clone(),
                     shared.gateway.clone(),
                     all,
-                )
+                );
+                if let Some(route) = shared.route.get() {
+                    space.set_route(route.clone());
+                }
+                if let Some(reason) = shared.fallback.get() {
+                    space.set_fallback_reason(reason.clone());
+                }
+                space
             }
         }
+    }
+
+    /// The environment, working directory and user of the build this Space
+    /// was made from; commands run through [`Space::shell_command`] get
+    /// them.
+    pub fn image_config(&self) -> Option<&crate::build::ImageConfig> {
+        self.inner.image_config.get()
+    }
+
+    /// Records the image configuration of a Space made from a build (the
+    /// `cua daemon` reports it in the Space's record).
+    pub fn with_image_config(self, config: crate::build::ImageConfig) -> Self {
+        self.set_image_config(config);
+        self
+    }
+
+    pub(crate) fn set_image_config(&self, config: crate::build::ImageConfig) {
+        let _ = self.inner.image_config.set(config);
+    }
+
+    /// Which way this Space's spacesd calls go (see [`crate::ChannelRoute`]),
+    /// when known: set by [`crate::Spaces`] on connect, or by whoever
+    /// attached the connection ([`Space::with_route`]).
+    pub fn route(&self) -> Option<&crate::ChannelRoute> {
+        self.inner.route.get()
+    }
+
+    /// Records the route of a connection someone else established (for
+    /// example the route a `cua daemon` reported for its passthrough).
+    pub fn with_route(self, route: crate::ChannelRoute) -> Self {
+        self.set_route(route);
+        self
+    }
+
+    /// What carries this Space's connection (see [`crate::Transport`]):
+    /// `relay_https` means the relay can read the session in transit.
+    pub fn transport(&self) -> crate::Transport {
+        self.route()
+            .map(crate::ChannelRoute::transport)
+            .unwrap_or(crate::Transport::Unknown)
+    }
+
+    /// Why this Space took the relay's HTTPS path although the mesh was
+    /// wanted (the relay or the computer has no mesh, or the mesh did not
+    /// answer); `None` on the mesh, and when the HTTPS path was chosen
+    /// (`CUA_MESH=off`).
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.inner.fallback.get().map(String::as_str)
+    }
+
+    /// Records why another process's connection fell back to the relay's
+    /// HTTPS path (the `cua daemon` reports it next to the route).
+    pub fn with_fallback_reason(self, reason: impl Into<String>) -> Self {
+        self.set_fallback_reason(reason.into());
+        self
+    }
+
+    pub(crate) fn set_fallback_reason(&self, reason: String) {
+        let _ = self.inner.fallback.set(reason);
+    }
+
+    /// The host file of the bulk lane this Space's large file transfers use
+    /// (a Linux VM on this machine), when there is one.
+    pub fn bulk_path(&self) -> Option<&std::path::Path> {
+        self.inner.bulk.get().map(std::path::PathBuf::as_path)
+    }
+
+    pub(crate) fn set_bulk_path(&self, path: std::path::PathBuf) {
+        let _ = self.inner.bulk.set(path);
+    }
+
+    pub(crate) fn set_route(&self, route: crate::ChannelRoute) {
+        let _ = self.inner.route.set(route);
     }
 
     /// The image the sandbox runs (as requested) and the digest of the
@@ -305,6 +430,22 @@ impl Space {
         self.inner.env.is_some()
     }
 
+    pub(crate) fn set_spacesd_unavailable(&self, endpoint: String, reason: String) {
+        let _ = self.inner.spacesd_unavailable.set((endpoint, reason));
+    }
+
+    /// When no cua-spacesd answered because this host has no route to a
+    /// local VM (on macOS: Local Network privacy blocks this process), the
+    /// cause in words, naming the app to allow. `None` for any other reason
+    /// (still starting, nothing listening) or a Space that is not local.
+    pub fn spacesd_unreachable_cause(&self) -> Option<String> {
+        if !matches!(self.inner.id, SpaceId::Local { .. }) {
+            return None;
+        }
+        let (endpoint, reason) = self.inner.spacesd_unavailable.get()?;
+        unreachable_cause(endpoint, reason)
+    }
+
     fn no_spacesd(&self) -> Error {
         Error::CapabilityMissing {
             space: self.inner.id.to_string(),
@@ -361,10 +502,7 @@ impl Space {
             None => Err(Error::CapabilityMissing {
                 space: self.inner.id.to_string(),
                 feature: name.into(),
-                limitation: format!(
-                    "cua-spacesd {} does not report this feature",
-                    self.inner.caps.version
-                ),
+                limitation: unreported_feature_limitation(&self.inner.caps.version, name),
             }),
         }
     }
@@ -388,36 +526,32 @@ impl Space {
             .unwrap_or(pb::OsFamily::Unspecified)
     }
 
+    /// The connected handshake's canonical (family, name, pretty name).
+    /// `None` means no spacesd: preserve the registry/discovery metadata.
+    /// A missing or unrecognized live family returns three empty strings,
+    /// so consumers clear stale OS metadata together. Never uses the image
+    /// catalog or refreshes the connection.
+    pub fn reported_os(&self) -> Option<(&'static str, &str, &str)> {
+        if !self.has_spacesd() {
+            return None;
+        }
+        let family = crate::spaces::os_family(self.capabilities());
+        match (family, self.capabilities().os.as_ref()) {
+            ("", _) | (_, None) => Some(("", "", "")),
+            (family, Some(os)) => Some((family, &os.name, &os.pretty_name)),
+        }
+    }
+
     /// Whether the guest is Windows (shell commands go through `cmd /C`).
     pub fn is_windows(&self) -> bool {
         self.os_family() == pb::OsFamily::Windows
     }
 
     /// Headers a WebSocket to this Space's spacesd needs besides its
-    /// ticket (the Fleet gateway's bearer and claim).
+    /// ticket (a `cua daemon` passthrough's loopback bearer).
     pub async fn websocket_headers(&self) -> Result<Vec<(String, String)>> {
         match &self.inner.gateway {
             None => Ok(vec![]),
-            Some(Gateway::Fleet { fleet, claim }) => {
-                let bearer = fleet.access_token(false).await?;
-                let mut h = vec![
-                    (
-                        cua_proto::metadata::AUTHORIZATION.into(),
-                        format!("Bearer {bearer}"),
-                    ),
-                    ("x-cua-fleet-claim".into(), claim.clone()),
-                ];
-                // The gateway consumes `authorization`; the env token rides
-                // in its own header (MEDIA.md: tickets still authenticate
-                // the socket, this lets a gateway-side check pass too).
-                if let Some(t) = self.inner.token.as_deref().filter(|t| !t.is_empty()) {
-                    h.push((
-                        cua_proto::metadata::ENV_AUTHORIZATION.into(),
-                        format!("Bearer {t}"),
-                    ));
-                }
-                Ok(h)
-            }
             Some(Gateway::Headers(h)) => Ok(h.clone()),
         }
     }
@@ -436,7 +570,7 @@ pub struct SpaceInfo {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// `fleet`, `local` or `direct`.
+    /// `local`, `direct` or `relay`.
     pub provider: Provider,
     /// spacesd version at the last handshake.
     pub spacesd_version: String,
@@ -490,7 +624,7 @@ pub struct SpaceInfo {
     /// while it runs).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub power_state: String,
-    /// A Space in your own cloud: the provider (`aws`, `gcp`, `modal`);
+    /// A Space in your own cloud: the provider (`aws`, `gcp`, `hetzner`, `modal`);
     /// empty otherwise.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cloud: String,
@@ -503,6 +637,54 @@ pub struct SpaceInfo {
     /// for other Spaces.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cloud_delete: String,
+    /// A relay machine the relay says cannot be reached now: `offline`
+    /// (its driver is not connected) or `not sharing` (its owner stopped
+    /// sharing it). Empty when reachable, and for other Spaces.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// A durable Space ([`crate::durable`]): its name. It is created again
+    /// on another of your machines when its machine goes away. Empty for
+    /// other Spaces.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub durable: String,
+    /// Why a local Space stopped without being asked to, in plain words
+    /// ("out of memory", "killed", "exited with code 1"); empty otherwise,
+    /// and once it is started again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stop_reason: String,
+    /// Named volumes mounted in the Space ([`crate::named_volumes`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<crate::named_volumes::VolumeMount>,
+    /// Labels set when it was created (`SpaceCreate::labels`): up to 64
+    /// pairs, keys up to 63 bytes, values up to 256. Kept by the device
+    /// that created the Space.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// When the Space ends (Unix seconds), as set by
+    /// [`crate::Spaces::set_lifetime`]; 0 when it has no lifetime.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expires_at_unix: u64,
+    /// What happens then: `delete` or `suspend`; empty without a lifetime.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_expire: String,
+    /// When the Space was created (Unix seconds): the moment a create
+    /// finished, or for a Space added by address the time it was added. 0
+    /// when unknown (a machine only the relay lists).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub created_at_unix: u64,
+    /// The egress policy last set on the Space ([`crate::egress`]); empty
+    /// when it has none.
+    #[serde(default, skip_serializing_if = "crate::egress::EgressPolicy::is_empty")]
+    pub egress: crate::egress::EgressPolicy,
+    /// Where that policy is enforced: [`crate::egress::Enforcement::Host`]
+    /// (outside the guest, by the host the Space runs on); `None` without
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_enforced: Option<crate::egress::Enforcement>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl SpaceInfo {
@@ -535,6 +717,23 @@ impl SpaceInfo {
             cloud: record.cloud.clone(),
             cloud_place: record.cloud_place.clone(),
             cloud_delete: record.cloud_delete.clone(),
+            status: String::new(),
+            durable: record.durable.clone(),
+            stop_reason: record.stop_reason.clone(),
+            volumes: record.volumes.iter().cloned().map(Into::into).collect(),
+            expires_at_unix: 0,
+            on_expire: String::new(),
+            egress: Default::default(),
+            egress_enforced: None,
+            created_at_unix: record
+                .added_at
+                .as_ref()
+                .map_or(0, |t| t.seconds.max(0) as u64),
+            labels: record
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         })
     }
 }
@@ -581,6 +780,39 @@ fn humantime_rfc3339(at: std::time::SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_compare_against_a_floor() {
+        assert!(spacesd_older_than("0.1.0", "0.2.2"));
+        assert!(spacesd_older_than("0.2.1", "0.2.2"));
+        assert!(spacesd_older_than("0.0.0-mock", "0.2.2"));
+        assert!(spacesd_older_than("", "0.2.2"));
+        assert!(spacesd_older_than("garbage", "0.2.2"));
+        assert!(!spacesd_older_than("0.2.2", "0.2.2"));
+        assert!(!spacesd_older_than("v0.3.0", "0.2.2"));
+        assert!(!spacesd_older_than("1.0.0-rc.1", "0.2.2"));
+        assert!(!spacesd_older_than("0.1.0", "not-a-version"));
+    }
+
+    #[test]
+    fn an_unreported_feature_names_the_release_to_update_to() {
+        assert_eq!(spacesd_floor("relay_attach"), Some("0.2.2"));
+        let old = unreported_feature_limitation("0.1.0", "relay_attach");
+        assert!(old.contains("cua-spacesd 0.1.0 is too old"), "{old}");
+        assert!(old.contains("cua-spacesd 0.2.2 or newer"), "{old}");
+        // A current driver that still lacks it, or a feature without a
+        // floor, keeps the plain text.
+        assert_eq!(
+            unreported_feature_limitation("0.3.0", "relay_attach"),
+            "cua-spacesd 0.3.0 does not report this feature"
+        );
+        assert_eq!(
+            unreported_feature_limitation("0.1.0", "pty"),
+            "cua-spacesd 0.1.0 does not report this feature"
+        );
+    }
+
     #[test]
     fn rfc3339_formats_known_instants() {
         let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_758_300_000);
@@ -589,5 +821,40 @@ mod tests {
             super::humantime_rfc3339(std::time::UNIX_EPOCH),
             "1970-01-01T00:00:00Z"
         );
+    }
+}
+
+/// [`Space::spacesd_unreachable_cause`] from the endpoint and the
+/// connect's reason (pure).
+pub(crate) fn unreachable_cause(endpoint: &str, reason: &str) -> Option<String> {
+    let l = reason.to_ascii_lowercase();
+    let cause = if l.contains("no route to host") {
+        "No route to host"
+    } else if l.contains("network is unreachable") {
+        "Network is unreachable"
+    } else {
+        return None;
+    };
+    let addr = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    Some(cua_vmm::probe::unreachable_error(addr, &cause).to_string())
+}
+
+#[cfg(test)]
+mod unreachable_tests {
+    use super::unreachable_cause;
+
+    #[test]
+    fn no_route_to_a_local_vm_names_local_network_access() {
+        let reason = "nothing answered at http://192.168.64.191:3211/ (it may still be starting; \
+                      retry in a few seconds): grpc: transport error (No route to host (os error 65))";
+        let c = unreachable_cause("http://192.168.64.191:3211/", reason).unwrap();
+        assert!(c.contains("192.168.64.191:3211"), "{c}");
+        if cfg!(target_os = "macos") {
+            assert!(c.contains("Local Network access is not available"), "{c}");
+        }
+        assert!(unreachable_cause("http://x:1", "nothing answered: connection refused").is_none());
     }
 }

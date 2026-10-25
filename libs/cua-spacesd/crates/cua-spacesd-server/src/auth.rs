@@ -174,6 +174,10 @@ struct TicketPayload {
     p: String,
     e: u64,
     n: String,
+    /// The minting call's relay assertion `iat`, when relayed (the relay
+    /// refuses a ticket from before a revoke of `p`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    a: Option<u64>,
 }
 
 /// What an external credential authorized.
@@ -204,6 +208,14 @@ pub struct RelayCaller {
     pub name: Option<String>,
     /// `owner` or `shared` (an editor).
     pub role: String,
+    /// The relay assertion's `iat` (seconds, relay clock). Tickets minted
+    /// for the call carry it, so the relay can refuse one that predates a
+    /// revoke of this account.
+    pub issued_at: u64,
+    /// Teams (or organizations) the relay admitted the account through;
+    /// empty for the owner and a direct share. Share links to a team check
+    /// these.
+    pub teams: Vec<String>,
 }
 
 /// The only calls a relayed caller may make on a machine that does not
@@ -218,7 +230,25 @@ pub const HOST_ONLY_GRPC_METHODS: &[&str] = &[
     "/cua.env.v1.HostSpacesService/DeleteHostSpace",
     "/cua.env.v1.HostSpacesService/CancelHostSpace",
     "/cua.env.v1.HostSpacesService/SetHostSpacePower",
+    "/cua.env.v1.HostSpacesService/SetHostWarm",
     "/cua.env.v1.HostSpacesService/DeleteCloudSpace",
+    "/cua.env.v1.HostSpacesService/SetHostSpaceEgress",
+    "/cua.env.v1.HostJobsService/RunHostJobs",
+    "/cua.env.v1.HostJobsService/GetHostJob",
+    "/cua.env.v1.HostJobsService/ListHostJobs",
+    "/cua.env.v1.HostJobsService/CancelHostJob",
+    "/cua.env.v1.HostSnapshotsService/ListHostSnapshots",
+    "/cua.env.v1.HostSnapshotsService/ExportHostSnapshot",
+    "/cua.env.v1.HostSnapshotsService/PullHostSnapshot",
+    "/cua.env.v1.HostSnapshotsService/PublishHostSnapshot",
+    // A Space this host provides routed (reached through the host, with no
+    // relay machine of its own): the forward is checked to be to that
+    // Space's loopback port ([`crate::host_spaces::routed_port_allowed`]).
+    "/cua.env.v1.TunnelService/Forward",
+    "/cua.env.v1.TunnelService/CloseForward",
+    "/cua.env.v1.HostSnapshotsService/CreateHostSnapshot",
+    "/cua.env.v1.HostSnapshotsService/DeleteHostSnapshot",
+    "/cua.env.v1.HostSpacesService/DiagnoseHost",
 ];
 
 impl ExternalGrant {
@@ -272,12 +302,23 @@ pub trait ExternalAuthenticator: Send + Sync {
     /// token). `Some(Ok(grant))`: authorized as `grant.principal`, view-only
     /// when `grant.view_only`. `Some(Err(reason))`: presented but refused.
     fn authenticate(&self, headers: &http::HeaderMap) -> Option<Result<ExternalGrant, String>>;
+
+    /// The cua daemon's share gateway socket while the host policy turns
+    /// shares on (`/share/*`), else `None`. `Err` when the policy cannot be
+    /// read or the machine stopped sharing (fail closed).
+    fn share_gateway(&self) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(None)
+    }
 }
 
 /// Holds the root token and derives every HMAC key.
 pub struct Auth {
     token: RwLock<Option<Arc<str>>>,
-    boot_secret: [u8; 32],
+    /// Keys tickets while no token is configured. From the OS randomness;
+    /// replaced by [`Auth::renew_boot_secret`] when the guest becomes a new
+    /// machine (a memory snapshot would otherwise share it with every
+    /// clone).
+    boot_secret: RwLock<[u8; 32]>,
     external: RwLock<Option<Arc<dyn ExternalAuthenticator>>>,
     access_log: RwLock<Option<Arc<crate::access_log::AccessLog>>>,
 }
@@ -285,15 +326,19 @@ pub struct Auth {
 impl Auth {
     /// Creates the store with an optional initial token (empty → none).
     pub fn new(token: Option<String>) -> Self {
-        use rand::RngCore as _;
-        let mut boot_secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut boot_secret);
         Self {
             token: RwLock::new(token.filter(|t| !t.is_empty()).map(Arc::from)),
-            boot_secret,
+            boot_secret: RwLock::new(crate::identity::fresh_secret(b"boot-secret", &[])),
             external: RwLock::new(None),
             access_log: RwLock::new(None),
         }
+    }
+
+    /// Replaces the per-boot ticket secret (this guest became a new
+    /// machine). Tickets minted without a token stop validating.
+    pub fn renew_boot_secret(&self, extra: &[u8]) {
+        *self.boot_secret.write().expect("boot secret lock") =
+            crate::identity::fresh_secret(b"boot-secret", extra);
     }
 
     /// Records every authorized remote access in `log` from now on.
@@ -310,6 +355,33 @@ impl Auth {
         }
     }
 
+    /// Records an authorized gRPC call to `path` ([`call_what`]); a
+    /// screenshot is left to its handler ([`record_screenshot`]), which
+    /// knows whether it is a thumbnail. `owner`: the caller is the
+    /// machine's owner (the token, or the owner's relay account).
+    pub fn record_call(
+        &self,
+        extensions: &mut http::Extensions,
+        via: &str,
+        who: &str,
+        path: &str,
+        owner: bool,
+    ) {
+        if path == SCREENSHOT_METHOD {
+            let log = self.access_log.read().expect("access log lock").clone();
+            if let Some(log) = log {
+                extensions.insert(PendingAccess {
+                    log,
+                    via: via.into(),
+                    who: who.into(),
+                    owner,
+                });
+            }
+            return;
+        }
+        self.record_access(via, who, &call_what(path));
+    }
+
     /// Records the access `headers` were authorized with for `what`: the
     /// relay-asserted identity, else the token (with any client-claimed
     /// name marked as claimed). Nothing without a token (a loopback server
@@ -317,11 +389,13 @@ impl Auth {
     pub fn record_headers(&self, headers: &http::HeaderMap, what: &str) {
         match self.authenticate_external(headers) {
             Some(Ok(g)) if g.view_only => self.record_access(
-                "relay",
+                via_of(&g.principal),
                 &principal_label(&g.principal),
                 &format!("refused {what} (view-only share)"),
             ),
-            Some(Ok(g)) => self.record_access("relay", &principal_label(&g.principal), what),
+            Some(Ok(g)) => {
+                self.record_access(via_of(&g.principal), &principal_label(&g.principal), what)
+            }
             Some(Err(_)) => {}
             None if self.has_token() => {
                 self.record_access("token", &token_label(principal_from_headers(headers)), what)
@@ -338,6 +412,15 @@ impl Auth {
     /// Removes the external authenticator (a relay was detached).
     pub fn clear_external(&self) {
         *self.external.write().expect("external lock") = None;
+    }
+
+    /// The share gateway socket the external authenticator's host policy
+    /// names (`shares` on), if any.
+    pub fn share_gateway(&self) -> Result<Option<std::path::PathBuf>, String> {
+        match self.external.read().expect("external lock").clone() {
+            Some(external) => external.share_gateway(),
+            None => Ok(None),
+        }
     }
 
     /// Runs the external authenticator, if any.
@@ -405,8 +488,9 @@ impl Auth {
     }
 
     /// Checks the token in `authorization` **or** `x-cua-env-authorization`
-    /// (the Fleet gateway consumes and strips `authorization`, so the SDK
-    /// sends the env token in the alternate header through `/api/svc`).
+    /// (a gateway in front of the daemon may consume and strip
+    /// `authorization`, so the SDK sends the env token in the alternate header
+    /// when it goes through one).
     /// Always true with no token.
     pub fn check_headers(&self, headers: &http::HeaderMap) -> bool {
         match self.authenticate_external(headers) {
@@ -434,9 +518,13 @@ impl Auth {
     /// Derives a purpose-specific HMAC key from the token (or boot secret).
     pub fn derive_key(&self, purpose: &str) -> [u8; 32] {
         let token = self.token();
+        let boot_secret;
         let base: &[u8] = match &token {
             Some(token) => token.as_bytes(),
-            None => &self.boot_secret,
+            None => {
+                boot_secret = *self.boot_secret.read().expect("boot secret lock");
+                &boot_secret
+            }
         };
         let mut mac = HmacSha256::new_from_slice(base).expect("hmac accepts any key");
         mac.update(b"cua-spacesd/");
@@ -452,6 +540,19 @@ impl Auth {
         principal_id: &str,
         ttl: Duration,
     ) -> (String, SystemTime) {
+        self.mint_ticket_issued(scope, resource, principal_id, None, ttl)
+    }
+
+    /// [`Self::mint_ticket`] for a relayed call: records its assertion's
+    /// `iat` (`issued`) in the ticket.
+    pub fn mint_ticket_issued(
+        &self,
+        scope: TicketScope,
+        resource: &str,
+        principal_id: &str,
+        issued: Option<u64>,
+        ttl: Duration,
+    ) -> (String, SystemTime) {
         let expires_at = SystemTime::now() + ttl.min(MAX_TICKET_TTL);
         let exp_ms = expires_at
             .duration_since(UNIX_EPOCH)
@@ -463,6 +564,7 @@ impl Auth {
             p: principal_id.to_owned(),
             e: exp_ms,
             n: random_id(9),
+            a: issued,
         };
         let payload = serde_json::to_vec(&payload).expect("ticket payload serializes");
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -621,6 +723,16 @@ pub fn encode_principal(principal: &Principal) -> String {
 }
 
 /// `name (id)` of a verified principal, or the id alone.
+/// Who vouched for an external grant, for the access log: the host's tailnet
+/// (`tailnet:` principals) or the relay (an assertion, also over the mesh).
+pub fn via_of(p: &Principal) -> &'static str {
+    if p.id.starts_with("tailnet:") {
+        "tailnet"
+    } else {
+        "relay"
+    }
+}
+
 pub fn principal_label(p: &Principal) -> String {
     if p.display_name.is_empty() || p.display_name == p.id {
         p.id.clone()
@@ -647,10 +759,144 @@ pub fn token_label(claimed: Option<Principal>) -> String {
     }
 }
 
+/// Separates an access line's caller from the agent session that made the
+/// call (` · agent Claude Code (agent:claude-code-4242)`).
+pub const AGENT_SESSION_TAG: &str = " \u{b7} agent ";
+
+/// The agent session a caller says it is, as an access line's suffix:
+/// ` · agent <name> (<id>)` for an agent principal (`agent:<label>-<pid>`,
+/// one per `cua mcp` process), empty for anything else. The name and id
+/// are the client's claim; the line's caller before the tag stays the
+/// verified identity. Readers use it to tell two agents of one account
+/// apart (the second-agent prompt in the apps).
+pub fn agent_session_suffix(claimed: Option<&Principal>) -> String {
+    let Some(p) = claimed.filter(|p| {
+        p.kind == cua_proto::env::v1::PrincipalKind::Agent as i32 && p.id.starts_with("agent:")
+    }) else {
+        return String::new();
+    };
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_control() && !matches!(c, '(' | ')'))
+            .take(64)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let id = clean(&p.id);
+    let name = clean(&p.display_name);
+    let name = if name.is_empty() {
+        "Agent".to_string()
+    } else {
+        name
+    };
+    format!("{AGENT_SESSION_TAG}{name} ({id})")
+}
+
 /// The gRPC service of a `/pkg.Service/Method` path (`ProcessService`).
 pub fn grpc_service(path: &str) -> &str {
     let service = path.trim_start_matches('/').split('/').next().unwrap_or("");
     service.rsplit('.').next().unwrap_or(service)
+}
+
+/// Read-only, low-impact calls (capability and health probes, status
+/// polls, presence, listings) that clients make on their own. The access
+/// log records them as `<Service>/<Method> (background)` so readers can
+/// leave them out of "connected now"; the classification is the route's,
+/// decided here on the host, never anything the caller says about itself.
+/// Every other call (a stream, input, a shell, files, an agent, teleport,
+/// a share or the volume) is recorded by its service name, as before.
+pub const BACKGROUND_GRPC_METHODS: &[&str] = &[
+    "/cua.env.v1.SystemService/GetCapabilities",
+    "/cua.env.v1.SystemService/Health",
+    "/cua.env.v1.SystemService/Metrics",
+    "/cua.env.v1.PresenceService/Join",
+    "/cua.env.v1.PresenceService/UpdateCursor",
+    "/cua.env.v1.PresenceService/Leave",
+    "/cua.env.v1.StreamService/ListTargets",
+    "/cua.env.v1.ComputerService/ListDisplays",
+    "/cua.env.v1.HostSpacesService/GetHostSpaces",
+    "/cua.env.v1.HostJobsService/ListHostJobs",
+    "/cua.env.v1.HostJobsService/GetHostJob",
+    "/cua.env.v1.TunnelService/ListForwards",
+    "/cua.env.v1.TunnelService/GetHotspotStatus",
+    "/cua.env.v1.VolumeService/GetVolumeStatus",
+    "/cua.env.v1.DriverService/ListTools",
+];
+
+/// The suffix of a background call's `what` in the access log.
+pub const BACKGROUND_TAG: &str = " (background)";
+
+/// `ComputerService.Screenshot`: recorded by the handler once it knows the
+/// size asked for ([`record_screenshot`]).
+pub const SCREENSHOT_METHOD: &str = "/cua.env.v1.ComputerService/Screenshot";
+
+/// A screenshot no larger than this (long edge, pixels) is a thumbnail.
+pub const THUMBNAIL_MAX_DIMENSION: u32 = 480;
+
+/// What the access log records for an authorized gRPC call to `path`.
+pub fn call_what(path: &str) -> String {
+    let route = path.trim_start_matches('/');
+    let route = route.rsplit_once('.').map_or(route, |(_, r)| r);
+    if BACKGROUND_GRPC_METHODS.contains(&path) {
+        return format!("{route}{BACKGROUND_TAG}");
+    }
+    let service = grpc_service(path);
+    // Older drivers wrote these services bare, and readers take a bare
+    // one as background; their other calls (a viewer ticket, shutdown)
+    // name the method so they still count.
+    if LEGACY_BACKGROUND_SERVICES.contains(&service) {
+        return route.to_string();
+    }
+    service.to_string()
+}
+
+/// Services older drivers recorded without the method, which readers take
+/// as background when bare ([`call_what`] names the method for the rest).
+pub const LEGACY_BACKGROUND_SERVICES: &[&str] = &["SystemService", "PresenceService"];
+
+/// What the access log records for a screenshot of at most
+/// `max_dimension` pixels (0: full size): a thumbnail (background for the
+/// machine's owner, surfaced for anyone else) or a screen read.
+pub fn screenshot_what(max_dimension: u32, owner: bool) -> String {
+    if (1..=THUMBNAIL_MAX_DIMENSION).contains(&max_dimension) {
+        if owner {
+            "ComputerService/Screenshot (thumbnail)".into()
+        } else {
+            "ComputerService/Screenshot (thumbnail, not owner)".into()
+        }
+    } else {
+        "ComputerService".into()
+    }
+}
+
+/// An authorized screenshot not yet recorded: the handler records it with
+/// the size it was asked for ([`record_screenshot`]).
+#[derive(Clone)]
+pub struct PendingAccess {
+    log: Arc<crate::access_log::AccessLog>,
+    via: String,
+    who: String,
+    owner: bool,
+}
+
+impl std::fmt::Debug for PendingAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAccess")
+            .field("via", &self.via)
+            .field("who", &self.who)
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+/// Records the screenshot `request` asks for (`ComputerService.Screenshot`
+/// handlers call it first): a thumbnail or a screen read, by its size.
+pub fn record_screenshot<T>(request: &tonic::Request<T>, max_dimension: u32) {
+    if let Some(p) = request.extensions().get::<PendingAccess>() {
+        p.log
+            .record(&p.via, &p.who, &screenshot_what(max_dimension, p.owner));
+    }
 }
 
 /// How the gRPC surface treats callers when no token is configured.
@@ -697,6 +943,10 @@ pub struct CallerIdentity {
     pub viewer: Option<Arc<ViewerGrant>>,
     /// The relay-verified account of a relayed call.
     pub account: Option<RelayCaller>,
+    /// A relayed call to a machine that does not share its desktop
+    /// ([`ExternalGrant::host_only`]): `GetCapabilities` reports the
+    /// desktop's features unsupported to it.
+    pub host_only: bool,
 }
 
 /// Tower layer that authenticates gRPC (and gRPC-Web) calls.
@@ -758,7 +1008,7 @@ where
                     let who = principal_label(&grant.principal);
                     if !SHARED_VIEWER_GRPC_METHODS.contains(&path.as_str()) {
                         self.auth.record_access(
-                            "relay",
+                            via_of(&grant.principal),
                             &who,
                             &format!("refused {} (view-only share)", grpc_service(&path)),
                         );
@@ -771,7 +1021,31 @@ where
                         .into_http::<R>();
                         return Box::pin(async move { Ok(response) });
                     }
-                    self.auth.record_access("relay", &who, grpc_service(&path));
+                    if grant.host_only && !HOST_ONLY_GRPC_METHODS.contains(&path.as_str()) {
+                        self.auth.record_access(
+                            via_of(&grant.principal),
+                            &who,
+                            &format!("refused {} (desktop not shared)", grpc_service(&path)),
+                        );
+                        tracing::debug!(%path, %who, "refused: this machine does not share its desktop");
+                        let response = crate::error::status(
+                            tonic::Code::PermissionDenied,
+                            cua_proto::env::v1::ErrorReason::PermissionDenied,
+                            format!(
+                                "this computer does not share its desktop (it only provides Spaces): \
+                                 {who} cannot call {path}"
+                            ),
+                        )
+                        .into_http::<R>();
+                        return Box::pin(async move { Ok(response) });
+                    }
+                    self.auth.record_call(
+                        req.extensions_mut(),
+                        via_of(&grant.principal),
+                        &who,
+                        &path,
+                        false,
+                    );
                     let viewer = Arc::new(grant.viewer_grant());
                     req.extensions_mut().insert(CallerIdentity {
                         principal: Some(grant.principal),
@@ -779,6 +1053,7 @@ where
                         asserted: true,
                         viewer: Some(viewer),
                         account: grant.account,
+                        host_only: grant.host_only,
                     });
                     let mut inner = self.inner.clone();
                     std::mem::swap(&mut self.inner, &mut inner);
@@ -789,7 +1064,7 @@ where
                     if grant.host_only && !HOST_ONLY_GRPC_METHODS.contains(&path.as_str()) {
                         let who = principal_label(&grant.principal);
                         self.auth.record_access(
-                            "relay",
+                            via_of(&grant.principal),
                             &who,
                             &format!("refused {} (desktop not shared)", grpc_service(&path)),
                         );
@@ -798,17 +1073,29 @@ where
                             tonic::Code::PermissionDenied,
                             cua_proto::env::v1::ErrorReason::PermissionDenied,
                             format!(
-                                "this machine does not share its desktop (it only provides Spaces): \
+                                "this computer does not share its desktop (it only provides Spaces): \
                                  {who} cannot call {path}"
                             ),
                         )
                         .into_http::<R>();
                         return Box::pin(async move { Ok(response) });
                     }
-                    self.auth.record_access(
-                        "relay",
-                        &principal_label(&grant.principal),
-                        grpc_service(&path),
+                    let owner = grant.account.as_ref().is_some_and(|a| a.role == "owner");
+                    // Only an owner keeps the agent kind (`principal_for`):
+                    // name which of its agent sessions this is.
+                    let session = if grant.principal.kind
+                        == cua_proto::env::v1::PrincipalKind::Agent as i32
+                    {
+                        agent_session_suffix(principal_from_headers(req.headers()).as_ref())
+                    } else {
+                        String::new()
+                    };
+                    self.auth.record_call(
+                        req.extensions_mut(),
+                        via_of(&grant.principal),
+                        &format!("{}{session}", principal_label(&grant.principal)),
+                        &path,
+                        owner,
                     );
                     req.extensions_mut().insert(CallerIdentity {
                         principal: Some(grant.principal),
@@ -816,6 +1103,7 @@ where
                         asserted: true,
                         viewer: None,
                         account: grant.account,
+                        host_only: grant.host_only,
                     });
                     let mut inner = self.inner.clone();
                     std::mem::swap(&mut self.inner, &mut inner);
@@ -841,10 +1129,12 @@ where
             let path = req.uri().path().to_owned();
             let refusal = match viewer {
                 Ok(grant) if cua_proto::metadata::VIEWER_GRPC_METHODS.contains(&path.as_str()) => {
-                    self.auth.record_access(
+                    self.auth.record_call(
+                        req.extensions_mut(),
                         "viewer",
                         &principal_label(&grant.principal()),
-                        grpc_service(&path),
+                        &path,
+                        false,
                     );
                     req.extensions_mut().insert(CallerIdentity {
                         principal: Some(grant.principal()),
@@ -852,6 +1142,7 @@ where
                         asserted: true,
                         viewer: Some(Arc::new(grant)),
                         account: None,
+                        host_only: false,
                     });
                     let mut inner = self.inner.clone();
                     std::mem::swap(&mut self.inner, &mut inner);
@@ -913,11 +1204,14 @@ where
             Ok(token_verified) => {
                 let principal = principal_from_headers(req.headers());
                 if token_verified {
-                    self.auth.record_access(
-                        "token",
-                        &token_label(principal.clone()),
-                        grpc_service(req.uri().path()),
+                    let path = req.uri().path().to_owned();
+                    let who = format!(
+                        "{}{}",
+                        token_label(principal.clone()),
+                        agent_session_suffix(principal.as_ref())
                     );
+                    self.auth
+                        .record_call(req.extensions_mut(), "token", &who, &path, true);
                 }
                 req.extensions_mut().insert(CallerIdentity {
                     principal,
@@ -925,6 +1219,7 @@ where
                     asserted: false,
                     viewer: None,
                     account: None,
+                    host_only: false,
                 });
                 let mut inner = self.inner.clone();
                 std::mem::swap(&mut self.inner, &mut inner);
@@ -951,6 +1246,53 @@ pub fn caller<T>(request: &tonic::Request<T>) -> CallerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshots_are_recorded_as_thumbnails_or_screen_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let auth = Auth::new(Some("t".into()));
+        auth.set_access_log(Arc::new(crate::access_log::AccessLog::open(&path)));
+        let shot = |who: &str, owner: bool, max_dimension: u32| {
+            let mut ext = http::Extensions::new();
+            auth.record_call(&mut ext, "relay", who, SCREENSHOT_METHOD, owner);
+            let req = tonic::Request::from_parts(tonic::metadata::MetadataMap::new(), ext, ());
+            record_screenshot(&req, max_dimension);
+        };
+        shot("owner", true, 320);
+        shot("guest", false, 320);
+        shot("owner", true, 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let what: Vec<String> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::access_log::AccessEntry>(l)
+                    .unwrap()
+                    .body
+                    .what
+            })
+            .collect();
+        assert_eq!(
+            what,
+            [
+                "ComputerService/Screenshot (thumbnail)",
+                "ComputerService/Screenshot (thumbnail, not owner)",
+                "ComputerService",
+            ]
+        );
+        assert_eq!(
+            call_what("/cua.env.v1.SystemService/Health"),
+            "SystemService/Health (background)"
+        );
+        assert_eq!(
+            call_what("/cua.env.v1.SystemService/CreateViewerTicket"),
+            "SystemService/CreateViewerTicket"
+        );
+        assert_eq!(
+            call_what("/cua.env.v1.TeleportService/ImportSession"),
+            "TeleportService"
+        );
+    }
 
     #[test]
     fn claim_token_installs_only_the_first_token() {
@@ -994,6 +1336,33 @@ mod tests {
             auth.validate_ticket(&ticket, TicketScope::Media),
             Err(TicketError::WrongScope)
         );
+    }
+
+    #[test]
+    fn a_relayed_ticket_records_the_assertion_time_and_still_validates() {
+        use base64::Engine as _;
+        let auth = Auth::new(Some("secret".into()));
+        let payload = |ticket: &str| -> serde_json::Value {
+            let body = ticket.split('.').nth(1).unwrap();
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(body)
+                .unwrap();
+            serde_json::from_slice(&raw).unwrap()
+        };
+        let (relayed, _) = auth.mint_ticket_issued(
+            TicketScope::Media,
+            "m",
+            "bob",
+            Some(1_791_773_000),
+            Duration::from_secs(60),
+        );
+        assert_eq!(payload(&relayed)["a"], 1_791_773_000);
+        assert_eq!(payload(&relayed)["p"], "bob");
+        let claims = auth.validate_ticket(&relayed, TicketScope::Media).unwrap();
+        assert_eq!(claims.principal_id, "bob");
+        // A local caller's ticket carries no `a` (same wire form as before).
+        let (local, _) = auth.mint_ticket(TicketScope::Media, "m", "", Duration::from_secs(60));
+        assert!(payload(&local).get("a").is_none());
     }
 
     #[test]
@@ -1090,6 +1459,33 @@ mod tests {
         let found = ticket_from_parts(&"/tunnel".parse().unwrap(), &headers).unwrap();
         assert_eq!(found.ticket, "v1.c.d");
         assert_eq!(found.subprotocol.as_deref(), Some("cua.ticket.v1.c.d"));
+    }
+
+    #[test]
+    fn an_agent_caller_names_its_session_on_the_access_line() {
+        let agent = |id: &str, name: &str| Principal {
+            id: id.into(),
+            display_name: name.into(),
+            color: String::new(),
+            kind: cua_proto::env::v1::PrincipalKind::Agent as i32,
+        };
+        assert_eq!(
+            agent_session_suffix(Some(&agent("agent:claude-code-4242", "Claude Code"))),
+            " \u{b7} agent Claude Code (agent:claude-code-4242)"
+        );
+        // A person, a non-agent id, or nobody: nothing added.
+        let human = Principal {
+            kind: cua_proto::env::v1::PrincipalKind::Human as i32,
+            ..agent("agent:x-1", "Ada")
+        };
+        assert_eq!(agent_session_suffix(Some(&human)), "");
+        assert_eq!(agent_session_suffix(Some(&agent("u1", "Codex"))), "");
+        assert_eq!(agent_session_suffix(None), "");
+        // The claim can't break the line's shape.
+        assert_eq!(
+            agent_session_suffix(Some(&agent("agent:a-1", "Evil) (x\n"))),
+            " \u{b7} agent Evil x (agent:a-1)"
+        );
     }
 
     #[test]

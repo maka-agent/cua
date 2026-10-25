@@ -17,6 +17,7 @@ public struct PendingTeleport: Equatable {
 /// The Settings window's tabs.
 public enum SettingsTab: Hashable, Sendable {
     case general
+    case agents
     case devices
     case experiments
     case about
@@ -32,6 +33,17 @@ public enum MainSelection: Hashable {
     case drive
     /// The notifications feed.
     case notifications
+    /// Your machines: this one and the others that run your Spaces.
+    case machines
+    /// The getting-started checklist.
+    case gettingStarted
+}
+
+/// A detail action to run once that Space's detail shows (the checklist's
+/// Teleport and Share).
+public struct DetailRequest: Equatable {
+    public let spaceId: String
+    public let action: AppDetailActionId
 }
 
 /// The app's root model. It holds the core's Space list state and forwards
@@ -41,12 +53,28 @@ public enum MainSelection: Hashable {
 @Observable
 public final class AppModel {
     public let backend: SpacesBackend
+    /// The launch until the live services are in (ready at once for
+    /// fixtures and tests): the window shows it instead of its content.
+    public let startup: StartupModel
+    /// The SDK backend, once the launch made it (nil in fixtures, and when
+    /// it could not start).
+    public private(set) var live: LiveSpacesBackend?
+    private var whenLive: [(LiveSpacesBackend) -> Void] = []
     public private(set) var roster: AppRosterState
     public var query = ""
     public var selection: MainSelection?
+    public var rosterError: String?
+    /// Another app keeps its own daemon running and this app uses it (the
+    /// supervisor yields to it after replacing it once): one line above
+    /// every page while it lasts. Nil otherwise.
+    public var daemonNotice: String?
     public var banner: String?
     public var bannerIsError = false
     public var showingNewSpace = false
+    /// The command palette (⌘K).
+    public var showingPalette = false
+    /// Run by the Space's detail when it shows (`DetailRequest`).
+    public var detailRequest: DetailRequest?
     public var confirmDeleteId: String?
     /// A teleport the notch started: the Space and the dropped app.
     public var pendingTeleport: PendingTeleport?
@@ -62,10 +90,16 @@ public final class AppModel {
     public let devices: DevicesModel
     /// Persistent agents, the Cua Volume and the notifications feed.
     public let persistent: PersistentModel
+    /// The getting-started checklist.
+    public let checklist: ChecklistModel
     /// Settings, Storage: the Cua Volume's store, Finder volume and cache.
     public internal(set) var storage: StorageModel
+    /// Settings, Agents: the provider keys agents get (kept by the daemon).
+    public let agentKeys: AgentKeysModel
     /// The user's own clouds: the "Your cloud" tile and "Connect a cloud".
     public let cloud: CloudModel
+    /// The cloud hosts the elastic pool added (Machines), read-only.
+    public let elastic: ElasticModel
     /// The Settings tab showing.
     public var settingsTab: SettingsTab = .general
     /// A Settings section to scroll to when Settings opens (captures).
@@ -80,11 +114,30 @@ public final class AppModel {
     public private(set) var cloudConfigured = false
     /// The Settings sign-in in progress.
     public private(set) var signIn: AppSignInPhase = .idle
+    /// The page a waiting sign-in finishes on ("Open the browser again").
+    public private(set) var signInURL: URL?
+    /// A failed sign-in's toast (the classic window shows it for a while).
+    public var signInToast: AppSignInToast?
+    /// A sign-in still waiting after this fails (a device code lives
+    /// about this long).
+    public var signInTimeout: Duration = .seconds(600)
+    /// Tells one sign-in from the next (a timeout of an old one is ignored).
+    private var signInAttempt = 0
+    /// The attempt in progress asked for a code instead of the browser's way back.
+    private var signInByCode = false
     public private(set) var telemetryInput: AppTelemetryInput?
     /// The account's Cua Cloud billing (Settings, Billing), once read.
     public private(set) var billingStatus: AppBillingStatus?
     /// Cua Cloud billing (nil: no Billing row).
     let billing: BillingRunning?
+    /// Reads the account's Teams from the Spaces API (nil: Settings shows
+    /// the account app's links only). Set by `AppEnvironment`.
+    public var teamsReader: TeamsReading?
+    /// Where Settings' Teams stand: not read yet, read, or failed.
+    public private(set) var teamsState: AppTeamsState = .signedOut
+    /// The owner's one-line note that sharing is for teams now and some
+    /// people can no longer open a shared computer; shown once.
+    public private(set) var shareRemovalNote: AppShareRemovalNote?
     /// This app as a login item (nil: no Launch at login row).
     let loginItem: LoginItemControlling?
     /// What the system reports for it (nil until read).
@@ -103,11 +156,17 @@ public final class AppModel {
     /// Spaces being created: each shows in the list the moment its create
     /// starts and follows the SDK's progress (`spaces::creating`). Spaces
     /// being deleted, which show Deleting until the delete returns.
-    public private(set) var creates = AppCreatesState(pending: [], deleting: [], powering: [])
+    public private(set) var creates = AppCreatesState(pending: [], deleting: [], powering: [], streaks: [])
     /// Sidebar rows as targets for a dragged real window.
     public let dropTargets = SidebarDropTargets()
+    /// The New UI window's Space tiles, the same kind of target.
+    public let pageDropTargets = SidebarDropTargets()
     public var settings: AppSettings
     let settingsPath: String
+    /// The running app's version: with it, the New UI's default follows
+    /// the update channel and the version (`appSettingsResolveNewUi`);
+    /// without it (tests, fixtures), the New UI is on only by choice.
+    let appVersion: String?
     /// Settings → About and the updater (none until `AppEnvironment`
     /// starts one).
     public var updates = UpdatesModel(updater: nil)
@@ -117,12 +176,21 @@ public final class AppModel {
                 host: HostRunning? = nil, account: AccountRunning? = nil,
                 telemetry: TelemetryRunning? = nil, agentSetup: AgentSetupRunning? = nil,
                 billing: BillingRunning? = nil, devices: DevicesRunning? = nil,
-                presence: PresenceChecking = LivePresence(), loginItem: LoginItemControlling? = nil) {
+                presence: PresenceChecking = LivePresence(), loginItem: LoginItemControlling? = nil,
+                startup: StartupModel? = nil, appVersion: String? = nil) {
         self.backend = backend
+        self.startup = startup ?? StartupModel()
         self.devices = DevicesModel(devices: devices, presence: presence)
         self.persistent = PersistentModel(tools: backend as? AgentsToolRunning)
+        self.checklist = ChecklistModel(path: URL(fileURLWithPath: settingsPath)
+            .deletingLastPathComponent().appendingPathComponent("checklist.json").path)
         self.storage = StorageModel(tools: backend as? AgentsToolRunning)
+        self.agentKeys = AgentKeysModel(tools: backend as? AgentsToolRunning)
         self.cloud = CloudModel(tools: backend as? CloudToolRunning)
+        // Fixtures never read the real cua home's ledger.
+        let fixtures = backend as? FixtureSpacesBackend
+        self.elastic = ElasticModel(tools: backend as? CloudToolRunning,
+                                    ledger: fixtures.map { fx in { fx.fixtureElastic ? FixtureSpacesBackend.fixtureLedger() : nil } })
         self.billing = billing
         self.loginItem = loginItem
         self.host = HostModel(host: host)
@@ -133,21 +201,24 @@ public final class AppModel {
         self.keyvault = keyvault
         self.onboarding = onboarding
         self.settingsPath = settingsPath
-        let settings = appSettingsLoad(path: settingsPath)
+        self.appVersion = appVersion
+        var settings = appSettingsLoad(path: settingsPath)
+        if let appVersion { settings = appSettingsResolveNewUi(settings: settings, version: appVersion) }
         self.settings = settings
         self.wizard = WizardModel(env: AppWizardEnv(
             defaultLocation: settings.defaultLocation, cloudAvailable: false,
             localAvailable: true, localReason: nil, localBackends: nil, localDetails: nil,
             maxCpus: UInt32(max(2, min(16, ProcessInfo.processInfo.activeProcessorCount))),
-            hostArch: Self.hostArch, storage: nil, cloudPricing: nil, clouds: [], hosts: [],
-            experiments: settings.experiments, gpus: nil))
+            hostArch: Self.hostArch, lumeSource: nil, linuxSource: nil, storage: nil, cloudPricing: nil, clouds: [], hosts: [],
+            experiments: settings.experiments, gpus: nil, nameSeed: nil))
         self.notch = NotchModel()
         // The notch tiles and the preview cover read one thumbnail store,
         // filled from the SDK's shared cache.
         notch.thumbnails.fetch = { [backend] id, maxAgeMs in await backend.thumbnail(id: id, maxAgeMs: maxAgeMs) }
         // The app core's usage events for each step (the Tauri app sends
-        // the same ones): the first run, Settings, Storage, enrollment.
-        onboarding.telemetry = telemetry
+        // the same ones): Settings, Storage, enrollment. The first run's
+        // are the web page's (`telemetry.track`).
+        self.checklist.telemetry = telemetry
         self.storage.telemetry = telemetry
         self.devices.telemetry = telemetry
         // Live Keyvault sign-ins show left of the notch (and in the menu).
@@ -161,19 +232,9 @@ public final class AppModel {
             self.saveSettings()
         }
         self.host.onChange = { [weak self] in self?.recompose() }
-        // The first run's "Where should Cua Spaces show up?" is this setting.
-        onboarding.onPresentation = { [weak self] menuBar in
-            guard let self else { return }
-            self.settings.menuBar = menuBar
-            self.saveSettings()
-        }
-        onboarding.currentMenuBar = { [weak self] in self?.settings.menuBar ?? false }
+        followChecklist()
         // Done's "Launch at login" checkbox is the user's choice.
         onboarding.onLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
-        // Settings, Experiments decide the first run's pages (Cua Volume).
-        onboarding.currentExperiments = { [weak self] in
-            self?.settings.experiments ?? AppExperiments(cuaVolume: false, yourCloud: false, sharing: false)
-        }
         // Which experiments are on: the day's `cua_app_active` carries them.
         telemetry?.record(appTelemetryExperimentsOn(experiments: settings.experiments))
         // The notifications marker lives in the settings file, so a restart
@@ -194,9 +255,54 @@ public final class AppModel {
             if case .failed = self.signIn { return false }
             return self.identity != nil
         }
+        // "Set up for access" signs in inline when relay setup has no
+        // account, then carries on.
+        self.host.signIn = { [weak self] in
+            guard let self else { return false }
+            await self.beginSignIn()
+            if case .failed = self.signIn { return false }
+            return self.identity != nil
+        }
+        // Relay sharing follows the sign-in: whose account this Mac is
+        // shared with, read from the local session (no network).
+        self.host.currentAccount = { [weak self] in
+            guard let self, let account = self.account, let who = account.identity() else { return nil }
+            let profile = account.profile()
+            let name = profile?.name.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+            return AppHostAccount(id: profile?.subject, email: profile?.email, display: name ?? who)
+        }
         // A row takes a window drop by the core's rule (the notch tiles' too).
         dropTargets.isDropTarget = { [weak self] id in
             self?.spaces.first { $0.id == id }.map { appSpaceAcceptsDrop(space: $0) } ?? false
+        }
+        pageDropTargets.isDropTarget = dropTargets.isDropTarget
+    }
+
+    // MARK: - Launch
+
+    /// Runs `f` with the SDK backend once the launch has it (now, when it
+    /// already does). Never runs without one.
+    public func onLive(_ f: @escaping (LiveSpacesBackend) -> Void) {
+        if let live { f(live) } else { whenLive.append(f) }
+    }
+
+    /// The live services are in: read the account again (it was unknown
+    /// until now) and show what the backend has.
+    func attachLive(_ live: LiveSpacesBackend?) {
+        identity = account?.identity()
+        host.identity = identity
+        devices.signedIn = identity != nil
+        if let live {
+            self.live = live
+            let queued = whenLive
+            whenLive = []
+            for f in queued { f(live) }
+        }
+        watchListFromNow()
+        Task {
+            await refresh()
+            await keyvault.refresh()
+            await devices.refresh()
         }
     }
 
@@ -227,7 +333,7 @@ public final class AppModel {
 
     /// The Spaces that can stream now (running and reachable).
     public var streamableSpaceIds: [String] {
-        spaces.filter { appSpaceDetail(space: $0).canStream }.map(\.id)
+        spaces.filter { detail($0).canStream }.map(\.id)
     }
 
     /// What the Space's preview card shows over (or instead of) its live
@@ -235,14 +341,251 @@ public final class AppModel {
     public func cover(_ detail: AppSpaceDetail, requested: Bool, stream: AppStreamPhase) -> AppDesktopCover {
         appDesktopCover(input: AppDesktopCoverInput(
             canStream: detail.canStream, previewText: detail.previewText,
-            autoConnect: settings.autoConnect, connectRequested: requested, stream: stream))
+            autoConnect: settings.autoConnect, connectRequested: requested, stream: stream,
+            access: detail.access))
     }
 
     /// The detail without what Settings, Experiments hides (Share while
-    /// Sharing is off).
+    /// Sharing is off), as this Mac sees it: a machine reached through the
+    /// relay has its Connect greyed out while this Mac is not enrolled, and
+    /// one that does not share its desktop shows why in its place.
     public func detail(_ space: AppSpace) -> AppSpaceDetail {
-        appSpaceDetailWith(space: space, usage: usage[space.id], hostArch: Self.hostArch,
-                           experiments: settings.experiments)
+        appSpaceDetailFor(space: space, usage: usage[space.id], hostArch: Self.hostArch,
+                          experiments: settings.experiments, access: devices.accessNotice)
+    }
+
+    /// The Spaces one of your machines provides (its detail lists them).
+    public func hostedRows(_ machineId: String) -> [AppSidebarRow] {
+        appHostedRows(spaces: spaces, machineSpaceId: machineId, selectedId: sidebar.selectedId ?? "")
+    }
+
+    // MARK: - Machines and getting started
+
+    /// The Machines page's rows (the core's `machines::page_rows`, which
+    /// the web UI lists too): This machine, the machines the Spaces list
+    /// shows (one sharing its desktop, one that provides Spaces), then
+    /// the account's devices that are none of them; each computer once.
+    public var machinePageRows: [AppMachinePageRow] { appMachinesPageRows(input: machinesPageInput) }
+
+    /// What the Machines page is listed from: the Spaces list, the
+    /// account's devices, the hostnames and who the relay sees connected.
+    var machinesPageInput: AppMachinesPageInput {
+        let devices = self.devices.snapshot == nil ? [] : self.devices.input.devices.map {
+            AppDeviceIn(id: $0.id, name: $0.name, platform: $0.platform ?? "", lastSeen: $0.lastSeen,
+                        current: $0.current, state: $0.state)
+        }
+        return AppMachinesPageInput(
+            hostOs: .macos, spaces: spaces, devices: devices, hostnames: relayHostnames,
+            presence: self.devices.relayOnline, now: self.devices.nowSecs)
+    }
+
+    /// The Machines page as every UI draws it (the core's
+    /// `machines_view::view`, which the New UI draws too): the list in
+    /// groups with one line each, and each machine's page.
+    public var machinesView: AppMachinesView {
+        let relay = (devices.snapshot?.machines ?? []).map {
+            AppMachinesViewRelay(id: $0.id, role: $0.role, team: $0.team, ownerEmail: $0.ownerEmail,
+                                 providesSpaces: $0.providesSpaces)
+        }
+        // The Cua Spaces update this app found: a peer on a newer Cua is
+        // fixed by it (this app bundles its Cua), and by nothing else.
+        let update = updates.updateState
+        let found = [.available, .downloading, .downloaded].contains(update.status) ? update.version ?? "" : ""
+        return appMachinesView(input: AppMachinesViewInput(
+            page: machinesPageInput, relay: relay, host: host.state, about: Self.machinesAbout, rows: nil,
+            health: machineHealth.keys.sorted().compactMap { machineHealth[$0] },
+            appUpdate: found, appUpdateReady: !found.isEmpty && update.status == .downloaded))
+    }
+
+    /// What each machine's own daemon last reported of its health, by
+    /// Machines page row id (`checkMachineHealth`): the view's issues.
+    public var machineHealth: [String: AppMachinesViewHealth] = [:]
+    @ObservationIgnored private var healthCheck: Task<Void, Never>?
+
+    /// At most this many machines are checked at once.
+    static let healthConcurrency = 3
+    /// One machine's check may take this long.
+    static let healthTimeout: Double = 35
+
+    /// Checks the health of every machine the Machines page can check
+    /// (`healthTarget`: This Mac through its daemon, another of your
+    /// machines that is online through its own daemon over the relay or
+    /// mesh), a few at once, and keeps what each said. A machine that is
+    /// no longer checkable (offline, removed) loses its old result, so no
+    /// stale issue shows. One check at a time; a call during one waits for
+    /// it.
+    public func checkMachineHealth() async {
+        if let running = healthCheck {
+            await running.value
+            return
+        }
+        let task = Task { await self.runHealthChecks() }
+        healthCheck = task
+        await task.value
+        healthCheck = nil
+    }
+
+    private func runHealthChecks() async {
+        let targets = machinesView.machines.compactMap { m in m.healthTarget.map { (id: m.id, target: $0) } }
+        let wanted = Set(targets.map(\.id))
+        machineHealth = machineHealth.filter { wanted.contains($0.key) }
+        let backend = self.backend
+        var pending = targets[...]
+        while !pending.isEmpty {
+            let batch = pending.prefix(Self.healthConcurrency)
+            pending = pending.dropFirst(batch.count)
+            let results = await withTaskGroup(of: (String, AppMachinesViewHealth).self) { group in
+                for t in batch {
+                    group.addTask {
+                        let machine = t.target.isEmpty ? nil : t.target
+                        let r = await withTimeout(seconds: Self.healthTimeout) {
+                            try await backend.machineHealth(machine: machine)
+                        }
+                        switch r {
+                        case .success(var h):
+                            h.id = t.id
+                            return (t.id, h)
+                        case .failure(let error):
+                            let why = (error as? TimeoutError) != nil
+                                ? "it didn\u{2019}t answer within \(Int(Self.healthTimeout)) s"
+                                : LiveSpacesBackend.words(error)
+                            return (t.id, AppMachinesViewHealth(id: t.id, checks: [], cuaVersion: "", error: why))
+                        }
+                    }
+                }
+                var out: [(String, AppMachinesViewHealth)] = []
+                for await r in group { out.append(r) }
+                return out
+            }
+            for (id, h) in results where wanted.contains(id) { machineHealth[id] = h }
+        }
+    }
+
+    /// This Mac as the Machines page names it: its name, the app's
+    /// version and macOS's.
+    static let machinesAbout: AppMachinesViewAbout = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        let os = v.patchVersion == 0 ? "macOS \(v.majorVersion).\(v.minorVersion)"
+            : "macOS \(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+        return AppMachinesViewAbout(
+            computerName: Foundation.Host.current().localizedName ?? "",
+            appVersion: info["CuaVersion"] as? String ?? info["CFBundleShortVersionString"] as? String ?? "",
+            osVersion: os)
+    }()
+
+    /// Renames a machine from the Machines page: `this-mac` is this Mac's
+    /// own relay registration (its host setup takes the name too).
+    public func renameMachine(id: String, name: String) async throws {
+        guard let clean = appDevicesCleanName(name: name) else {
+            throw CuaError.InvalidArgument(message: "A machine needs a name")
+        }
+        let machine = id == "this-mac" ? host.machineId : id
+        guard let machine, let relay = devices.devices else {
+            throw CuaError.InvalidArgument(message: "Renaming a machine needs a signed-in, enrolled Mac")
+        }
+        try await relay.renameMachine(id: machine, name: clean)
+        await host.refresh()
+        await devices.refresh()
+        await refresh(fresh: true)
+    }
+
+    /// Remove from account: `machine` leaves the relay directory, then
+    /// `device` is revoked. This Mac's own host setup is the host's
+    /// `remove` instead.
+    public func removeMachine(machine: String?, device: String?) async throws {
+        if let machine { try await backend.relayUnregister(id: "relay:\(machine)") }
+        if let device {
+            guard let relay = devices.devices else {
+                throw CuaError.InvalidArgument(message: "Revoking a device needs a signed-in Cua account")
+            }
+            try await relay.revoke(id: device)
+        }
+        await devices.refresh()
+        await refresh(fresh: true)
+    }
+
+    /// What each machine sharing its desktop (`relay:<machine>`) reported
+    /// as its hostname, by machine id: the page lists it and the device on
+    /// it once.
+    var relayHostnames: [String: String] {
+        var out: [String: String] = [:]
+        for space in spaces where space.id.hasPrefix("relay:") && space.host == nil {
+            if let name = backend.reportedHostname(id: space.id) { out[String(space.id.dropFirst(6))] = name }
+        }
+        return out
+    }
+
+    /// Your Spaces: neither This machine nor one of your machines.
+    var realSpaces: [AppSpace] {
+        spaces.filter { !$0.id.hasPrefix("relay:") && !detail($0).isHost }
+    }
+
+    /// Agent runs seen in any Space (a Space's detail, the web UI's
+    /// Agents page): the checklist's "Run an agent".
+    public private(set) var agentRunsSeen = 0
+
+    /// A Space's agent runs were read: `count` of them.
+    public func sawAgentRuns(_ count: Int) {
+        if count > agentRunsSeen { agentRunsSeen = count }
+    }
+
+    /// Whether the persistent agents were read for the checklist.
+    private var checklistReadAgents = false
+
+    /// What the checklist ticks off from what the app shows: the core's
+    /// one reading (`checklist::observe_from`), whichever UI is open.
+    var checklistSeen: AppChecklistAction {
+        appChecklistObserveFrom(seen: AppChecklistSeen(
+            machines: machinePageRows, spaces: spaces,
+            agents: UInt32(persistent.agentCount), runs: UInt32(agentRunsSeen)))
+    }
+
+    /// Ticks the checklist off from what the app shows now, and again each
+    /// time that changes, whichever UI is open (or none).
+    func followChecklist() {
+        let seen = withObservationTracking { checklistSeen } onChange: { [weak self] in
+            DispatchQueue.main.async { self?.followChecklist() }
+        }
+        checklist.send(seen)
+    }
+
+    /// "Add a machine": New Space's "Connect by address".
+    public func openAddMachine() async {
+        await openNativeNewSpace()
+        wizard.send(.showAddress)
+    }
+
+    /// Getting started (the palette, Help): opens the checklist again.
+    public func openGettingStarted() {
+        checklist.send(.reopen)
+        selection = .gettingStarted
+    }
+
+    /// A checklist step's button.
+    public func runChecklistStep(_ step: AppChecklistStep) async {
+        switch step {
+        case .addMachine:
+            selection = .machines
+            await openAddMachine()
+        case .createSpace: await openNewSpace()
+        case .teleport: await openOnSpace(.teleport)
+        case .share: await openOnSpace(.share)
+        case .runAgent: selection = .agents
+        }
+    }
+
+    /// Opens `action` on the first Space that offers it now; without one,
+    /// New Space (no Space yet) or the first Space (to start it).
+    private func openOnSpace(_ action: AppDetailActionId) async {
+        let real = realSpaces
+        if real.isEmpty { return await openNewSpace() }
+        let ready = real.first { space in
+            detail(space).actions.contains { $0.id == action && $0.enabled }
+        }
+        let space = ready ?? real[0]
+        selection = .space(space.id)
+        if ready != nil { detailRequest = DetailRequest(spaceId: space.id, action: action) }
     }
 
 
@@ -291,8 +634,10 @@ public final class AppModel {
     /// the registry's Spaces.
     func recompose() {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let spaces = host.host == nil ? registrySpaces
-            : appWithThisMachine(spaces: registrySpaces, status: host.summaryInput, nowMs: now)
+        // This Mac's own relay entry is "This machine", not one of "My machines".
+        let listed = appWithoutThisRelayMachine(spaces: registrySpaces, thisMachineId: host.machineId)
+        let spaces = host.host == nil ? listed
+            : appWithThisMachine(spaces: listed, status: host.summaryInput, nowMs: now)
         send(.syncSpaces(spaces: appCreatesCompose(spaces: spaces, state: creates)))
     }
 
@@ -336,27 +681,190 @@ public final class AppModel {
     }
 
     static let createTickMs = 250
+    /// How often the app's refresh checks relay sharing against the sign-in.
+    static let accountCheckInterval: TimeInterval = 120
 
     static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
-    /// Re-reads the registry (and the host).
-    public func refresh() async {
-        await host.refresh()
+    // MARK: - List health
+
+    /// How long one read of the registry may take before this refresh gives
+    /// up on it (the read keeps going; the next refresh waits on it rather
+    /// than asking again).
+    public var listTimeout: Double = 20
+    /// How long the host's own reads in a refresh may take.
+    public var hostTimeout: Double = 15
+    /// With no successful list read for this long, the daemon connection
+    /// is made again (`reconnect`).
+    public var listStaleAfter: TimeInterval = 45
+    /// The last time the registry was read.
+    public private(set) var lastListOk: Date?
+    /// The last time the daemon answered a list read, with the rows or with
+    /// an error of its own (the relay refused the sign-in, say): the
+    /// connection works, so a new one would not help.
+    public private(set) var lastListAnswer: Date?
+    /// The list health's clock (tests step it instead of waiting).
+    @ObservationIgnored var listClock: @MainActor () -> Date = { Date() }
+    /// Since when the list has been watched (the live services came in, or
+    /// the last reconnect).
+    private var listWatchedSince = Date()
+    /// Makes a new SDK client of the daemon (starting the daemon again when
+    /// it is gone) and hands it to the backend; false when it could not.
+    /// Set once the live services are in (`AppEnvironment.attach`).
+    public var reconnect: (@MainActor () async -> Bool)?
+    public private(set) var reconnecting = false
+    /// Reconnects so far (tests and logs).
+    public private(set) var reconnects = 0
+    /// The registry read in flight: refreshes share it, so a read that
+    /// never returns is asked once, not once a poll.
+    private var rowsInFlight: Task<[AppSpaceRow], Error>?
+    /// Registry reads started so far, the one in flight and the newest
+    /// one shown: an older read that answers late is not shown over it.
+    private var rowsReads = 0
+    private var rowsInFlightRead = 0
+    private var rowsShownRead = 0
+    private var hostInFlight: Task<Void, Never>?
+
+    /// The list poll: a refresh every `interval`, each one bounded, and a
+    /// reconnect when the list went stale. The window, the notch and New UI
+    /// all show what this keeps fresh.
+    public func startListPoll(every interval: Duration = .seconds(10)) -> Task<Void, Never> {
+        Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.refresh()
+                await self.checkListHealth()
+                try? await Task.sleep(for: interval)
+            }
+        }
+    }
+
+    /// Reconnects when the list has not been read for `listStaleAfter`
+    /// (nothing before the live services are in).
+    func checkListHealth(now: Date? = nil) async {
+        guard startup.isReady, reconnect != nil, !reconnecting else { return }
+        let now = now ?? listClock()
+        let since = max(lastListAnswer ?? listWatchedSince, listWatchedSince)
+        guard now.timeIntervalSince(since) >= listStaleAfter else { return }
+        await reconnectNow(reason: "the Space list was not read for \(Int(now.timeIntervalSince(since))) s")
+    }
+
+    /// A new connection to the daemon, then the list again. One at a time.
+    func reconnectNow(reason: String) async {
+        guard let reconnect, !reconnecting else { return }
+        reconnecting = true
+        reconnects += 1
+        NSLog("Cua Spaces: reconnecting to the cua daemon (%@)", reason)
+        // What hung on the old connection is left behind.
+        rowsInFlight = nil
+        hostInFlight = nil
+        let ok = await reconnect()
+        listWatchedSince = listClock()
+        reconnecting = false
+        if !ok { NSLog("Cua Spaces: the reconnect did not make a new connection; trying again later") }
+        await refresh()
+    }
+
+    /// Whether a failed read is the daemon's own answer, not a connection
+    /// that broke (only that one is made again).
+    static func daemonAnswered(_ error: Error) -> Bool {
+        switch error {
+        case CuaError.DaemonNotRunning, CuaError.Transport, CuaError.Closed: false
+        case is CuaError: true
+        default: false
+        }
+    }
+
+    /// The live services just came in: watch the list from now.
+    func watchListFromNow() {
+        listWatchedSince = listClock()
+    }
+
+    /// The host's reads, shared and bounded.
+    private func refreshHost() async {
+        let task = hostInFlight ?? Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.host.refresh()
+            // At launch, then every few minutes: a session that expired for
+            // good (or a `cua auth logout`) pauses relay sharing too.
+            await self.host.reconcileAccount(ifOlderThan: Self.accountCheckInterval)
+        }
+        hostInFlight = task
+        let finished = await withDeadline(seconds: hostTimeout) { await task.value }
+        if finished, hostInFlight == task { hostInFlight = nil }
+    }
+
+    /// The registry, shared and bounded (`TimeoutError` past `listTimeout`),
+    /// with the number of the read that answered. `fresh`: a new read, not
+    /// one already in flight, which started before the change just made
+    /// and may answer without it.
+    private func readRows(fresh: Bool = false) async throws -> (rows: [AppSpaceRow], read: Int) {
+        if fresh || rowsInFlight == nil {
+            rowsReads += 1
+            rowsInFlightRead = rowsReads
+            rowsInFlight = Task { [backend] in try await backend.rows() }
+        }
+        guard let task = rowsInFlight else { throw CancellationError() }
+        let read = rowsInFlightRead
+        let result = await withTimeout(seconds: listTimeout) { try await task.value }
+        if case .failure(TimeoutError.timedOut) = result {
+            // Still running: the next refresh waits on the same read.
+        } else if rowsInFlight == task {
+            rowsInFlight = nil
+        }
+        return (try result.get(), read)
+    }
+
+    /// Re-reads the registry (and the host). Bounded: a daemon that stopped
+    /// answering leaves the list as it was, and the poll reconnects.
+    /// `fresh` after a change this app made (a create, a delete): the list
+    /// is read again from now, so it shows the change.
+    public func refresh(fresh: Bool = false) async {
+        await refreshHost()
         cloudConfigured = await backend.cloudAvailable()
         do {
-            let rows = try await backend.rows()
+            let (rows, read) = try await readRows(fresh: fresh)
+            lastListOk = listClock()
+            lastListAnswer = lastListOk
+            // A read from before a newer one already shown is out of date.
+            guard read >= rowsShownRead else { return }
+            rowsShownRead = read
             let now = Int64(Date().timeIntervalSince1970 * 1000)
             registrySpaces = appRowsToSpaces(rows: rows, nowMs: now)
             creates = appCreatesSettle(state: creates, spaces: registrySpaces)
             recompose()
             loaded = true
+            rosterError = nil
+            // Your machines' load for their sidebar lines, every so often
+            // (each machine is asked; never holds up the list).
+            if registrySpaces.contains(where: { $0.id.hasPrefix("relay:") }),
+               hostsReadAt.map({ Date().timeIntervalSince($0) >= Self.hostsRefreshInterval }) ?? true {
+                hostsReadAt = Date()
+                Task { await refreshHosts() }
+            }
+            // The pool's cloud hosts, spend and events (it reads no more
+            // than every few seconds, and never holds up the list).
+            Task { await elastic.refresh() }
+            // The checklist's "Run an agent": read the persistent agents
+            // once (the Agents page reads them again when it opens).
+            if !checklistReadAgents, servicesIn, !checklist.state.done.contains(.runAgent) {
+                checklistReadAgents = true
+                Task { await persistent.loadAgents() }
+            }
             if selection == nil, let first = sidebar.selectedId { selection = .space(first) }
             // A preview for every running Space from the daemon's cache
             // (it survives restarts), before one is opened.
             let running = streamableSpaceIds
             Task { await thumbnails.warm(running) }
+        } catch TimeoutError.timedOut {
+            // The daemon is slow or gone: the list stays as it was, and the
+            // poll reconnects when it stays stale (`checkListHealth`).
         } catch {
-            show(error: "Could not list Spaces: \(LiveSpacesBackend.words(error))")
+            if Self.daemonAnswered(error) { lastListAnswer = listClock() }
+            // Errors may contain server bodies or credential-bearing URLs.
+            rosterError = loaded
+                ? "Could not refresh Spaces. Previously loaded rows may be out of date."
+                : "Could not load Spaces. Try refreshing again."
         }
     }
 
@@ -367,22 +875,97 @@ public final class AppModel {
 
     // MARK: - New Space
 
-    public func openNewSpace() async {
+    /// Opens New UI's New Space wizard (`on`: "Run on" preset, or nil);
+    /// false when there is no New UI window to show it in. Set by the New UI
+    /// window while the `web_ui` experiment is on.
+    public var openWebNewSpace: ((_ on: String?) -> Bool)?
+    /// Puts the New UI window in the native main window's place (the
+    /// `web_ui` experiment was turned on).
+    public var openWebUI: (() -> Void)?
+    /// Closes the New UI window and puts the native one in its place (the
+    /// `web_ui` experiment was turned off).
+    public var closeWebUI: (() -> Void)?
+    /// The first run is due again (Settings, Welcome, Show again): opens its
+    /// window (the web onboarding), which nothing else would while only
+    /// Settings is up.
+    public var openOnboarding: (() -> Void)?
+
+    /// New Space with "Run on" set to `on` (`host:<machine>`): a machine's
+    /// "New Space on <name>…".
+    public func openNewSpace(on: String) async {
+        if openInWebUI(on: on) { return }
+        await openNativeNewSpace()
+        wizard.send(.choosePlacement(on: on))
+    }
+
+    /// New Space: New UI's wizard while the `web_ui` experiment is on, else
+    /// (the fallback) the native sheet.
+    /// `quick`: the empty home's one click: that OS's default Space, created at once
+    /// when the core says it can be; else New Space opens on it and says why.
+    public func openNewSpace(quick os: AppSpaceOs? = nil) async {
+        if os == nil, openInWebUI(on: nil) { return }
+        await openNativeNewSpace(quick: os)
+    }
+
+    private func openInWebUI(on: String?) -> Bool {
+        guard settings.experiments.webUi, let open = openWebNewSpace else { return false }
+        return open(on)
+    }
+
+    /// The native New Space sheet (the web UI is off), or `quick`'s one click.
+    public func openNativeNewSpace(quick os: AppSpaceOs? = nil) async {
+        wizard.reset(env: await newSpaceEnv())
+        if let os {
+            wizard.send(.chooseOs(os: os))
+            if wizard.view.canContinue { create(wizard.view.plan); return }
+        }
+        showingNewSpace = true
+        telemetry?.record([.spaceWizard(action: "opened")])
+        self.cloud.onConnected = { [weak self] in self?.cloudsChanged() }
+    }
+
+    /// What New Space knows, freshly probed (this Mac's runtimes, storage,
+    /// GPUs, your machines that provide Spaces, your clouds, pricing): the
+    /// native sheet's env, and New UI's (`spaces.createOptions`).
+    /// Every probe runs at once and each is bounded, so the env comes in
+    /// seconds even when one of them hangs (New UI's `spaces.createOptions`
+    /// must answer before the page stops waiting).
+    public func newSpaceEnv() async -> AppWizardEnv {
         async let runtimesProbe = backend.localRuntimes()
         async let storageProbe = backend.localStorage()
         async let pricingProbe = backend.cloudPricing()
         async let gpusProbe = backend.gpuChoices()
         async let hostsProbe = backend.hosts()
-        let cloud = await backend.cloudAvailable()
+        async let cloudProbe = backend.cloudAvailable()
+        async let lumeProbe = backend.lumeSource()
+        async let linuxProbe = backend.linuxSource()
+        async let macosVmsProbe = backend.runningMacosVms()
         await self.cloud.refresh()
-        let (runtimes, storage, pricing, gpus) = await (runtimesProbe, storageProbe, pricingProbe, gpusProbe)
+        let (runtimes, storage, pricing, gpus, cloud) = await (runtimesProbe, storageProbe, pricingProbe, gpusProbe, cloudProbe)
+        (lumeSource, linuxSource) = await (lumeProbe, linuxProbe)
         hosts = await hostsProbe
-        wizard.reset(env: wizardEnv(cloud: cloud, runtimes: runtimes, storage: storage, pricing: pricing,
-                                    gpus: gpus))
-        showingNewSpace = true
-        telemetry?.record([.spaceWizard(action: "opened")])
-        self.cloud.onConnected = { [weak self] in self?.cloudsChanged() }
+        // Lume did not answer this time: keep what it said last (a VM that
+        // stopped since shows on the next read that answers).
+        runningMacosVms = await macosVmsProbe ?? runningMacosVms
+        return wizardEnv(cloud: cloud, runtimes: runtimes, storage: storage, pricing: pricing, gpus: gpus)
     }
+
+    /// What New Space knows without asking anything (no probe, no wait):
+    /// the env New UI gets while the live services are still starting.
+    public func knownNewSpaceEnv() -> AppWizardEnv {
+        wizardEnv(cloud: false, runtimes: nil, storage: nil, pricing: nil, gpus: nil)
+    }
+
+    /// The live services are in (the launch's stand-ins have them): until
+    /// then every probe would wait for them.
+    public var servicesIn: Bool {
+        guard let pending = backend as? PendingSpacesBackend else { return true }
+        return pending.gate.current != nil
+    }
+
+    /// macOS VMs running on this Mac (Lume's, Spaces or not), as New Space
+    /// last read them; nil when Lume did not say. Apple's license allows two.
+    public private(set) var runningMacosVms: Int?
 
     /// The connected clouds changed ("Connect a cloud"): the open wizard
     /// reads them again, where it is.
@@ -390,8 +973,67 @@ public final class AppModel {
         wizard.update(env: wizardEnv(from: wizard.env))
     }
 
-    /// Your machines that provide Spaces, as New Space last read them.
+    /// Your machines that provide Spaces, as New Space or the sidebar last
+    /// read them.
     var hosts: [AppSpaceHost] = []
+    /// When the sidebar last asked for `hosts`.
+    @ObservationIgnored private var hostsReadAt: Date?
+    /// How often the sidebar asks your machines how busy they are.
+    static let hostsRefreshInterval: TimeInterval = 30
+
+    /// Reads your machines that provide Spaces again (how busy each is).
+    func refreshHosts() async {
+        hostsReadAt = Date()
+        hosts = await backend.hosts()
+    }
+
+    /// The one short line under one of your machines in the sidebar ("3
+    /// running · 40% CPU", "Paused"); `nil` for any other row, or while the
+    /// machine is offline or reports no load.
+    func hostLoadLine(_ rowId: String) -> String? {
+        guard rowId.hasPrefix("relay:") else { return nil }
+        let id = String(rowId.dropFirst("relay:".count))
+        return hosts.first { $0.id == id }.flatMap { appHostLoadText(host: $0) }
+    }
+
+    /// Which Lume macOS Spaces run on (`runtime.lume`), once read.
+    public private(set) var lumeSource: String?
+    /// Which engine local Linux Spaces run on (`runtime.linux`), once read.
+    public private(set) var linuxSource: String?
+    /// `placement.overflow` (Settings, General), once read.
+    public private(set) var placementOverflow: Bool?
+
+    /// New Space's "Use built-in Lume" / "Use built-in runtime": switches
+    /// `runtime.lume` or `runtime.linux`, then the open wizard reads the
+    /// runtimes again (This Mac can run it now).
+    public func applyRuntimeSwitch(_ change: AppRuntimeSwitch) async {
+        let linux = change.setting == "runtime.linux"
+        do {
+            if linux {
+                try await backend.setLinuxSource(change.value)
+            } else {
+                try await backend.setLumeSource(change.value)
+            }
+        } catch {
+            show(error: LiveSpacesBackend.words(error))
+            return
+        }
+        if linux {
+            linuxSource = await backend.linuxSource() ?? change.value
+        } else {
+            lumeSource = await backend.lumeSource() ?? change.value
+        }
+        let runtimes = await backend.localRuntimes()
+        var e = wizard.env
+        let backends = runtimes?.ready
+        e.localAvailable = backends.map { !$0.isEmpty } ?? true
+        e.localReason = backends?.isEmpty == true ? "No local runtime found (Docker or Lume)." : nil
+        e.localBackends = backends
+        e.localDetails = runtimes?.details
+        e.lumeSource = lumeSource
+        e.linuxSource = linuxSource
+        wizard.update(env: e)
+    }
 
     private func wizardEnv(from e: AppWizardEnv) -> AppWizardEnv {
         var e = e
@@ -411,9 +1053,10 @@ public final class AppModel {
             localAvailable: backends.map { !$0.isEmpty } ?? true,
             localReason: backends?.isEmpty == true ? "No local runtime found (Docker or Lume)." : nil,
             localBackends: backends, localDetails: runtimes?.details, maxCpus: wizard.env.maxCpus,
-            hostArch: Self.hostArch, storage: storage.map(Self.wizardStorage),
+            hostArch: Self.hostArch, lumeSource: lumeSource, linuxSource: linuxSource,
+            storage: storage.map(Self.wizardStorage),
             cloudPricing: available ? pricing : nil, clouds: [], hosts: [],
-            experiments: settings.experiments, gpus: gpus))
+            experiments: settings.experiments, gpus: gpus, nameSeed: nil))
     }
 
     /// The New Space panel's Cancel.
@@ -442,7 +1085,8 @@ public final class AppModel {
             v.map { AppStorageVolume(availableBytes: $0.availableBytes, totalBytes: $0.totalBytes, name: $0.name) }
         }
         return AppLocalStorage(reserveBytes: s.reserveBytes, lume: volume(s.lume), qemu: volume(s.qemu),
-                               container: volume(s.container), pulled: s.pulled)
+                               container: volume(s.container), pulled: s.pulled,
+                               linuxRuntimeDownloadBytes: s.linuxRuntimeDownloadBytes)
     }
 
     /// "Create Space": the new Space shows in the list and the notch at
@@ -455,36 +1099,200 @@ public final class AppModel {
         telemetry?.record([.spaceWizard(action: "submitted")])
         let args = appWizardCreateArgs(plan: plan)
         let pendingId = "pending:\(UUID().uuidString.lowercased())"
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
-        sendCreate(.start(id: pendingId, name: args.name ?? "", os: plan.image.os,
+        startCreate(args, os: plan.image.os, pendingId: pendingId, select: plan.openDesktop)
+        // A failure stays on its row.
+        Task {
+            guard let id = try? await followCreate(args, os: plan.image.os, pendingId: pendingId), plan.openDesktop else { return }
+            WebUIWindowController.actions?.openSpace(id)
+        }
+    }
+
+    /// Runs a create from the core's create arguments: the native sheet's
+    /// (`create`) and New UI's (`spaces.create`, with the page's pending id).
+    /// The new Space shows in the list and the notch at once (the core's
+    /// pending row), follows the SDK's progress (also handed to `progress`)
+    /// and hands over to the registry's row when it is ready; returns its
+    /// id. A failure stays on its row; a cancelled create (Cancel, or `cua
+    /// spaces cancel` elsewhere) only leaves the list. Either way it throws.
+    ///
+    /// A failure that usually passes (the core's `fail_decision`: a runtime
+    /// that did not start this time, a network drop during the download, a
+    /// VM that did not answer in time) runs the create once more by itself,
+    /// the row saying "Retrying…"; `retrying` hears of it first (New UI's
+    /// page applies the same failure). Only the final outcome throws.
+    @discardableResult
+    public func runCreate(_ args: AppCreateSpaceArgs, os: AppSpaceOs, pendingId: String,
+                          progress: (@MainActor @Sendable (SpaceCreateProgress) -> Void)? = nil,
+                          retrying: (@MainActor @Sendable (_ error: String, _ errorVariant: String) -> Void)? = nil)
+        async throws -> String {
+        startCreate(args, os: os, pendingId: pendingId, select: false)
+        return try await followCreate(args, os: os, pendingId: pendingId, progress: progress, retrying: retrying)
+    }
+
+    /// The pending row (selected when `open`).
+    private func startCreate(_ args: AppCreateSpaceArgs, os: AppSpaceOs, pendingId: String, select open: Bool) {
+        // A create on one of your machines (`host:<machine>`) says which, so
+        // that machine's own record of the Space it is creating is not a
+        // second row next to this one, and a failure names the machine.
+        let machine = args.on.hasPrefix("host:") ? String(args.on.dropFirst("host:".count)) : nil
+        sendCreate(.start(id: pendingId, name: args.name ?? "", os: os,
                           provider: args.on == "cloud" ? .cloud : args.on == "local" ? .local : .relay,
-                          now: now,
-                          image: args.image, kind: args.kind, hostArch: Self.hostArch, gpu: args.gpu != nil))
+                          now: Self.nowMs(),
+                          image: args.image, kind: args.kind, hostArch: Self.hostArch, gpu: args.gpu != nil,
+                          host: machine, hostName: machine.flatMap(machineName(of:))))
         // The detail shows the live desktop inline: selecting the new Space
         // opens it (`plan.openDesktop`), starting with its progress.
-        if plan.openDesktop { select(pendingId) }
-        Task {
+        if open { select(pendingId) }
+    }
+
+    /// The name of one of your machines, from the Spaces it provides (or its
+    /// own entry on the relay).
+    private func machineName(of id: String) -> String? {
+        spaces.first { $0.id == "relay:\(id)" }?.name
+            ?? spaces.first { $0.host == id && $0.hostName != nil }?.hostName
+    }
+
+    /// Asks for macOS Local Network access before a macOS Space is created
+    /// on this Mac (the core's steps; nil in fixtures and tests that do not
+    /// set one).
+    public var localNetworkGate: LocalNetworkGate?
+
+    /// How long the daemon may take to take a create (its first progress
+    /// report, "Preparing", comes as it starts): past it the create fails
+    /// at once, with Try again, instead of after the 4 min stall.
+    public var createAcceptTimeout: Double = 30
+
+    /// The create the daemon never took.
+    struct CreateNotAccepted: LocalizedError {
+        let seconds: Int
+        var errorDescription: String? {
+            "Cua's background service didn't start this create within \(seconds) s. "
+                + "Cua Spaces reconnected to it. Try again."
+        }
+    }
+
+    /// The SDK's create, through to the registry's row; once more when the
+    /// core says the failure usually passes (`retryPending` on the row).
+    private func followCreate(_ args: AppCreateSpaceArgs, os: AppSpaceOs, pendingId: String,
+                              progress: (@MainActor @Sendable (SpaceCreateProgress) -> Void)? = nil,
+                              retrying: (@MainActor @Sendable (_ error: String, _ errorVariant: String) -> Void)? = nil)
+        async throws -> String {
+        // A macOS Space here needs Local Network access: explained and asked
+        // for now, or the create fails at once with the fix (never retried).
+        if let gate = localNetworkGate,
+           appLocalNetworkApplies(provider: args.on == "local" ? .local : .relay, os: os, hostIsMac: true) {
             do {
-                let id = try await backend.create(args, createId: pendingId) { progress in
-                    Task { @MainActor [weak self] in
-                        self?.sendCreate(.progress(id: pendingId, phase: progress.phase,
-                                                   fraction: progress.fraction, now: Self.nowMs(),
-                                                   bytesDone: progress.bytesDone, bytesTotal: progress.bytesTotal,
-                                                   bytesPerSecond: progress.bytesPerSecond))
+                try await gate.check()
+            } catch where isCancelled(error) {
+                sendCreate(.cancelDone(id: pendingId))
+                throw error
+            } catch {
+                sendCreate(.fail(id: pendingId, error: LiveSpacesBackend.words(error),
+                                 errorVariant: Self.errorVariant(error), now: Self.nowMs()))
+                throw error
+            }
+        }
+        while true {
+            let reconnectsBefore = reconnects
+            do {
+                return try await attemptCreate(args, pendingId: pendingId, progress: progress)
+            } catch where isCancelled(error) {
+                throw error
+            } catch {
+                guard let row = creates.pending.first(where: { $0.id == pendingId }),
+                      row.retryPending, !row.cancelling else { throw error }
+                retrying?(LiveSpacesBackend.words(error), Self.errorVariant(error))
+                // Cua's service did not take the create: it is being
+                // connected again; the second try goes over the new connection.
+                if row.retriedSubclass == "daemon_unresponsive", reconnect != nil {
+                    var waited = 0
+                    while (reconnects == reconnectsBefore || reconnecting) && waited < 120 {
+                        try? await Task.sleep(for: .milliseconds(250))
+                        waited += 1
                     }
                 }
-                sendCreate(.finish(id: pendingId, spaceId: id))
-                await refresh()
-                if selectedSpaceId == pendingId { select(id) }
-                // The registry lists it now; the pending row is gone from
-                // the list already, so drop it from the state too.
-                sendCreate(.dismiss(id: pendingId))
-            } catch where isCancelled(error) {
-                // Cancelled, here or elsewhere: the row goes; it did not fail.
-                sendCreate(.cancelDone(id: pendingId))
-            } catch {
-                sendCreate(.fail(id: pendingId, error: LiveSpacesBackend.words(error)))
             }
+        }
+    }
+
+    /// The error enum's case name telemetry and the core read (`Runtime`).
+    static func errorVariant(_ error: Error) -> String {
+        (error as? LocalNetworkRefusal)?.variant
+            ?? (error as? CuaError).flatMap { Mirror(reflecting: $0).children.first?.label } ?? ""
+    }
+
+    /// One run of the SDK's create: the row follows it; a failure is put on
+    /// the row (the core may turn it into a retry) and thrown.
+    private func attemptCreate(_ args: AppCreateSpaceArgs, pendingId: String,
+                               progress: (@MainActor @Sendable (SpaceCreateProgress) -> Void)?) async throws -> String {
+        do {
+            let accepted = CreateAcceptance()
+            let backend = self.backend
+            let create = Task {
+                // The connection it goes over, so a cancel of this attempt
+                // goes there too, never to the next connection's retry.
+                let connection = await (backend as? PendingSpacesBackend)?.connection() ?? backend
+                accepted.sent(on: connection)
+                return try await connection.create(args, createId: pendingId) { p in
+                    accepted.mark()
+                    Task { @MainActor [weak self] in
+                        self?.sendCreate(.progress(id: pendingId, phase: p.phase,
+                                                   fraction: p.fraction, now: Self.nowMs(),
+                                                   bytesDone: p.bytesDone, bytesTotal: p.bytesTotal,
+                                                   bytesPerSecond: p.bytesPerSecond))
+                        progress?(p)
+                    }
+                }
+            }
+            let id = try await awaitAccepted(create, accepted: accepted, pendingId: pendingId)
+            sendCreate(.finish(id: pendingId, spaceId: id))
+            await refresh(fresh: true)
+            if selectedSpaceId == pendingId { select(id) }
+            // Listed: the pending row is gone from the list already, so
+            // drop it from the state too. Not listed yet (a slow read): the
+            // finished row stays until a read lists the Space.
+            if registrySpaces.contains(where: { $0.id == id }) {
+                sendCreate(.dismiss(id: pendingId))
+            }
+            return id
+        } catch where isCancelled(error) {
+            // Cancelled, here or elsewhere: the row goes; it did not fail.
+            sendCreate(.cancelDone(id: pendingId))
+            throw error
+        } catch {
+            devices.noteRefusal(LiveSpacesBackend.words(error))
+            sendCreate(.fail(id: pendingId, error: LiveSpacesBackend.words(error),
+                             errorVariant: Self.errorVariant(error), now: Self.nowMs()))
+            throw error
+        }
+    }
+
+    /// The create's result, or `CreateNotAccepted` when the daemon reported
+    /// nothing within `createAcceptTimeout` (then the create is cancelled
+    /// where it may still arrive, and the connection is made again).
+    private func awaitAccepted(_ create: Task<String, Error>, accepted: CreateAcceptance,
+                               pendingId: String) async throws -> String {
+        let limit = createAcceptTimeout
+        let first = await withTimeout(seconds: limit) { try await create.value }
+        switch first {
+        case .success(let id): return id
+        case .failure(TimeoutError.timedOut) where !accepted.done:
+            NSLog("Cua Spaces: the cua daemon did not take create %@ within %d s", pendingId, Int(limit))
+            // Best effort: it may still reach the daemon over the old
+            // connection; never wait on it. Only that connection: the
+            // retry goes over the new one under the same create id.
+            if let connection = accepted.connection {
+                Task.detached {
+                    _ = await withTimeout(seconds: 30) { try await connection.cancelCreate(createId: pendingId) }
+                }
+            }
+            Task { @MainActor [weak self] in await self?.reconnectNow(reason: "a create was not taken") }
+            throw CreateNotAccepted(seconds: Int(limit.rounded(.up)))
+        case .failure(TimeoutError.timedOut):
+            // Taken: it runs as long as its phases do.
+            return try await create.value
+        case .failure(let error):
+            throw error
         }
     }
 
@@ -508,7 +1316,7 @@ public final class AppModel {
     public func addByAddress(url: String, token: String?, name: String?) async throws {
         try await backend.add(url: url, token: token, name: name)
         showingNewSpace = false
-        await refresh()
+        await refresh(fresh: true)
     }
 
     /// Whether the Space is being deleted (its row shows Deleting).
@@ -538,7 +1346,7 @@ public final class AppModel {
             do {
                 try await backend.remove(id: space.id, removeOnly: removeOnly || detail.removeOnly)
                 sendCreate(.deleteDone(id: space.id))
-                await refresh()
+                await refresh(fresh: true)
             } catch {
                 sendCreate(.deleteFail(id: space.id))
                 show(error: appDeleteFailedText(name: space.name, error: LiveSpacesBackend.words(error)))
@@ -563,8 +1371,9 @@ public final class AppModel {
             do {
                 try await backend.setPower(id: space.id, on: on)
                 sendCreate(.powerDone(id: space.id))
-                await refresh()
+                await refresh(fresh: true)
             } catch {
+                devices.noteRefusal(LiveSpacesBackend.words(error))
                 sendCreate(.powerFail(id: space.id, error: LiveSpacesBackend.words(error)))
             }
         }
@@ -577,6 +1386,7 @@ public final class AppModel {
     }
 
     public func show(error: String) {
+        devices.noteRefusal(error)
         banner = error
         bannerIsError = true
     }
@@ -587,16 +1397,22 @@ public final class AppModel {
     }
 
     /// The menu bar item's status line.
-    /// Counts the Spaces the user can open, the notch's count (This machine
-    /// only while it is shared and reachable).
-    public var statusLine: String { appStatusLine(count: appOpenableCount(spaces: spaces)) }
+    /// Counts the Spaces on or starting, the notch's count (never a stopped
+    /// Space, This machine or another of your machines).
+    public var statusLine: String { appOnStatusLine(count: appOnCount(spaces: spaces)) }
 
     /// The menu bar item's menu: the count, Cua Volume's sync state next to
     /// it and its conflicts, then the actions.
     public var menuBar: [AppMenuItem] {
-        appMenu(input: AppMenuInput(spaces: spaces, keyvault: keyvault.sharingLabel, sync: persistent.driveSync,
+        let items = appMenu(input: AppMenuInput(spaces: spaces, keyvault: keyvault.sharingLabel, sync: persistent.driveSync,
                                    nowMs: UInt64(Date().timeIntervalSince1970 * 1000),
                                    backend: persistent.driveBackend, experiments: settings.experiments))
+        // Still launching (opened at login, waiting for Keychain access):
+        // say so first, so the menu explains why nothing shows yet.
+        let title = startup.copy.title
+        guard !startup.isReady, !title.isEmpty else { return items }
+        return [AppMenuItem(id: .status, label: title, shortcut: nil, enabled: false),
+                AppMenuItem(id: .separator, label: "", shortcut: nil, enabled: false)] + items
     }
 
     /// The window chrome (account line, New Space, empty state).
@@ -609,30 +1425,121 @@ public final class AppModel {
 
     /// "Sign in" / "Sign in to Cua": the browser flow, the code while it waits.
     public func beginSignIn() async {
-        guard let account, signIn != .starting else { return }
+        guard let current = startSignIn() else { return }
+        await runSignIn(current)
+    }
+
+    /// "Get a code instead": a code to enter on any device, for when the
+    /// browser never gets back to the app.
+    public func beginSignIn(code: Bool) async {
+        guard let current = startSignIn(code: code) else { return }
+        await runSignIn(current)
+    }
+
+    /// Marks a sign-in as starting, now (the web page reads it at once), and
+    /// returns its attempt; nil when one is already starting.
+    @discardableResult
+    public func startSignIn(code: Bool = false) -> Int? {
+        guard account != nil, signIn != .starting else { return nil }
+        signInByCode = code
         signIn = .starting
+        signInURL = nil
+        signInAttempt += 1
+        return signInAttempt
+    }
+
+    /// Runs attempt `current`: every way it ends is shown (`signIn`), never
+    /// a silent stop.
+    func runSignIn(_ current: Int) async {
+        guard let account else { return }
         do {
-            let attempt = try await account.beginSignIn()
-            signIn = .waiting(userCode: attempt.userCode)
+            let attempt = signInByCode ? try await account.beginSignIn(code: true) : try await account.beginSignIn()
+            // Cancelled, retried or signed in while it started.
+            guard signInAttempt == current, signIn == .starting else { return }
+            signIn = .waiting(userCode: attempt.userCode, opened: attempt.opened)
+            signInURL = attempt.url
+            let timeout = signInTimeout
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: timeout)
+                guard let self, self.signInAttempt == current, case .waiting = self.signIn else { return }
+                self.signInFailed(appSignInFailed(reason: .notConfirmed, detail: nil))
+            }
             let who = try await attempt.wait()
-            guard case .waiting = signIn else { return }
+            // Whichever attempt the browser finished stored the session:
+            // take it, even when a retry or Cancel superseded this one (an
+            // earlier tab confirmed after all). Only a sign-out since then
+            // leaves it.
+            guard signInAttempt == current || identity == nil else { return }
+            signInAttempt += 1
+            let previous = identity
             identity = who ?? account.identity()
             host.identity = identity
             devices.signedIn = identity != nil
-            onboarding.send(.signedIn(identity: identity ?? ""))
+            // Activation funnel: the first run's page records `signed_in` on
+            // its own (the core's flow); a sign-in once it is done (from
+            // Settings, the machines page) records it here, for a new account.
+            if onboarding.completed, let who = identity, !who.isEmpty, who != previous {
+                telemetry?.record([.step(step: "signed_in", ok: true)])
+            }
             signIn = .idle
+            signInURL = nil
+            // Relay sharing paused while signed out comes back for its
+            // owner (another account is asked to set it up again).
+            await host.reconcileAccount()
+            await reloadTeams()
+            await reloadShareRemovals()
         } catch {
-            signIn = .failed(message: LiveSpacesBackend.words(error))
+            // A superseded attempt (a retry, Cancel) ends quietly; the one
+            // shown fails with its reason.
+            guard signInAttempt == current, signIn != .idle else { return }
+            let variant = (error as? CuaError).flatMap { Mirror(reflecting: $0).children.first?.label } ?? ""
+            signInFailed(appSignInFailedFromError(variant: variant, message: LiveSpacesBackend.words(error)))
         }
     }
 
-    public func cancelSignIn() { signIn = .idle }
+    /// Shown where the sign-in was started and in the sidebar's foot, with
+    /// a toast; counted by its kind only (the core keeps the words).
+    private func signInFailed(_ phase: AppSignInPhase) {
+        signIn = phase
+        signInURL = nil
+        guard case let .failed(reason, _, _) = phase else { return }
+        signInToast = signInFooter.toast
+        telemetry?.record(appTelemetrySignInFailure(reason: reason))
+    }
+
+    /// Stops waiting for the browser (the page can start again).
+    public func cancelSignIn() {
+        switch signIn {
+        case .starting, .waiting:
+            signInAttempt += 1
+            telemetry?.record(appTelemetrySignInFailure(reason: nil))
+        default: break
+        }
+        signIn = .idle
+        signInURL = nil
+    }
+
+    /// Opens the sign-in page again (the tab was closed).
+    public func reopenSignIn() {
+        guard let signInURL else { return }
+        NSWorkspace.shared.open(signInURL)
+    }
+
+    /// The sidebar's foot: every sign-in state in one place.
+    public var signInFooter: AppSignInFooter {
+        appSignInFooter(input: AppSignInFooterInput(identity: identity, cloudConfigured: cloudConfigured,
+                                                    canSignIn: account != nil, signIn: signIn,
+                                                    hasUrl: signInURL != nil))
+    }
 
     public func signOut() async {
         try? await account?.signOut()
         identity = nil
         host.identity = nil
         devices.signedIn = false
+        teamsState = .signedOut
+        // Signed out: relay sharing stops (the setup stays to resume).
+        await host.reconcileAccount()
         await devices.refresh()
         signIn = .idle
     }
@@ -644,11 +1551,62 @@ public final class AppModel {
             identity: identity, apiKeyClient: nil, signIn: signIn, canSignOut: account != nil && identity != nil,
             menuBar: settings.menuBar, defaultLocation: settings.defaultLocation, locationLockedBy: nil,
             telemetry: telemetryInput, agents: agentRows, agentsBusy: agentsBusy, agentsPending: agentsPending,
+            teams: teamsSettingsInput,
             billing: identity == nil ? nil : billingStatus, loginItem: loginItemInput,
             experiments: settings.experiments, keyvaultAutoWipe: keyvault.autoWipe,
             keyvaultUnlockPrompt: keyvault.unlockPromptShows,
             keyvaultSiteIcons: settings.keyvaultSiteIcons, keyvaultProtection: keyvault.page.protection,
-            autoConnect: settings.autoConnect))
+            autoConnect: settings.autoConnect, lumeSource: lumeSource, linuxSource: linuxSource,
+            overflow: placementOverflow))
+    }
+
+    /// Teams for Settings: the account's organizations with their people
+    /// (the Spaces API), and the account app's address for this environment.
+    var teamsSettingsInput: AppTeamsInput {
+        AppTeamsInput(accountAppUrl: appAccountAppUrl(), state: identity == nil ? .signedOut : teamsState,
+                      currentTeamId: settings.currentTeamId)
+    }
+
+    /// The account is in a team on the Teams plan, which sharing needs: nil
+    /// until Teams are read, so the server decides.
+    public var hasSharingTeam: Bool? {
+        if case .ready(let list) = teamsState { return list.contains { $0.plan == "teams" } }
+        return nil
+    }
+
+    /// Reads who lost access to a shared computer (sharing is for teams) and
+    /// words the one-line note. Nothing when signed out or when there is no one.
+    public func reloadShareRemovals() async {
+        guard identity != nil, let teamsReader else {
+            shareRemovalNote = nil
+            return
+        }
+        let removals = (try? await teamsReader.shareRemovals()) ?? []
+        shareRemovalNote = appShareRemovalNote(removals: removals)
+    }
+
+    /// Closes the note and tells the account it was seen, so it shows once.
+    public func dismissShareRemovalNote() {
+        shareRemovalNote = nil
+        guard let teamsReader else { return }
+        Task { try? await teamsReader.ackShareRemovals() }
+    }
+
+    /// Reads the account's Teams (Settings, Teams). A failure says so in the
+    /// row; the account app's links stay.
+    func reloadTeams() async {
+        guard identity != nil, let teamsReader else {
+            teamsState = .signedOut
+            return
+        }
+        if case .ready = teamsState {} else { teamsState = .loading }
+        do {
+            let input = try await teamsReader.teams()
+            guard identity != nil else { return }
+            teamsState = input.state
+        } catch {
+            teamsState = .failed(message: LiveSpacesBackend.words(error))
+        }
     }
 
     /// Settings, General with Settings, Storage after General while the Cua
@@ -664,15 +1622,36 @@ public final class AppModel {
 
     /// A switch in Settings, Experiments: saved, recorded, and followed by
     /// the first run and an open New Space. Off hides; nothing is undone.
+    /// The New UI's switch ("Use classic UI") also saves the user's choice,
+    /// which later launches keep whatever the default becomes.
     public func chooseExperiment(row: String, option: String) {
         let before = settings.experiments
-        let after = appExperimentsChoose(experiments: before, row: row, option: option)
-        let signals = appTelemetryExperimentsChanged(before: before, after: after)
-        guard !signals.isEmpty else { return }
-        settings.experiments = after
+        let next = appSettingsChooseExperiment(settings: settings, row: row, option: option)
+        guard next != settings else { return }
+        settings = next
+        let after = next.experiments
         saveSettings()
-        telemetry?.record(signals)
-        onboarding.send(.experimentsLoaded(experiments: after))
+        telemetry?.record(appTelemetryExperimentsChanged(before: before, after: after))
+        applyExperiments(before: before, after: after)
+    }
+
+    /// Settings → About's channel, saved; with no choice of the user's, the
+    /// New UI follows the channel's default at once.
+    public func setUpdateChannel(_ channel: AppUpdateChannel) {
+        settings.updateChannel = channel
+        let before = settings.experiments
+        if let appVersion { settings = appSettingsResolveNewUi(settings: settings, version: appVersion) }
+        saveSettings()
+        if settings.experiments != before { applyExperiments(before: before, after: settings.experiments) }
+    }
+
+    /// What follows a change of the switches: an open New
+    /// Space, and the New UI's window in place of the native one (or back).
+    private func applyExperiments(before: AppExperiments, after: AppExperiments) {
+        guard before != after else { return }
+        // New UI on: its window takes the native one's place; off: the reverse.
+        if !before.webUi, after.webUi { openWebUI?() }
+        if before.webUi, !after.webUi { closeWebUI?() }
         wizard.update(env: wizardEnv(from: wizard.env))
         // The Volume page went with Cua Volume: back to the Spaces.
         if selection == .drive, chrome.volumeLabel == nil { selection = nil }
@@ -738,12 +1717,24 @@ public final class AppModel {
         readLoginItem()
     }
 
+    /// Reads the usage-data switch alone. The web page gets it with its
+    /// Settings snapshot (`settings.get`) and drops every usage signal while
+    /// that has none, so it cannot wait for the native Settings view's
+    /// `loadSettings` (the page runs signed out, before any Settings view).
+    public func refreshTelemetry() {
+        telemetryInput = telemetry?.status()
+    }
+
     /// Reads what Settings shows (telemetry, the coding agents).
     public func loadSettings() async {
+        lumeSource = await backend.lumeSource()
+        linuxSource = await backend.linuxSource()
+        placementOverflow = await backend.placementOverflow()
         telemetryInput = telemetry?.status()
         readLoginItem()
         await storage.load()
         await reloadBilling()
+        await reloadTeams()
         await reloadAgents()
         await keyvault.refresh()
     }
@@ -756,7 +1747,7 @@ public final class AppModel {
         billingStatus = try? await billing.status()
     }
 
-    /// Opens a website page (Manage billing, Add credit, the Teams waitlist).
+    /// Opens a website page (Manage billing, Add credit, the account app's Teams page).
     public func openBillingPage(_ raw: String) {
         guard let url = URL(string: raw), url.scheme == "https" || url.scheme == "http" else { return }
         BillingBrowser.open(url)
@@ -780,11 +1771,36 @@ public final class AppModel {
     /// A choice row changed.
     public func choose(row: String, option: String) async {
         switch row {
+        case "team-current":
+            // Settings, Teams: the team to work in (saved; the option is its id).
+            settings.currentTeamId = option
+            saveSettings()
         case "notch":
             settings.menuBar = option == "hide"
             saveSettings()
+        case "macos-runtime":
+            do {
+                try await backend.setLumeSource(option)
+                lumeSource = await backend.lumeSource() ?? option
+            } catch {
+                show(error: LiveSpacesBackend.words(error))
+            }
+        case "linux-runtime":
+            do {
+                try await backend.setLinuxSource(option)
+                linuxSource = await backend.linuxSource() ?? option
+            } catch {
+                show(error: LiveSpacesBackend.words(error))
+            }
+        case "placement-overflow":
+            do {
+                try await backend.setPlacementOverflow(option == "on")
+                placementOverflow = await backend.placementOverflow() ?? (option == "on")
+            } catch {
+                show(error: LiveSpacesBackend.words(error))
+            }
         case "default-location":
-            settings.defaultLocation = option == "cloud" ? .cloud : .local
+            settings.defaultLocation = .local  // Cua Cloud has ended: only This Mac is a default
             saveSettings()
         case "auto-connect":
             settings.autoConnect = option == "on"
@@ -807,6 +1823,9 @@ public final class AppModel {
         case "telemetry":
             do {
                 telemetryInput = try telemetry?.setEnabled(option == "on")
+                // The switch sits beside the usage note (the first run's
+                // Welcome, Settings): the notice was seen.
+                telemetry?.acknowledgeNotice()
             } catch {
                 show(error: LiveSpacesBackend.words(error))
             }
@@ -820,12 +1839,14 @@ public final class AppModel {
         case "account": await signOut()
         case "sign-in": await beginSignIn()
         case "sign-in-code": cancelSignIn()
-        case "welcome": onboarding.restart()
+        case "welcome":
+            onboarding.restart()
+            openOnboarding?()
         case "launch-at-login-approve":
             loginItem?.openSystemSettings()
-        case "billing", "teams":
-            // A website page: billing (hidden while the apps do not offer
-            // Cua Cloud) or the Teams waitlist.
+        case "billing", "teams-manage", "teams-billing":
+            // The account app (app.cua.ai): invites, roles and plans for
+            // teams, billing.
             if let url = settingsPage.sections.flatMap(\.rows).first(where: { $0.id == row })?.linkUrl {
                 openBillingPage(url)
             }
@@ -844,6 +1865,14 @@ public final class AppModel {
         agentsBusy = false
     }
 
+    /// Starts the agent's own sign-in on this Mac (`codex login`); the rows
+    /// show `signedIn` once the agent wrote it.
+    func agentSignIn(_ agent: String) async throws {
+        guard let agentSetup else { return }
+        try await agentSetup.signIn(agent: agent)
+        await reloadAgents()
+    }
+
     func agentAction(_ ids: [String], remove: Bool) async {
         guard let agentSetup, !ids.isEmpty else { return }
         agentsPending += ids
@@ -860,4 +1889,16 @@ public final class AppModel {
         }
         await reloadAgents()
     }
+}
+
+/// Whether the daemon reported anything about a create yet.
+final class CreateAcceptance: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reported = false
+    private var sentOn: SpacesBackend?
+    func mark() { lock.withLock { reported = true } }
+    var done: Bool { lock.withLock { reported } }
+    /// The daemon connection the create was sent over (nil until it was).
+    func sent(on connection: SpacesBackend) { lock.withLock { sentOn = connection } }
+    var connection: SpacesBackend? { lock.withLock { sentOn } }
 }

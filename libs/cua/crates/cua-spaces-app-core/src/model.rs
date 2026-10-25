@@ -17,15 +17,32 @@ pub enum SpaceOs {
     Windows,
     /// Linux.
     Linux,
+    /// The host has not reported a recognized operating system.
+    #[serde(other)]
+    Unknown,
 }
 
 impl SpaceOs {
+    /// The system this build runs on, for the words of a view a native
+    /// shell asks the library for (the Electron shell on Windows and Linux).
+    /// macOS in the wasm core, whose callers name theirs (`hostOs`).
+    pub fn this_host() -> Self {
+        if cfg!(target_os = "windows") {
+            SpaceOs::Windows
+        } else if cfg!(target_os = "linux") {
+            SpaceOs::Linux
+        } else {
+            SpaceOs::Macos
+        }
+    }
+
     /// "macOS", "Windows", "Linux".
     pub fn label(self) -> &'static str {
         match self {
             SpaceOs::Macos => "macOS",
             SpaceOs::Windows => "Windows",
             SpaceOs::Linux => "Linux",
+            SpaceOs::Unknown => "Unknown",
         }
     }
 
@@ -35,6 +52,7 @@ impl SpaceOs {
             SpaceOs::Macos => "macos",
             SpaceOs::Windows => "windows",
             SpaceOs::Linux => "linux",
+            SpaceOs::Unknown => "unknown",
         }
     }
 
@@ -45,6 +63,26 @@ impl SpaceOs {
             "windows" => Some(SpaceOs::Windows),
             "linux" => Some(SpaceOs::Linux),
             _ => None,
+        }
+    }
+
+    /// What the app calls the computer it runs on, when that runs this
+    /// system: "This Mac", "This PC", "This computer".
+    pub fn this_machine(self) -> &'static str {
+        match self {
+            SpaceOs::Macos => "This Mac",
+            SpaceOs::Windows => "This PC",
+            SpaceOs::Linux | SpaceOs::Unknown => "This computer",
+        }
+    }
+
+    /// [`Self::this_machine`] mid-sentence: "this Mac", "this PC",
+    /// "this computer".
+    pub fn this_machine_lower(self) -> &'static str {
+        match self {
+            SpaceOs::Macos => "this Mac",
+            SpaceOs::Windows => "this PC",
+            SpaceOs::Linux | SpaceOs::Unknown => "this computer",
         }
     }
 }
@@ -282,6 +320,10 @@ pub struct SpacePower {
     /// Why the last power action failed, until the next one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why it stopped without being asked to, in plain words ("out of
+    /// memory"), while it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 /// How far a Space being created has come.
@@ -311,6 +353,43 @@ pub struct SpaceProgress {
     /// Cancel was pressed and the create is being cleaned up.
     #[serde(default)]
     pub cancelling: bool,
+    /// The app is running the create a second time by itself, after a
+    /// failure that usually passes (the label says "Retrying…" while it
+    /// prepares).
+    #[serde(default)]
+    pub retrying: bool,
+    /// It failed the same way twice in a row (same cause, same machine,
+    /// same image): the fix to show instead of a plain Try again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<CreateFix>,
+}
+
+/// What a fix button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CreateFixAction {
+    /// Copies `value` (a Terminal command) to the clipboard.
+    CopyCommand,
+    /// Opens `value` (a help page) in the browser.
+    OpenUrl,
+    /// Opens the failed create's details (the diagnostic report to review).
+    Details,
+}
+
+/// The fix for a create that keeps failing the same way: one plain
+/// sentence and one button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFix {
+    /// What is wrong and what to do, in plain words.
+    pub text: String,
+    /// The button's words.
+    pub label: String,
+    /// What the button does.
+    pub action: CreateFixAction,
+    /// The command to copy or the page to open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// One row of the SDK's `list_spaces`.
@@ -384,6 +463,11 @@ pub struct SpaceRow {
     /// (that machine created it) or `elsewhere` (another device did).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_delete: Option<String>,
+    /// Why a local Space stopped without being asked to, in plain words
+    /// ("out of memory", "killed", "exited with code 1"), as the SDK
+    /// recorded it; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 /// `arm64` or `amd64` for any spelling of a CPU architecture (`aarch64`,
@@ -399,6 +483,16 @@ pub fn normalize_arch(arch: &str) -> Option<&'static str> {
 /// The architecture in words: "ARM" or "x64".
 pub fn arch_label(arch: &str) -> Option<&'static str> {
     normalize_arch(arch).map(|a| if a == "arm64" { "ARM" } else { "x64" })
+}
+
+/// The architecture in words on a host of `os`: "ARM" or "x64" on a Mac
+/// (as [`arch_label`]), "arm64" or "x64" on Windows and Linux, where
+/// "ARM" alone reads as 32-bit.
+pub fn arch_label_on(os: SpaceOs, arch: &str) -> Option<&'static str> {
+    match os {
+        SpaceOs::Macos => arch_label(arch),
+        _ => normalize_arch(arch).map(|a| if a == "arm64" { "arm64" } else { "x64" }),
+    }
 }
 
 /// This machine's CPU architecture, as the image catalog spells it (`arm64`,
@@ -441,12 +535,24 @@ pub fn emulation_warning(
     host_arch: Option<&str>,
     arch: Option<&str>,
 ) -> Option<String> {
+    emulation_warning_on(SpaceOs::Macos, local, host_arch, arch)
+}
+
+/// [`emulation_warning`] on a host of `os` ("Emulated on this PC\u{2019}s
+/// arm64 processor. ...").
+pub fn emulation_warning_on(
+    os: SpaceOs,
+    local: bool,
+    host_arch: Option<&str>,
+    arch: Option<&str>,
+) -> Option<String> {
     let host = normalize_arch(host_arch?)?;
     let arch = normalize_arch(arch?)?;
     (local && host != arch).then(|| {
         format!(
-            "Emulated on this Mac\u{2019}s {} processor. Performance may be degraded.",
-            arch_label(host).unwrap_or(host)
+            "Emulated on {}\u{2019}s {} processor. Performance may be degraded.",
+            os.this_machine_lower(),
+            arch_label_on(os, host).unwrap_or(host)
         )
     })
 }
@@ -466,7 +572,7 @@ pub enum Location {
     Cloud,
     /// This Mac.
     Local,
-    /// The user's own cloud account (AWS, Google Cloud, Modal), connected
+    /// The user's own cloud account (AWS, Google Cloud, Hetzner, Modal), connected
     /// with `cua cloud connect`: the SDK's `on` is the provider's word
     /// (`aws`), which the wizard carries beside it.
     Yours,
@@ -474,16 +580,28 @@ pub enum Location {
     /// one added by its Tailscale or LAN address): the SDK's `on` is
     /// `host:<machine>`, which the wizard carries beside it.
     Host,
+    /// The least-loaded of the user's machines that can take it: this Mac
+    /// or one of their machines that provides Spaces (the SDK's
+    /// `on="auto"`). Offered only while the user has such a machine, and
+    /// never a default.
+    Auto,
 }
 
 impl Location {
-    /// "Cua Cloud" / "This Mac" / "Your cloud" / "Your machine".
+    /// "Cua Cloud" / "This Mac" / "Your cloud" / "Your machine" / "Auto".
     pub fn label(self) -> &'static str {
+        self.label_on(SpaceOs::Macos)
+    }
+
+    /// [`Self::label`] in a shell on `os`: local is "This PC" on Windows,
+    /// "This computer" on Linux.
+    pub fn label_on(self, os: SpaceOs) -> &'static str {
         match self {
             Location::Cloud => "Cua Cloud",
-            Location::Local => "This Mac",
+            Location::Local => os.this_machine(),
             Location::Yours => "Your cloud",
-            Location::Host => "Your machine",
+            Location::Host => "Your computer",
+            Location::Auto => "Auto",
         }
     }
 
@@ -491,7 +609,7 @@ impl Location {
     /// Cloud.
     pub fn other(self) -> Self {
         match self {
-            Location::Cloud | Location::Yours | Location::Host => Location::Local,
+            Location::Cloud | Location::Yours | Location::Host | Location::Auto => Location::Local,
             Location::Local => Location::Cloud,
         }
     }
@@ -504,6 +622,7 @@ impl Location {
             Location::Local => "local",
             Location::Yours => "yours",
             Location::Host => "host",
+            Location::Auto => "auto",
         }
     }
 }
@@ -537,8 +656,10 @@ impl SpaceKind {
 }
 
 /// The engine that runs a Space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// JSON is the SDK's plain `runtime` word: the built-in engines' words, or
+/// the name of an external runtime provider ([`Runtime::Other`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Runtime {
     /// Let the SDK pick.
     Auto,
@@ -552,23 +673,39 @@ pub enum Runtime {
     Lume,
     /// KubeVirt.
     Kubevirt,
+    /// An external runtime provider installed on this machine, by its name
+    /// (the `<name>` of its `cua-runtime-<name>` executable).
+    Other(String),
+}
+
+/// Whether `word` has the shape of an external runtime provider's name:
+/// `[a-z0-9][a-z0-9-]{0,31}`.
+pub fn valid_runtime_word(word: &str) -> bool {
+    let b = word.as_bytes();
+    (1..=32).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
 impl Runtime {
-    /// "Automatic", "gVisor", ...
-    pub fn label(self) -> &'static str {
+    /// "Automatic", "gVisor", ...; for an external runtime provider, the
+    /// name it gives itself while registered
+    /// ([`crate::wizard::set_external_runtimes`]), else its runtime word.
+    pub fn label(&self) -> String {
         match self {
-            Runtime::Auto => "Automatic",
-            Runtime::Gvisor => "gVisor",
-            Runtime::Runc => "runc",
-            Runtime::Qemu => "QEMU",
-            Runtime::Lume => "Lume",
-            Runtime::Kubevirt => "KubeVirt",
+            Runtime::Auto => "Automatic".into(),
+            Runtime::Gvisor => "gVisor".into(),
+            Runtime::Runc => "runc".into(),
+            Runtime::Qemu => "QEMU".into(),
+            Runtime::Lume => "Lume".into(),
+            Runtime::Kubevirt => "KubeVirt".into(),
+            Runtime::Other(n) => crate::wizard::external_runtime_label(n),
         }
     }
 
     /// The SDK's `runtime` word.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Runtime::Auto => "auto",
             Runtime::Gvisor => "gvisor",
@@ -576,6 +713,77 @@ impl Runtime {
             Runtime::Qemu => "qemu",
             Runtime::Lume => "lume",
             Runtime::Kubevirt => "kubevirt",
+            Runtime::Other(n) => n,
         }
+    }
+
+    /// Parses the SDK's `runtime` word: a built-in engine's, else an
+    /// external runtime provider's name. `None` for a word that is neither.
+    pub fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "auto" => Runtime::Auto,
+            "gvisor" => Runtime::Gvisor,
+            "runc" => Runtime::Runc,
+            "qemu" => Runtime::Qemu,
+            "lume" => Runtime::Lume,
+            "kubevirt" => Runtime::Kubevirt,
+            w if valid_runtime_word(w) => Runtime::Other(w.to_string()),
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for Runtime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Runtime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Runtime::parse(&word)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown runtime `{word}`")))
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_words_round_trip() {
+        for (word, rt) in [
+            ("auto", Runtime::Auto),
+            ("gvisor", Runtime::Gvisor),
+            ("runc", Runtime::Runc),
+            ("qemu", Runtime::Qemu),
+            ("lume", Runtime::Lume),
+            ("kubevirt", Runtime::Kubevirt),
+            ("acme", Runtime::Other("acme".into())),
+            ("acme-2", Runtime::Other("acme-2".into())),
+        ] {
+            let json = format!("\"{word}\"");
+            assert_eq!(serde_json::from_str::<Runtime>(&json).unwrap(), rt);
+            assert_eq!(serde_json::to_string(&rt).unwrap(), json);
+            assert_eq!(rt.as_str(), word);
+        }
+    }
+
+    #[test]
+    fn runtime_rejects_words_no_provider_can_have() {
+        for word in ["", "Acme", "-acme", "acme_vm", "a b", &"a".repeat(33)] {
+            assert!(
+                serde_json::from_str::<Runtime>(&format!("\"{word}\"")).is_err(),
+                "{word}"
+            );
+        }
+        assert!(valid_runtime_word(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn an_unregistered_provider_is_labelled_by_its_word() {
+        assert_eq!(Runtime::Gvisor.label(), "gVisor");
+        assert_eq!(Runtime::Other("zeta".into()).label(), "zeta");
     }
 }

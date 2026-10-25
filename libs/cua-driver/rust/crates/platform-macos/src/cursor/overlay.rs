@@ -16,18 +16,16 @@
 //! ## Coordinate system
 //!
 //! All coordinates are **screen points** with the **top-left origin**
-//! (matching `OverlayCommand::MoveTo` and AX element coordinates).  The
+//! (matching `OverlayCommand::MoveTo` and AX element coordinates).
 //! Each display has a separate NSWindow and backing scale. AppKit bottom-left
 //! frames are converted to the primary display's CG top-left coordinate space.
 //!
 //! ## Cross-platform note (2026-05 dedup audit)
 //!
 //! Animation state + render pipeline live in `cursor_overlay::render_state`
-//! (`RenderStateCore`, `tick_swift_constants`, `apply_command_base`,
-//! `render_frame`).  macOS uses the hardcoded Swift reference constants
-//! (peakSpeed=900, springK=400, overshoot=0.8) and the sentinel-snap
-//! variants of MoveTo / ClickPulse — see the wrapper around
-//! `apply_command_base` below.
+//! (`RenderStateCore`, `tick_motion`, `apply_command_base`,
+//! `render_frame`). macOS uses the shared trajectory player and first-placement
+//! variants of MoveTo / ClickPulse — see `apply_command_base` below.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -232,6 +230,12 @@ pub fn init(cfg: CursorConfig) {
                         reduced_motion: selection.reduced_motion,
                     },
                 ),
+                CursorEvent::KeyCombo { session, keys } => {
+                    (session, OverlayCommand::ShowKeyCombo(keys))
+                }
+                CursorEvent::SelectMotion { session, motion } => {
+                    (session, OverlayCommand::ApplyMotion(motion))
+                }
             };
             send_command(session, cmd);
         },
@@ -346,7 +350,7 @@ pub fn current_theme_state(
     Some((id, version, profile, fallback, state.core.visual.clone()))
 }
 
-/// Seed a brand-new (sentinel-positioned) cursor at an on-screen start point
+/// Seed a brand-new unplaced cursor at an on-screen start point
 /// offset up-left of `(target_x, target_y)` so the immediately-following
 /// `MoveTo` glides INTO the target instead of silently snapping. Without this,
 /// a cursor's very first action (common on a pure-AX run — launch app, AX-press
@@ -358,7 +362,7 @@ pub fn current_theme_state(
 /// to the target display, including displays with negative global coordinates.
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
-fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
+fn seed_start_if_unplaced(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
     let mut guard = RENDER.lock().unwrap();
     let Some(map) = guard.as_mut() else {
         return false;
@@ -369,19 +373,27 @@ fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool
         .iter()
         .find(|surface| contains(surface.frame, target_x, target_y))
         .map(|surface| surface.frame);
-    map.seed_start_if_sentinel(key, target_x, target_y, frame)
+    map.seed_start_if_unplaced(key, target_x, target_y, frame)
 }
 
-/// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
-/// completes and the spring overshoot begins.
+/// Animate the overlay cursor to `(x, y)` and suspend until the arrival frame
+/// has been presented.
 ///
 /// Mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
 /// Returns immediately (no animation) only when the overlay is disabled for
 /// this cursor. A brand-new cursor still at the off-screen sentinel is first
-/// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
+/// seeded on-screen via [`seed_start_if_unplaced`] so its FIRST action glides
 /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
 /// run).
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
+    animate_cursor_to_target(key, x, y, None).await;
+}
+
+/// [`animate_cursor_to`] with the targeted element's screen rect
+/// `[x, y, width, height]` (same space as `x`/`y`), so motion styles can use
+/// Fitts timing and highlight the target. `None` when the action has no
+/// element (pixel coordinates).
+pub async fn animate_cursor_to_target(key: CursorKey, x: f64, y: f64, target: Option<[f64; 4]>) {
     // Empty key is the explicit no-cursor sentinel → nothing to animate.
     if key.is_empty() {
         return;
@@ -389,7 +401,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
     // being short-circuited. After this the cursor has a position, so the
     // should-animate check passes on the first action just like later ones.
-    seed_start_if_sentinel(&key, x, y);
+    seed_start_if_unplaced(&key, x, y);
 
     // Check whether animation should run for THIS cursor. A disabled cursor
     // never animates; an absent cursor (seed found nothing to prime) is skipped.
@@ -397,7 +409,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         let guard = RENDER.lock().unwrap();
         matches!(
             guard.as_ref().and_then(|m| m.cursors.get(&key)),
-            Some(rs) if rs.core.cfg.enabled && rs.core.positioned
+            Some(rs) if rs.core.cfg.enabled && rs.core.placed
         )
     };
     if !should_animate {
@@ -418,13 +430,21 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
             // Arrive pointing upper-left (45°), matching the macOS system-cursor
             // convention and Swift reference (`endAngleDegrees: 45`).
             end_heading_radians: std::f64::consts::FRAC_PI_4,
+            target,
         },
     );
 
     // Active overlays acknowledge only after the current-generation frame has
     // been presented. The owning operation supplies cancellation and its budget;
     // a fixed animation timeout must not permit input before presentation.
-    wait_for_arrival(rx, RENDER_LOOP_RUNNING.load(Ordering::Acquire)).await;
+    await_arrival(rx, RENDER_LOOP_RUNNING.load(Ordering::Acquire)).await;
+}
+
+pub(crate) async fn await_arrival(
+    rx: tokio::sync::oneshot::Receiver<()>,
+    render_loop_running: bool,
+) -> bool {
+    wait_for_arrival(rx, render_loop_running).await
 }
 
 async fn wait_for_arrival(
@@ -528,12 +548,11 @@ impl RenderEntry for RenderState {
         &mut self.core
     }
 
-    /// Advance the animation by `dt`.  Uses the Swift reference constants
-    /// (peakSpeed=900, springK=400, overshoot=0.8) — see
-    /// [`RenderStateCore::tick_swift_constants`].  Returns true if an
-    /// arrival signal should be fired (the path just ended).
+    /// Advance the animation by `dt` with the shared trajectory player (see
+    /// [`RenderStateCore::tick_motion`]). Returns true if an arrival signal
+    /// should be fired (the cursor just reached its target).
     fn tick(&mut self, dt: f64) -> bool {
-        let fire_arrival = self.core.tick_swift_constants(dt);
+        let fire_arrival = self.core.tick_motion(dt);
 
         // Advance focus-rect fade (fades out over ~600ms).  macOS-only —
         // the shared core has no focus_rect concept.
@@ -585,7 +604,7 @@ impl RenderEntry for RenderState {
             || self.focus_rect.is_some()
             || (self.core.motion.idle_hide_ms > 0.0
                 && self.core.visible
-                && self.core.positioned
+                && self.core.placed
                 && self.core.idle_alpha >= 0.004)
     }
 }
@@ -1102,7 +1121,7 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
     state.core.cfg.enabled
         && state.core.visible
         && !state.core.pinned_target_off_workspace
-        && state.core.positioned
+        && state.core.placed
         && state.core.idle_alpha >= 0.004
 }
 
@@ -1525,6 +1544,23 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_batched_step_still_waits_for_presented_arrival() {
+        use cua_driver_core::step_pacing::{scope, StepPacing};
+        runtime().block_on(scope(StepPacing::Batched, async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let mut arrival = Box::pin(await_arrival(rx, true));
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                assert!(arrival.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tx.send(()).unwrap();
+            assert!(arrival.await);
+        }));
+    }
+
     fn window(window_id: u32, pid: i32, z_index: usize) -> crate::windows::WindowInfo {
         crate::windows::WindowInfo {
             window_id,
@@ -1565,7 +1601,7 @@ mod tests {
 
     fn placed<'a>(map: &'a mut RenderMap, key: &str) -> &'a mut RenderState {
         let frame = Some(ScreenFrame::new(0.0, 0.0, 100.0, 100.0));
-        assert!(map.seed_start_if_sentinel(key, 60.0, 60.0, frame));
+        assert!(map.seed_start_if_unplaced(key, 60.0, 60.0, frame));
         map.cursors.get_mut(key).unwrap()
     }
 
@@ -1638,8 +1674,25 @@ mod tests {
 
         placed(&mut map, "sessA");
         assert!(cursor_is_externally_visible(&map.cursors["sessA"]));
+        map.cursors.get_mut("sessA").unwrap().core.placed = false;
+        assert!(!cursor_is_externally_visible(&map.cursors["sessA"]));
+        map.cursors.get_mut("sessA").unwrap().core.placed = true;
 
         map.cursors.get_mut("sessA").unwrap().core.cfg.enabled = false;
+        assert!(!cursor_is_externally_visible(&map.cursors["sessA"]));
+    }
+
+    #[test]
+    fn a_cursor_on_a_negative_display_remains_externally_visible() {
+        let mut map = empty_map();
+        let state = placed(&mut map, "sessA");
+        state.core.pos = (-200.0, 30.0);
+        assert!(cursor_is_externally_visible(&map.cursors["sessA"]));
+        map.cursors
+            .get_mut("sessA")
+            .unwrap()
+            .core
+            .pinned_target_off_workspace = true;
         assert!(!cursor_is_externally_visible(&map.cursors["sessA"]));
     }
 

@@ -1,23 +1,16 @@
 {
   "title": "Spaces",
   "pages": [
-    "create",
+    "lifetime",
     "space",
+    "elastic",
+    "build",
+    "channel",
     "volume",
-    "volume-sync",
     "streams",
-    "windows",
+    "resources",
     "agents",
     "persistent-agents",
-    "cloud",
-    "teleport",
-    "decoded-media",
-    "teleport-host",
-    "teleport-apps",
-    "app-core",
-    "volume-app-core",
-    "agents-app-core",
-    "devices",
     "host"
   ]
 }

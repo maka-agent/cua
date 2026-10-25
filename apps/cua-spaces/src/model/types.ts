@@ -9,7 +9,7 @@
  */
 
 /** Operating system a Space runs. */
-export type SpaceOs = "macos" | "windows" | "linux";
+export type SpaceOs = "macos" | "windows" | "linux" | "unknown";
 
 /**
  * Lifecycle status of a Space.
@@ -115,12 +115,14 @@ export interface Space {
   /** Whether and how it turns off and on (the SDK's `power`), with a power
    * action in flight; absent when it cannot (a cloud Space). */
   power?: SpacePower;
-  /** For a Space in your cloud: the provider word (`aws`, `gcp`, `modal`),
+  /** For a Space in your cloud: the provider word (`aws`, `gcp`, `hetzner`, `modal`),
    * its account and region in words ("AWS · us-west-2"), and where Delete
    * Permanently can delete it (`here`, `host:<machine>`, `elsewhere`). */
   cloud?: string;
   cloudPlace?: string;
   cloudDelete?: string;
+  /** Why a local Space stopped without being asked to ("out of memory"). */
+  stopReason?: string;
 }
 
 /** A Space's power (the app core's `model::SpacePower`). */
@@ -133,6 +135,8 @@ export interface SpacePower {
   turningOn?: boolean | null;
   /** Why the last power action failed, until the next one. */
   error?: string | null;
+  /** Why it stopped without being asked to ("out of memory"), while it is off. */
+  stopReason?: string | null;
 }
 
 /** How far a Space being created has come. */

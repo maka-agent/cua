@@ -121,6 +121,10 @@ pub struct RunOptions {
     /// Give the agent the host bridge (MCP server `cua`: a pipe the host
     /// answers as the persistent agent, see `runner/bridge.mjs`).
     pub bridge: bool,
+    /// Make the run durable (see [`crate::durable`]): an epoch-fenced
+    /// journal, a tool ledger, resume with a recovery note. Implies
+    /// `exit_when_idle`.
+    pub durable: Option<crate::durable::DurableOptions>,
 }
 
 /// `meta.json`.
@@ -317,7 +321,35 @@ pub fn valid_home_name(name: &str) -> bool {
         })
 }
 
-fn valid_env_name(k: &str) -> Result<()> {
+/// Whether [`Agents::start`] must look for a credential in the guest: not
+/// when the caller passed one of the harness's keys, nor with a custom
+/// endpoint (a proxy may need none).
+fn needs_probe(h: &Harness, opts: &RunOptions) -> bool {
+    opts.endpoint.is_none()
+        && !h
+            .keys
+            .iter()
+            .any(|k| opts.env.get(*k).is_some_and(|v| !v.is_empty()))
+}
+
+/// Decides on the guest probe's output ([`Harness::auth_probe`]; `None`
+/// when it could not run): refused when no credential was found and cua
+/// knows every source, a note when it does not, nothing otherwise.
+fn credential_check(h: &Harness, probe: Option<&str>) -> Result<Option<String>> {
+    if probe.map(str::trim) != Some(harness::PROBE_NONE) {
+        return Ok(None);
+    }
+    if h.logins.is_some() {
+        return Err(Error::NoCredential(h.missing_credential()));
+    }
+    Ok(Some(format!(
+        "no provider key reached this run; unless {} is configured inside the Space it fails with \"Authentication required\": {}",
+        h.name,
+        h.auth_hint()
+    )))
+}
+
+pub(crate) fn valid_env_name(k: &str) -> Result<()> {
     if k.is_empty()
         || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         || k.as_bytes()[0].is_ascii_digit()
@@ -605,6 +637,8 @@ impl Agents {
             app_dirs: vec![],
             os: cua_agent_setup::Os::Linux,
             run_agent_clis: false,
+            // The guest's own cua: the bundled names, whatever the host is.
+            channel: cua_agent_setup::CuaChannel::Stable,
         };
         let dir = loc.resolve(&env).to_string_lossy().replace('\\', "/");
         let mut done = vec![];
@@ -676,6 +710,7 @@ impl Agents {
         let mut s = format!(
             "#!/bin/sh\n# cua agent run launcher (generated)\numask 077\ncd {q} || exit 1\n\
              export CUA_EVENTS_FILE={q}/events.jsonl\n\
+             export CUA_AGENT_RUN_ID=\"$(basename {q})\"\n\
              cua_state() {{ printf '{{\"status\":\"%s\",\"error\":%s,\"turn\":0}}' \"$1\" \"$2\" > {q}/.state.tmp && mv {q}/.state.tmp {q}/state.json; }}\n\
              cua_event() {{ n=$(( $(wc -l < {q}/events.jsonl 2>/dev/null || echo 0) + 1 )); \
              printf '{{\"seq\":%s,\"ts\":%s000,\"turn\":0,\"type\":\"%s\",\"message\":\"%s\"}}\\n' \"$n\" \"$(date +%s)\" \"$1\" \"$2\" >> {q}/events.jsonl; }}\n\
@@ -784,6 +819,15 @@ impl Agents {
             None => format!("{rdir}/work"),
         });
         let mut notes = vec![];
+        // A run without a credential fails with "Authentication required"
+        // only after the install; refuse it before anything is installed.
+        if needs_probe(h, &opts) {
+            // A probe that cannot run decides nothing.
+            let probe = self.sh(&h.auth_probe(), Duration::from_secs(30)).await.ok();
+            if let Some(note) = credential_check(h, probe.as_deref())? {
+                notes.push(note);
+            }
+        }
         // The run directory is private to the guest user. With a repo, the
         // clone creates the working directory.
         let mk_cwd = if opts.repo.is_some() {
@@ -806,7 +850,7 @@ impl Agents {
             }
             e
         });
-        let launch = harness::launch_with_home(
+        let mut launch = harness::launch_with_home(
             h,
             endpoint.as_ref(),
             opts.model.as_deref(),
@@ -814,6 +858,9 @@ impl Agents {
             &cwd,
             home_dir.as_deref(),
         )?;
+        if opts.durable.as_ref().is_some_and(|d| d.guard) {
+            launch.env.extend(crate::durable::guard_env(h));
+        }
         for f in &launch.files {
             let path = if f.rel.starts_with('/') {
                 f.rel.clone()
@@ -918,11 +965,16 @@ impl Agents {
             "prompt": prompt,
             "files": files,
             "mcpServers": mcp,
-            "exitWhenIdle": opts.exit_when_idle,
+            "exitWhenIdle": opts.exit_when_idle || opts.durable.is_some(),
             "idleExitSecs": opts.idle_exit_secs.unwrap_or(1800),
             "authMethod": h.auth_method,
+            "authHint": h.auth_hint(),
+            "keyCheck": harness::key_check(h, &opts.env, endpoint.is_some()),
             "mcpBridge": format!("{}/.cua/bin/mcp-remote", self.home),
             "modeKinds": h.mode_kinds,
+            "guardModeKinds": crate::durable::guard_mode_kinds(h),
+            "secretEnv": opts.durable.as_ref().map(|_| opts.env.keys().collect::<Vec<_>>()),
+            "durable": opts.durable.as_ref().map(|d| d.run_section(Some(&rdir))),
         });
         self.write(
             &format!("{rdir}/run.json"),
@@ -974,6 +1026,36 @@ impl Agents {
             cwd,
             run_dir: rdir,
             notes,
+        })
+    }
+
+    /// Starts a durable run again at a higher `epoch`: the same run
+    /// directory and journal, a new runner. The new runner raises the epoch
+    /// fence first, so a runner that is still alive somewhere is cut off; it
+    /// resumes the agent's session and sends it a recovery note. The caller
+    /// (a re-driver) owns the epoch counter; the run's secrets are still in
+    /// the run directory.
+    pub async fn redrive(&self, run_id: &str, epoch: u64) -> Result<Started> {
+        let rdir = self.run_dir(run_id);
+        let raw = self
+            .read(&format!("{rdir}/run.json"), 0, 0)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("run {run_id}")))?;
+        let next = crate::durable::redrive_run_json(&raw, epoch)?;
+        self.write(&format!("{rdir}/run.json"), next, 0o600).await?;
+        let meta: RunMeta = self
+            .json_file(&format!("{rdir}/meta.json"))
+            .await?
+            .and_then(|v| serde_json::from_value(v).ok())
+            .ok_or_else(|| Error::NotFound(format!("run {run_id} metadata")))?;
+        let tag = self.spawn_run(run_id).await?;
+        Ok(Started {
+            run_id: run_id.into(),
+            harness: meta.harness,
+            process_tag: tag,
+            cwd: meta.cwd,
+            run_dir: rdir,
+            notes: vec![],
         })
     }
 
@@ -1123,9 +1205,15 @@ impl Agents {
         if before.alive == Some(false) {
             // Restart: installs are cached, the runner resumes the session.
             if before.status == RunStatus::Failed {
+                let mut state = self
+                    .json_file(&format!("{rdir}/state.json"))
+                    .await?
+                    .unwrap_or_else(|| json!({}));
+                state["status"] = json!("starting");
+                state["error"] = Value::Null;
                 self.write(
                     &format!("{rdir}/state.json"),
-                    br#"{"status":"starting","error":null}"#.to_vec(),
+                    serde_json::to_vec(&state)?,
                     0o600,
                 )
                 .await?;
@@ -1321,6 +1409,97 @@ pub fn summarize(run_id: &str, status: RunStatus, evs: &[AgentEvent]) -> RunResu
 mod tests {
     use super::*;
 
+    fn probe(h: &Harness, home: &std::path::Path, env: &[(&str, &str)]) -> String {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(h.auth_probe())
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_run_without_a_credential_is_refused_before_the_install() {
+        let claude = harness::harness("claude-code").unwrap();
+        let codex = harness::harness("openai-codex").unwrap();
+        let home = std::env::temp_dir().join(format!("cua-auth-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // Nothing: refused, naming the keys and how they reach a run.
+        let p = probe(claude, &home, &[]);
+        if p == "login" {
+            // A host Keychain sign-in (macOS) answers the probe; covered below.
+        } else {
+            assert_eq!(p, harness::PROBE_NONE);
+            let e = credential_check(claude, Some(&p)).unwrap_err().to_string();
+            assert!(
+                e.contains("ANTHROPIC_API_KEY") && e.contains("env_from_host"),
+                "{e}"
+            );
+            assert!(
+                e.contains("Authentication required")
+                    && e.contains("`~/.cua/bin/claude` inside the Space"),
+                "{e}"
+            );
+            assert!(
+                e.contains("Add an Anthropic API key in Cua Spaces → Settings → Agents"),
+                "{e}"
+            );
+        }
+        let p = probe(codex, &home, &[]);
+        assert_eq!(p, harness::PROBE_NONE);
+        let e = credential_check(codex, Some(&p)).unwrap_err().to_string();
+        assert!(
+            e.contains("OPENAI_API_KEY") && e.contains("--env-from-host"),
+            "{e}"
+        );
+        assert!(
+            e.contains("Add an OpenAI API key in Cua Spaces → Settings → Agents"),
+            "{e}"
+        );
+        // A key in the guest environment, or a sign-in file: allowed.
+        assert_eq!(
+            probe(codex, &home, &[("CODEX_API_KEY", "k")]),
+            "env:CODEX_API_KEY"
+        );
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+        assert_eq!(probe(codex, &home, &[]), "login");
+        assert_eq!(credential_check(codex, Some("login")).unwrap(), None);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        assert_eq!(probe(claude, &home, &[]), "login");
+        let _ = std::fs::remove_dir_all(&home);
+        // A probe that could not run decides nothing.
+        assert_eq!(credential_check(codex, None).unwrap(), None);
+        // A harness configurable through its own files: a note, not a refusal.
+        let goose = harness::harness("goose").unwrap();
+        let note = credential_check(goose, Some("none")).unwrap().unwrap();
+        assert!(note.contains("OPENAI_API_KEY"), "{note}");
+    }
+
+    #[test]
+    fn a_passed_key_or_an_endpoint_skips_the_probe() {
+        let h = harness::harness("claude-code").unwrap();
+        assert!(needs_probe(h, &RunOptions::default()));
+        let mut o = RunOptions::default();
+        o.env.insert("ANTHROPIC_API_KEY".into(), "k".into());
+        assert!(!needs_probe(h, &o));
+        o.env.insert("ANTHROPIC_API_KEY".into(), String::new());
+        assert!(needs_probe(h, &o));
+        let o = RunOptions {
+            endpoint: Some(Endpoint {
+                base_url: "http://proxy".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!needs_probe(h, &o));
+    }
+
     /// Every MCP session of one run names the run, so the guest draws one
     /// cursor for it (cua-spacesd `/mcp` keys the driver session by it).
     #[test]
@@ -1400,6 +1579,32 @@ mod tests {
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(r.tool_calls, 1);
         assert!(r.usage.is_some());
+    }
+
+    /// Every run's environment names the run, so a Cua program inside it
+    /// records no agent runs of its own (the host that started it does).
+    #[test]
+    fn launch_script_names_the_run() {
+        let s = Agents::launch_script(
+            "/root",
+            &harness::HARNESSES[0],
+            "/root/.cua/agents/run-1a2b3c4d",
+            "/root/.cua/tools/cua-runner/x",
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("export CUA_AGENT_RUN_ID="))
+            .expect("exported");
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{line}; printf %s \"$CUA_AGENT_RUN_ID\""))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "run-1a2b3c4d");
     }
 
     /// The launcher is valid shell and never embeds a secret.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! Spaces in your own cloud account (`on="aws"`, `"gcp"`, `"modal"`).
+//! Spaces in your own cloud account (`on="aws"`, `"gcp"`, `"hetzner"`, `"modal"`).
 //!
 //! A cloud Space is a sandbox from that provider (the sandbox layer owns
 //! the cloud: provisioning, tags, records, stop and start, cleanup; see
@@ -19,8 +19,8 @@ use cua_sandbox_core::placement::Kind;
 use cua_sandbox_core::{CreateOptions, ProviderKind};
 
 pub use cua_sandbox_core::byoc::{
-    CloudCheck, CloudConnected, CloudCredentials, CloudDisconnected, CloudKind, CloudProvider,
-    CloudResource, CloudStatusReport, CloudSweepItem, CloudSweepReport, CloudTarget,
+    CloudAuditEntry, CloudCheck, CloudConnected, CloudCredentials, CloudDisconnected, CloudKind,
+    CloudProvider, CloudResource, CloudStatusReport, CloudSweepItem, CloudSweepReport, CloudTarget,
     CloudTestReport,
 };
 
@@ -135,7 +135,7 @@ impl Spaces {
             .cloned()
             .ok_or_else(|| {
                 Error::invalid(format!(
-                    "{word} sandbox {} did not join the relay (no relay machine)",
+                    "{word} sandbox {} did not join the relay (no relay computer)",
                     sandbox.name()
                 ))
             })?;
@@ -146,13 +146,18 @@ impl Spaces {
         if let Err(e) = self.space(&id).await {
             tracing::warn!(space = %id, "the new cloud Space did not answer its handshake yet: {e}");
         }
-        let info = self
-            .list_all()
-            .await?
-            .into_iter()
-            .find(|i| i.id == id)
-            .ok_or_else(|| Error::NotFound(format!("{id} on the relay")))?;
-        Ok(info)
+        // Provisioning has already succeeded. A directory outage must not
+        // conceal a recorded target or imply that creation should be retried.
+        let unavailable = || {
+            Error::Relay(cua_host::Error::Relay(
+                concat!(
+                    "The cloud sandbox was created, but its Space details could not be read. ",
+                    "Inspect the existing sandbox before retrying creation."
+                )
+                .into(),
+            ))
+        };
+        self.find(&id).await.map_err(|_| unavailable())
     }
 
     /// The name of the cloud sandbox behind a `relay:<machine>` Space, if

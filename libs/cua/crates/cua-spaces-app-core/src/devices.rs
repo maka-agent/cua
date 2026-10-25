@@ -399,10 +399,10 @@ pub fn activity_text(
     match e.kind.as_str() {
         "machine_access" if subject == "unenrolled device" => format!(
             "An unenrolled device opened {}",
-            machine.unwrap_or("a machine")
+            machine.unwrap_or("a computer")
         ),
-        "machine_access" => format!("{target} opened {}", machine.unwrap_or("a machine")),
-        "shared_access" => format!("{subject} opened {}", machine.unwrap_or("a machine")),
+        "machine_access" => format!("{target} opened {}", machine.unwrap_or("a computer")),
+        "shared_access" => format!("{subject} opened {}", machine.unwrap_or("a computer")),
         "unenrolled_access" => "An unenrolled device used your account".into(),
         "device_registered" => format!("{target} asked to join"),
         "device_enrolled" if subject == "bootstrap:grace" => {
@@ -412,7 +412,7 @@ pub fn activity_text(
             format!("{target} was enrolled by a fresh sign-in")
         }
         "device_rekeyed" => format!(
-            "{target} replaced {} on the same machine",
+            "{target} replaced {} on the same computer",
             name_or_id(devices, subject)
         ),
         "device_enrolled" => format!(
@@ -424,19 +424,19 @@ pub fn activity_text(
         "device_revoked" => format!("{} was revoked{}", name_or_id(devices, subject), by(device)),
         "share_added" => format!(
             "{} was shared with {subject}{}",
-            machine.unwrap_or("A machine"),
+            machine.unwrap_or("A computer"),
             by(device)
         ),
         "share_removed" => format!(
             "{} is no longer shared with {subject}{}",
-            machine.unwrap_or("A machine"),
+            machine.unwrap_or("A computer"),
             by(device)
         ),
-        "sharing_stopped" => format!("{} stopped sharing", machine.unwrap_or("A machine")),
-        "sharing_started" => format!("{} started sharing", machine.unwrap_or("A machine")),
-        "machine_registered" => format!("{} was added", machine.unwrap_or("A machine")),
-        "machine_reregistered" => format!("{} was set up again", machine.unwrap_or("A machine")),
-        "machine_removed" => format!("{} was removed", machine.unwrap_or("A machine")),
+        "sharing_stopped" => format!("{} stopped sharing", machine.unwrap_or("A computer")),
+        "sharing_started" => format!("{} started sharing", machine.unwrap_or("A computer")),
+        "machine_registered" => format!("{} was added", machine.unwrap_or("A computer")),
+        "machine_reregistered" => format!("{} was set up again", machine.unwrap_or("A computer")),
+        "machine_removed" => format!("{} was removed", machine.unwrap_or("A computer")),
         other => other.replace('_', " "),
     }
 }
@@ -465,8 +465,8 @@ pub fn labels() -> DevicesLabels {
         rename_title: "Rename Device".into(),
         rename_confirm: "Rename".into(),
         cancel: "Cancel".into(),
-        signed_out: "Sign in to Cua to see the devices that can reach your machines.".into(),
-        new_machines: "New Machines".into(),
+        signed_out: "Sign in to Cua to see the devices that can reach your computers.".into(),
+        new_machines: "New Computers".into(),
         confirm_machine: "Confirm".into(),
     }
 }
@@ -502,11 +502,11 @@ fn revoke_confirm(name: &str, this: bool) -> DeviceConfirm {
     DeviceConfirm {
         title: format!("Revoke \u{201c}{name}\u{201d}?"),
         message: if this {
-            "This device will no longer list or reach your machines until you enroll it again."
+            "This device will no longer list or reach your computers until you enroll it again."
                 .into()
         } else {
             format!(
-                "{name} will no longer list or reach your machines. To use it again, enroll it again."
+                "{name} will no longer list or reach your computers. To use it again, enroll it again."
             )
         },
         confirm_label: "Revoke".into(),
@@ -576,7 +576,7 @@ pub fn devices_view(input: &DevicesInput, now: u64) -> DevicesView {
         )),
         Some(("revoked", _)) => Some(enroll(
             BannerTone::Critical,
-            "This device was revoked. Enroll it again to reach your machines.".into(),
+            "This device was revoked. Enroll it again to reach your computers.".into(),
         )),
         // Signing in again enrolls it at once: the banner offers that
         // before the code.
@@ -596,10 +596,10 @@ pub fn devices_view(input: &DevicesInput, now: u64) -> DevicesView {
             },
             match input.enforce_after {
                 Some(t) if t > now => format!(
-                    "Enroll this device within {} to keep reaching your machines.",
+                    "Enroll this device within {} to keep reaching your computers.",
                     days(t - now)
                 ),
-                _ => "Enroll this device to reach your machines.".into(),
+                _ => "Enroll this device to reach your computers.".into(),
             },
         )),
     };
@@ -678,7 +678,7 @@ pub fn devices_view(input: &DevicesInput, now: u64) -> DevicesView {
                         format!("Re-verify \u{201c}{name}\u{201d} for another 30 days?")
                     } else {
                         format!(
-                            "Let \u{201c}{name}\u{201d} list and open your machines? Only approve a device you just signed in on."
+                            "Let \u{201c}{name}\u{201d} list and open your computers? Only approve a device you just signed in on."
                         )
                     },
                     requires_presence: true,
@@ -688,9 +688,9 @@ pub fn devices_view(input: &DevicesInput, now: u64) -> DevicesView {
                         format!("Approve \u{201c}{name}\u{201d}?")
                     },
                     notify_body: if expired {
-                        "It needs one approval to keep reaching your machines.".into()
+                        "It needs one approval to keep reaching your computers.".into()
                     } else {
-                        "A device signed in to your Cua account and asks to reach your machines."
+                        "A device signed in to your Cua account and asks to reach your computers."
                             .into()
                     },
                     name,
@@ -748,6 +748,74 @@ pub fn devices_view(input: &DevicesInput, now: u64) -> DevicesView {
         recent,
         unconfirmed_machines,
         labels: labels(),
+    }
+}
+
+// ---- Opening a machine while this device is not enrolled --------------
+
+/// Why this device cannot open the account's machines (signed in, but not
+/// enrolled): the one line above a machine's greyed-out Connect, its
+/// status word and the one action that fixes it (the enroll sheet, which
+/// offers a fresh sign-in or an approval from an enrolled device).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineAccessNotice {
+    /// This device's enrollment.
+    pub kind: EnrollmentKind,
+    /// The machine's Status: "Not enrolled", "Waiting for approval", ...
+    pub status: String,
+    /// The line above the disabled Connect.
+    pub text: String,
+    /// The action's label; it opens the enroll sheet.
+    pub action_label: String,
+}
+
+/// "Enroll This Mac…": the notice's action for a device that never
+/// enrolled, waits for approval or was revoked.
+pub const ENROLL_THIS_MAC_LABEL: &str = "Enroll This Mac\u{2026}";
+/// "Re-verify This Mac…": the notice's action once enrollment expired.
+pub const REVERIFY_THIS_MAC_LABEL: &str = "Re-verify This Mac\u{2026}";
+
+/// The notice for this device's enrollment `kind`: `None` while it may
+/// open the account's machines (enrolled, or still in the grace period).
+/// `pending_code` is the one-time code this device shows while it waits.
+pub fn machine_access_notice(
+    kind: EnrollmentKind,
+    pending_code: Option<&str>,
+) -> Option<MachineAccessNotice> {
+    let notice = |status: &str, text: String, action: &str| MachineAccessNotice {
+        kind,
+        status: status.into(),
+        text,
+        action_label: action.into(),
+    };
+    match kind {
+        EnrollmentKind::Enrolled | EnrollmentKind::Grace => None,
+        EnrollmentKind::NeedsEnrollment => Some(notice(
+            "Not enrolled",
+            "Enroll this Mac to connect to your other computers.".into(),
+            ENROLL_THIS_MAC_LABEL,
+        )),
+        EnrollmentKind::Waiting => Some(notice(
+            "Waiting for approval",
+            match pending_code.map(str::trim).filter(|c| !c.is_empty()) {
+                Some(code) => format!(
+                    "Waiting for approval. On an enrolled device, approve this Mac with the code {code}."
+                ),
+                None => "Waiting for approval. Approve this Mac in Settings \u{203a} Devices on an enrolled device.".into(),
+            },
+            ENROLL_THIS_MAC_LABEL,
+        )),
+        EnrollmentKind::Due => Some(notice(
+            "Re-verification due",
+            "This Mac\u{2019}s access expired. Re-verify it to connect to your other computers.".into(),
+            REVERIFY_THIS_MAC_LABEL,
+        )),
+        EnrollmentKind::Revoked => Some(notice(
+            "Revoked",
+            "This Mac was revoked. Enroll it again to connect to your other computers.".into(),
+            ENROLL_THIS_MAC_LABEL,
+        )),
     }
 }
 
@@ -946,7 +1014,7 @@ pub fn enroll_view(state: &EnrollState) -> EnrollView {
     };
     EnrollView {
         title: "Enroll This Device".into(),
-        lede: "Your machines can be reached only from enrolled devices.".into(),
+        lede: "Your computers can be reached only from enrolled devices.".into(),
         options,
         code: state.code.clone(),
         code_help: state.code.as_ref().map(|code| {
@@ -1170,14 +1238,16 @@ pub fn approve_view(state: &ApproveSheetState, devices: &[DeviceInput]) -> Appro
             format!("Approve \u{201c}{name}\u{201d}?")
         },
         message: if state.expired {
-            format!("{name} needs one approval to keep reaching your machines for another 30 days.")
+            format!(
+                "{name} needs one approval to keep reaching your computers for another 30 days."
+            )
         } else if fallback.is_some() {
             format!(
                 "The code expired. Approve \u{201c}{name}\u{201d} by ID instead? Only approve a device you just signed in on."
             )
         } else {
             format!(
-                "Enter the code {name} shows to let it list and open your machines. Only approve a device you just signed in on."
+                "Enter the code {name} shows to let it list and open your computers. Only approve a device you just signed in on."
             )
         },
         needs_code: !state.expired,
@@ -1251,7 +1321,7 @@ mod tests {
         assert_eq!(b.tone, BannerTone::Warning);
         assert_eq!(
             b.text,
-            "Enroll this device within 5 days to keep reaching your machines."
+            "Enroll this device within 5 days to keep reaching your computers."
         );
         assert_eq!(b.action, Some(DeviceAction::Enroll));
         assert!(!v.enrolled);
@@ -1356,7 +1426,7 @@ mod tests {
         // The replaced key is no longer listed: it reads as its id.
         assert_eq!(
             text("device_rekeyed", "dev_old"),
-            "MacBook replaced dev_old on the same machine"
+            "MacBook replaced dev_old on the same computer"
         );
     }
 
@@ -1763,5 +1833,37 @@ mod tests {
         });
         let s = failed(&expired, &one_match);
         assert!(!s.code_expired);
+    }
+
+    /// Signed in but not enrolled: every state says why Connect is greyed
+    /// out and offers the one action; enrolled (or in the grace period)
+    /// says nothing.
+    #[test]
+    fn machine_access_notice_covers_every_enrollment_state() {
+        assert!(machine_access_notice(EnrollmentKind::Enrolled, None).is_none());
+        assert!(machine_access_notice(EnrollmentKind::Grace, None).is_none());
+        let never = machine_access_notice(EnrollmentKind::NeedsEnrollment, None).unwrap();
+        assert_eq!(never.status, "Not enrolled");
+        assert_eq!(never.action_label, ENROLL_THIS_MAC_LABEL);
+        assert!(never.text.contains("Enroll this Mac"));
+        let waiting = machine_access_notice(EnrollmentKind::Waiting, Some("K7QX-M2RP")).unwrap();
+        assert_eq!(waiting.status, "Waiting for approval");
+        assert!(waiting.text.contains("K7QX-M2RP"), "{}", waiting.text);
+        // No code this launch: how to approve from another device instead.
+        let waiting = machine_access_notice(EnrollmentKind::Waiting, Some(" ")).unwrap();
+        assert!(
+            waiting.text.contains("Settings \u{203a} Devices"),
+            "{}",
+            waiting.text
+        );
+        let expired = machine_access_notice(EnrollmentKind::Due, None).unwrap();
+        assert_eq!(expired.action_label, REVERIFY_THIS_MAC_LABEL);
+        assert!(expired.text.contains("expired"));
+        let revoked = machine_access_notice(EnrollmentKind::Revoked, None).unwrap();
+        assert_eq!(revoked.action_label, ENROLL_THIS_MAC_LABEL);
+        for n in [never, waiting, expired, revoked] {
+            assert!(!n.text.contains('\u{2014}'), "{}", n.text);
+            assert!(n.text.len() < 100, "one short line: {}", n.text);
+        }
     }
 }

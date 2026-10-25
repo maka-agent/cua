@@ -11,18 +11,29 @@ import PackageDescription
 // decision is the core's.
 //
 //  * CuaSpacesMacKit: view models (thin holders of core state), views, the
-//    notch panel and the menu bar extra.
-//  * CuaSpacesMac: the app entry point.
+//    notch panel and the menu bar extra. The notch's views are
+//    CuaSpacesNotchUI (libs/spaces-notch-swift), shared with the Electron
+//    app's notch helper.
+//  * CuaSpacesMac: the app entry point, and the host service's login item
+//    (`--service-helper run`: the bundled cua-spacesd as its child, under
+//    the app's own identity).
 //  * CuaSpacesMacTests: view-model, parity and snapshot tests (swift-testing).
 //
 // Sparkle (pinned; Package.resolved) is the macOS updater: a binary
 // framework that scripts/build-app.sh embeds in Contents/Frameworks and
 // scripts/build-release.sh signs from the inside out.
 //
+// PermissionFlow (MIT, pinned to a release) is the guide to Screen
+// Recording and Accessibility in System Settings: it opens the pane and
+// floats this app beside it to drag into the list (PermissionGuide.swift).
+// Its strings ship as a SwiftPM resource bundle, which build-app.sh copies
+// into Contents/Resources like ours.
+//
 // UI tests (XCUITest) live in UITests/ and build through project.yml
 // (XcodeGen) on a macOS runner with Xcode.
 let package = Package(
     name: "CuaSpacesMac",
+    defaultLocalization: "en",
     platforms: [.macOS(.v26)],
     products: [
         .executable(name: "CuaSpacesMac", targets: ["CuaSpacesMac"]),
@@ -32,7 +43,9 @@ let package = Package(
         .package(name: "Cua", path: "../../libs/cua/swift"),
         .package(name: "CuaSpacesSDK", path: "../../libs/spaces-sdk-swift"),
         .package(name: "CuaSpacesApp", path: "../../libs/spaces-app-swift"),
+        .package(name: "CuaSpacesNotch", path: "../../libs/spaces-notch-swift"),
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
+        .package(url: "https://github.com/jaywcjlove/PermissionFlow", exact: "2.11.4"),
     ],
     targets: [
         .target(
@@ -43,7 +56,9 @@ let package = Package(
                 .product(name: "CuaSpacesStreaming", package: "CuaSpacesApp"),
                 .product(name: "CuaSpacesFFI", package: "CuaSpacesApp"),
                 .product(name: "CuaSpacesTeleport", package: "CuaSpacesApp"),
+                .product(name: "CuaSpacesNotchUI", package: "CuaSpacesNotch"),
                 .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "PermissionFlow", package: "PermissionFlow"),
             ],
             path: "Sources/CuaSpacesMacKit",
             resources: [.process("Resources")],
@@ -59,7 +74,10 @@ let package = Package(
             name: "CuaSpacesMacTests",
             dependencies: ["CuaSpacesMacKit", .product(name: "Cua", package: "Cua"),
                            .product(name: "CuaSpacesFFI", package: "CuaSpacesApp"),
-                           .product(name: "CuaSpacesStreaming", package: "CuaSpacesApp")],
+                           .product(name: "CuaSpacesStreaming", package: "CuaSpacesApp"),
+                           .product(name: "CuaSpacesNotchUI", package: "CuaSpacesNotch"),
+                           .product(name: "CuaSpacesNotchHelper", package: "CuaSpacesNotch"),
+                           .product(name: "PermissionFlow", package: "PermissionFlow")],
             path: "Tests/CuaSpacesMacTests",
             resources: [.copy("Snapshots")],
             swiftSettings: [.swiftLanguageMode(.v5)]

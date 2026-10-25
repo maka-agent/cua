@@ -125,13 +125,15 @@ func exerciseSpaces(_ cua: Cua, _ fx: Fixtures, tmp: URL, teleport: Bool = false
 @Suite(.serialized) struct SpacesTests {
     @Test func everyContractToolMapsToAGeneratedMethod() {
         let rows = spacesToolMethods()
-        #expect(rows.count == 86)
+        #expect(rows.count == 96)
         // Swift spells `Class.method_name` as `methodName` on the generated
         // protocol; check each against the protocol's requirement list.
         let spaceMethods: Set<String> = [
             "add", "list", "resolve", "remove", "create", "delete",
             "stop", "start", "space", "agentCapabilities", "listToolsJson", "callToolJson",
-            "cloudStatus", "cloudConnect", "cloudTest", "cloudDisconnect", "cloudSweep",
+            "cloudStatus", "cloudConnect", "cloudTest", "cloudDisconnect", "cloudSweep", "cloudAudit",
+            "cloudAddHost", "cloudBudget", "cloudHosts", "cloudPlan", "cloudReconcile",
+            "cloudRemoveHost", "prewarm", "prewarms", "removePrewarm",
             "persistentAgentCreate", "persistentAgents", "persistentAgentRemove",
             "persistentAgentSend", "persistentAgentSave", "agentPause", "agentResume",
             "routineAdd", "routines", "routineRemove", "routineSetEnabled", "notifyUser",
@@ -165,7 +167,7 @@ func exerciseSpaces(_ cua: Cua, _ fx: Fixtures, tmp: URL, teleport: Bool = false
             { $0.delete }, { $0.stop }, { $0.start }, { $0.space }, { $0.agentCapabilities },
             { $0.listToolsJson }, { $0.callToolJson },
             { $0.cloudStatus }, { $0.cloudConnect }, { $0.cloudTest }, { $0.cloudDisconnect },
-            { $0.cloudSweep },
+            { $0.cloudSweep }, { $0.cloudAudit },
             { $0.persistentAgentCreate }, { $0.persistentAgents }, { $0.persistentAgentRemove },
             { $0.persistentAgentSend }, { $0.persistentAgentSave }, { $0.agentPause },
             { $0.agentResume }, { $0.routineAdd }, { $0.routines }, { $0.routineRemove },
@@ -198,7 +200,7 @@ func exerciseSpaces(_ cua: Cua, _ fx: Fixtures, tmp: URL, teleport: Bool = false
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
         let cua = try Cua.embedded(
-            stateDir: tmp.appendingPathComponent("sbx").path, fleetFromEnv: false,
+            stateDir: tmp.appendingPathComponent("sbx").path,
             spacesHome: tmp.appendingPathComponent("cua").path,
             teleportHome: fx.fields["teleport_host_home"])
         try await exerciseSpaces(cua, fx, tmp: tmp)
@@ -228,6 +230,7 @@ func exerciseSpaces(_ cua: Cua, _ fx: Fixtures, tmp: URL, teleport: Bool = false
         var env = ProcessInfo.processInfo.environment
         env["HOME"] = home
         env["CUA_HOME"] = home
+        env["CUA_DAEMON_NO_RELAY"] = "1"
         env["CUA_SPACES_TELEPORT_HOME"] = fx.fields["teleport_host_home"]
         env["CUA_SPACES_AGENT_CREDENTIALS_HOME"] = "none"
         daemon.environment = env
