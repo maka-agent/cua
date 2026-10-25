@@ -147,9 +147,6 @@ pub(crate) fn scroll_actions(
     let mut remaining = match by {
         cua_driver_contract::ScrollBy::Line => amount,
         cua_driver_contract::ScrollBy::Page => amount * PAGE_WHEEL_DETENTS,
-        cua_driver_contract::ScrollBy::Pixel => {
-            bail!("pixel-unit scrolling is unavailable through the Hyprland detent protocol")
-        }
     };
     let mut actions = Vec::new();
     while remaining > 0 {
@@ -1537,13 +1534,6 @@ mod tests {
             assert!(scroll_actions(None, "sideways", 1, by).is_err());
             assert!(scroll_actions(None, "", 1, by).is_err());
         }
-        assert_eq!(
-            scroll_actions(None, "down", 1, cua_driver_contract::ScrollBy::Pixel)
-                .err()
-                .expect("pixel units must be refused before planning detent packets")
-                .to_string(),
-            "pixel-unit scrolling is unavailable through the Hyprland detent protocol"
-        );
         // The packet encoder keeps its own protocol bound.
         let over = Action::Scroll {
             point: None,

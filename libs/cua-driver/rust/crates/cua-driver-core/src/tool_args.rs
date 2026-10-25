@@ -78,6 +78,24 @@ pub fn parse_typed_projection<T: cua_driver_contract::ToolInput>(
     parse_typed_input(tool_name, Value::Object(projected))
 }
 
+/// Parse the portable line/page batch count before native effects. Platform
+/// pixel requests have their own units and must not pass through this bound.
+pub fn parse_scroll_amount(args: &Value) -> Result<usize, ToolResult> {
+    let requested = match args.get("amount") {
+        Some(value) => {
+            serde_json::from_value::<u64>(value.clone()).map_err(|error| error.to_string())
+        }
+        None => Ok(cua_driver_contract::ScrollInput::DEFAULT_AMOUNT),
+    };
+    requested
+        .and_then(cua_driver_contract::ScrollInput::checked_amount)
+        .map_err(|detail| {
+            ToolResult::error(format!("scroll: invalid arguments: {detail}")).with_structured(
+                json!({"code":"invalid_arguments","tool":"scroll","detail":detail}),
+            )
+        })
+}
+
 /// Keep the released desktop-coordinate wire parser independent of the SDK's
 /// explicit addressing API. Native handlers still accept legacy scope/defaults.
 pub fn parse_legacy_click_input(
@@ -551,6 +569,33 @@ impl ArgsExt for Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scroll_amount_rejects_invalid_batches_instead_of_clamping_or_defaulting() {
+        assert_eq!(parse_scroll_amount(&json!({})).unwrap(), 3);
+        for amount in [1, 3, 50] {
+            assert_eq!(
+                parse_scroll_amount(&json!({"amount":amount})).unwrap(),
+                amount as usize
+            );
+        }
+        for amount in [json!(0), json!(51), json!(u64::MAX)] {
+            let error = parse_scroll_amount(&json!({"amount":amount})).unwrap_err();
+            let structured = error.structured_content.unwrap();
+            assert_eq!(structured["code"], "invalid_arguments");
+            assert_eq!(
+                structured["detail"],
+                "amount must be between 1 and 50 for line/page scrolling"
+            );
+        }
+        for amount in [json!(-1), json!(1.5), json!("3"), Value::Null] {
+            let error = parse_scroll_amount(&json!({"amount":amount})).unwrap_err();
+            assert_eq!(
+                error.structured_content.unwrap()["code"],
+                "invalid_arguments"
+            );
+        }
+    }
 
     #[test]
     fn require_i32_happy_path() {

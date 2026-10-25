@@ -102,6 +102,17 @@ schemas as `outputSchema`; all action tools share the closed `ActionResult`
 schema even when their richer runtime input is not part of the portable SDK
 manifest.
 
+The portable `scroll` method accepts `by: "line" | "page"` and an optional
+`amount` of 1–50 repetitions (default 3), preserving the upstream SDK batch
+contract. An invalid batch is refused before input; it is never silently
+clamped. This range is not a native pixel-distance limit. Platform-aware clients
+use the same runtime-discovered `scroll` tool through the generic call for
+native units: Linux X11 accepts a separate non-zero `pixels` integer through
+65535, exclusive with `by` and `amount`; macOS accepts `by: "pixel"` with its
+native `amount` range of 1–20000. Linux converts pixels to wheel detents rather
+than promising a viewport displacement. These native forms are outside the
+portable DTO, and must not be sent to a backend that does not advertise them.
+
 See [Action results and postcondition verification](../docs/action-result-contract.md)
 for the wire shape and 0.14 migration guidance.
 

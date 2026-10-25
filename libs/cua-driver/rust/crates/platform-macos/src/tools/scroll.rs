@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use core_foundation::base::{CFRelease, CFTypeRef};
-use cua_driver_contract::{ScrollBy, ScrollDirection, ScrollInput};
+use cua_driver_contract::{ScrollDirection, ScrollInput};
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef},
@@ -49,15 +49,48 @@ impl ScrollTool {
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
-fn scroll_amount(by: &str, requested: u64) -> Option<usize> {
-    let maximum = match by {
-        "pixel" => 20000,
-        "line" | "page" => 50,
-        _ => return None,
+fn scroll_amount(by: &str, requested: u64) -> Result<usize, String> {
+    match by {
+        "pixel" => (1..=20000)
+            .contains(&requested)
+            .then_some(requested as usize)
+            .ok_or_else(|| "pixel scroll amount out of range".into()),
+        "line" | "page" => ScrollInput::checked_amount(requested),
+        _ => Err("unsupported scroll granularity".into()),
+    }
+}
+
+fn scroll_parameters(args: &Value) -> Result<(&'static str, usize), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+
+    let by = match args.get("by").and_then(Value::as_str) {
+        None if args.get("by").is_none() => "line",
+        Some("line") => "line",
+        Some("page") => "page",
+        Some("pixel") => "pixel",
+        _ => return Err(ToolResult::error("unsupported scroll granularity")),
     };
-    (1..=maximum)
-        .contains(&requested)
-        .then_some(requested as usize)
+    let requested = match args.get("amount") {
+        Some(_) => args.require_u64("amount")?,
+        None => ScrollInput::DEFAULT_AMOUNT,
+    };
+    scroll_amount(by, requested)
+        .map(|amount| (by, amount))
+        .map_err(ToolResult::error)
+}
+
+fn desktop_scroll_input(args: &Value, by: &str) -> Result<ScrollInput, ToolResult> {
+    if by != "pixel" {
+        return parse_typed_projection("scroll", args);
+    }
+    // Quartz pixels belong to the native tool, outside the portable line/page
+    // projection used here to validate the desktop target and coordinates.
+    let mut projection = args.clone();
+    if let Some(fields) = projection.as_object_mut() {
+        fields.remove("by");
+        fields.remove("amount");
+    }
+    parse_typed_projection("scroll", &projection)
 }
 
 const ELECTRON_BACKGROUND_SCROLL_UNAVAILABLE: &str = "Background scroll is unavailable for \
@@ -124,25 +157,28 @@ impl Tool for ScrollTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        if args.get("pixels").is_some() {
+            return ToolResult::error("unsupported: pixels is an X11-native scroll unit")
+                .with_structured(serde_json::json!({"code":"unsupported"}));
+        }
+        let (by, amount) = match scroll_parameters(&args) {
+            Ok(parameters) => parameters,
+            Err(error) => return error,
+        };
+        let precise = by == "pixel";
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
         {
-            let input = match parse_typed_projection::<ScrollInput>("scroll", &args) {
+            let input = match desktop_scroll_input(&args, by) {
                 Ok(input) => input,
                 Err(result) => return result,
             };
             let (x, y) = (input.x, input.y);
             let direction = input.direction.as_str();
-            let by = input.by.unwrap_or(ScrollBy::Line).as_str();
-            let amount = input.amount.unwrap_or(3);
-            let precise = input.by == Some(ScrollBy::Pixel);
-            let Some(amount) = scroll_amount(by, amount) else {
-                return ToolResult::error("scroll amount out of range");
-            };
             let step = if precise {
                 amount as i32
-            } else if input.by == Some(ScrollBy::Page) {
+            } else if by == "page" {
                 WHEEL_STEP_PAGE_PX
             } else {
                 WHEEL_STEP_LINE_PX
@@ -197,12 +233,7 @@ impl Tool for ScrollTool {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let by = args.str_or("by", "line");
-        let amount = args.u64_or("amount", 3);
-        let precise = by == "pixel";
-        let Some(amount) = scroll_amount(&by, amount) else {
-            return ToolResult::error("scroll granularity or amount out of range");
-        };
+        let by = by.to_owned();
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match self.state.snapshots.resolve(pid, &args) {
             Ok(r) => r,
@@ -865,12 +896,53 @@ mod tests {
 
     #[test]
     fn amount_limits_preserve_pixel_deltas_and_refuse_invalid_repetitions() {
-        assert_eq!(scroll_amount("pixel", 1100), Some(1100));
-        assert_eq!(scroll_amount("pixel", 20000), Some(20000));
-        assert_eq!(scroll_amount("pixel", 20001), None);
-        assert_eq!(scroll_amount("line", 50), Some(50));
-        assert_eq!(scroll_amount("page", 51), None);
-        assert_eq!(scroll_amount("line", 0), None);
-        assert_eq!(scroll_amount("unknown", 3), None);
+        assert_eq!(scroll_amount("pixel", 1100), Ok(1100));
+        assert_eq!(scroll_amount("pixel", 20000), Ok(20000));
+        assert_eq!(
+            scroll_amount("pixel", 20001).unwrap_err(),
+            "pixel scroll amount out of range"
+        );
+        assert_eq!(scroll_amount("line", 50), Ok(50));
+        for (by, amount) in [("page", 51), ("line", 0)] {
+            assert_eq!(
+                scroll_amount(by, amount).unwrap_err(),
+                "amount must be between 1 and 50 for line/page scrolling"
+            );
+        }
+        assert_eq!(
+            scroll_amount("unknown", 3).unwrap_err(),
+            "unsupported scroll granularity"
+        );
+    }
+
+    #[test]
+    fn desktop_native_pixels_keep_their_own_amount_and_validate_coordinates() {
+        let request = serde_json::json!({
+            "scope":"desktop", "x":12.5, "y":34.0,
+            "direction":"down", "by":"pixel", "amount":1100,
+        });
+        let (by, amount) = scroll_parameters(&request).unwrap();
+        assert_eq!((by, amount), ("pixel", 1100));
+        let input = desktop_scroll_input(&request, by).unwrap();
+        assert_eq!((input.x, input.y), (12.5, 34.0));
+        assert_eq!(input.direction, ScrollDirection::Down);
+
+        let mut malformed = request.clone();
+        malformed["x"] = serde_json::json!("12.5");
+        assert_eq!(
+            desktop_scroll_input(&malformed, by)
+                .unwrap_err()
+                .structured_content
+                .unwrap()["code"],
+            "invalid_arguments"
+        );
+        for amount in [serde_json::json!(0), serde_json::json!(1.5), Value::Null] {
+            malformed = request.clone();
+            malformed["amount"] = amount;
+            assert_eq!(
+                scroll_parameters(&malformed).unwrap_err().is_error,
+                Some(true)
+            );
+        }
     }
 }

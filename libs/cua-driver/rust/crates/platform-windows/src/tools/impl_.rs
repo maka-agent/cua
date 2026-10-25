@@ -6496,12 +6496,16 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if args.get("by").and_then(Value::as_str) == Some("pixel") {
+        if args.get("by").and_then(Value::as_str) == Some("pixel") || args.get("pixels").is_some() {
             return ToolResult::error(
                 "unsupported: pixel-unit input is unavailable on this native adapter",
             )
             .with_structured(serde_json::json!({"code":"unsupported"}));
         }
+        let amount = match cua_driver_core::tool_args::parse_scroll_amount(&args) {
+            Ok(amount) => amount as u32,
+            Err(error) => return error,
+        };
 
         use crate::input::delivery::{DeliveryMode, EventKind};
         use cua_driver_core::tool_args::ArgsExt;
@@ -6532,7 +6536,6 @@ impl Tool for ScrollTool {
             let sx = input.x as i32;
             let sy = input.y as i32;
             let direction = input.direction;
-            let amount = input.amount.unwrap_or(3) as u32;
             // Direction → (horizontal?, sign). Positive ticks = up / right.
             let (horizontal, sign) = match direction {
                 ScrollDirection::Up => (false, 1),
@@ -6560,7 +6563,6 @@ impl Tool for ScrollTool {
             Some(d) => d.to_owned(),
             None => return ToolResult::error("Missing required string field direction."),
         };
-        let amount = args.u64_or("amount", 3).clamp(1, 50) as u32;
 
         // Swift error wording 1:1.
         let raw_pid = match args.get("pid").and_then(|v| v.as_i64()) {

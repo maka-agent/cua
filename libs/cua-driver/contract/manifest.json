@@ -3906,15 +3906,15 @@
         "additionalProperties": false,
         "properties": {
           "amount": {
-            "maximum": 20000,
+            "description": "Line/page repetitions in one portable SDK call (1..=50). Platform-owned\nnative pixel requests use the richer live `scroll` tool schema instead.",
+            "maximum": 50,
             "minimum": 1,
             "type": "integer"
           },
           "by": {
             "enum": [
               "line",
-              "page",
-              "pixel"
+              "page"
             ],
             "type": "string"
           },

@@ -148,7 +148,7 @@ fn drag_steps_schema(_: &mut SchemaGenerator) -> Schema {
 }
 
 fn scroll_amount_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({ "type": "integer", "minimum": 1, "maximum": 20000 })
+    json_schema!({ "type": "integer", "minimum": 1, "maximum": ScrollInput::MAX_AMOUNT })
 }
 
 fn cursor_theme_id_schema(_: &mut SchemaGenerator) -> Schema {
@@ -330,7 +330,6 @@ impl ScrollDirection {
 pub enum ScrollBy {
     Line,
     Page,
-    Pixel,
 }
 
 impl ScrollBy {
@@ -338,7 +337,6 @@ impl ScrollBy {
         match self {
             Self::Line => "line",
             Self::Page => "page",
-            Self::Pixel => "pixel",
         }
     }
 }
@@ -1003,13 +1001,32 @@ pub struct ScrollInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "scroll_by_schema")]
     pub by: Option<ScrollBy>,
+    /// Line/page repetitions in one portable SDK call (1..=50). Platform-owned
+    /// native pixel requests use the richer live `scroll` tool schema instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "scroll_amount_schema")]
     pub amount: Option<u64>,
 }
 
+impl ScrollInput {
+    pub const DEFAULT_AMOUNT: u64 = 3;
+    /// Existing portable line/page batch contract; this is not a native pixel bound.
+    pub const MAX_AMOUNT: u64 = 50;
+
+    pub fn checked_amount(amount: u64) -> Result<usize, String> {
+        if !(1..=Self::MAX_AMOUNT).contains(&amount) {
+            return Err("amount must be between 1 and 50 for line/page scrolling".into());
+        }
+        Ok(amount as usize)
+    }
+}
+
 impl ToolInput for ScrollInput {
     const TOOL_NAME: &'static str = "scroll";
+
+    fn validate(&self) -> Result<(), String> {
+        Self::checked_amount(self.amount.unwrap_or(Self::DEFAULT_AMOUNT)).map(|_| ())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
@@ -1269,6 +1286,34 @@ mod tests {
             schema["properties"]["count"],
             json!({ "type": "integer", "minimum": 1, "maximum": 3 })
         );
+    }
+
+    #[test]
+    fn portable_scroll_keeps_line_page_batches_separate_from_native_pixel_units() {
+        let input = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({"x":12,"y":34,"direction":"down"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ScrollInput>(value)
+        };
+        for amount in [1, 3, 50] {
+            let decoded = input(serde_json::json!({"by":"page","amount":amount})).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap()["amount"], amount);
+        }
+        for amount in [0, 51, u64::MAX] {
+            assert_eq!(
+                input(serde_json::json!({"amount":amount}))
+                    .unwrap()
+                    .validate()
+                    .unwrap_err(),
+                "amount must be between 1 and 50 for line/page scrolling"
+            );
+        }
+        assert!(input(serde_json::json!({"by":"pixel"})).is_err());
+        assert!(input(serde_json::json!({"pixels":800})).is_err());
     }
 
     #[test]
