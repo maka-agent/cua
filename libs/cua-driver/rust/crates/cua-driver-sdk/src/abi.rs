@@ -170,6 +170,7 @@ impl AbiFailure {
 #[serde(default, deny_unknown_fields)]
 struct AbiDriverOptions {
     claude_code_compatibility: bool,
+    audio_enabled: bool,
     authorization: Option<AbiRuntimeAuthorizationOptions>,
 }
 
@@ -312,7 +313,7 @@ fn validate_explicit_authorization_sources(
 }
 
 fn runtime_options_from_abi(options: AbiDriverOptions) -> Result<RuntimeOptions, AbiFailure> {
-    match options.authorization {
+    let mut runtime = match options.authorization {
         Some(authorization) => {
             validate_explicit_authorization_sources(&authorization)?;
             let ceiling = SessionModeCeiling::for_trusted_sessions(
@@ -337,7 +338,9 @@ fn runtime_options_from_abi(options: AbiDriverOptions) -> Result<RuntimeOptions,
             ))
         }
         None => Ok(RuntimeOptions::embedded(options.claude_code_compatibility)),
-    }
+    }?;
+    runtime.audio_enabled = options.audio_enabled;
+    Ok(runtime)
 }
 
 fn environment_flag(name: &str) -> bool {

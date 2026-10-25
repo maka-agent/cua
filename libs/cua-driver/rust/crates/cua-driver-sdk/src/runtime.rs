@@ -47,6 +47,7 @@ pub(crate) enum RuntimeCreateError {
 #[derive(Clone)]
 pub(crate) struct RuntimeOptions {
     pub cursor: CursorConfig,
+    pub audio_enabled: bool,
     /// Whether the importing/embedding host owns macOS permission UX. Such a
     /// runtime may inspect TCC state but must never raise Cua-owned prompts.
     pub host_owns_permission_ux: bool,
@@ -73,6 +74,7 @@ impl RuntimeOptions {
                 enabled: false,
                 ..CursorConfig::default()
             },
+            audio_enabled: false,
             host_owns_permission_ux: true,
             host_bundle_id: None,
             compatibility_mode,
@@ -154,11 +156,18 @@ impl Drop for RuntimeSession {
         self.authorization_registry
             .revoke_connection(&self.connection);
         self.authorization_registry.revoke_host(&self.host);
+        let session = self.context.runtime_session_key(&self.public_session);
+        if self.runtime.is_running() {
+            // The canonical lifecycle retains cleanup hook copies itself.
+            // Closing a handle must not extend the runtime registry lifetime.
+            cua_driver_core::session::request_session_end(&session);
+        }
     }
 }
 
 pub(crate) struct DriverRuntime {
     registry: Arc<ToolRegistry>,
+    audio: Option<Arc<cua_driver_core::audio::AudioRecordings>>,
     authorization_registry: Arc<SessionAuthorizationRegistry>,
     compatibility_context: Arc<EffectiveAuthorizationContext>,
     shutdown: AtomicBool,
@@ -197,13 +206,18 @@ impl DriverRuntime {
                 .legacy_context()
                 .map_err(RuntimeCreateError::Authorization)?,
         };
-        let registry = Arc::new(cua_driver_core::tool::with_runtime_scope(
+        let (registry, audio) = cua_driver_core::tool::with_runtime_scope(
             compatibility_context.runtime_scope_key(),
-            || build_registry(&options),
-        ));
+            || {
+                let mut registry = build_registry(&options);
+                let audio = register_audio(&mut registry, &options);
+                (Arc::new(registry), audio)
+            },
+        );
         registry.init_self_weak();
         let runtime = Arc::new(Self {
             registry,
+            audio,
             authorization_registry,
             compatibility_context,
             shutdown: AtomicBool::new(false),
@@ -228,7 +242,12 @@ impl DriverRuntime {
     pub(crate) async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _drained = self.lifecycle.write().await;
-        self.stop_lifecycle_maintenance();
+        if let Some(maintenance) = self.stop_lifecycle_maintenance() {
+            let _ = tokio::task::spawn_blocking(move || maintenance.join()).await;
+        }
+        if let Some(audio) = self.audio.clone() {
+            let _ = tokio::task::spawn_blocking(move || audio.close_all()).await;
+        }
         self.authorization_registry.revoke_all();
         let runtime_prefix = format!(
             "__cua_runtime_{}:",
@@ -246,13 +265,11 @@ impl DriverRuntime {
         let _ = tokio::task::spawn_blocking(move || recording.stop_owner(None)).await;
     }
 
-    fn stop_lifecycle_maintenance(&self) {
-        if let Some(maintenance) = self.lifecycle_maintenance.lock().unwrap().take() {
-            let _ = maintenance.shutdown.send(());
-            if maintenance.thread.thread().id() != std::thread::current().id() {
-                let _ = maintenance.thread.join();
-            }
-        }
+    fn stop_lifecycle_maintenance(&self) -> Option<std::thread::JoinHandle<()>> {
+        let maintenance = self.lifecycle_maintenance.lock().unwrap().take()?;
+        let _ = maintenance.shutdown.send(());
+        (maintenance.thread.thread().id() != std::thread::current().id())
+            .then_some(maintenance.thread)
     }
 
     pub(crate) fn tools_list(&self) -> Option<Value> {
@@ -458,10 +475,32 @@ fn activity_lifecycle_event(
 impl Drop for DriverRuntime {
     fn drop(&mut self) {
         let was_running = !self.shutdown.swap(true, Ordering::AcqRel);
-        self.stop_lifecycle_maintenance();
+        let maintenance = self.stop_lifecycle_maintenance();
         self.authorization_registry.revoke_all();
         let runtime_scope = self.compatibility_context.runtime_scope_key();
         let runtime_prefix = format!("__cua_runtime_{runtime_scope}:");
+        if let Some(audio) = self.audio.clone() {
+            let registry = self.registry.clone();
+            let _ = std::thread::Builder::new()
+                .name("cua-audio-runtime-cleanup".into())
+                .spawn(move || {
+                    if let Some(maintenance) = maintenance {
+                        let _ = maintenance.join();
+                    }
+                    let _ = audio.close_all();
+                    cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
+                    cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
+                    cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
+                    cua_driver_core::snapshot_store::retire_runtime_scope(&runtime_scope);
+                    if was_running {
+                        let _ = registry.recording.stop_owner(None);
+                    }
+                });
+            return;
+        }
+        if let Some(maintenance) = maintenance {
+            let _ = maintenance.join();
+        }
         cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
         cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
         cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
@@ -554,7 +593,44 @@ fn spawn_lifecycle_maintenance(runtime: &Arc<DriverRuntime>) -> LifecycleMainten
 /// Session 0). Finite CLI inspection commands use it to preserve their
 /// desktop-free compatibility contract without weakening runtime admission.
 pub(crate) fn tool_inventory(options: RuntimeOptions) -> Value {
-    build_registry(&options).tools_list()
+    let mut registry = build_registry(&options);
+    let _audio = register_audio(&mut registry, &options);
+    registry.tools_list()
+}
+
+fn register_audio(
+    registry: &mut ToolRegistry,
+    options: &RuntimeOptions,
+) -> Option<Arc<cua_driver_core::audio::AudioRecordings>> {
+    if !options.audio_enabled {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    let factory = platform_macos::audio::LoopbackAudioBackendFactory;
+    #[cfg(target_os = "windows")]
+    let factory = platform_windows::audio::LoopbackAudioBackendFactory;
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    let factory = platform_linux::audio::LoopbackAudioBackendFactory;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    {
+        Some(cua_driver_core::audio::register_tools(
+            registry,
+            Arc::new(factory),
+        ))
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    )))]
+    {
+        let _ = registry;
+        None
+    }
 }
 
 fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
@@ -780,6 +856,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    fn computer_audio_requires_explicit_runtime_constructor_opt_in() {
+        let mut options = RuntimeOptions::embedded(false);
+        let disabled = tool_inventory(options.clone());
+        for name in ["start_audio_recording", "stop_audio_recording"] {
+            assert!(!disabled["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name));
+        }
+        options.audio_enabled = true;
+        let enabled = tool_inventory(options);
+        for name in ["start_audio_recording", "stop_audio_recording"] {
+            assert!(enabled["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name));
+        }
+    }
+
+    #[test]
     fn canonical_inventory_advertises_unavailable_perception_tool() {
         let inventory = tool_inventory(RuntimeOptions::embedded(false));
         let tools = inventory["tools"].as_array().unwrap();
@@ -984,6 +1087,48 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_bound_session_runs_its_exact_canonical_cleanup() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+        let mut options = standard_options();
+        options.audio_enabled = true;
+        let runtime = DriverRuntime::create(options).unwrap();
+        let session = runtime
+            .create_trusted_session(DelegatedSessionRequest {
+                public_session: "runtime-close-resource".into(),
+                transport_session: "runtime-close-resource-transport".into(),
+                mode: PermissionMode::Standard,
+                ttl: Duration::from_secs(60),
+                idle_ttl: Duration::from_secs(30),
+                capability_manifest: None,
+            })
+            .unwrap();
+        let internal = session.context.runtime_session_key(&session.public_session);
+        let observed = internal.clone();
+        let (completed, mut completion) = tokio::sync::mpsc::unbounded_channel();
+        let _hook = cua_driver_core::session::register_scoped_fallible_session_end_hook(
+            "runtime-close-resource-test",
+            move |ended| {
+                if ended == observed {
+                    completed.send(()).unwrap();
+                }
+                Ok(())
+            },
+        );
+        let started = session
+            .invoke("start_session", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_ne!(started.is_error, Some(true));
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(5), completion.recv())
+            .await
+            .expect("closing a bound SDK session must end its native resources")
+            .unwrap();
+        assert!(cua_driver_core::session::is_session_ended(&internal));
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn shutdown_stops_lifecycle_maintenance() {
         let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
@@ -1007,5 +1152,38 @@ mod tests {
             probe.send(()).is_err(),
             "lifecycle maintenance is still running after shutdown"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_waits_for_maintenance_without_blocking_the_executor() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+        let mut options = standard_options();
+        options.audio_enabled = true;
+        let runtime = DriverRuntime::create(options).unwrap();
+        let original = runtime.stop_lifecycle_maintenance().unwrap();
+        tokio::task::spawn_blocking(move || original.join().unwrap())
+            .await
+            .unwrap();
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
+        let (entered, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            shutdown_rx.recv().unwrap();
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        *runtime.lifecycle_maintenance.lock().unwrap() =
+            Some(LifecycleMaintenance { shutdown, thread });
+        let closing = runtime.clone();
+        let shutdown = tokio::spawn(async move {
+            closing.shutdown().await;
+        });
+        reached.recv().await.unwrap();
+        // A maintenance worker can be settling native idle-session cleanup.
+        // The sole executor thread must remain usable while shutdown joins it.
+        assert!(!shutdown.is_finished());
+        release.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert!(runtime.lifecycle_maintenance.lock().unwrap().is_none());
     }
 }

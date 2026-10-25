@@ -44,6 +44,7 @@ pub struct SessionManifest {
     desktop_applications: HashSet<i64>,
     desktop_windows: HashSet<(i64, u64)>,
     desktop_display: bool,
+    system_audio_output: bool,
     readable_paths: HashSet<String>,
     writable_paths: HashSet<String>,
     readable_roots: Vec<PathGrant>,
@@ -181,6 +182,9 @@ impl SessionManifest {
             ))
         };
         match adapter_id {
+            "system_audio_output" => (kind == "system_audio_output" && self.system_audio_output)
+                .then_some(())
+                .ok_or_else(|| "system audio output is outside the capability manifest".to_owned()),
             "computer_history" => {
                 if kind != "computer_history" {
                     return refused();
@@ -392,6 +396,9 @@ impl SessionManifest {
                 })
             };
         match kind {
+            "session_audio_output" => self.system_audio_output.then_some(()).ok_or_else(|| {
+                "session audio output is outside the capability manifest".to_owned()
+            }),
             "browser_upload" => {
                 if all_allowed(
                     &resource["canonical_paths"],
@@ -547,6 +554,8 @@ struct RawManifest {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawResources {
+    #[serde(default)]
+    system_audio_output: bool,
     #[serde(default)]
     apps: Vec<RawApplicationResource>,
     #[serde(default)]
@@ -771,6 +780,7 @@ pub fn load_manifest(path: &Path) -> Result<SessionManifest, String> {
             ask,
         } = raw;
         let RawResources {
+            system_audio_output,
             apps: raw_applications,
             browser,
             desktop,
@@ -1033,6 +1043,7 @@ pub fn load_manifest(path: &Path) -> Result<SessionManifest, String> {
             desktop_applications,
             desktop_windows,
             desktop_display,
+            system_audio_output,
             readable_paths,
             writable_paths,
             readable_roots,

@@ -969,6 +969,7 @@ fn run_typed_sdk_native_window(fixture: &mut Fixture) -> Observation {
         // its child process, without changing this test process's environment.
         if std::env::var_os("CUA_E2E_UNRESTRICTED_GUI").is_some() {
             CuaDriver::create_configured(ConfiguredDriverOptions {
+                audio_enabled: false,
                 claude_code_compatibility: false,
                 authorization: RuntimeAuthorizationOptions {
                     allowed_modes: vec![SessionPermissionMode::Unrestricted],

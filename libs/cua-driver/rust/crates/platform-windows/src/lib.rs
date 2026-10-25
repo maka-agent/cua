@@ -23,6 +23,8 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
+#[cfg(any(target_os = "windows", test))]
+pub mod audio;
 pub mod diagnostics;
 pub mod health_report;
 pub mod overlay;

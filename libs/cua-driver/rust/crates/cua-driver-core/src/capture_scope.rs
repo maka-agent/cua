@@ -580,4 +580,92 @@ mod tests {
         assert_eq!(fresh_state.policy, CaptureScopePolicy::Window);
         assert!(!fresh_state.desktop_unlocked);
     }
+
+    #[test]
+    fn scope_retirement_keeps_end_pending_and_prevents_early_revival() {
+        use crate::session::{SessionClientKind, SessionTransport};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let session = fresh("end-initialization");
+        bind_session(&session, Some(CaptureScopePolicy::Desktop)).unwrap();
+        crate::session::activate_session(
+            &session,
+            Some("end-initialization"),
+            &session,
+            false,
+            SessionTransport::McpStdio,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+
+        // Pause retirement using the real policy lock. End must release its
+        // transition locks, but retain cleanup ownership, while waiting here.
+        let policies = scopes().lock().unwrap();
+        let ending_session = session.clone();
+        let ending = std::thread::spawn(move || crate::session::end_session(&ending_session));
+        let observing_session = session.clone();
+        let (observed, observation) = mpsc::sync_channel(1);
+        let observing = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::session::is_session_ended(&observing_session) && Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let owned =
+                crate::session::end_session_for_owner(&observing_session, &observing_session);
+            let status = crate::session::session_cleanup_status(&observing_session);
+            let retried = crate::session::retry_session_cleanup(&observing_session);
+            let revived = crate::session::revive_session(&observing_session);
+            let revived_for_owner =
+                crate::session::revive_session_for_owner(&observing_session, &observing_session);
+            let activated = crate::session::activate_or_revive_session_for_owner(
+                &observing_session,
+                Some("end-initialization"),
+                &observing_session,
+                false,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+                None,
+            );
+            let _ = observed.send((
+                owned,
+                status,
+                retried,
+                revived,
+                revived_for_owner,
+                activated,
+            ));
+        });
+        // Release even on failure so an incorrect lock order fails this test
+        // within the deadline instead of stranding either test thread.
+        let observation = observation.recv_timeout(Duration::from_secs(5));
+        drop(policies);
+        ending.join().unwrap();
+        observing.join().unwrap();
+        let (owned, status, retried, revived, revived_for_owner, activated) =
+            observation.expect("end must publish pending cleanup before waiting for scope");
+        assert!(owned);
+        assert!(!status.complete);
+        assert!(status.in_progress);
+        assert!(!retried.complete);
+        assert!(retried.in_progress);
+        assert!(!revived);
+        let incomplete = "session cleanup is incomplete; retry end_session before revival";
+        assert_eq!(revived_for_owner, Err(incomplete));
+        assert_eq!(activated, Err(incomplete));
+        assert!(get_session(&session).is_none());
+        assert!(crate::session::session_cleanup_status(&session).complete);
+
+        assert_eq!(
+            crate::session::revive_session_for_owner(&session, &session),
+            Ok(true)
+        );
+        let (fresh_state, created) =
+            bind_session(&session, Some(CaptureScopePolicy::Window)).unwrap();
+        assert!(created);
+        assert_eq!(fresh_state.policy, CaptureScopePolicy::Window);
+        assert!(!fresh_state.desktop_unlocked);
+        crate::session::end_session(&session);
+    }
 }

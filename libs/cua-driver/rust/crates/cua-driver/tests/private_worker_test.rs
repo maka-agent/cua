@@ -29,6 +29,7 @@ fn worker_options(state: &IsolatedStateRoot) -> PrivateWorkerOptions {
         startup_timeout_ms: Some(10_000),
         shutdown_timeout_ms: Some(2_000),
         configured_driver: ConfiguredDriverOptions {
+            audio_enabled: false,
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![

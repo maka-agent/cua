@@ -840,6 +840,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // ── accessibility / window state ─────────────────────────────
         "get_accessibility_tree" => &["accessibility.tree", "accessibility.tree.structured"],
         "element_bounds" => &["accessibility.element_tokens"],
+        "start_audio_recording" | "stop_audio_recording" => &["audio.capture.loopback"],
         "get_window_state" => &[
             "accessibility.window_state",
             "accessibility.tree",
@@ -2086,6 +2087,38 @@ impl ToolRegistry {
                 return protected_consent_refusal(error);
             }
         }
+        if has_adapter("system_audio_output") {
+            let scope = match self
+                .authorize_attested_resource(
+                    tool.as_ref(),
+                    "system_audio_output",
+                    crate::authorization::RiskClass::R2,
+                    &public_args,
+                    context,
+                    runtime_session.as_deref(),
+                    "Allow Cua to record this session's computer output audio",
+                    Duration::from_secs(30 * 60),
+                    Duration::from_secs(8 * 60 * 60),
+                )
+                .await
+            {
+                Ok(scope) => scope,
+                Err(refusal) => return refusal,
+            };
+            if let Err(refusal) = self
+                .validate_attested_resource(
+                    tool.as_ref(),
+                    "system_audio_output",
+                    &public_args,
+                    context,
+                    runtime_session.as_deref(),
+                    &scope,
+                )
+                .await
+            {
+                return refusal;
+            }
+        }
         if has_adapter("file_transfer_and_output") {
             if let Err(refusal) = self
                 .authorize_file_transfer(
@@ -2611,15 +2644,22 @@ impl ToolRegistry {
             (resource, summary.to_owned())
         } else if let Some(resource) = browser_scope {
             let target_id = browser_target.unwrap_or("unknown");
-            (
-                resource,
+            let native_window = resource.get("kind").and_then(Value::as_str) == Some("window");
+            let summary = if native_window {
+                format!(
+                    "Allow Cua to observe window {} of process {}",
+                    resource.get("window_id").unwrap_or(&Value::Null),
+                    resource.get("pid").unwrap_or(&Value::Null)
+                )
+            } else {
                 match browser_tab {
                     Some(tab_id) => {
                         format!("Allow Cua to observe browser target {target_id}, tab {tab_id}")
                     }
                     None => format!("Allow Cua to observe browser target {target_id}"),
-                },
-            )
+                }
+            };
+            (resource, summary)
         } else if browser_target.is_some() {
             return Err(crate::consent::ConsentError::Provider(
                 "browser observation did not attest a live top-level origin".to_owned(),
@@ -2998,6 +3038,16 @@ impl ToolRegistry {
                         .to_owned(),
                 )
             }
+            "stop_audio_recording" => (
+                serde_json::json!({
+                    "kind":"session_audio_output",
+                    "direction":"system_output_to_caller",
+                    "destination_class":"runtime_owned_temporary_file",
+                    "caller_selectable_path":false,
+                }),
+                "Allow Cua to return this session's captured WAV from its owned temporary file"
+                    .to_owned(),
+            ),
             "replay_trajectory" => {
                 let source = canonical_existing_directory(required_path_arg(args, "dir")?)?;
                 args["dir"] = Value::String(source.clone());

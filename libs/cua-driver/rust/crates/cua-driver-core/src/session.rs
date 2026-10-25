@@ -394,11 +394,15 @@ impl Drop for SessionDispatchGuard {
                 .unwrap()
                 .insert(self.session_id.clone(), Instant::now());
             (record.in_flight == 0)
-                .then(|| record.pending_end.take())
+                .then_some(record.pending_end)
                 .flatten()
         };
         if let Some(reason) = pending {
-            finish_session_end(&self.session_id, reason);
+            finish_session_end_with_cleanup(
+                &self.session_id,
+                reason,
+                tokio::runtime::Handle::try_current().is_ok(),
+            );
         }
     }
 }
@@ -482,6 +486,9 @@ fn begin_session_dispatch_inner(
                     .is_some_and(|owner| owner.as_deref() == Some(owner_transport)))
         {
             return Err("session has ended");
+        }
+        if recreated && !session_cleanup_status(session_id).complete {
+            return Err("session cleanup is incomplete; retry the call");
         }
         let mut records = lifecycle_records().lock().unwrap();
         let record = records
@@ -666,6 +673,11 @@ pub fn activate_or_revive_session_for_owner(
             Some(_) => true,
             None => false,
         };
+        // An end may have started after the preliminary cleanup check. Keep
+        // its tombstone until the cleanup for that episode really completes.
+        if revived && !session_cleanup_status(session_id).complete {
+            return Err("session cleanup is incomplete; retry end_session before revival");
+        }
 
         let mut records = lifecycle_records().lock().unwrap();
         if let Some(record) = records.get_mut(session_id) {
@@ -1257,9 +1269,6 @@ pub fn fire_session_end(session_id: &str) -> bool {
 
 fn fire_session_end_for_owner(session_id: &str, owner_transport: Option<&str>) -> bool {
     let first_fire = mark_session_ended(session_id, owner_transport, SessionEndReason::Unknown);
-    if first_fire {
-        initialize_session_cleanup(session_id);
-    }
     let _ = retry_session_cleanup(session_id);
     first_fire
 }
@@ -1275,40 +1284,54 @@ fn mark_session_ended(
     reason: SessionEndReason,
 ) -> bool {
     activity().lock().unwrap().remove(session_id);
-    let mut ended = ended_sessions().lock().unwrap();
-    let record = lifecycle_records().lock().unwrap().remove(session_id);
-    // Only the transport's own unnamed session, reclaimed for inactivity, is
-    // recreated on its next call. Named sessions and every other end reason
-    // keep the resurrection guard until an explicit start_session.
-    let idle_implicit = reason == SessionEndReason::IdleTimeout
-        && record
-            .as_ref()
-            .is_some_and(|record| record.implicit && record.owner_transport == session_id);
-    let mut idle_ended = idle_ended_implicit_sessions().lock().unwrap();
-    if ended.contains_key(session_id) {
-        // A later explicit or transport end makes an idle end terminal.
-        if reason != SessionEndReason::IdleTimeout {
-            idle_ended.remove(session_id);
-        }
-        false
-    } else {
-        ended.insert(
-            session_id.to_owned(),
-            owner_transport
-                .map(str::to_owned)
-                .or(record.map(|record| record.owner_transport)),
-        );
-        if idle_implicit {
-            idle_ended.insert(session_id.to_owned());
+    let first_fire = {
+        let mut ended = ended_sessions().lock().unwrap();
+        let record = lifecycle_records().lock().unwrap().remove(session_id);
+        // Only the transport's own unnamed session, reclaimed for inactivity, is
+        // recreated on its next call. Named sessions and every other end reason
+        // keep the resurrection guard until an explicit start_session.
+        let idle_implicit = reason == SessionEndReason::IdleTimeout
+            && record
+                .as_ref()
+                .is_some_and(|record| record.implicit && record.owner_transport == session_id);
+        let mut idle_ended = idle_ended_implicit_sessions().lock().unwrap();
+        if ended.contains_key(session_id) {
+            // A later explicit or transport end makes an idle end terminal.
+            if reason != SessionEndReason::IdleTimeout {
+                idle_ended.remove(session_id);
+            }
+            false
         } else {
-            idle_ended.remove(session_id);
+            ended.insert(
+                session_id.to_owned(),
+                owner_transport
+                    .map(str::to_owned)
+                    .or(record.map(|record| record.owner_transport)),
+            );
+            if idle_implicit {
+                idle_ended.insert(session_id.to_owned());
+            } else {
+                idle_ended.remove(session_id);
+            }
+            // A tombstone is never visible without its pending cleanup. The
+            // initialization latch also keeps revival behind scope retirement.
+            initialize_session_cleanup(session_id);
+            true
         }
-        true
+    };
+    if first_fire {
+        // Scope writers hold their own lock while checking the tombstone.
+        // Never acquire that lock while holding the transition locks above.
+        crate::capture_scope::clear_session(session_id);
+        if let Some(progress) = cleanup_progress().lock().unwrap().get_mut(session_id) {
+            progress.running = false;
+        }
     }
+    first_fire
 }
 
+// Called only while the new episode's tombstone is still transition-locked.
 fn initialize_session_cleanup(session_id: &str) {
-    crate::capture_scope::clear_session(session_id);
     let mut registered = hooks()
         .lock()
         .unwrap()
@@ -1322,7 +1345,7 @@ fn initialize_session_cleanup(session_id: &str) {
             hooks: registered,
             completed: HashSet::new(),
             failures: Vec::new(),
-            running: false,
+            running: true,
         },
     );
 }
@@ -1331,31 +1354,43 @@ fn initialize_session_cleanup(session_id: &str) {
 /// lifecycle episode. Panics are converted to structured failures so another
 /// explicit end can retry them instead of losing cleanup state.
 pub fn retry_session_cleanup(session_id: &str) -> SessionCleanupReport {
-    let work = {
-        let mut all = cleanup_progress().lock().unwrap();
-        let Some(progress) = all.get_mut(session_id) else {
-            return SessionCleanupReport {
-                complete: true,
-                in_progress: false,
-                failures: Vec::new(),
-            };
-        };
-        if progress.running {
-            return SessionCleanupReport {
-                complete: false,
-                in_progress: true,
-                failures: progress.failures.clone(),
-            };
-        }
-        progress.running = true;
-        progress
-            .hooks
-            .iter()
-            .filter(|(id, _)| !progress.completed.contains(id))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    match reserve_session_cleanup(session_id) {
+        Ok(work) => run_session_cleanup(session_id, work),
+        Err(report) => report,
+    }
+}
 
+fn reserve_session_cleanup(
+    session_id: &str,
+) -> Result<Vec<(u64, RegisteredSessionEndHook)>, SessionCleanupReport> {
+    let mut all = cleanup_progress().lock().unwrap();
+    let Some(progress) = all.get_mut(session_id) else {
+        return Err(SessionCleanupReport {
+            complete: true,
+            in_progress: false,
+            failures: Vec::new(),
+        });
+    };
+    if progress.running {
+        return Err(SessionCleanupReport {
+            complete: false,
+            in_progress: true,
+            failures: progress.failures.clone(),
+        });
+    }
+    progress.running = true;
+    Ok(progress
+        .hooks
+        .iter()
+        .filter(|(id, _)| !progress.completed.contains(id))
+        .cloned()
+        .collect::<Vec<_>>())
+}
+
+fn run_session_cleanup(
+    session_id: &str,
+    work: Vec<(u64, RegisteredSessionEndHook)>,
+) -> SessionCleanupReport {
     let mut successes = Vec::new();
     let mut failures = Vec::new();
     for (id, hook) in work {
@@ -1412,7 +1447,7 @@ pub fn session_cleanup_status(session_id: &str) -> SessionCleanupReport {
         };
     };
     SessionCleanupReport {
-        complete: progress.completed.len() == progress.hooks.len(),
+        complete: !progress.running && progress.completed.len() == progress.hooks.len(),
         in_progress: progress.running,
         failures: progress.failures.clone(),
     }
@@ -1527,6 +1562,9 @@ pub fn revive_session(session_id: &str) -> bool {
         return false;
     }
     let mut ended = ended_sessions().lock().unwrap();
+    if ended.contains_key(session_id) && !session_cleanup_status(session_id).complete {
+        return false;
+    }
     idle_ended_implicit_sessions()
         .lock()
         .unwrap()
@@ -1584,6 +1622,9 @@ pub fn revive_session_for_owner(
         }
         None if owner_transport != session_id => Err("session is not available to this transport"),
         _ => {
+            if !session_cleanup_status(session_id).complete {
+                return Err("session cleanup is incomplete; retry end_session before revival");
+            }
             ended.remove(session_id);
             idle_ended_implicit_sessions()
                 .lock()
@@ -1632,16 +1673,33 @@ pub fn end_session(session_id: &str) {
     end_session_with_reason(session_id, SessionEndReason::Explicit);
 }
 
+/// Close admission synchronously and schedule native cleanup off the caller's
+/// thread. SDK handle release uses the same lifecycle episode and cleanup
+/// progress as explicit end; callers needing completion use end_session.
+pub fn request_session_end(session_id: &str) {
+    request_session_end_with_cleanup(session_id, SessionEndReason::Explicit, true);
+}
+
 fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
+    request_session_end_with_cleanup(session_id, reason, false);
+}
+
+fn request_session_end_with_cleanup(
+    session_id: &str,
+    reason: SessionEndReason,
+    defer_cleanup: bool,
+) {
     if !is_trackable(session_id) {
         return;
     }
     let defer = {
         let mut records = lifecycle_records().lock().unwrap();
         match records.get_mut(session_id) {
-            Some(record) if record.in_flight > 0 => {
+            Some(record) => {
+                // Close admission before releasing the record lock, including
+                // when the final admitted action has already completed.
                 record.pending_end.get_or_insert(reason);
-                true
+                record.in_flight > 0
             }
             _ => false,
         }
@@ -1649,10 +1707,14 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
     if defer {
         return;
     }
-    finish_session_end(session_id, reason);
+    finish_session_end_with_cleanup(session_id, reason, defer_cleanup);
 }
 
-fn finish_session_end(session_id: &str, reason: SessionEndReason) {
+fn finish_session_end_with_cleanup(
+    session_id: &str,
+    reason: SessionEndReason,
+    defer_cleanup: bool,
+) {
     let first_fire = mark_session_ended(session_id, None, reason);
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()
@@ -1677,14 +1739,43 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
         }
     });
     let cursor = cursor.or(fallback);
-    if first_fire {
-        initialize_session_cleanup(session_id);
-    }
-    let _ = retry_session_cleanup(session_id);
-    if first_fire {
-        if let Some(observer) = SESSION_OBSERVER.get() {
-            observer.on_session_ended(public_session_label(session_id), reason, cursor);
+    let notify = move |session_id: &str| {
+        if first_fire {
+            if let Some(observer) = SESSION_OBSERVER.get() {
+                observer.on_session_ended(public_session_label(session_id), reason, cursor);
+            }
         }
+    };
+    if defer_cleanup {
+        if let Ok(work) = reserve_session_cleanup(session_id) {
+            let session = session_id.to_owned();
+            // These bounded observation values are Copy, so the first-fire
+            // notification remains owned here if thread creation fails.
+            let dispatched_notify = notify;
+            if let Err(error) = std::thread::Builder::new()
+                .name("cua-session-cleanup".into())
+                .spawn(move || {
+                    let _ = run_session_cleanup(&session, work);
+                    dispatched_notify(&session);
+                })
+            {
+                if let Some(progress) = cleanup_progress().lock().unwrap().get_mut(session_id) {
+                    progress.running = false;
+                    progress.failures.push(SessionCleanupFailure {
+                        hook: "cleanup_dispatch".into(),
+                        error: error.to_string(),
+                    });
+                }
+                notify(session_id);
+            }
+        } else {
+            // A concurrent end may already own or have completed the cleanup.
+            // It cannot own this first-fire observation as well.
+            notify(session_id);
+        }
+    } else {
+        let _ = retry_session_cleanup(session_id);
+        notify(session_id);
     }
 }
 
@@ -2151,6 +2242,115 @@ mod tests {
         assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
         assert!(end_session_for_owner(sid, owner));
         assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn end_closes_admission_before_installing_the_tombstone() {
+        let sid = "test-end-admission-before-tombstone-3C4D5E";
+        let owner = "test-end-admission-before-tombstone-owner";
+        activate_session(
+            sid,
+            Some("end-admission"),
+            owner,
+            false,
+            SessionTransport::McpStdio,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+
+        // Pause the end after its live-record transition, before it can add
+        // the tombstone. A new dispatch must already see closed admission.
+        let tombstones = ended_sessions().lock().unwrap();
+        let ending = std::thread::spawn(move || end_session(sid));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while has_session_activity(sid) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!has_session_activity(sid), "end must reach its tombstone");
+        assert_eq!(
+            lifecycle_records()
+                .lock()
+                .unwrap()
+                .get(sid)
+                .unwrap()
+                .pending_end,
+            Some(SessionEndReason::Explicit)
+        );
+        drop(tombstones);
+        ending.join().unwrap();
+        assert_eq!(
+            begin_session_dispatch(
+                sid,
+                Some("end-admission"),
+                owner,
+                false,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+            .err(),
+            Some("session has ended")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_cleanup_keeps_failures_retryable_without_blocking_dispatch() {
+        let sid = "test-deferred-cleanup-retry-6F7A8B";
+        let owner = "test-deferred-cleanup-retry-owner";
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let hook_attempts = attempts.clone();
+        let (entered, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        let _registration =
+            register_scoped_fallible_session_end_hook("deferred-cleanup-test", move |ended| {
+                if ended == sid && hook_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    return Err("retry deferred cleanup".into());
+                }
+                Ok(())
+            });
+        let guard = begin_session_dispatch(
+            sid,
+            None,
+            owner,
+            true,
+            SessionTransport::McpStdio,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+        end_session(sid);
+        drop(guard);
+        reached.recv().await.unwrap();
+        let pending = session_cleanup_status(sid);
+        assert!(!pending.complete);
+        assert!(pending.in_progress);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session_cleanup_status(sid).in_progress {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let failed = session_cleanup_status(sid);
+        assert!(!failed.complete);
+        assert_eq!(
+            failed.failures,
+            vec![SessionCleanupFailure {
+                hook: "deferred-cleanup-test".into(),
+                error: "retry deferred cleanup".into(),
+            }]
+        );
+        let retried = tokio::task::spawn_blocking(move || retry_session_cleanup(sid))
+            .await
+            .unwrap();
+        assert!(retried.complete);
+        assert!(retried.failures.is_empty());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

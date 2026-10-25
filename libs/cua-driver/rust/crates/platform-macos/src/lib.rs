@@ -15,6 +15,8 @@
 pub mod apple_events;
 #[cfg(target_os = "macos")]
 pub mod apps;
+#[cfg(any(target_os = "macos", test))]
+pub mod audio;
 #[cfg(target_os = "macos")]
 pub mod ax;
 #[cfg(target_os = "macos")]

@@ -507,17 +507,33 @@ impl Tool for EndSessionTool {
             return result;
         }
         let owner = owner_transport_of(&args, &id);
-        let owned = crate::session::end_session_for_owner(&id, &owner);
+        let ended = tokio::task::spawn_blocking({
+            let id = id.clone();
+            move || {
+                let owned = crate::session::end_session_for_owner(&id, &owner);
+                let cleanup = if crate::session::is_session_ended(&id) {
+                    crate::session::session_cleanup_status(&id)
+                } else {
+                    crate::session::SessionCleanupReport {
+                        complete: false,
+                        in_progress: true,
+                        failures: Vec::new(),
+                    }
+                };
+                (owned, cleanup)
+            }
+        })
+        .await;
+        let (owned, cleanup) = match ended {
+            Ok(ended) => ended,
+            Err(error) => {
+                return ToolResult::error(format!("session cleanup worker failed: {error}"))
+                    .with_structured(
+                        json!({"code":"session_cleanup_partial","cleanup_complete":false}),
+                    )
+            }
+        };
         if owned {
-            let cleanup = if crate::session::is_session_ended(&id) {
-                crate::session::session_cleanup_status(&id)
-            } else {
-                crate::session::SessionCleanupReport {
-                    complete: false,
-                    in_progress: true,
-                    failures: Vec::new(),
-                }
-            };
             if !cleanup.complete {
                 return ToolResult::error(if cleanup.in_progress {
                     "Session is ending after its in-flight action completes; retry end_session for final cleanup status."
@@ -567,6 +583,36 @@ mod tests {
 
     fn result_code(result: &ToolResult) -> Option<&str> {
         result.structured_content.as_ref()?.get("code")?.as_str()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn end_session_settles_blocking_cleanup_without_blocking_its_executor() {
+        let id = format!("session-tool-blocking-cleanup-{}", std::process::id());
+        let (entered, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(std::sync::Mutex::new(wait));
+        let observed = id.clone();
+        let _registration = crate::session::register_scoped_fallible_session_end_hook(
+            "blocking-cleanup-test",
+            move |ended| {
+                if ended == observed {
+                    entered.send(()).unwrap();
+                    wait.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            },
+        );
+        let started = StartSessionTool.invoke(json!({"session": id})).await;
+        assert_ne!(started.is_error, Some(true));
+        let end = tokio::spawn(async move { EndSessionTool.invoke(json!({"session": id})).await });
+        reached.recv().await.unwrap();
+        // Reaching here on the sole executor thread proves that the synchronous
+        // native cleanup hook runs elsewhere. End must still wait for it.
+        assert!(!end.is_finished());
+        release.send(()).unwrap();
+        let ended = end.await.unwrap();
+        assert_ne!(ended.is_error, Some(true));
+        assert_eq!(ended.structured_content.unwrap()["active"], false);
     }
 
     #[test]

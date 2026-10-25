@@ -231,6 +231,7 @@ const PRIVATE_OBSERVATION_OPERATIONS: &[&str] = &[
     "get_desktop_state",
     "get_accessibility_tree",
     "get_window_state",
+    "element_bounds",
     "parse_visual_regions",
     "verify_state",
     "list_apps",
@@ -257,6 +258,15 @@ const PRIVATE_OBSERVATION_SCOPE_KEYS: &[&str] = &[
 ];
 
 const COMPUTER_HISTORY_OPERATIONS: &[&str] = &["history_status", "history_query"];
+const SYSTEM_AUDIO_OPERATIONS: &[&str] = &["start_audio_recording", "stop_audio_recording"];
+const SYSTEM_AUDIO_SCOPE_KEYS: &[&str] = &[
+    "daemon_generation",
+    "public_session",
+    "capture_source",
+    "permission_mode",
+    "managed_policy_sha256",
+    "user_policy_sha256",
+];
 const COMPUTER_HISTORY_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
     "public_session",
@@ -306,6 +316,7 @@ const FILE_TRANSFER_OPERATIONS: &[&str] = &[
     "get_window_state[with_file_output]",
     "start_recording",
     "stop_recording",
+    "stop_audio_recording",
     "replay_trajectory",
     "install_ffmpeg",
     "install_extension",
@@ -438,6 +449,23 @@ pub const ENFORCEMENT_ADAPTERS: &[EnforcementAdapterDescriptor] = &[
         revocation_triggers: SESSION_REVOCATION,
         refusal_code: Some("authorization_required"),
         authorization_source: "built_in_standard; unattended_bounded_profile; trusted_unrestricted_mode; optional_capability_manifest_ceiling",
+        enforcement_by_mode: AdapterEnforcement::uniform(RiskEnforcement::Active),
+        profile_behavior: AdapterProfileBehavior::Routine,
+    },
+    EnforcementAdapterDescriptor {
+        id: "system_audio_output",
+        operations: SYSTEM_AUDIO_OPERATIONS,
+        state: RiskEnforcement::Active,
+        risk_class: RiskClass::R2,
+        resource_kind: "system_audio_output",
+        scope_keys: SYSTEM_AUDIO_SCOPE_KEYS,
+        grant_type: Some("protected_resource_grant"),
+        idle_ttl_seconds: Some(30 * 60),
+        absolute_ttl_seconds: Some(8 * 60 * 60),
+        authorization_requirement: "trusted_constructor_audio_opt_in_and_optional_capability_manifest",
+        revocation_triggers: SESSION_REVOCATION,
+        refusal_code: Some("authorization_required"),
+        authorization_source: "trusted_constructor_opt_in; host_audio_approval_where_required; optional_system_audio_output_capability_manifest_ceiling",
         enforcement_by_mode: AdapterEnforcement::uniform(RiskEnforcement::Active),
         profile_behavior: AdapterProfileBehavior::Routine,
     },
@@ -740,6 +768,7 @@ pub fn enforcement_adapters_for_call(
         "get_desktop_state"
             | "get_accessibility_tree"
             | "get_window_state"
+            | "element_bounds"
             | "verify_state"
             | "list_apps"
             | "list_windows"
@@ -763,6 +792,10 @@ pub fn enforcement_adapters_for_call(
         add("computer_history");
     }
 
+    if SYSTEM_AUDIO_OPERATIONS.contains(&tool) {
+        add("system_audio_output");
+    }
+
     if DESKTOP_INPUT_OPERATIONS.contains(&tool) {
         add("desktop_input");
     }
@@ -782,6 +815,7 @@ pub fn enforcement_adapters_for_call(
             | "browser_download"
             | "start_recording"
             | "stop_recording"
+            | "stop_audio_recording"
             | "replay_trajectory"
     ) || writes_screenshot
         || (tool == "clipboard_write"
@@ -918,10 +952,12 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "debug_window_info"
         | "check_permissions"
         | "get_accessibility_tree"
+        | "element_bounds"
         | "verify_state"
         | "set_config"
         | "escalate_session"
         | "start_recording"
+        | "start_audio_recording"
         | "get_browser_state"
         | "browser_prepare"
         | "browser_navigate"
@@ -938,6 +974,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "get_window_state"
         | "kill_app"
         | "stop_recording"
+        | "stop_audio_recording"
         | "replay_trajectory"
         | "install_ffmpeg"
         | "install_extension"
@@ -1031,6 +1068,7 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
             operation_sensitive: true,
         },
         "get_accessibility_tree"
+        | "element_bounds"
         | "list_apps"
         | "list_windows"
         | "debug_window_info"
@@ -1038,6 +1076,11 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "escalate_session"
         | "zoom"
         | "clipboard_read" => RiskAssessment {
+            class: RiskClass::R2,
+            enforcement: RiskEnforcement::Active,
+            operation_sensitive: true,
+        },
+        "start_audio_recording" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -1060,6 +1103,7 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "browser_download"
         | "start_recording"
         | "stop_recording"
+        | "stop_audio_recording"
         | "replay_trajectory" => RiskAssessment {
             class: RiskClass::R3,
             enforcement: RiskEnforcement::Active,
@@ -1678,6 +1722,7 @@ mod tests {
                 "browser_prepare.isolated",
                 "browser_prepare.existing_profile",
                 "private_observation",
+                "system_audio_output",
                 "computer_history",
                 "desktop_input",
                 "file_transfer_and_output",
@@ -1704,6 +1749,7 @@ mod tests {
                 "browser_prepare.isolated",
                 "browser_prepare.existing_profile",
                 "private_observation",
+                "system_audio_output",
                 "computer_history",
                 "desktop_input",
                 "file_transfer_and_output",
@@ -1740,6 +1786,7 @@ mod tests {
         for id in [
             "browser_prepare.isolated",
             "private_observation",
+            "system_audio_output",
             "desktop_input",
             "file_transfer_and_output",
             "browser_consequential_action",
@@ -1901,6 +1948,18 @@ mod tests {
             vec!["private_observation", "file_transfer_and_output"]
         );
         assert_eq!(
+            ids("start_audio_recording", serde_json::json!({})),
+            vec!["system_audio_output"]
+        );
+        assert_eq!(
+            ids("stop_audio_recording", serde_json::json!({})),
+            vec!["system_audio_output", "file_transfer_and_output"]
+        );
+        assert_eq!(
+            ids("element_bounds", serde_json::json!({})),
+            vec!["private_observation"]
+        );
+        assert_eq!(
             ids("escalate_session", serde_json::json!({})),
             vec!["private_observation"]
         );
@@ -1995,6 +2054,7 @@ mod tests {
                 "browser_prepare.isolated",
                 "browser_prepare.existing_profile",
                 "private_observation",
+                "system_audio_output",
                 "computer_history",
                 "desktop_input",
                 "file_transfer_and_output",
@@ -2021,6 +2081,7 @@ mod tests {
                 "browser_prepare.isolated",
                 "browser_prepare.existing_profile",
                 "private_observation",
+                "system_audio_output",
                 "computer_history",
                 "desktop_input",
                 "file_transfer_and_output",

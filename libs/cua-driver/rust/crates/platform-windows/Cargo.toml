@@ -33,6 +33,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    "Win32_System_Performance",
     # CreatePipe: the result pipe of the standard-user shell launch helper.
     "Win32_System_Pipes",
     "Win32_System_SystemInformation",
@@ -65,6 +66,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
     "Win32_Media",
+    "Win32_Media_Audio",
     "Win32_System_Registry",
     # Locale-independent TCP listener ownership for browser endpoint proof.
     "Win32_NetworkManagement_IpHelper",

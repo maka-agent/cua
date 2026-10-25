@@ -478,6 +478,11 @@ pub struct RuntimeAuthorizationOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct ConfiguredDriverOptions {
     pub claude_code_compatibility: bool,
+    /// Trusted opt-in to computer output loopback recording. Public tool calls
+    /// cannot enable it and no recorder methods are registered when false.
+    #[serde(default)]
+    #[uniffi(default = false)]
+    pub audio_enabled: bool,
     pub authorization: RuntimeAuthorizationOptions,
 }
 
@@ -490,6 +495,7 @@ fn configured_driver_options_json(options: &ConfiguredDriverOptions) -> Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "claude_code_compatibility": options.claude_code_compatibility,
+        "audio_enabled": options.audio_enabled,
         "authorization": {
             "allowed_modes": allowed_modes,
             "compatibility_mode": options.authorization.compatibility_mode.as_str(),
@@ -1123,6 +1129,7 @@ impl CuaDriver {
     /// admission.
     pub fn inspect_host_tools(options: DriverHostOptions) -> Value {
         runtime::tool_inventory(RuntimeOptions {
+            audio_enabled: false,
             cursor: options.cursor,
             host_owns_permission_ux: options.host_owns_permission_ux,
             host_bundle_id: options.host_bundle_id,
@@ -1268,6 +1275,7 @@ impl CuaDriver {
         Ok(Arc::new(Self {
             backend: DriverBackend::Embedded(Arc::new(NativeAbiDriver::create_for_host(
                 RuntimeOptions {
+                    audio_enabled: false,
                     cursor: options.cursor,
                     host_owns_permission_ux: options.host_owns_permission_ux,
                     host_bundle_id: options.host_bundle_id,
@@ -1316,6 +1324,7 @@ impl CuaDriver {
         Ok(Arc::new(Self {
             backend: DriverBackend::Embedded(Arc::new(NativeAbiDriver::create_for_host(
                 RuntimeOptions {
+                    audio_enabled: false,
                     cursor: options.cursor,
                     host_owns_permission_ux: options.host_owns_permission_ux,
                     host_bundle_id: options.host_bundle_id,
@@ -2131,6 +2140,7 @@ mod tests {
 
     fn configured_standard_driver() -> Arc<CuaDriver> {
         CuaDriver::create_configured(ConfiguredDriverOptions {
+            audio_enabled: false,
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![SessionPermissionMode::Standard],
@@ -2162,6 +2172,7 @@ mod tests {
         let observer = Arc::new(RecordingActivityObserver::default());
         let driver = CuaDriver::create_configured_with_activity_observer(
             ConfiguredDriverOptions {
+                audio_enabled: false,
                 claude_code_compatibility: false,
                 authorization: RuntimeAuthorizationOptions {
                     allowed_modes: vec![SessionPermissionMode::Standard],
@@ -2194,6 +2205,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn configured_unrestricted_driver() -> Arc<CuaDriver> {
         CuaDriver::create_configured(ConfiguredDriverOptions {
+            audio_enabled: false,
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![SessionPermissionMode::Unrestricted],
@@ -2436,6 +2448,7 @@ mod tests {
         let hook_baseline = cua_driver_core::session::session_end_hook_count();
         let first = configured_standard_driver();
         let second = CuaDriver::create_configured(ConfiguredDriverOptions {
+            audio_enabled: false,
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![
@@ -2646,6 +2659,7 @@ mod tests {
     async fn authorization_expiry_in_one_runtime_does_not_affect_another() {
         let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
         let expiring = CuaDriver::create_configured(ConfiguredDriverOptions {
+            audio_enabled: false,
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![SessionPermissionMode::Standard],
@@ -2748,6 +2762,7 @@ mod tests {
     async fn trusted_session_is_bound_in_memory_and_rejects_public_id_substitution() {
         let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
         let driver = CuaDriver::create_configured(ConfiguredDriverOptions {
+            audio_enabled: false,
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![

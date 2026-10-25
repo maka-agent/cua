@@ -8,6 +8,7 @@ const PROBE_ENV: &str = "CUA_DRIVER_SDK_CONFIGURATION_PROBE";
 
 fn options(allowed_modes: Vec<SessionPermissionMode>) -> ConfiguredDriverOptions {
     ConfiguredDriverOptions {
+        audio_enabled: false,
         claude_code_compatibility: false,
         authorization: RuntimeAuthorizationOptions {
             allowed_modes,
