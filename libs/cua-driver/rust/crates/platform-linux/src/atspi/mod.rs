@@ -597,6 +597,13 @@ impl TokenElement {
         }
     }
 
+    /// Keep all later routes bound to the observed object, including bounds
+    /// lookup after a semantic action is unavailable.
+    pub fn without_index_fallback(mut self) -> Self {
+        self.may_reresolve = false;
+        self
+    }
+
     /// The D-Bus object every token action addresses first.
     pub fn object(&self) -> Result<&native::ObjectRef> {
         self.observed.object_ref.as_ref().ok_or_else(|| {
@@ -703,9 +710,9 @@ pub fn token_bounds(
     )
 }
 
-/// Scroll the token's element. A fresh walk finds it by its observed
-/// identity; only where `may_reresolve` allows it does a gone identity fall
-/// back to the index.
+/// Scroll the token's element. A fresh walk finds it by its observed identity.
+/// A gone object is stale on every platform; a different node at the old index
+/// is never a replacement scroll target.
 pub fn scroll_token(
     pid: u32,
     token: &TokenElement,
@@ -714,13 +721,7 @@ pub fn scroll_token(
     by: cua_driver_contract::ScrollBy,
 ) -> Result<ScrollProgress> {
     let observed = WindowElement::Identity(token.observed.identity.clone());
-    match native::scroll_element(pid, &observed, direction, amount, by) {
-        Err(error) if token.may_reresolve && error.is::<native::CachedElementGone>() => {
-            let index = WindowElement::Index(token.index);
-            native::scroll_element(pid, &index, direction, amount, by)
-        }
-        result => result,
-    }
+    native::scroll_element(pid, &observed, direction, amount, by)
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -1020,6 +1021,24 @@ mod token_dispatch_tests {
             })
             .unwrap_err();
         assert!(error.is::<native::CachedElementGone>());
+    }
+
+    #[test]
+    fn retained_scroll_routes_never_replace_a_gone_object_with_its_old_index() {
+        for proof in [WindowProof::Proven, WindowProof::NotRequired] {
+            let retained = token(proof).without_index_fallback();
+            let error = retained
+                .act(gone, |_| panic!("scroll retargeted to the old ordinal"))
+                .unwrap_err();
+            assert!(error.is::<native::CachedElementGone>());
+            let addressed = retained
+                .act(
+                    |object| Ok(object.path.clone()),
+                    |_| panic!("scroll ignored the retained object"),
+                )
+                .unwrap();
+            assert_eq!(addressed, "/window_b/text");
+        }
     }
 
     #[test]

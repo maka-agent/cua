@@ -522,6 +522,101 @@ fn harness_gtk3_stale_element_token_fails_closed() {
 
 #[test]
 #[ignore]
+fn harness_gtk3_scroll_keeps_the_observed_identity_after_control_replacement() {
+    run_case(
+        native_readonly_case(
+            "gtk3",
+            "scroll_retained_identity",
+            Targeting::Ax,
+            DriverRoute::LinuxAtSpiAction,
+            vec![OracleKind::AxState],
+        ),
+        |pid, window_id, driver| {
+            let observe = |driver: &mut McpDriver| {
+                // The complete GTK fixture took about 1.9 s in the disposable
+                // X11 gate; the default 1 s walk can omit the status at its end.
+                let state = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid": pid,
+                        "window_id": window_id,
+                        "timeout_ms": 5000
+                    }),
+                );
+                assert!(!state.is_error(), "{}", state.text());
+                assert_ne!(state.structured()["truncated"].as_bool(), Some(true));
+                state
+            };
+            let first = observe(driver);
+            assert!(first.tree_text().contains("slider_replaced=False"));
+            let original_index = element_index(&first, "sld-value");
+            let original = element_token(&first, "sld-value");
+            let replace = element_token(&first, "btn-replace-slider");
+            let replaced = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid,
+                    "window_id": window_id,
+                    "element_token": replace,
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(!replaced.is_error(), "{}", replaced.text());
+
+            // Do not observe between replacement and scroll: that would retire
+            // the snapshot and exercise cache expiry rather than object identity.
+            let refused = driver.call(
+                "scroll",
+                serde_json::json!({
+                    "pid": pid,
+                    "window_id": window_id,
+                    "element_token": original,
+                    "direction": "down",
+                    "by": "line",
+                    "amount": 3,
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(refused.is_error(), "{}", refused.text());
+            if refused.structured()["code"].as_str() == Some("stale_element_token") {
+                assert_eq!(refused.structured()["effect"].as_str(), Some("none"));
+            } else {
+                // GNOME's window-membership proof can reject the missing
+                // object before the semantic scroll route is entered.
+                assert_eq!(DisplayServer::current(), DisplayServer::Wayland);
+                assert_eq!(
+                    refused.structured()["refusal"]["code"].as_str(),
+                    Some("window_scope_unproven"),
+                    "the live observed object must be gone, not just its snapshot: {}",
+                    refused.text()
+                );
+            }
+
+            let after = observe(driver);
+            assert!(after.tree_text().contains("slider_replaced=True"));
+            assert!(after.tree_text().contains("slider_value=0"));
+            assert_eq!(element_index(&after, "sld-value"), original_index);
+            let fresh = driver.call(
+                "scroll",
+                serde_json::json!({
+                    "pid": pid,
+                    "window_id": window_id,
+                    "element_token": element_token(&after, "sld-value"),
+                    "direction": "down",
+                    "by": "line",
+                    "amount": 3,
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(!fresh.is_error(), "{}", fresh.text());
+            wait_for_positive_state(driver, pid, window_id, "slider_value=");
+            Observation::delivered(vec![OracleKind::AxState], Evidence::default())
+        },
+    );
+}
+
+#[test]
+#[ignore]
 fn harness_gtk3_invoke_menu_live_path() {
     run_case(
         native_foreground_case(

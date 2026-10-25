@@ -9959,7 +9959,7 @@ impl Tool for ScrollTool {
             Err(e) => return e,
         };
         let token = match prove_token_element(pid, &resolved, "scroll").await {
-            Ok(token) => token,
+            Ok(token) => token.map(crate::atspi::TokenElement::without_index_fallback),
             Err(refusal) => return refusal,
         };
         let xid_opt: Option<u64> = match &resolved {

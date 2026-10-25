@@ -206,6 +206,12 @@ class HarnessWindow(Gtk.Window):
         ext.connect("clicked", lambda *_: Gtk.main_quit())
         root.pack_start(ext, False, False, 0)
 
+        replace = aid(Gtk.Button(label="Replace slider"), "btn-replace-slider")
+        replace.connect("clicked", self.on_replace_slider)
+        root.pack_start(replace, False, False, 0)
+        self.replacement_status = Gtk.Label(label="slider_replaced=False", xalign=0)
+        root.pack_start(self.replacement_status, False, False, 0)
+
         self.connect("destroy", Gtk.main_quit)
         self.connect("key-press-event", self.on_key_press)
 
@@ -260,6 +266,20 @@ class HarnessWindow(Gtk.Window):
 
     def on_scale(self, s):
         self.scale_status.set_text(f"slider_value={int(s.get_value())}")
+
+    def on_replace_slider(self, *_):
+        parent = self.scale.get_parent()
+        position = parent.get_children().index(self.scale)
+        self.scale.destroy()
+        adjustment = Gtk.Adjustment(value=0, lower=0, upper=100, step_increment=1, page_increment=10)
+        self.scale = aid(Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment), "sld-value")
+        self.scale.set_draw_value(False)
+        self.scale.connect("value-changed", self.on_scale)
+        parent.pack_start(self.scale, False, False, 0)
+        parent.reorder_child(self.scale, position)
+        self.scale.show()
+        self.scale_status.set_text("slider_value=0")
+        self.replacement_status.set_text("slider_replaced=True")
 
     def on_chk(self, c):
         self.chk_status.set_text(f"agreed={c.get_active()}")
