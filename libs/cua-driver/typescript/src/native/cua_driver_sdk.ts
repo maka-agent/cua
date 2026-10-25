@@ -382,6 +382,11 @@ const FfiConverterTypeRuntimeAuthorizationOptions = (() => {
  */
 export type ConfiguredDriverOptions = {
     claudeCodeCompatibility: boolean,
+    /**
+     * Trusted opt-in to computer output loopback recording. Public tool calls
+     * cannot enable it and no recorder methods are registered when false.
+     */
+    audioEnabled: boolean,
     authorization: RuntimeAuthorizationOptions
 }
 
@@ -390,6 +395,7 @@ export type ConfiguredDriverOptions = {
  */
 export const ConfiguredDriverOptions = (() => {
     const defaults = () => ({
+        audioEnabled: false,
     });
     const create = (() => {
         return uniffiCreateRecord<ConfiguredDriverOptions, ReturnType<typeof defaults>>(defaults);
@@ -407,15 +413,18 @@ const FfiConverterTypeConfiguredDriverOptions = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 claudeCodeCompatibility: FfiConverterBool.read(from),
+                audioEnabled: FfiConverterBool.read(from),
                 authorization: FfiConverterTypeRuntimeAuthorizationOptions.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterBool.write(value.claudeCodeCompatibility, into);
+            FfiConverterBool.write(value.audioEnabled, into);
             FfiConverterTypeRuntimeAuthorizationOptions.write(value.authorization, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.claudeCodeCompatibility) +
+             FfiConverterBool.allocationSize(value.audioEnabled) +
              FfiConverterTypeRuntimeAuthorizationOptions.allocationSize(value.authorization);
 
         }

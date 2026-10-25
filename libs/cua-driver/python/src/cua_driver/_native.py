@@ -2625,17 +2625,20 @@ class ConfiguredDriverOptions:
     Additive configured-runtime constructor options. Existing callers continue
     to use [`DriverOptions`] and inherit the compatibility session.
 """
-    def __init__(self, *, claude_code_compatibility:bool, authorization:RuntimeAuthorizationOptions):
+    def __init__(self, *, claude_code_compatibility:bool, audio_enabled:bool = False, authorization:RuntimeAuthorizationOptions):
         self.claude_code_compatibility = claude_code_compatibility
+        self.audio_enabled = audio_enabled
         self.authorization = authorization
 
 
 
 
     def __str__(self):
-        return "ConfiguredDriverOptions(claude_code_compatibility={}, authorization={})".format(self.claude_code_compatibility, self.authorization)
+        return "ConfiguredDriverOptions(claude_code_compatibility={}, audio_enabled={}, authorization={})".format(self.claude_code_compatibility, self.audio_enabled, self.authorization)
     def __eq__(self, other):
         if self.claude_code_compatibility != other.claude_code_compatibility:
+            return False
+        if self.audio_enabled != other.audio_enabled:
             return False
         if self.authorization != other.authorization:
             return False
@@ -2646,17 +2649,20 @@ class _UniffiFfiConverterTypeConfiguredDriverOptions(_UniffiConverterRustBuffer)
     def read(buf):
         return ConfiguredDriverOptions(
             claude_code_compatibility=_UniffiFfiConverterBoolean.read(buf),
+            audio_enabled=_UniffiFfiConverterBoolean.read(buf),
             authorization=_UniffiFfiConverterTypeRuntimeAuthorizationOptions.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterBoolean.check_lower(value.claude_code_compatibility)
+        _UniffiFfiConverterBoolean.check_lower(value.audio_enabled)
         _UniffiFfiConverterTypeRuntimeAuthorizationOptions.check_lower(value.authorization)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterBoolean.write(value.claude_code_compatibility, buf)
+        _UniffiFfiConverterBoolean.write(value.audio_enabled, buf)
         _UniffiFfiConverterTypeRuntimeAuthorizationOptions.write(value.authorization, buf)
 
 class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
