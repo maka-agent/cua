@@ -31,31 +31,31 @@ mod native {
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
     use windows::core::{w, Interface, BSTR};
-    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, WAIT_TIMEOUT};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, WAIT_TIMEOUT};
     use windows::Win32::Security::{
         EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetTokenInformation, GetUserObjectSecurity, IsWellKnownSid, TokenLogonSid,
-        WinLocalSystemSid, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SE_DACL_PROTECTED, TOKEN_GROUPS, TOKEN_QUERY,
+        GetTokenInformation, GetUserObjectSecurity, TokenLogonSid, ACCESS_ALLOWED_ACE,
+        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_GROUPS,
+        TOKEN_QUERY,
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
     use windows::Win32::System::StationsAndDesktops::{
-        EnumDesktopWindows, GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW,
-        HDESK, UOI_FLAGS, UOI_IO, UOI_NAME, USEROBJECTFLAGS,
+        GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, HDESK, UOI_IO,
+        UOI_NAME,
     };
     use windows::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, OpenProcessToken,
         WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::Accessibility::{
-        IUIAutomationElement, IUIAutomationInvokePattern, IUIAutomationValuePattern,
-        UIA_InvokePatternId, UIA_ValuePatternId,
+        IUIAutomationElement, IUIAutomationValuePattern, UIA_ValuePatternId,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetPropW, GetWindowThreadProcessId, IsChild, IsWindow,
     };
 
-    const WSF_VISIBLE: u32 = 1;
+    // READ_CONTROL | CREATEWINDOW | CREATEMENU | READOBJECTS | WRITEOBJECTS; no SWITCHDESKTOP.
+    const PRIVATE_DESKTOP_ACCESS: u32 = 0x0002_0087;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const MAX_COMMAND_BYTES: usize = 4096;
 
@@ -91,6 +91,7 @@ mod native {
         op: String,
         #[serde(default)]
         pid: u32,
+        expected_tid: u32,
         #[serde(default)]
         hwnd: u64,
         #[serde(default)]
@@ -126,6 +127,7 @@ mod native {
             &self,
             hwnd: u64,
             pid: u32,
+            expected_tid: u32,
         ) -> Result<platform_windows::uia::snapshot::RetainedElement> {
             for (ordinal, node) in self
                 .nodes
@@ -145,6 +147,12 @@ mod native {
                     ensure!(
                         unsafe { element.CurrentProcessId()? } as u32 == pid,
                         "child UIA PID mismatch"
+                    );
+                    let mut owner = 0;
+                    let thread = unsafe { GetWindowThreadProcessId(native, Some(&mut owner)) };
+                    ensure!(
+                        owner == pid && thread == expected_tid,
+                        "retained fixture HWND/PID/TID mismatch"
                     );
                     return self
                         .snapshot
@@ -184,7 +192,7 @@ mod native {
         Ok(String::from_utf16(&data[..end])?)
     }
 
-    unsafe fn check_acl(handle: HANDLE, protected: bool) -> Result<()> {
+    unsafe fn check_acl(handle: HANDLE) -> Result<()> {
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
         let token = OwnedHandle(token);
@@ -230,8 +238,8 @@ mod native {
         let mut revision = 0;
         GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)?;
         ensure!(
-            !protected || control & SE_DACL_PROTECTED.0 != 0,
-            "private station DACL is not protected"
+            control & SE_DACL_PROTECTED.0 != 0,
+            "private desktop DACL is not protected"
         );
         let mut present = BOOL(0);
         let mut defaulted = BOOL(0);
@@ -242,7 +250,7 @@ mod native {
             "private object requires an explicit non-null DACL"
         );
         ensure!(
-            (*dacl).AceCount > 0 && (*dacl).AceCount <= 2,
+            (*dacl).AceCount == 1,
             "unexpected private object ACL entries"
         );
         let mut own = false;
@@ -257,8 +265,8 @@ mod native {
             let sid = PSID((&ace.SidStart as *const u32).cast_mut().cast());
             let is_own = EqualSid(sid, own_sid).is_ok();
             ensure!(
-                is_own || IsWellKnownSid(sid, WinLocalSystemSid).as_bool(),
-                "private object grants another principal"
+                is_own && ace.Mask == PRIVATE_DESKTOP_ACCESS,
+                "private desktop principal or access mask mismatch"
             );
             own |= is_own;
         }
@@ -268,29 +276,17 @@ mod native {
 
     fn private_context(station: &str, desktop: &str) -> Result<HDESK> {
         ensure!(size_of::<usize>() == 8, "fixture requires a 64-bit build");
+        ensure!(!station.is_empty(), "station name is empty");
         ensure!(
-            !station.eq_ignore_ascii_case("WinSta0") && !station.is_empty(),
-            "interactive station is forbidden"
+            desktop.starts_with("MakaCuaPrivate-"),
+            "task-private desktop name required"
         );
         unsafe {
             let own_station = GetProcessWindowStation()?;
             ensure!(
                 object_name(HANDLE(own_station.0))? == station,
-                "private station name mismatch"
+                "caller station name mismatch"
             );
-            let mut flags = USEROBJECTFLAGS::default();
-            GetUserObjectInformationW(
-                HANDLE(own_station.0),
-                UOI_FLAGS,
-                Some((&mut flags as *mut USEROBJECTFLAGS).cast()),
-                size_of::<USEROBJECTFLAGS>() as u32,
-                None,
-            )?;
-            ensure!(
-                flags.dwFlags & WSF_VISIBLE == 0,
-                "visible window station is forbidden"
-            );
-            check_acl(HANDLE(own_station.0), true)?;
             let own_desktop = GetThreadDesktop(GetCurrentThreadId())?;
             ensure!(
                 object_name(HANDLE(own_desktop.0))? == desktop,
@@ -305,29 +301,19 @@ mod native {
                 None,
             )?;
             ensure!(!input.as_bool(), "input desktop is forbidden");
-            check_acl(HANDLE(own_desktop.0), false)?;
+            check_acl(HANDLE(own_desktop.0))?;
             Ok(own_desktop)
         }
     }
 
-    struct Membership {
-        wanted: HWND,
-        found: bool,
-    }
-    unsafe extern "system" fn member(hwnd: HWND, data: LPARAM) -> BOOL {
-        let scan = &mut *(data.0 as *mut Membership);
-        if hwnd == scan.wanted {
-            scan.found = true;
-            BOOL(0)
-        } else {
-            BOOL(1)
-        }
-    }
-
-    fn identity(command: &Command, desktop: HDESK) -> Result<OwnedHandle> {
+    fn identity(command: &Command) -> Result<OwnedHandle> {
         ensure!(
             command.pid != 0 && command.pid != unsafe { GetCurrentProcessId() },
             "fixture must be a separate known process"
+        );
+        ensure!(
+            command.expected_tid != 0,
+            "fixture primary TID must be nonzero"
         );
         ensure!(
             command.hwnd != 0
@@ -353,28 +339,20 @@ mod native {
                 WaitForSingleObject(process.0, 0) == WAIT_TIMEOUT,
                 "fixture process has exited"
             );
-            let mut scan = Membership {
-                wanted: root,
-                found: false,
-            };
-            let _ = EnumDesktopWindows(
-                desktop,
-                Some(member),
-                LPARAM((&mut scan as *mut Membership) as isize),
-            );
-            ensure!(
-                scan.found,
-                "fixture HWND is absent from the verified private desktop"
-            );
+            // Fixture only: the controller binds Ready's TID to CreateProcess's primary
+            // TID. The fixture verifies its own private desktop before creating these
+            // windows and before Ready. While they exist, its thread cannot move:
+            // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop
+            // This is not a replacement desktop check for arbitrary applications.
             for window in [command.hwnd, command.edit_hwnd, command.button_hwnd] {
                 let handle = HWND(window as *mut _);
                 let mut owner = 0;
+                let thread = GetWindowThreadProcessId(handle, Some(&mut owner));
                 ensure!(
-                    IsWindow(handle).as_bool()
-                        && GetWindowThreadProcessId(handle, Some(&mut owner)) != 0
-                        && owner == command.pid,
+                    IsWindow(handle).as_bool() && thread != 0 && owner == command.pid,
                     "fixture HWND/PID mismatch"
                 );
+                ensure!(thread == command.expected_tid, "fixture HWND/TID mismatch");
                 ensure!(
                     window == command.hwnd || IsChild(root, handle).as_bool(),
                     "fixture control is outside the admitted root"
@@ -391,85 +369,73 @@ mod native {
 
     fn execute(command: &Command, station: &str, desktop_name: &str) -> Result<Value> {
         ensure!(
-            matches!(command.op.as_str(), "observe" | "set_value" | "invoke"),
+            matches!(command.op.as_str(), "observe" | "set_value"),
             "unsupported private fixture operation"
         );
-        if command.op == "set_value" {
-            let value = command
-                .value
-                .as_deref()
-                .context("set_value requires value")?;
-            ensure!(
-                value.len() <= 128 && value.is_ascii(),
-                "fixture value must be bounded ASCII"
-            );
-        } else {
-            ensure!(command.value.is_none(), "value is only valid for set_value");
-        }
-        let desktop = private_context(station, desktop_name)?;
-        let process = identity(command, desktop)?;
-        // Prove private object membership before even initializing COM. All
+        let expected_value = command
+            .value
+            .as_deref()
+            .context("fixture command requires value")?;
+        ensure!(
+            matches!(
+                expected_value,
+                "Maka private fixture baseline" | "Maka private UIA verified" | "Café 日本語 🐧"
+            ),
+            "value is outside the literal source fixture cases"
+        );
+        private_context(station, desktop_name)?;
+        let process = identity(command)?;
+        // Prove the controlled fixture's primary-thread identity before COM. All
         // returned/retained references drop before this command's MTA guard.
         let _apartment = Apartment::new()?;
         let tree = Tree::new(
             walk_native_tree_checked(command.hwnd, command.pid).map_err(anyhow::Error::msg)?,
         );
-        let _rechecked = identity(command, desktop)?;
+        let _rechecked = identity(command)?;
         ensure!(
             unsafe { WaitForSingleObject(process.0, 0) } == WAIT_TIMEOUT,
             "admitted fixture process exited"
         );
         match command.op.as_str() {
             "observe" => {
-                let _edit = tree.element(command.edit_hwnd, command.pid)?;
-                let _button = tree.element(command.button_hwnd, command.pid)?;
+                let retained =
+                    tree.element(command.edit_hwnd, command.pid, command.expected_tid)?;
+                let element = ManuallyDrop::new(unsafe {
+                    IUIAutomationElement::from_raw(retained.as_ptr() as *mut _)
+                });
+                let pattern: IUIAutomationValuePattern =
+                    unsafe { element.GetCurrentPattern(UIA_ValuePatternId)? }.cast()?;
+                let actual_value = unsafe { pattern.CurrentValue()? }.to_string();
+                ensure!(
+                    actual_value == expected_value,
+                    "UIA literal fixture value readback mismatch"
+                );
+                let _button =
+                    tree.element(command.button_hwnd, command.pid, command.expected_tid)?;
                 Ok(
-                    json!({"backend":"checked_native_uia", "nodes":tree.nodes.iter().map(|node| json!({
+                    json!({"backend":"checked_native_uia", "edit_value":actual_value, "nodes":tree.nodes.iter().map(|node| json!({
                 "index":node.element_index,"control_type":node.control_type,"name":node.name,
                 "value":node.value,"actions":node.actions
                 })).collect::<Vec<_>>(), "generation":command.generation}),
                 )
             }
             "set_value" => {
-                let value = command
-                    .value
-                    .as_deref()
-                    .context("set_value requires value")?;
-                ensure!(
-                    value.len() <= 128 && value.is_ascii(),
-                    "fixture value must be bounded ASCII"
-                );
-                let retained = tree.element(command.edit_hwnd, command.pid)?;
+                let value = expected_value;
+                let retained =
+                    tree.element(command.edit_hwnd, command.pid, command.expected_tid)?;
                 let element = ManuallyDrop::new(unsafe {
                     IUIAutomationElement::from_raw(retained.as_ptr() as *mut _)
                 });
                 let pattern: IUIAutomationValuePattern =
                     unsafe { element.GetCurrentPattern(UIA_ValuePatternId)? }.cast()?;
-                let _last_check = identity(command, desktop)?;
+                let _last_check = identity(command)?;
                 patterns::set_value(&pattern, &BSTR::from(value))
                     .context("ValuePattern dispatch returned failure; its effect is unknown")?;
-                let _after = identity(command, desktop).context(
+                let _after = identity(command).context(
                     "fixture identity changed after ValuePattern dispatch; effect is unknown",
                 )?;
                 Ok(
                     json!({"path":"shared_value_pattern_leaf","hresult_success":true,"effect":"requires_fixture_oracle"}),
-                )
-            }
-            "invoke" => {
-                let retained = tree.element(command.button_hwnd, command.pid)?;
-                let element = ManuallyDrop::new(unsafe {
-                    IUIAutomationElement::from_raw(retained.as_ptr() as *mut _)
-                });
-                let pattern: IUIAutomationInvokePattern =
-                    unsafe { element.GetCurrentPattern(UIA_InvokePatternId)? }.cast()?;
-                let _last_check = identity(command, desktop)?;
-                patterns::invoke(&pattern)
-                    .context("InvokePattern dispatch returned failure; its effect is unknown")?;
-                let _after = identity(command, desktop).context(
-                    "fixture identity changed after InvokePattern dispatch; effect is unknown",
-                )?;
-                Ok(
-                    json!({"path":"shared_invoke_pattern_leaf","hresult_success":true,"effect":"requires_fixture_oracle"}),
                 )
             }
             _ => bail!("unsupported private fixture operation"),
@@ -480,7 +446,7 @@ mod native {
         let args: Vec<String> = std::env::args().skip(1).collect();
         ensure!(
             args.len() == 5
-                && args[0] == "--private-fixture"
+                && args[0] == "--current-station-private-desktop"
                 && args[1] == "--station"
                 && args[3] == "--desktop",
             "launch only through the reviewed private fixture controller"
