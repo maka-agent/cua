@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Canonical typed Cua Driver SDK and UniFFI export boundary.
 //!
 //! [`CuaDriver::create`] owns the platform runtime in the importing process.
@@ -17,8 +19,8 @@ use cua_driver_contract::{
     ToolOutput, TypeTextInput, VerifyStateInput, VerifyStateOutput, WindowStateOutput,
 };
 use cua_driver_core::daemon::{
-    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin, is_daemon_listening,
-    request_daemon_metadata, send_request, socket_path_for_namespace,
+    is_daemon_listening, request_daemon_metadata, send_request, socket_path_for_namespace,
+    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,8 +50,8 @@ pub use cursor_motion::*;
 pub use embedded::*;
 use remote::{DriverEnvelopeChannel, RemoteBoundSession, RemoteDriverClient};
 pub use remote_mcp::{
-    DriverServiceHeader, DriverServiceRequest, DriverServiceResponse, DriverServiceTransport,
-    DriverServiceTransportError, McpDriverChannel, open_mcp_driver_channel,
+    open_mcp_driver_channel, DriverServiceHeader, DriverServiceRequest, DriverServiceResponse,
+    DriverServiceTransport, DriverServiceTransportError, McpDriverChannel,
 };
 use runtime::RuntimeOptions;
 use service_session::ServiceSessionClient;
@@ -70,8 +72,8 @@ pub fn configure_perception_client_resolver(
     let _ = PERCEPTION_CLIENT_RESOLVER.set(resolver);
 }
 
-pub(crate) fn configured_perception_client()
--> cua_driver_core::perception_client::PerceptionClientHandle {
+pub(crate) fn configured_perception_client(
+) -> cua_driver_core::perception_client::PerceptionClientHandle {
     use cua_driver_core::perception_client::{PerceptionClient, PerceptionClientHandle};
     PERCEPTION_CLIENT_RESOLVER.get().map_or_else(
         || PerceptionClientHandle::fixed(PerceptionClient::unavailable()),
@@ -149,6 +151,45 @@ pub struct DriverMetadata {
     pub pid: u32,
     pub embedded: bool,
     pub host_bundle_id: Option<String>,
+}
+
+/// An observation bound to one native computer-audio capture.
+///
+/// Cloning or dropping this handle does not stop, retrieve or clear the
+/// recording. Later captures cannot replace the result observed by this handle.
+/// This Rust-host type is absent from UniFFI and agent tool schemas.
+#[derive(Clone)]
+#[must_use]
+pub struct AudioCompletion {
+    native: cua_driver_core::audio::AudioCompletion,
+}
+
+impl std::fmt::Debug for AudioCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AudioCompletion")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AudioCompletion {
+    /// Wait for the bound capture and its output writes to settle.
+    ///
+    /// Native cleanup/join and WAV retrieval remain separate operations.
+    /// Cancelling this wait only detaches this observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the native capture failure, or a protocol error if its worker
+    /// disappears without reporting completion.
+    pub async fn wait(&self) -> Result<(), DriverError> {
+        self.native
+            .wait()
+            .await
+            .map_err(|error| DriverError::Protocol {
+                reason: error.to_string(),
+            })
+    }
 }
 
 /// The TCC grants required by a macOS host application before it starts an
@@ -1811,6 +1852,34 @@ impl CuaDriverSession {
         }
     }
 
+    /// Click a freshly resolved native Linux selector through this binding.
+    ///
+    /// The selector and caller deadline stay in a typed sidecar. Ordinary
+    /// `click` authorization sees the exact process, window and delivery mode;
+    /// the native worker retains that same admitted operation until it exits.
+    ///
+    /// # Errors
+    /// Returns a driver error for an unsupported backend or failed transport.
+    /// Native preparation and dispatch refusals remain in [`ToolResult`].
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub async fn click_native_element_window(
+        &self,
+        request: platform_linux::input::native_element::NativeElementClickRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = request.arguments();
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                "click",
+                session
+                    .invoke_native_element_click(arguments, request)
+                    .await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native Linux element clicks require an embedded trusted session".into(),
+            }),
+        }
+    }
+
     /// Observe one host-prepared macOS source frame through this exact session.
     /// The request supplies data, never authority. This Rust-only method uses
     /// the ordinary get_window_state authorization and operation lifecycle.
@@ -1892,6 +1961,35 @@ impl CuaDriverSession {
         }
     }
 
+    /// Snapshot this binding's current native audio capture for a trusted host.
+    ///
+    /// The host must await its serialized start, then await this snapshot
+    /// before reporting successful startup or admitting another audio command.
+    /// The returned handle is already bound even if its wait is never polled.
+    /// Runtime admission is released before this method returns.
+    ///
+    /// This method is absent from UniFFI and public agent protocols.
+    ///
+    /// # Errors
+    ///
+    /// Refuses disabled audio, an absent capture, a closed runtime, and session
+    /// backends without trusted native completion observation.
+    pub async fn audio_completion(&self) -> Result<AudioCompletion, DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(session) => {
+                let native = session.audio_completion().await?;
+                Ok(AudioCompletion { native })
+            }
+            SessionBackend::PrivateWorker { .. }
+            | SessionBackend::Service { .. }
+            | SessionBackend::Remote(_) => Err(DriverError::Protocol {
+                reason:
+                    "trusted audio completion observation is unavailable for this session backend"
+                        .into(),
+            }),
+        }
+    }
+
     /// Trusted Rust-host observation of this binding's current native audio.
     ///
     /// Completes only after the native capture has exited/stopped and settled
@@ -1903,17 +2001,14 @@ impl CuaDriverSession {
     ///
     /// This method is absent from UniFFI and public agent protocols. It refuses
     /// disabled audio, an absent active capture, and unsupported backends.
+    /// To bind before a later command or startup receipt, await
+    /// [`Self::audio_completion`] and retain its returned handle instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns snapshot errors or the native capture's finalization failure.
     pub async fn wait_audio_finished(&self) -> Result<(), DriverError> {
-        match &self.backend {
-            SessionBackend::Embedded(session) => session.wait_audio_finished().await,
-            SessionBackend::PrivateWorker { .. }
-            | SessionBackend::Service { .. }
-            | SessionBackend::Remote(_) => Err(DriverError::Protocol {
-                reason:
-                    "trusted audio completion observation is unavailable for this session backend"
-                        .into(),
-            }),
-        }
+        self.audio_completion().await?.wait().await
     }
 
     /// Trusted Rust-host cleanup of this session's computer audio only.
@@ -2384,6 +2479,186 @@ mod snapshot_lifecycle_tests;
 #[cfg(test)]
 mod tests {
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    struct NativeElementClickProbe;
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for NativeElementClickProbe {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            static DEF: OnceLock<cua_driver_core::tool::ToolDef> = OnceLock::new();
+            DEF.get_or_init(|| cua_driver_core::tool::ToolDef {
+                name: "click".into(),
+                description: "test-only native element click argument probe".into(),
+                input_schema: serde_json::json!({
+                    "type":"object","additionalProperties":false,"properties":{
+                        "session":{"type":"string"},"pid":{"type":"integer"},
+                        "window_id":{"type":"integer"},"scope":{"type":"string"},
+                        "button":{"type":"string"},"count":{"type":"integer"},
+                        "delivery_mode":{"type":"string"},
+                    }
+                }),
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            })
+        }
+
+        async fn invoke(&self, arguments: Value) -> cua_driver_core::protocol::ToolResult {
+            use cua_driver_core::action_record::{
+                ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+            };
+            let requested = if arguments["delivery_mode"] == "foreground" {
+                RequestedDelivery::Foreground
+            } else {
+                RequestedDelivery::Background
+            };
+            cua_driver_core::protocol::ToolResult::error(arguments.to_string()).with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Refused,
+                    ActionTransport::LinuxAtSpiAction,
+                    requested,
+                )
+                .refusal("test_probe", None)
+                .build()
+                .unwrap(),
+            )
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    fn register_native_element_click_probes(registry: &mut cua_driver_core::tool::ToolRegistry) {
+        registry.register(Box::new(NativeObservationProbe));
+        registry.register(Box::new(NativeElementClickProbe));
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[tokio::test]
+    async fn native_element_click_uses_bound_mutation_admission_and_canonical_arguments() {
+        use platform_linux::input::native_element::NativeElementClickRequest;
+        use platform_linux::input::native_window::NativeClickButton;
+
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
+        let observer = Arc::new(RecordingActivityObserver::default());
+        let driver = CuaDriver::try_create_configured_for_host(
+            ConfiguredDriverOptions {
+                audio_enabled: false,
+                claude_code_compatibility: false,
+                authorization: RuntimeAuthorizationOptions {
+                    allowed_modes: vec![SessionPermissionMode::Standard],
+                    compatibility_mode: SessionPermissionMode::Standard,
+                    compatibility_capability_manifest_path: None,
+                    compatibility_bounded_manifest_path: None,
+                    unrestricted_acknowledged: false,
+                    max_session_ttl_seconds: 60,
+                    max_idle_ttl_seconds: 30,
+                },
+            },
+            DriverHostOptions {
+                cursor: cursor_overlay::CursorConfig {
+                    enabled: false,
+                    ..cursor_overlay::CursorConfig::default()
+                },
+                host_owns_permission_ux: false,
+                host_bundle_id: None,
+                claude_code_compatibility: false,
+                prepare_desktop_environment: false,
+                register_host_tools: Some(register_native_element_click_probes),
+                authorization_host: None,
+                activity_observer: Some(observer.clone()),
+            },
+        )
+        .unwrap();
+        let session = driver
+            .create_trusted_session(TrustedSessionOptions {
+                public_session: "native-element-click-test".into(),
+                mode: SessionPermissionMode::Standard,
+                ttl_seconds: 60,
+                idle_ttl_seconds: 30,
+                capability_manifest_path: None,
+                bounded_manifest_path: None,
+            })
+            .unwrap();
+        session
+            .call_tool("get_window_state".into(), "{}".into())
+            .await
+            .unwrap();
+        let target_pid = if std::process::id() == 123 { 124 } else { 123 };
+        let mut request = NativeElementClickRequest {
+            pid: target_pid,
+            window_id: 456,
+            element_id: Some(":1.0:/org/a11y/atspi/accessible/5".into()),
+            button: NativeClickButton::Left,
+            count: 1,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        };
+        let ordinary = session
+            .call_tool("click".into(), request.arguments().to_string())
+            .await
+            .unwrap();
+        assert!(ordinary.is_error, "the hermetic probe always refuses input");
+        for (button, delivery) in [
+            (NativeClickButton::Left, "background"),
+            (NativeClickButton::Right, "foreground"),
+        ] {
+            request.button = button;
+            let result = session
+                .click_native_element_window(request.clone())
+                .await
+                .unwrap();
+            assert!(result.is_error, "the hermetic probe always refuses input");
+            let actual: Value = serde_json::from_str(&result.text).unwrap();
+            assert_eq!(actual["pid"], target_pid);
+            assert_eq!(actual["window_id"], 456);
+            assert_eq!(actual["scope"], "window");
+            assert_eq!(actual["button"], button.as_str());
+            assert_eq!(actual["count"], 1);
+            assert_eq!(actual["delivery_mode"], delivery);
+            for absent in [
+                "element_id",
+                "element_token",
+                "x",
+                "y",
+                "deadline",
+                "native_profile",
+            ] {
+                assert!(
+                    actual.get(absent).is_none(),
+                    "{absent} stays outside authorized JSON"
+                );
+            }
+        }
+        let SessionBackend::Embedded(native) = &session.backend else {
+            panic!("test host has an embedded binding");
+        };
+        let mut substituted = request.arguments();
+        substituted["window_id"] = 789.into();
+        assert!(
+            matches!(native.invoke_native_element_click(substituted, request).await,
+            Err(DriverError::Protocol { reason }) if reason == "native Linux element click data does not match its canonical request")
+        );
+        {
+            let events = observer.events.lock().unwrap();
+            let read = events
+                .iter()
+                .find(|event| event.tool_name == "get_window_state")
+                .unwrap();
+            let clicks: Vec<_> = events
+                .iter()
+                .filter(|event| event.tool_name == "click")
+                .collect();
+            assert_eq!(clicks.len(), 3);
+            for event in clicks {
+                assert_eq!(event.kind, DriverActivityKind::ActionFailed);
+                assert!(event.refusal_code.is_none());
+                assert_ne!(event.risk_class, read.risk_class);
+            }
+        }
+        session.close();
+        driver.shutdown().await.unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     struct NativeObservationProbe;
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -2844,11 +3119,9 @@ mod tests {
             authorization_host: None,
             activity_observer: None,
         });
-        assert!(
-            inventory["tools"]
-                .as_array()
-                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click"))
-        );
+        assert!(inventory["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click")));
 
         let driver = CuaDriver::create(None).unwrap();
         driver.shutdown().await.unwrap();
@@ -4088,11 +4361,9 @@ mod tests {
         let driver = CuaDriver::connect_remote(Arc::new(LegacyRemoteChannel)).unwrap();
         let error = driver.metadata().await.unwrap_err();
         assert!(matches!(error, DriverError::Protocol { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("does not support request cancellation")
-        );
+        assert!(error
+            .to_string()
+            .contains("does not support request cancellation"));
     }
 
     struct CancellableRemoteChannel {

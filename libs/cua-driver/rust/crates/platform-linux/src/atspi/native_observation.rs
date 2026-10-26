@@ -5,12 +5,12 @@
 //! The Rust caller supplies the target and its real deadline. This context
 //! carries no authorization and is never selected by a JSON argument.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::{
     future::Future,
     sync::{
-        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -277,11 +277,9 @@ mod tests {
 
     #[tokio::test]
     async fn selected_wayland_refuses_native_context_without_changing_generic_observation() {
-        assert!(
-            for_window_on_route(PID, 15, true)
-                .expect("generic observation keeps the selected compositor route")
-                .is_none()
-        );
+        assert!(for_window_on_route(PID, 15, true)
+            .expect("generic observation keeps the selected compositor route")
+            .is_none());
         with_native_observation(request(15, None), async {
             assert_eq!(
                 for_window_on_route(PID, 15, true)
@@ -289,22 +287,18 @@ mod tests {
                     .to_string(),
                 X11_ROUTE_REQUIRED
             );
-            assert!(
-                for_window_on_route(PID, 15, false)
-                    .expect("the matching X11 target remains admitted")
-                    .is_some()
-            );
+            assert!(for_window_on_route(PID, 15, false)
+                .expect("the matching X11 target remains admitted")
+                .is_some());
         })
         .await;
     }
 
     #[tokio::test]
     async fn nested_scope_restores_target_and_keeps_incomplete_causes_separate() {
-        assert!(
-            for_window_on_route(PID, 13, false)
-                .expect("no scoped request is generic")
-                .is_none()
-        );
+        assert!(for_window_on_route(PID, 13, false)
+            .expect("no scoped request is generic")
+            .is_none());
         with_native_observation(request(13, None), async {
             let outer = for_window_on_route(PID, 13, false)
                 .expect("outer target matches")

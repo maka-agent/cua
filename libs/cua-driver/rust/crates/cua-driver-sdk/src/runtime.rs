@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Private platform-runtime composition behind the public SDK boundary.
 //!
 //! This is deliberately not a second public interface. Both imported SDK
@@ -120,27 +122,25 @@ pub(crate) struct RuntimeSession {
 }
 
 impl RuntimeSession {
-    /// Observe the exact current native capture without retaining a lifecycle
-    /// read guard throughout its remaining duration. Host revocation/shutdown
-    /// must remain able to stop this same capture while the host waits.
-    pub(crate) async fn wait_audio_finished(&self) -> Result<(), String> {
-        let completion = {
-            let _admitted = self.runtime.lifecycle.read().await;
-            if !self.runtime.is_running() {
-                return Err("Cua Driver runtime has shut down".into());
-            }
-            let audio = self
-                .runtime
-                .audio
-                .clone()
-                .ok_or("computer audio is not enabled for this runtime")?;
-            let session = self.context.runtime_session_key(&self.public_session);
-            tokio::task::spawn_blocking(move || audio.completion(&session))
-                .await
-                .map_err(|error| format!("computer audio completion snapshot failed: {error}"))?
-                .map_err(|error| error.to_string())?
-        };
-        completion.wait().await.map_err(|error| error.to_string())
+    /// Bind to the current capture while admitted, then release admission
+    /// before the host waits for that capture or reports its startup receipt.
+    pub(crate) async fn audio_completion(
+        &self,
+    ) -> Result<cua_driver_core::audio::AudioCompletion, String> {
+        let _admitted = self.runtime.lifecycle.read().await;
+        if !self.runtime.is_running() {
+            return Err("Cua Driver runtime has shut down".into());
+        }
+        let audio = self
+            .runtime
+            .audio
+            .clone()
+            .ok_or("computer audio is not enabled for this runtime")?;
+        let session = self.context.runtime_session_key(&self.public_session);
+        tokio::task::spawn_blocking(move || audio.completion(&session))
+            .await
+            .map_err(|error| format!("computer audio completion snapshot failed: {error}"))?
+            .map_err(|error| error.to_string())
     }
 
     /// Trusted resource cleanup for this immutable binding, not a model action

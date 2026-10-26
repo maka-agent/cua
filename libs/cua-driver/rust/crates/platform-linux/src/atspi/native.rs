@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Native AT-SPI access over D-Bus via the `atspi` crate (zbus).
 //!
 //! Replaces the previous `python3 -c "import pyatspi; ..."` subprocess bridge:
@@ -16,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
@@ -24,8 +26,14 @@ use atspi_connection::AccessibilityConnection;
 
 use super::{AtspiIdentity, AtspiNode};
 
+mod element;
+mod element_position;
 pub mod hit;
 pub(crate) mod hit_test;
+mod traversal;
+mod visible_table;
+
+pub(crate) use element::click_native_element;
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
@@ -404,8 +412,8 @@ mod listener_startup_tests {
     use super::wait_for_listener_startup;
     use anyhow::anyhow;
     use std::sync::{
-        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
     };
     use std::time::{Duration, Instant};
 
@@ -430,11 +438,9 @@ mod listener_startup_tests {
         })
         .expect_err("unreachable listener must fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic AT-SPI connection failure")
-        );
+        assert!(error
+            .to_string()
+            .contains("synthetic AT-SPI connection failure"));
     }
 
     #[test]
@@ -534,6 +540,12 @@ struct Visited<'a> {
     /// Display text: the accessible `name`, or — for editable/text widgets that
     /// expose no name — the Text-interface content (where typed text lives).
     name: String,
+    /// Exact properties retained only for the private native observation view.
+    native_name: Option<String>,
+    native_description: Option<String>,
+    native_states: Option<StateSet>,
+    native_value: Option<String>,
+    native_actions_observed: bool,
     /// AT-SPI `Description`, read for controls only: Qt publishes a control's
     /// tooltip there ("Play"/"Pause", "Look in"), GTK its tooltip text.
     description: String,
@@ -860,6 +872,21 @@ fn process_name(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Generic compatibility fallbacks do not prove a native observation's target.
+fn allow_unproven_application_scope(native_observation: bool) -> bool {
+    !native_observation
+}
+
+fn require_native_window_scope(
+    native_observation: bool,
+    scoped_frame: Option<usize>,
+) -> Result<()> {
+    if native_observation && scoped_frame.is_none() {
+        return Err(anyhow!("native_observation_window_identity_unproven"));
+    }
+    Ok(())
+}
+
 async fn resolve_app_for_pid<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
@@ -955,6 +982,15 @@ async fn resolve_app_for_pid<'a>(
     }
     match selection.into_selected() {
         Ok(Some(app)) => Ok(Some(app)),
+        // A native selector's window owner and AT-SPI application must name
+        // the same live process. A similarly named application is not proof.
+        Ok(None)
+            if !allow_unproven_application_scope(
+                super::native_observation::current().is_some(),
+            ) =>
+        {
+            Ok(None)
+        }
         Ok(None) => {
             dlog!(
                 "no application accessible matched pid {pid} by exact pid; trying WM_CLASS/process-name fallback"
@@ -1289,7 +1325,9 @@ async fn resolve_window_frame(
             .collect::<Vec<_>>();
         return correlate_hyprland_frame(&frames, &clients, target);
     }
-    if seeds.len() == 1 {
+    if seeds.len() == 1
+        && allow_unproven_application_scope(super::native_observation::current().is_some())
+    {
         // One top-level: on X11, and on compositors without a GNOME Shell,
         // the caller's window is the only thing this application could be
         // showing, and no geometry round-trip can make that more certain.
@@ -1366,6 +1404,12 @@ enum VisitBudget {
 }
 
 impl VisitBudget {
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Indexed(remaining) | Self::Admitted(remaining) => *remaining,
+        }
+    }
+
     fn admit(&mut self) -> bool {
         match self {
             Self::Indexed(remaining) => *remaining > 0,
@@ -1502,9 +1546,7 @@ async fn collect_visited_bounded_opts<'a>(
     };
 
     let native_observation = super::native_observation::current();
-    if native_observation.is_some() && scoped_frame.is_none() {
-        return Err(anyhow!("native_observation_window_identity_unproven"));
-    }
+    require_native_window_scope(native_observation.is_some(), scoped_frame)?;
 
     // Walk the caller's window FIRST when it was resolved: under a short
     // budget an application-wide pre-order (main window, then dialogs) could
@@ -1530,7 +1572,7 @@ async fn collect_visited_bounded_opts<'a>(
     if native_observation.is_some() {
         ordered.retain(|(_, _, _, ordinal)| Some(*ordinal) == scoped_frame);
     }
-    let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = ordered.into_iter().rev().collect();
+    let mut stack = traversal::Traversal::observation(ordered.into_iter().rev().collect());
     // Direct children of a `menu bar`: a top-level menu whose popup is not
     // open keeps its child count but is not descended into.
     let mut menubar_children: std::collections::HashSet<(String, String)> =
@@ -1575,6 +1617,9 @@ async fn collect_visited_bounded_opts<'a>(
             .unwrap_or(CHILD_ENUMERATION_CAP)
     });
     let mut depth_pending = 0usize;
+    // Only the native table sampler's returned cells receive the original
+    // table-cell Text value projection. Ordinary table cells keep no value.
+    let mut native_text_cells = HashSet::new();
 
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
         // Original admits after budget/depth checks and before property reads.
@@ -1688,7 +1733,7 @@ async fn collect_visited_bounded_opts<'a>(
         // pointer hovered a widget (foreground delivery); it carries no
         // actionable element, so skipping it changes nothing else. One extra
         // round-trip per toplevel, not per node.
-        if depth == 0 {
+        if depth == 0 && native_observation.is_none() {
             if let Some(Ok(role)) = call(acc.get_role_name()).await {
                 if is_tooltip_role(&role) {
                     dlog!("skipping tooltip toplevel {}", oref.path);
@@ -1717,22 +1762,52 @@ async fn collect_visited_bounded_opts<'a>(
         // Fetch the child list only for real containers within the cap: leaves
         // (the majority of nodes) save a round-trip, and a huge container is
         // never enumerated (see CHILD_ENUMERATION_CAP).
-        let children_r: Option<Result<Vec<RawObjectRef>>> = match count_r {
-            Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
-            Some(Ok(count)) if child_cap.is_some_and(|cap| count as usize > cap) => {
-                huge_containers.push((count as usize, visited.len()));
-                Some(Ok(Vec::new()))
-            }
-            Some(Ok(_)) => call(raw_children(zconn, &oref)).await,
-            // Count unavailable (older bridges, error): fall back to the
-            // historical unconditional fetch.
-            Some(Err(_)) => call(raw_children(zconn, &oref)).await,
-            None => None,
-        };
         let role = match role_r {
             Some(Ok(r)) => r,
             _ => String::new(),
         };
+        let children_r: Option<Result<Vec<RawObjectRef>>> = if native_observation.is_some() {
+            Some(
+                visible_table::children_with_role(conn, &oref, &role, budget.remaining(), None)
+                    .await
+                    .map(|children| {
+                        if children.sampled {
+                            native_text_cells.extend(
+                                children
+                                    .objects
+                                    .iter()
+                                    .map(|child| (child.name.clone(), child.path.clone())),
+                            );
+                        }
+                        children.objects
+                    }),
+            )
+        } else {
+            match count_r {
+                Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
+                Some(Ok(count)) if child_cap.is_some_and(|cap| count as usize > cap) => {
+                    huge_containers.push((count as usize, visited.len()));
+                    Some(Ok(Vec::new()))
+                }
+                Some(Ok(_)) => call(raw_children(zconn, &oref)).await,
+                // Count unavailable (older bridges, error): fall back to the
+                // historical unconditional fetch.
+                Some(Err(_)) => call(raw_children(zconn, &oref)).await,
+                None => None,
+            }
+        };
+        let native_name = native_observation.as_ref().and_then(|_| {
+            name_r
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned()
+        });
+        let native_states = native_observation.as_ref().and_then(|_| {
+            state_r
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .copied()
+        });
         let mut name = match name_r {
             Some(Ok(n)) => n,
             _ => String::new(),
@@ -1783,26 +1858,41 @@ async fn collect_visited_bounded_opts<'a>(
         // content. Only touch `proxies` when an interface is actually present,
         // and drop the borrow before `acc` moves into `visited`.
         let mut actions: Vec<String> = Vec::new();
+        let mut native_actions_observed = false;
+        // Original raw values are Text.GetText(0, -1) for these exact roles.
+        // Generic Value/Text presentation keeps its existing reads and cap.
+        let sampled_cell = native_text_cells.remove(&(oref.name.clone(), oref.path.clone()));
+        let native_text_value = native_observation.is_some()
+            && (matches!(role.as_str(), "text" | "entry")
+                || (role == "table cell" && sampled_cell));
+        let mut native_value = None;
         let mut value: Option<String> = None;
         let mut text_content = String::new();
         let mut text_observed = false;
-        if has_action || has_value || has_text {
+        if has_action || has_value || has_text || native_text_value {
             if let Some(Ok(proxies)) = call(acc.proxies()).await {
                 if has_action {
                     if let Some(Ok(ap)) = call(proxies.action()).await {
-                        let n = call(ap.n_actions()).await.and_then(|r| r.ok()).unwrap_or(0);
-                        for i in 0..n {
-                            // Preserve the AT-SPI action index even when an
-                            // individual name lookup fails. `do_action` takes
-                            // this original index, so compacting the vector
-                            // could otherwise actuate a different action than
-                            // the name we selected.
-                            actions.push(
-                                call(ap.get_name(i))
-                                    .await
-                                    .and_then(|result| result.ok())
-                                    .unwrap_or_default(),
-                            );
+                        if native_observation.is_some() {
+                            if let Some(Ok(observed)) = call(ap.get_actions()).await {
+                                actions = observed.into_iter().map(|action| action.name).collect();
+                                native_actions_observed = true;
+                            }
+                        } else {
+                            let observed_count = call(ap.n_actions()).await.and_then(|r| r.ok());
+                            native_actions_observed = observed_count.is_some();
+                            let n = observed_count.unwrap_or(0);
+                            for i in 0..n {
+                                // Preserve the AT-SPI action index even when an
+                                // individual name lookup fails. `do_action` takes
+                                // this original index, so compacting the vector
+                                // could otherwise actuate a different action than
+                                // the name we selected.
+                                let observed_name =
+                                    call(ap.get_name(i)).await.and_then(|result| result.ok());
+                                native_actions_observed &= observed_name.is_some();
+                                actions.push(observed_name.unwrap_or_default());
+                            }
                         }
                     }
                 }
@@ -1816,21 +1906,38 @@ async fn collect_visited_bounded_opts<'a>(
                 }
                 // Text content is where editable/entry text (the typed string)
                 // lives; `name` is usually empty for such widgets.
-                if has_text {
+                if has_text || native_text_value {
                     if let Some(Ok(tp)) = call(proxies.text()).await {
-                        if let Some(Ok(count)) = call(tp.character_count()).await {
-                            if count == 0 {
-                                text_observed = true;
-                            } else if count > 0 {
-                                let end = count.min(4096);
-                                if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
-                                    text_content = t;
+                        if native_text_value {
+                            native_value = call(tp.get_text(0, -1))
+                                .await
+                                .and_then(|result| result.ok());
+                        }
+                        if has_text {
+                            if let Some(Ok(count)) = call(tp.character_count()).await {
+                                if count == 0 {
                                     text_observed = true;
+                                } else if count > 0 {
+                                    let end = count.min(4096);
+                                    if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
+                                        text_content = t;
+                                        text_observed = true;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+        if has_action && !native_actions_observed {
+            if let Some(observation) = &native_observation {
+                observation.mark_incomplete("node_error");
+            }
+        }
+        if native_text_value && native_value.is_none() {
+            if let Some(observation) = &native_observation {
+                observation.mark_incomplete("node_error");
             }
         }
 
@@ -1858,9 +1965,22 @@ async fn collect_visited_bounded_opts<'a>(
             || has_editable
             || (has_component && is_control_role(&role_lower));
         let mut description = String::new();
-        if is_control {
-            if let Some(Ok(text)) = call(acc.description()).await {
-                description = text.trim().to_owned();
+        let mut native_description = None;
+        if is_control || native_observation.is_some() {
+            match call(acc.description()).await {
+                Some(Ok(text)) => {
+                    if is_control {
+                        description = text.trim().to_owned();
+                    }
+                    if native_observation.is_some() {
+                        native_description = Some(text);
+                    }
+                }
+                _ => {
+                    if let Some(observation) = &native_observation {
+                        observation.mark_incomplete("node_error");
+                    }
+                }
             }
         }
         // An unnamed value/editable control: its `LABELLED_BY` relation names
@@ -1902,7 +2022,8 @@ async fn collect_visited_bounded_opts<'a>(
         // any menu that is not showing) keeps its child count and is not
         // walked: its items are hidden, never indexed, and cost a round-trip
         // each. Open menus (expanded / showing popup contents) still descend.
-        let mut closed_menu = !walk_closed_menus
+        let mut closed_menu = native_observation.is_none()
+            && !walk_closed_menus
             && role_lower == "menu"
             && (!showing || (under_menubar && !expanded));
         if closed_menu && showing && under_menubar {
@@ -2023,6 +2144,11 @@ async fn collect_visited_bounded_opts<'a>(
             depth,
             role,
             name,
+            native_name,
+            native_description,
+            native_states,
+            native_value,
+            native_actions_observed,
             description,
             value,
             checked,
@@ -2162,19 +2288,87 @@ fn ordinal_word(n: usize) -> String {
 /// from the pre-order depth sequence: a node at depth `d` ends every open
 /// subtree at depth >= `d`. Ancestry never spans two top-levels.
 fn true_parents(visited: &[Visited<'_>]) -> Vec<Option<usize>> {
-    let mut parents = Vec::with_capacity(visited.len());
+    preorder_parents(visited.iter().map(|node| (node.depth, node.frame_ordinal)))
+}
+
+fn preorder_parents(nodes: impl IntoIterator<Item = (usize, usize)>) -> Vec<Option<usize>> {
+    let nodes = nodes.into_iter();
+    let mut parents = Vec::with_capacity(nodes.size_hint().0);
     let mut chain: Vec<usize> = Vec::new();
     let mut current_frame: Option<usize> = None;
-    for (pos, v) in visited.iter().enumerate() {
-        if current_frame != Some(v.frame_ordinal) {
-            current_frame = Some(v.frame_ordinal);
+    for (pos, (depth, frame_ordinal)) in nodes.enumerate() {
+        if current_frame != Some(frame_ordinal) {
+            current_frame = Some(frame_ordinal);
             chain.clear();
         }
-        chain.truncate(v.depth);
+        chain.truncate(depth);
         parents.push(chain.last().copied());
         chain.push(pos);
     }
     parents
+}
+
+/// Owned projection input from the same completed visits, without live proxies.
+struct NativeAxCapture {
+    object_ref: ObjectRef,
+    parent: Option<usize>,
+    depth: usize,
+    role: String,
+    name: Option<String>,
+    description: Option<String>,
+    value: Option<String>,
+    states: Option<StateSet>,
+    actions: Option<Vec<String>>,
+    element_index: Option<usize>,
+}
+
+fn native_ax_rows(
+    captured: impl IntoIterator<Item = NativeAxCapture>,
+) -> super::native_ax::NativeAxSnapshot {
+    use super::native_ax::{native_id, state_names, NativeAxRow, NativeAxSnapshot, NativeAxSource};
+
+    NativeAxSnapshot {
+        source: NativeAxSource::AtSpi,
+        rows: captured
+            .into_iter()
+            .map(|node| NativeAxRow {
+                native_id: native_id(&node.object_ref.bus, &node.object_ref.path),
+                parent: node.parent,
+                depth: node.depth,
+                role: node.role,
+                name: node.name,
+                description: node.description,
+                value: node.value,
+                states: node.states.map(state_names),
+                actions: node.actions,
+                element_index: node.element_index,
+            })
+            .collect(),
+    }
+}
+
+fn native_ax_snapshot(visited: Vec<Visited<'_>>) -> super::native_ax::NativeAxSnapshot {
+    let parents = true_parents(&visited);
+    let mut index = 0;
+    native_ax_rows(visited.into_iter().zip(parents).map(|(node, parent)| {
+        let element_index = is_indexable(&node).then(|| {
+            let current = index;
+            index += 1;
+            current
+        });
+        NativeAxCapture {
+            object_ref: node.object_ref,
+            parent,
+            depth: node.depth,
+            role: node.role,
+            name: node.native_name,
+            description: node.native_description,
+            value: node.native_value,
+            states: node.native_states,
+            actions: node.native_actions_observed.then_some(node.actions),
+            element_index,
+        }
+    }))
 }
 
 /// For an unnamed value control at `pos`: the nearest preceding sibling
@@ -2543,6 +2737,7 @@ pub fn walk_tree(pid: u32) -> Result<Option<(String, Vec<AtspiNode>)>> {
 pub struct WalkedTree {
     pub markdown: String,
     pub nodes: Vec<AtspiNode>,
+    pub native_ax: Option<super::native_ax::NativeAxSnapshot>,
     pub bounds: Vec<(usize, i32, i32, u32, u32)>,
     /// True when a non-zero `xid` was resolved to exactly one application
     /// top-level and the snapshot contains only that window's nodes. False
@@ -2636,6 +2831,7 @@ async fn walk_tree_snapshot(
             return Ok(Some(WalkedTree {
                 markdown: String::new(),
                 nodes: Vec::new(),
+                native_ax: super::native_observation::current().map(|_| native_ax_rows([])),
                 bounds: Vec::new(),
                 window_scoped: false,
                 truncation: Some(Truncation {
@@ -2654,6 +2850,7 @@ async fn walk_tree_snapshot(
             return Ok(Some(WalkedTree {
                 markdown: String::new(),
                 nodes: Vec::new(),
+                native_ax: super::native_observation::current().map(|_| native_ax_rows([])),
                 bounds: Vec::new(),
                 window_scoped: false,
                 truncation: Some(Truncation {
@@ -2723,23 +2920,27 @@ async fn walk_tree_snapshot(
     } else {
         bounds
     };
+    let nodes_visited = visited.len();
     let truncation = truncation.or_else(|| {
         super::native_observation::current()
             .and_then(|observation| observation.incomplete_reason())
             .map(|reason| Truncation {
                 reason,
-                visited: visited.len(),
+                visited: nodes_visited,
                 pending: 0,
             })
     });
+    // Move raw properties out only after rendering and bounds use the same visits.
+    let native_ax = super::native_observation::current().map(|_| native_ax_snapshot(visited));
     Ok(Some(WalkedTree {
         markdown,
         nodes,
+        native_ax,
         bounds,
         window_scoped: scoped_frame.is_some(),
         truncation,
         bounds_complete,
-        nodes_visited: visited.len(),
+        nodes_visited,
         elapsed: walk_started.elapsed(),
     }))
 }
@@ -7287,7 +7488,10 @@ mod stacking_z_index_tests {
 
 #[cfg(test)]
 mod frame_correlation_tests {
-    use super::{FRAME_MATCH_TOLERANCE_PX, correlate_frame_to_window};
+    use super::{
+        allow_unproven_application_scope, correlate_frame_to_window, require_native_window_scope,
+        ApplicationSelection, FRAME_MATCH_TOLERANCE_PX,
+    };
     use crate::x11::WindowInfo;
 
     fn window(x: i32, y: i32, width: u32, height: u32) -> WindowInfo {
@@ -7386,20 +7590,104 @@ mod frame_correlation_tests {
             None
         );
     }
+    #[test]
+    fn native_observation_refuses_a_sibling_hidden_by_a_sole_accessible_frame() {
+        let first = window(438, 80, 1050, 953);
+        let mut sibling = window(2400, 80, 1050, 953);
+        sibling.xid = first.xid + 1;
+        assert_eq!(
+            first.pid, sibling.pid,
+            "both native windows belong to one process"
+        );
+        assert_ne!(
+            first.xid, sibling.xid,
+            "the caller selected a distinct sibling"
+        );
+        let frames = [(
+            0usize,
+            (first.x, first.y, first.width as i32, first.height as i32),
+        )];
+
+        let native_scope = if frames.len() == 1 && allow_unproven_application_scope(true) {
+            Some(0)
+        } else {
+            correlate_frame_to_window(&frames, &sibling)
+        };
+        assert_eq!(
+            native_scope, None,
+            "the only accessible frame belongs to the other window"
+        );
+        assert_eq!(
+            require_native_window_scope(true, native_scope)
+                .expect_err("native observation requires a correlated target frame")
+                .to_string(),
+            "native_observation_window_identity_unproven"
+        );
+        let matching_scope = correlate_frame_to_window(&frames, &first);
+        assert_eq!(matching_scope, Some(0));
+        assert!(require_native_window_scope(true, matching_scope).is_ok());
+
+        let generic_scope = if frames.len() == 1 && allow_unproven_application_scope(false) {
+            Some(0)
+        } else {
+            correlate_frame_to_window(&frames, &sibling)
+        };
+        assert_eq!(
+            generic_scope,
+            Some(0),
+            "generic compatibility keeps its existing sole-frame shortcut"
+        );
+        assert!(require_native_window_scope(false, generic_scope).is_ok());
+        assert!(
+            require_native_window_scope(false, None).is_ok(),
+            "generic application-scoped reads remain available"
+        );
+    }
+
+    #[test]
+    fn native_observation_does_not_admit_a_name_only_application_after_exact_pid_miss() {
+        let target_pid = 99;
+        let mut selection = ApplicationSelection::new(target_pid);
+        let registered = [(Some(100), "same-name-other-process", true)];
+        for (pid, app, has_children) in registered {
+            if selection.matches_pid(pid) {
+                selection.consider_matching(app, has_children);
+            }
+        }
+        let exact = selection
+            .into_selected()
+            .expect("no exact PID candidate is unambiguous");
+        assert_eq!(exact, None);
+        let native = exact.or_else(|| {
+            allow_unproven_application_scope(true).then_some("same-name-other-process")
+        });
+        assert_eq!(
+            native, None,
+            "name equality cannot admit another PID into native observation"
+        );
+        let generic = exact.or_else(|| {
+            allow_unproven_application_scope(false).then_some("same-name-other-process")
+        });
+        assert_eq!(
+            generic,
+            Some("same-name-other-process"),
+            "generic name fallback admission remains unchanged"
+        );
+    }
 }
 
 #[cfg(test)]
 mod coord_tests {
-    use super::OP_DEADLINE;
     use super::parse_gtk_frame_extents;
+    use super::OP_DEADLINE;
     use super::{
-        ApplicationSelection, activation_index, before_snapshot_deadline, bounded_blocking,
+        activation_index, before_snapshot_deadline, bounded_blocking,
         combine_wayland_content_offsets, counts_as_showing, hyprland_document_top_inset,
         is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
         is_showing_state, is_web_process_bus, listing_state, passive_marker,
         prefer_authoritative_wayland_origin, project_screen_extents, rebase_renderer_window_offset,
         scoped_component_nodes, screen_extent_rebase, select_click_target, select_web_document,
-        wayland_window_origin,
+        wayland_window_origin, ApplicationSelection,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -8179,11 +8467,9 @@ mod budget_tests {
                     assert!(deadline_passed());
                     // Once the deadline has passed, calls short-circuit.
                     let started = std::time::Instant::now();
-                    assert!(
-                        call(tokio::time::sleep(Duration::from_secs(10)))
-                            .await
-                            .is_none()
-                    );
+                    assert!(call(tokio::time::sleep(Duration::from_secs(10)))
+                        .await
+                        .is_none());
                     assert!(started.elapsed() < Duration::from_millis(50));
                 })
                 .await;
@@ -8352,11 +8638,9 @@ mod at_point_rules_tests {
             selected: Some("file.txt".into()),
             selection_verified: true,
         };
-        assert!(
-            selected
-                .describe()
-                .starts_with("selected: canvas \"file.txt\"")
-        );
+        assert!(selected
+            .describe()
+            .starts_with("selected: canvas \"file.txt\""));
         assert!(selected.describe().contains("read back as selected"));
     }
 }
@@ -8364,9 +8648,9 @@ mod at_point_rules_tests {
 #[cfg(test)]
 mod window_scope_tests {
     use super::{
-        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN, accessibility_window_id,
-        gnome_window_scope_proven, lone_top_level_renders, project_screen_extents,
-        scoped_component_nodes, select_click_target, window_bound_element,
+        accessibility_window_id, gnome_window_scope_proven, lone_top_level_renders,
+        project_screen_extents, scoped_component_nodes, select_click_target, window_bound_element,
+        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN,
     };
 
     /// `(frame_ordinal, has_component, window-local extents)`.
@@ -8690,9 +8974,9 @@ mod window_scope_tests {
 #[cfg(test)]
 mod token_scope_tests {
     use super::{
-        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN, gnome_window_scope_proven,
-        is_window_membership_unproven, lone_top_level_renders, snapshot_binds_window,
-        window_element_membership,
+        gnome_window_scope_proven, is_window_membership_unproven, lone_top_level_renders,
+        snapshot_binds_window, window_element_membership, ELEMENT_OUTSIDE_WINDOW,
+        WINDOW_SCOPE_UNPROVEN,
     };
 
     // One PID owns Shell windows A and B; `get_window_state` reads B.
@@ -8774,15 +9058,110 @@ mod token_scope_tests {
         .unwrap_err();
         assert!(is_window_membership_unproven(&outside));
         assert_eq!(outside.to_string(), ELEMENT_OUTSIDE_WINDOW);
-        assert!(
-            window_element_membership(
-                Some(1),
-                Some(1),
-                proven(Some(1), vec![SIBLING_A, REQUESTED_B])
-            )
-            .is_ok()
-        );
+        assert!(window_element_membership(
+            Some(1),
+            Some(1),
+            proven(Some(1), vec![SIBLING_A, REQUESTED_B])
+        )
+        .is_ok());
         assert!(window_element_membership(Some(0), None, proven(None, vec![REQUESTED_B])).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_ax_projection_tests {
+    use super::{native_ax_rows, preorder_parents, NativeAxCapture, ObjectRef, State, StateSet};
+
+    #[test]
+    fn raw_projection_keeps_passive_unnamed_rows_properties_and_true_parents() {
+        let shape = [(0, 0), (1, 0), (2, 0), (1, 0), (0, 1)];
+        let parents = preorder_parents(shape);
+        assert_eq!(parents, [None, Some(0), Some(1), Some(0), None]);
+        let names = [
+            Some(" Raw frame "),
+            None,
+            Some(""),
+            Some("Raw button"),
+            None,
+        ];
+        let long_text = "x".repeat(5_000);
+        let captured = shape
+            .into_iter()
+            .enumerate()
+            .map(|(pos, (depth, _))| NativeAxCapture {
+                object_ref: ObjectRef {
+                    bus: "org.example.Accessible".to_owned(),
+                    path: format!("/org/a11y/atspi/accessible/{pos}"),
+                },
+                parent: parents[pos],
+                depth,
+                role: match pos {
+                    0 | 4 => "frame",
+                    1 => "filler",
+                    2 => "text",
+                    _ => "push button",
+                }
+                .to_owned(),
+                name: names[pos].map(str::to_owned),
+                description: (pos == 0).then(|| " exact description \n".to_owned()),
+                value: (pos == 2).then(|| long_text.clone()),
+                states: match pos {
+                    0 => Some(
+                        [State::Visible, State::Active, State::Enabled]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    1 => Some(StateSet::empty()),
+                    _ => None,
+                },
+                actions: match pos {
+                    2 => Some(vec![]),
+                    3 => Some(vec!["click".to_owned()]),
+                    _ => None,
+                },
+                element_index: (pos == 3).then_some(0),
+            });
+        let snapshot = native_ax_rows(captured);
+        assert_eq!(
+            snapshot.rows.len(),
+            5,
+            "raw projection cannot filter passive or unnamed visits"
+        );
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| row.parent)
+                .collect::<Vec<_>>(),
+            parents
+        );
+        assert_eq!(snapshot.rows[0].name.as_deref(), Some(" Raw frame "));
+        assert_eq!(
+            snapshot.rows[0].description.as_deref(),
+            Some(" exact description \n")
+        );
+        assert_eq!(
+            snapshot.rows[0].states,
+            Some(vec!["enabled".to_owned(), "visible".to_owned()])
+        );
+        assert_eq!(snapshot.rows[1].name, None);
+        assert_eq!(snapshot.rows[1].states, Some(vec![]));
+        assert_eq!(
+            snapshot.rows[2].name.as_deref(),
+            Some(""),
+            "display-name fallback is absent from raw rows"
+        );
+        assert_eq!(snapshot.rows[2].value.as_deref(), Some(long_text.as_str()));
+        assert_eq!(snapshot.rows[2].actions, Some(vec![]));
+        assert_eq!(snapshot.rows[3].element_index, Some(0));
+        assert_eq!(snapshot.rows[4].states, None);
+        for (pos, row) in snapshot.rows.iter().enumerate() {
+            assert_eq!(
+                row.native_id,
+                format!("org.example.Accessible:/org/a11y/atspi/accessible/{pos}")
+            );
+            assert_eq!(row.depth, shape[pos].0);
+        }
     }
 }
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! AT-SPI accessibility tree walking for Linux.
 //!
 //! AT-SPI2 is exposed over D-Bus. We talk to it natively in Rust via the
@@ -13,6 +15,7 @@ use self::snapshot as cache;
 use anyhow::Result;
 
 pub mod native;
+pub mod native_ax;
 pub mod native_observation;
 pub mod snapshot;
 pub use native::ensure_listener_active;
@@ -64,6 +67,8 @@ pub struct AtspiNode {
 pub struct AtspiTreeResult {
     pub tree_markdown: String,
     pub nodes: Vec<AtspiNode>,
+    /// Private raw observation data; never grants element or window authority.
+    pub native_ax: Option<native_ax::NativeAxSnapshot>,
     pub bounds: Vec<(usize, i32, i32, u32, u32)>,
     /// True only for a native AT-SPI walk. The X11 property fallback is a
     /// partial discovery aid and must not prove verification predicates.
@@ -115,6 +120,7 @@ impl AtspiTreeResult {
         AtspiTreeResult {
             tree_markdown: md,
             nodes: walked.nodes,
+            native_ax: walked.native_ax,
             bounds: walked.bounds,
             trusted: true,
             degraded_reason: None,
@@ -194,7 +200,7 @@ pub(crate) fn walk_tree_native_observation(
         return Err(anyhow::anyhow!(reason));
     }
     let result =
-        native_observation_or_metadata(walked, query, || walk_via_x11_properties(xid, query));
+        native_observation_or_metadata(walked, query, || read_x11_property_tree(xid, query, true));
     if let Some(reason) = observation.stop_reason() {
         return Err(anyhow::anyhow!(reason));
     }
@@ -419,8 +425,8 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
     perform_action_at_point_in(pid, 0, win_x, win_y, false)
 }
 
-pub use native::AtPointHit;
 pub use native::is_focus_taking_role;
+pub use native::AtPointHit;
 
 /// [`perform_action_at_point`] for a known window, in three rungs that never
 /// re-walk the tree first:
@@ -608,7 +614,7 @@ fn cached_bounds(pid: u32, xid: Option<u64>, idx: usize) -> Option<(i32, i32, u3
     }
 }
 
-pub use native::{WindowElement, WindowProof, is_window_membership_unproven};
+pub use native::{is_window_membership_unproven, WindowElement, WindowProof};
 
 /// Whether `get_window_state` may bind this snapshot's elements to window
 /// `xid` as element tokens. See [`native::snapshot_binds_window_for`].
@@ -777,6 +783,10 @@ pub fn scroll_token(
 
 /// Minimal X11 property-based tree (fallback when AT-SPI is unavailable).
 fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
+    read_x11_property_tree(xid, query, false)
+}
+
+fn read_x11_property_tree(xid: u64, query: Option<&str>, native_profile: bool) -> AtspiTreeResult {
     use x11rb::rust_connection::RustConnection;
 
     let (conn, _) = match RustConnection::connect(None) {
@@ -785,6 +795,10 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
             return AtspiTreeResult {
                 tree_markdown: String::new(),
                 nodes: vec![],
+                native_ax: native_profile.then(|| native_ax::NativeAxSnapshot {
+                    source: native_ax::NativeAxSource::X11,
+                    rows: vec![],
+                }),
                 bounds: vec![],
                 trusted: false,
                 degraded_reason: None,
@@ -802,12 +816,48 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
     let window = xid as u32;
 
     // Read window title.
-    let title = get_x11_title(&conn, window).unwrap_or_default();
+    let title = get_x11_title(&conn, window);
 
     // Read WM_CLASS.
-    let wm_class = get_x11_wm_class(&conn, window).unwrap_or_default();
+    let wm_class = get_x11_wm_class(&conn, window);
 
-    x11_property_tree(xid, title, wm_class, query)
+    let raw =
+        native_profile.then(|| native_x11_snapshot(window, title.as_deref(), wm_class.as_deref()));
+    let mut tree = x11_property_tree(
+        xid,
+        title.unwrap_or_default(),
+        wm_class
+            .unwrap_or_default()
+            .trim_end_matches('\0')
+            .replace('\0', "."),
+        query,
+    );
+    tree.native_ax = raw;
+    tree
+}
+
+fn native_x11_snapshot(
+    xid: u32,
+    title: Option<&str>,
+    wm_class: Option<&str>,
+) -> native_ax::NativeAxSnapshot {
+    use native_ax::{x11_native_id, NativeAxRow, NativeAxSnapshot, NativeAxSource};
+
+    NativeAxSnapshot {
+        source: NativeAxSource::X11,
+        rows: vec![NativeAxRow {
+            native_id: x11_native_id(xid),
+            parent: None,
+            depth: 0,
+            role: "window".to_owned(),
+            name: title.map(str::to_owned),
+            description: wm_class.map(|value| value.trim_end_matches('\0').replace('\0', " / ")),
+            value: None,
+            states: None,
+            actions: None,
+            element_index: None,
+        }],
+    }
 }
 
 fn x11_property_tree(
@@ -860,6 +910,7 @@ fn x11_property_tree(
     AtspiTreeResult {
         tree_markdown,
         nodes,
+        native_ax: None,
         bounds: vec![],
         trusted: false,
         // Built by reading this exact window's X11 properties, so it describes
@@ -915,9 +966,7 @@ fn get_x11_wm_class(conn: &x11rb::rust_connection::RustConnection, window: u32) 
         .ok()?
         .reply()
         .ok()?;
-    let s = String::from_utf8_lossy(&reply.value);
-    // WM_CLASS is two NUL-separated strings: instance_name\0class_name\0
-    Some(s.trim_end_matches('\0').replace('\0', "."))
+    Some(String::from_utf8_lossy(&reply.value).into_owned())
 }
 
 fn filter_tree(markdown: &str, query: &str) -> String {
@@ -983,6 +1032,7 @@ mod budget_tests {
             };
         native::WalkedTree {
             markdown: "- [0] frame \"Untitled\"\n  - [1] push button \"OK\"\n".into(),
+            native_ax: None,
             nodes: vec![
                 node(0, "frame", "Untitled", 0, vec![]),
                 node(1, "push button", "OK", 1, vec!["click".into()]),
@@ -994,6 +1044,40 @@ mod budget_tests {
             nodes_visited: 3,
             elapsed: std::time::Duration::from_millis(1234),
         }
+    }
+
+    #[test]
+    fn native_x11_metadata_keeps_original_id_and_class_without_element_authority() {
+        let raw = native_x11_snapshot(
+            0x00ab12,
+            Some("Owned window"),
+            Some("instance\0ClassName\0"),
+        );
+        assert_eq!(raw.source, native_ax::NativeAxSource::X11);
+        assert_eq!(raw.rows.len(), 1);
+        let row = &raw.rows[0];
+        assert_eq!(row.native_id, "x11:0xab12");
+        assert_eq!(row.description.as_deref(), Some("instance / ClassName"));
+        assert_eq!(row.name.as_deref(), Some("Owned window"));
+        assert_eq!(row.parent, None);
+        assert_eq!(row.depth, 0);
+        assert_eq!(row.element_index, None);
+        assert_eq!(row.actions, None);
+        assert_eq!(row.states, None);
+        let generic = x11_property_tree(
+            0xab12,
+            "Owned window".to_owned(),
+            "instance.ClassName".to_owned(),
+            None,
+        );
+        assert!(
+            generic.native_ax.is_none(),
+            "generic property trees do not expose the private payload"
+        );
+        assert_eq!(
+            generic.nodes[0].description.as_deref(),
+            Some("instance.ClassName")
+        );
     }
 
     #[test]

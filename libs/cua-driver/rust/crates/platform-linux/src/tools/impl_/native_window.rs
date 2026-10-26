@@ -4,7 +4,7 @@ use cua_driver_core::action_record::{
     ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
 };
 use cua_driver_core::protocol::ToolResult;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::input::native_window::{
     NativeWindowCancellation, NativeWindowError, NativeWindowInputRequest,

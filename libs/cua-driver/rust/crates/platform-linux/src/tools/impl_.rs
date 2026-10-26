@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Real Linux tool implementations (compiled only on Linux).
 
 use async_trait::async_trait;
@@ -8,10 +10,10 @@ use cua_driver_contract::{
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef, ToolRegistry},
-    tool_args::{ArgsExt, parse_legacy_click_input, parse_typed_input, parse_typed_projection},
+    tool_args::{parse_legacy_click_input, parse_typed_input, parse_typed_projection, ArgsExt},
     window_target::{PidOnlyWindowTargetGuard, WindowTargetCandidate, WindowTargetCandidates},
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -21,6 +23,7 @@ use cursor_overlay::CursorRegistry;
 
 mod pixel_scroll;
 use pixel_scroll::PixelScroll;
+mod native_element;
 mod native_window;
 
 fn window_target_candidates_for_pid(
@@ -1486,7 +1489,7 @@ impl Tool for GetWindowStateTool {
                             std::fs::write(path, &png)?;
                             (None, Some(path.clone()))
                         } else {
-                            use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                             (Some(B64.encode(&png)), None)
                         };
                         if let Some(reason) = native_for_capture
@@ -1624,6 +1627,9 @@ impl Tool for GetWindowStateTool {
                     structured["bounds_complete"] = json!(tr.bounds_complete);
                     structured["walk_elapsed_ms"] = json!(tr.elapsed_ms as u64);
                     if native_profile {
+                        if let Some(raw) = &tr.native_ax {
+                            structured["native_ax"] = json!(raw);
+                        }
                         structured["native_observation"] = json!({
                             "source":if tr.trusted { "at_spi" } else { "x11" },
                             "trusted":tr.trusted,
@@ -1769,8 +1775,8 @@ impl Tool for GetWindowStateTool {
                         );
                     } else if !source_trusted {
                         structured["degraded"] = json!(true);
-                        structured["degraded_reason"] =
-                            json!(source_degraded_reason.unwrap_or_else(|| {
+                        structured["degraded_reason"] = json!(source_degraded_reason
+                            .unwrap_or_else(|| {
                                 "x11_property_fallback_partial: AT-SPI was unavailable and \
                                  Cua Driver only recovered window metadata. Treat it as \
                                  discovery evidence; it cannot prove checked state."
@@ -3918,13 +3924,11 @@ impl PointerRoute {
                 v["popup"] = popup.to_json();
             }
             if !effect.popups.is_empty() {
-                v["popups"] = json!(
-                    effect
-                        .popups
-                        .iter()
-                        .map(|p| p.to_json())
-                        .collect::<Vec<_>>()
-                );
+                v["popups"] = json!(effect
+                    .popups
+                    .iter()
+                    .map(|p| p.to_json())
+                    .collect::<Vec<_>>());
             }
             // Evidence the action record can publish. A popup (menu, popover,
             // combo list) appearing is a window change the public contract
@@ -4826,8 +4830,8 @@ fn isolated_hyprland_task_error(error: tokio::task::JoinError, acknowledged: boo
 fn spawn_isolated_hyprland(
     args: &Value,
     work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<Value>
-    + Send
-    + 'static,
+        + Send
+        + 'static,
 ) -> Result<
     (
         crate::wayland::hyprland_input::CancelOnDrop,
@@ -5311,14 +5315,12 @@ fn coordinate_less_mouse_button_up_survives_snapshot_replacement() {
     );
 
     clear_mouse_hold_after_release(&state, cursor_id);
-    assert!(
-        state
-            .mouse_hold
-            .lock()
-            .unwrap()
-            .insert(cursor_id.to_owned(), hold)
-            .is_none()
-    );
+    assert!(state
+        .mouse_hold
+        .lock()
+        .unwrap()
+        .insert(cursor_id.to_owned(), hold)
+        .is_none());
 }
 
 #[cfg(test)]
@@ -5428,14 +5430,12 @@ fn failed_session_end_release_remains_retryable_and_bounded() {
     })
     .unwrap();
     assert_eq!(attempts, 2);
-    assert!(
-        state
-            .mouse_hold
-            .lock()
-            .unwrap()
-            .insert(session_id.to_owned(), hold)
-            .is_none()
-    );
+    assert!(state
+        .mouse_hold
+        .lock()
+        .unwrap()
+        .insert(session_id.to_owned(), hold)
+        .is_none());
 }
 
 #[cfg(test)]
@@ -5446,14 +5446,13 @@ fn isolated_hyprland_refused_partial_and_unknown_outcomes_stay_distinct() {
     assert_eq!(content["reason"], "lane_busy");
     assert_eq!(content["effect"], "refused");
     assert!(content.get("delivery").is_none());
-    assert!(
-        busy.action_record
-            .unwrap()
-            .public_result()
-            .unwrap()
-            .delivery
-            .is_none()
-    );
+    assert!(busy
+        .action_record
+        .unwrap()
+        .public_result()
+        .unwrap()
+        .delivery
+        .is_none());
 
     let refused = isolated_hyprland_result(Ok(
         json!({"ok":false,"code":"stale_target","detail":"stale_target"}),
@@ -6714,6 +6713,9 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(request) = crate::input::native_element::take_native_element_click() {
+            return native_element::invoke(args, request).await;
+        }
         if let Some(request) = crate::input::native_window::take_native_window_input() {
             return native_window::invoke("click", args, request).await;
         }
@@ -13123,7 +13125,7 @@ impl Tool for GetDesktopStateTool {
             } else {
                 None
             };
-            use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
             let b64 = if written.is_some() {
                 None
             } else {
@@ -14117,7 +14119,7 @@ impl Tool for ZoomTool {
                 ) {
                     return refusal;
                 }
-                use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                 let b64 = B64.encode(&crop.jpeg_bytes);
                 let (w, h) = (crop.out_w, crop.out_h);
                 use cua_driver_core::protocol::Content;
@@ -14658,8 +14660,8 @@ impl Tool for SetWindowFrameTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_contract::SetWindowFrameInput;
         use cua_driver_core::action_record::{
-            ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery, EvidenceKind,
-            RequestedDelivery, effect_from_value_readback,
+            effect_from_value_readback, ActionEvidence, ActionExecutionRecord, ActionTransport,
+            ActualDelivery, EvidenceKind, RequestedDelivery,
         };
 
         let input: SetWindowFrameInput =
@@ -15206,7 +15208,7 @@ mod visibility_tests;
 #[cfg(test)]
 mod cursor_hook_emission_tests {
     use super::emit_cursor_hook;
-    use cua_driver_core::cursor_hook::{CursorHookEvent, set_cursor_hook_fn};
+    use cua_driver_core::cursor_hook::{set_cursor_hook_fn, CursorHookEvent};
     use std::sync::{Arc, Mutex};
 
     /// Linux pointer actions report the agent cursor to an embedder's hook

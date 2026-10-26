@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Resource cleanup races without capturing a desktop or an audio device.
 
 use super::*;
@@ -296,6 +298,7 @@ async fn canceling_host_discard_await_does_not_release_native_cleanup_or_its_dra
 struct CompletingFactory {
     workers: Mutex<Vec<std::sync::mpsc::Sender<bool>>>,
     active: Arc<AtomicUsize>,
+    finished: Arc<AtomicUsize>,
 }
 
 struct CompletingBackend {
@@ -312,6 +315,7 @@ impl AudioBackendFactory for CompletingFactory {
     ) -> cua_driver_core::audio::AudioResult<Box<dyn AudioBackend>> {
         let path = path.to_owned();
         let active = self.active.clone();
+        let finished = self.finished.clone();
         let (stop, stopping) = std::sync::mpsc::channel();
         let (completion, completed) = AudioCompletion::channel();
         active.fetch_add(1, Ordering::SeqCst);
@@ -323,6 +327,7 @@ impl AudioBackendFactory for CompletingFactory {
             };
             active.fetch_sub(1, Ordering::SeqCst);
             completed.finish(&result);
+            finished.fetch_add(1, Ordering::SeqCst);
             result
         });
         self.workers.lock().unwrap().push(stop.clone());
@@ -365,16 +370,9 @@ async fn observing_audio(
     runtime: &DriverRuntime,
     session: Arc<RuntimeSession>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
-    use std::future::Future;
-    let mut wait = Box::pin(async move { session.wait_audio_finished().await });
-    // Poll once with no competing lifecycle lock: the observation enters its
-    // read-admitted snapshot before it awaits the blocking snapshot worker.
-    std::future::poll_fn(|cx| {
-        assert!(wait.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
-    let wait = tokio::spawn(wait);
+    let completion = session.audio_completion().await.unwrap();
+    let wait =
+        tokio::spawn(async move { completion.wait().await.map_err(|error| error.to_string()) });
     // Acquiring the writer proves the snapshot released admission. A waiter
     // that retained its read guard until capture end would deadlock here.
     let drained = tokio::time::timeout(Duration::from_secs(5), runtime.lifecycle.write())
@@ -459,7 +457,7 @@ async fn host_wait_reports_native_failure_and_refuses_an_absent_or_unsupported_c
     let runtime = runtime(factory.clone());
     let target = session(&runtime, "audio-wait-failure").await;
     assert_eq!(
-        target.wait_audio_finished().await.unwrap_err(),
+        target.audio_completion().await.err().unwrap(),
         "computer audio recording is not active"
     );
     invoke(&target, "start_audio_recording").await;
@@ -480,8 +478,89 @@ async fn host_wait_reports_native_failure_and_refuses_an_absent_or_unsupported_c
     let target = session(&unsupported, "audio-wait-unsupported").await;
     invoke(&target, "start_audio_recording").await;
     assert_eq!(
-        target.wait_audio_finished().await.unwrap_err(),
+        target.audio_completion().await.err().unwrap(),
         "native audio completion observation is unavailable for this backend"
     );
     unsupported.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_snapshot_keeps_the_original_capture_before_first_wait_poll_and_replacement() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let target = session(&runtime, "audio-exact-snapshot").await;
+    invoke(&target, "start_audio_recording").await;
+    let first = crate::AudioCompletion {
+        native: target.audio_completion().await.unwrap(),
+    };
+    invoke(&target, "stop_audio_recording").await;
+    invoke(&target, "start_audio_recording").await;
+    let second = crate::AudioCompletion {
+        native: target.audio_completion().await.unwrap(),
+    };
+    // No wait on first has been constructed or polled before capture two.
+    tokio::time::timeout(Duration::from_secs(5), first.wait())
+        .await
+        .expect("the first capture completed before replacement")
+        .unwrap();
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    // Successful snapshot registration no longer owns runtime admission.
+    let writer = tokio::time::timeout(Duration::from_secs(5), runtime.lifecycle.write())
+        .await
+        .expect("snapshot must release runtime admission before returning");
+    drop(writer);
+    drop(second.clone());
+    {
+        use std::future::Future;
+        let mut detached = Box::pin(second.wait());
+        std::future::poll_fn(|cx| {
+            assert!(detached.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(detached);
+    }
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    factory.workers.lock().unwrap()[1].send(false).unwrap();
+    for observation in [second.clone(), second] {
+        assert!(matches!(
+            observation.wait().await,
+            Err(crate::DriverError::Protocol { reason })
+                if reason == "fixture native finalization failed"
+        ));
+    }
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        target.discard_audio().await.unwrap_err(),
+        "fixture native finalization failed"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_snapshot_retains_native_completion_that_precedes_registration() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let target = session(&runtime, "audio-immediate-snapshot").await;
+    invoke(&target, "start_audio_recording").await;
+    factory.workers.lock().unwrap()[0].send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while factory.finished.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fixture native worker finalizes on its channel");
+    let completion = crate::AudioCompletion {
+        native: target.audio_completion().await.unwrap(),
+    };
+    // Shutdown joins the already-completed native worker and removes outputs;
+    // the detached observation remains the same capture's finalization result.
+    runtime.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), completion.wait())
+        .await
+        .expect("a pre-registration completion must not be lost")
+        .unwrap();
 }
