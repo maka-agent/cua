@@ -15,6 +15,7 @@ use core_graphics::{
     sys::CGEventRef,
 };
 use foreign_types::ForeignType;
+use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
 use std::{cell::RefCell, ffi::c_void, future::Future, sync::OnceLock, time::Duration};
 
 #[derive(Clone, Copy, Debug)]
@@ -67,7 +68,7 @@ pub(crate) fn take_native_page_scroll() -> Option<NativePageScrollRequest> {
 pub struct PreparedPageScroll {
     event: CGEvent,
     pid: i32,
-    timebase: libc::mach_timebase_info_data_t,
+    timebase: mach_timebase_info_data_t,
 }
 
 /// Build exactly one PIXEL event without moving a cursor or posting input.
@@ -134,11 +135,12 @@ impl PreparedPageScroll {
     pub fn post(self) -> anyhow::Result<()> {
         // SAFETY: mach_absolute_time is a read-only clock and `timebase` was
         // checked before preparation returned. The event stays retained here.
-        let ticks = unsafe { libc::mach_absolute_time() };
+        let ticks = unsafe { mach_absolute_time() };
         let nanos =
             u128::from(ticks) * u128::from(self.timebase.numer) / u128::from(self.timebase.denom);
         let timestamp = u64::try_from(nanos)
             .map_err(|_| anyhow::anyhow!("native page scroll uptime cannot be represented"))?;
+        // SAFETY: this event remains retained and the timestamp has the native ABI type.
         unsafe { CGEventSetTimestamp(self.event.as_ptr(), timestamp) };
         self.event.post_to_pid(self.pid);
         std::thread::sleep(Duration::from_millis(10));
@@ -146,17 +148,17 @@ impl PreparedPageScroll {
     }
 }
 
-fn uptime_timebase() -> anyhow::Result<libc::mach_timebase_info_data_t> {
-    let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
+pub(super) fn uptime_timebase() -> anyhow::Result<mach_timebase_info_data_t> {
+    let mut info = mach_timebase_info_data_t { numer: 0, denom: 0 };
     // SAFETY: the system fills one correctly sized native timebase record.
-    let result = unsafe { libc::mach_timebase_info(&mut info) };
+    let result = unsafe { mach_timebase_info(&mut info) };
     if result != 0 || info.numer == 0 || info.denom == 0 {
         anyhow::bail!("native page scroll uptime source unavailable");
     }
     Ok(info)
 }
 
-fn set_window_location(event: CGEventRef, point: CGPoint) -> anyhow::Result<()> {
+pub(super) fn set_window_location(event: CGEventRef, point: CGPoint) -> anyhow::Result<()> {
     type SetWindowLocation = unsafe extern "C" fn(CGEventRef, CGPoint);
     static FUNCTION: OnceLock<Option<SetWindowLocation>> = OnceLock::new();
     let function = FUNCTION.get_or_init(|| {

@@ -7,7 +7,7 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use super::ToolState;
+use super::{capture_binding::CaptureImage, ToolState};
 
 pub struct GetWindowStateTool {
     state: Arc<ToolState>,
@@ -51,10 +51,12 @@ fn publish_action_capture(
                 args,
                 pid,
                 window_id,
-                bytes.clone(),
-                *codec,
-                (*width, *height),
-                *native,
+                CaptureImage {
+                    encoded_bytes: bytes.clone(),
+                    codec: *codec,
+                    encoded_dimensions: (*width, *height),
+                    native_dimensions: *native,
+                },
             )
             .map(Some),
         _ => Ok(None),

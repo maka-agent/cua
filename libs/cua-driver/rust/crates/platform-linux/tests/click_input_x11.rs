@@ -89,7 +89,8 @@ fn desktop_clicks_deliver_a_hold_and_release_modifiers() -> Result<()> {
         for modifiers in [vec![], vec!["ctrl"]] {
             send_click_xtest_desktop_with_modifiers(50, 50, 1, count, &modifiers)?;
             let events = button_events(&conn, count * 2)?;
-            for pair in events.chunks_exact(2) {
+            let pairs = events.as_chunks::<2>().0;
+            for pair in pairs {
                 assert_pair(pair, target, !modifiers.is_empty());
                 assert_eq!(pair[0].1.response_type & 0x80, 0);
                 // Server timestamps cannot turn buffered transitions into a hold
@@ -98,7 +99,7 @@ fn desktop_clicks_deliver_a_hold_and_release_modifiers() -> Result<()> {
                 eprintln!("desktop count={count} modifiers={modifiers:?}: hold={held_ms} ms");
                 assert!(held_ms >= 30, "desktop click held only {held_ms} ms");
             }
-            for adjacent in events.chunks_exact(2).collect::<Vec<_>>().windows(2) {
+            for adjacent in pairs.windows(2) {
                 let gap_ms = adjacent[1][0].1.time.wrapping_sub(adjacent[0][1].1.time);
                 assert!(gap_ms >= 40, "multi-click gap was only {gap_ms} ms");
             }
@@ -132,7 +133,7 @@ fn background_clicks_deliver_spaced_pairs_without_changing_focus() -> Result<()>
             events
         })?;
         let mut holds = Vec::new();
-        for pair in events.chunks_exact(2) {
+        for pair in events.as_chunks::<2>().0 {
             assert_pair(pair, target, !modifiers.is_empty());
             assert_ne!(pair[0].1.response_type & 0x80, 0);
             holds.push(pair[1].2.duration_since(pair[0].2).as_millis());
@@ -174,7 +175,8 @@ fn wheel_routes_preserve_buttons_coordinates_source_flags_and_36_ms_holds() -> R
                 sender.join().expect("wheel sender panicked")?;
                 events
             })?;
-            for pair in events.chunks_exact(2) {
+            let pairs = events.as_chunks::<2>().0;
+            for pair in pairs {
                 assert!(pair[0].0 && !pair[1].0);
                 for (_, event, _) in pair {
                     assert_eq!(event.event, target);
@@ -187,7 +189,6 @@ fn wheel_routes_preserve_buttons_coordinates_source_flags_and_36_ms_holds() -> R
                 let held = pair[1].1.time.wrapping_sub(pair[0].1.time);
                 assert!(held >= 36, "{direction} desktop={desktop}: {held} ms");
             }
-            let pairs: Vec<_> = events.chunks_exact(2).collect();
             let mut gaps: Vec<_> = pairs
                 .windows(2)
                 .map(|pair| pair[1][0].1.time.wrapping_sub(pair[0][1].1.time))

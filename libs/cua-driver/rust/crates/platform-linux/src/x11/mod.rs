@@ -4,7 +4,7 @@
 //! then reads WM_NAME/_NET_WM_NAME, _NET_WM_PID, and geometry per window.
 //! A toplevel without `_NET_WM_PID` is attributed through the X-Resource
 //! extension when the server can prove it is a local client (see
-//! [`crate::x11_client_pid`]); otherwise its `pid` stays `None`.
+//! `crate::x11_client_pid`); otherwise its `pid` stays `None`.
 
 use anyhow::Result;
 use x11rb::connection::Connection;
@@ -644,7 +644,7 @@ pub fn window_is_viewable(xid: u64) -> bool {
 ///
 /// Deliberately property-only: input paths walk this up through child and
 /// window-manager frame windows, where an X-Resource answer would name the
-/// window manager. Client-list toplevels use [`OwnerResolver`] instead.
+/// window manager. Client-list toplevels use `OwnerResolver` instead.
 pub fn window_pid(xid: u64) -> Option<u32> {
     let xid = u32::try_from(xid).ok()?;
     let (conn, _) = RustConnection::connect(None).ok()?;

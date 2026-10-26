@@ -3,6 +3,7 @@
 //! This metadata is independent of screenshot success and pixel dimensions.
 //! The caller owns main-queue dispatch and target/process lifetime checks.
 
+pub mod event_target;
 mod selection;
 
 use crate::windows::{self, WindowBounds};

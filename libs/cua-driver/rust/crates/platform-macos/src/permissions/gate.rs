@@ -448,27 +448,15 @@ where
         GATE_PANEL_DISMISSED.store(true, Ordering::Relaxed);
         observer(GateProgress::Dismissed, telemetry_context());
     }
-    let should_auto_open_settings;
-    let skip_wait_loop;
-    match presentation {
+    let (should_auto_open_settings, skip_wait_loop) = match presentation {
         PanelPresentation::NotShown => {
             print_banner(&missing, opts.open_settings);
-            should_auto_open_settings = opts.open_settings;
-            skip_wait_loop = false;
+            (opts.open_settings, false)
         }
-        PanelPresentation::ShownOpenSettings => {
-            should_auto_open_settings = opts.open_settings;
-            skip_wait_loop = false;
-        }
-        PanelPresentation::ShownDismissed => {
-            should_auto_open_settings = false;
-            skip_wait_loop = false;
-        }
-        PanelPresentation::ShownAllGranted => {
-            should_auto_open_settings = false;
-            skip_wait_loop = true;
-        }
-    }
+        PanelPresentation::ShownOpenSettings => (opts.open_settings, false),
+        PanelPresentation::ShownDismissed => (false, false),
+        PanelPresentation::ShownAllGranted => (false, true),
+    };
 
     if should_auto_open_settings {
         for m in &missing {

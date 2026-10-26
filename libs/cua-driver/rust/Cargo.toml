@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["third-party/nom"]
 members = [
     "crates/cua-driver",
     "crates/cua-driver-contract",
@@ -25,6 +26,11 @@ edition = "2021"
 authors = ["trycua"]
 license = "MIT"
 repository = "https://github.com/trycua/cua"
+
+[patch.crates-io]
+# Preserve meval's parser while repairing legacy macros and fixed-array initialization.
+# Downstream workspace roots must select this same source; see its SOURCE.md.
+nom = { path = "third-party/nom" }
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

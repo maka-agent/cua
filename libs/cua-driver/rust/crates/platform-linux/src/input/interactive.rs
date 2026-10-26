@@ -11,8 +11,8 @@
 //! - `Background`: events are XSendEvent-addressed to the target window
 //!   without moving the pointer or focus. Opening a background session on a
 //!   window whose toolkit drops synthetic events (GTK3/4, Chromium) is refused
-//!   with [`InteractiveInputError::WouldRequireActivation`] instead of
-//!   producing input that is reported as dispatched and never arrives.
+//!   with [`InteractiveInputError::WouldRequireActivation`](cua_driver_core::interactive_input::InteractiveInputError::WouldRequireActivation)
+//!   instead of producing input that is reported as dispatched and never arrives.
 //!
 //! Every batch ends with an X round-trip, so the receipt means the server
 //! processed the events. Held keys and buttons are released when the session

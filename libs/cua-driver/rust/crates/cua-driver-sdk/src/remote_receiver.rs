@@ -23,6 +23,10 @@ const MAX_DEADLINE_MS: u128 = 120_000;
 
 /// A session-scoped executor. Implementations must preserve native results and
 /// must not interpret closing a connection as shutting down the shared runtime.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait DriverEnvelopeExecutor: Send + Sync {
     async fn metadata(&self) -> Result<Value, DriverError>;

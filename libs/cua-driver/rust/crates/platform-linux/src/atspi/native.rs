@@ -8,7 +8,7 @@
 //!
 //! Element indices match the markdown produced by [`walk_tree`]: a depth-first,
 //! pre-order traversal of the target application's windows, numbering the
-//! nodes accepted by the shared [`is_indexable`] capability predicate.
+//! nodes accepted by the shared `is_indexable` capability predicate.
 //! `perform_action`, `set_value`, and `get_element_bounds` index into that same
 //! ordered set.
 
@@ -2546,10 +2546,10 @@ pub(super) fn walk_tree_bounded_with_timeout(
 /// (get_window_state -> click by element_index) is unreachable — even though the
 /// AT-SPI tree itself is keyed by PID and works fine (see `walk_tree_bounded`,
 /// whose walk ignores the xid). This bridges that gap: it returns one
-/// [`WindowInfo`] per application top-level frame, with a SYNTHETIC but stable
-/// `xid`. Downstream `get_window_state` / `click` walk the tree by PID and never
-/// dereference the xid against X11, so the synthetic value only needs to be
-/// non-zero and to round-trip back from the caller.
+/// [`WindowInfo`](crate::x11::WindowInfo) per application top-level frame, with
+/// a SYNTHETIC but stable `xid`. Downstream `get_window_state` / `click` walk
+/// the tree by PID and never dereference the xid against X11, so the synthetic
+/// value only needs to be non-zero and to round-trip back from the caller.
 pub fn list_windows(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::spawn(move || list_windows_blocking(filter_pid))
@@ -3703,7 +3703,7 @@ pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)
 
 /// Screen bounds of a snapshot-cached element identity: one `GetExtents`
 /// round-trip, no tree re-walk. `Err` when the object is gone or does not
-/// answer within [`REF_ACTION_BUDGET`]; the caller decides whether to re-walk.
+/// answer within `REF_ACTION_BUDGET`; the caller decides whether to re-walk.
 /// The X11 origin lookup runs on the caller's (blocking) thread before the
 /// runtime is entered, so no synchronous X11 I/O happens under `block_on`.
 pub fn element_bounds_ref(

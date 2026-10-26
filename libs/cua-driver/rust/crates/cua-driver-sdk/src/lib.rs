@@ -1624,6 +1624,25 @@ fn native_page_scroll_arguments(
     }))
 }
 
+#[cfg(target_os = "macos")]
+fn native_move_arguments(
+    request: &platform_macos::input::native_move::NativeMoveRequest,
+) -> Result<Value, DriverError> {
+    let number = |value: f64, name: &str| {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| DriverError::Protocol {
+                reason: format!("native move {name} must be finite"),
+            })
+    };
+    Ok(serde_json::json!({
+        "target":{"kind":"window","pid":request.pid,"window_id":request.window_id},
+        "delivery_mode":"background",
+        "x":number(request.native_window_pixels[0], "native_window_pixels.x")?,
+        "y":number(request.native_window_pixels[1], "native_window_pixels.y")?,
+    }))
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl CuaDriverSession {
     pub async fn call_tool(
@@ -1758,6 +1777,27 @@ impl CuaDriverSession {
             ),
             _ => Err(DriverError::Protocol {
                 reason: "native macOS page input requires an embedded trusted session".into(),
+            }),
+        }
+    }
+
+    /// Post the native mouse move after the Host has awaited its visual move.
+    /// The selected move target is independent of the later scroll target.
+    /// This Embedded-only entry keeps the bound authorization, exact-window
+    /// gate and original operation future through the PID post and 10 ms wait.
+    #[cfg(target_os = "macos")]
+    pub async fn move_native_pointer(
+        &self,
+        request: platform_macos::input::native_move::NativeMoveRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = native_move_arguments(&request)?;
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                "move_cursor",
+                session.invoke_native_move(arguments, request).await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native macOS pointer input requires an embedded trusted session".into(),
             }),
         }
     }
@@ -2253,6 +2293,37 @@ mod snapshot_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_move_arguments_use_the_authorized_typed_window_target_and_true_pixels() {
+        let mut request = platform_macos::input::native_move::NativeMoveRequest {
+            pid: 123,
+            window_id: 456,
+            screen_point: Default::default(),
+            window_bounds: Default::default(),
+            window_uses_flipped_coordinates: false,
+            native_window_pixels: [0.12345678901234569, 47.300000000000004],
+        };
+        request.screen_point.x = -1.25;
+        let args = native_move_arguments(&request).unwrap();
+        assert_eq!(
+            args["target"],
+            serde_json::json!({"kind":"window","pid":123,"window_id":456})
+        );
+        assert!(args.get("pid").is_none());
+        assert_eq!(
+            args["x"].as_f64().unwrap().to_bits(),
+            request.native_window_pixels[0].to_bits()
+        );
+        assert_eq!(
+            args["y"].as_f64().unwrap().to_bits(),
+            request.native_window_pixels[1].to_bits()
+        );
+        assert_eq!(args["delivery_mode"], "background");
+        request.native_window_pixels[1] = f64::NAN;
+        assert!(native_move_arguments(&request).is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn native_page_arguments_keep_fractional_pages_and_distinct_point_frames() {

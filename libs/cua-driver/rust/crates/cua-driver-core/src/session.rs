@@ -2452,7 +2452,7 @@ mod tests {
         let _hook = register_scoped_fallible_session_end_hook("idle-recreate-test", move |id| {
             if id == observed
                 && failures_for_hook
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         left.checked_sub(1)
                     })
                     .is_ok()

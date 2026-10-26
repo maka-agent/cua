@@ -19,8 +19,8 @@
 //! refusal. That stays as it is, and the same call is repeated at the top
 //! level so agents read one place.
 //!
-//! Everything lives in one table ([`RULES`]) plus the unverifiable-action
-//! rules ([`effect_hint`]). [`annotate`] runs once, at the dispatch seam in
+//! Everything lives in one table (`RULES`) plus the unverifiable-action
+//! rules (`effect_hint`). [`annotate`] runs once, at the dispatch seam in
 //! `ToolRegistry`, so every platform, every tool and every nested
 //! `run_steps`/`run_script` call is covered. A producer that already set
 //! `hint` or `next_call` keeps its own value.

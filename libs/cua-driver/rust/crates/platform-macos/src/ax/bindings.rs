@@ -40,12 +40,12 @@ pub const kAXErrorAPIDisabled: AXError = -25211;
 pub struct __AXValue(c_void);
 pub type AXValueRef = *mut __AXValue;
 
-pub type AXValueType = c_int;
+pub type AXValueType = u32;
 pub const kAXValueCGPointType: AXValueType = 1;
 pub const kAXValueCGSizeType: AXValueType = 2;
 pub const kAXValueCGRectType: AXValueType = 3;
 pub const kAXValueCFRangeType: AXValueType = 4;
-pub const kAXValueIllegalType: AXValueType = 1_000;
+pub const kAXValueIllegalType: AXValueType = 0;
 
 // ── Link to AXUIElement functions ────────────────────────────────────────────
 #[link(name = "ApplicationServices", kind = "framework")]

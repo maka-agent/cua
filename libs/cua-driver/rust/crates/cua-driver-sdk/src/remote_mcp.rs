@@ -53,6 +53,10 @@ pub enum DriverServiceTransportError {
 /// 16 MiB. Rust bounds caller waits independently but deliberately never aborts
 /// an active response stream during receiver teardown.
 #[uniffi::export(with_foreign)]
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait DriverServiceTransport: Send + Sync + 'static {
     async fn send(

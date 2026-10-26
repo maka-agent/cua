@@ -190,7 +190,7 @@ mod tests {
             None,
             surface.scale as f32,
         );
-        let (weight, x_sum, y_sum) = pixmap.data().chunks_exact(4).enumerate().fold(
+        let (weight, x_sum, y_sum) = pixmap.data().as_chunks::<4>().0.iter().enumerate().fold(
             (0.0, 0.0, 0.0),
             |(weight, x_sum, y_sum), (index, pixel)| {
                 let alpha = f64::from(pixel[3]);

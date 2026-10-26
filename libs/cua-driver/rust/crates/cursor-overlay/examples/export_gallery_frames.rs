@@ -194,7 +194,7 @@ mod tests {
 }
 
 fn unpremultiply_rgba(mut pixels: Vec<u8>) -> Vec<u8> {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha == 0 {
             pixel[0] = 0;

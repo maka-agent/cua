@@ -1,7 +1,7 @@
 //! Linux process enumeration via the /proc filesystem.
 //!
-//! Each /proc/<pid>/status file contains Name:, Pid:, PPid: etc.
-//! /proc/<pid>/cmdline is the full command line (NUL-separated).
+//! Each `/proc/<pid>/status` file contains Name:, Pid:, PPid: etc.
+//! `/proc/<pid>/cmdline` is the full command line (NUL-separated).
 
 use std::fs;
 use std::path::Path;
@@ -107,7 +107,7 @@ pub(crate) fn process_exit_observation(
     }
 }
 
-/// Return all running processes by reading /proc/<pid>/status.
+/// Return all running processes by reading `/proc/<pid>/status`.
 pub fn list_processes() -> Vec<ProcessInfo> {
     let mut result = Vec::new();
     let proc_dir = Path::new("/proc");

@@ -18,6 +18,85 @@ impl MoveCursorTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
     }
+
+    async fn invoke_native_move(
+        &self,
+        args: Value,
+        request: crate::input::native_move::NativeMoveRequest,
+    ) -> ToolResult {
+        use cua_driver_core::background_input::BackgroundAction;
+        if !native_move_arguments_match(&args, &request) {
+            return native_move_error(
+                "native_move_request_mismatch",
+                "native move data does not match the authorized arguments".into(),
+            );
+        }
+        let lease = match super::gate_background_window_action(
+            request.pid,
+            request.window_id,
+            None,
+            BackgroundAction::WindowPointer,
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(refusal) => return refusal,
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            objc2::rc::autoreleasepool(|_| {
+                crate::input::native_move::prepare_native_move(request)
+                    .map_err(|error| {
+                        native_move_error("native_move_preparation_failed", error.to_string())
+                    })?
+                    .post()
+                    .map_err(|error| native_move_error("input_outcome_unknown", error.to_string()))
+            })
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => native_move_posted_result(&request),
+            Ok(Err(error)) => error,
+            Err(error) => native_move_error(
+                "input_outcome_unknown",
+                format!("native move worker did not complete normally: {error}"),
+            ),
+        }
+    }
+}
+
+fn native_move_arguments_match(
+    args: &Value,
+    request: &crate::input::native_move::NativeMoveRequest,
+) -> bool {
+    args.get("pid").and_then(Value::as_i64) == Some(i64::from(request.pid))
+        && args.get("window_id").and_then(Value::as_u64) == Some(u64::from(request.window_id))
+        && args.get("scope").and_then(Value::as_str) == Some("window")
+        && args.get("delivery_mode").and_then(Value::as_str) == Some("background")
+        && args.get("x").and_then(Value::as_f64) == Some(request.native_window_pixels[0])
+        && args.get("y").and_then(Value::as_f64) == Some(request.native_window_pixels[1])
+        && request
+            .native_window_pixels
+            .iter()
+            .all(|value| value.is_finite())
+}
+
+fn native_move_posted_result(request: &crate::input::native_move::NativeMoveRequest) -> ToolResult {
+    ToolResult::text("Native mouse move posted.").with_structured(serde_json::json!({
+        "path":"cgevent", "native_profile":"native_move",
+        "effect":"unverifiable", "verified":false,
+        "native_move_request":{
+            "pid":request.pid,"window_id":request.window_id,
+            "native_window_pixels":request.native_window_pixels,
+            "native_window_pixels_unit":"window_local_physical_pixels",
+            "screen_point":[request.screen_point.x,request.screen_point.y],
+            "screen_point_unit":"global_logical_points",
+        },
+    }))
+}
+
+fn native_move_error(code: &str, reason: String) -> ToolResult {
+    ToolResult::error(reason).with_structured(serde_json::json!({"code":code}))
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -63,6 +142,9 @@ impl Tool for MoveCursorTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        if let Some(request) = crate::input::native_move::take_native_move() {
+            return self.invoke_native_move(args, request).await;
+        }
         if args.opt_str("scope").as_deref() == Some("desktop") {
             let input = match parse_typed_projection::<MoveCursorInput>("move_cursor", &args) {
                 Ok(input) => input,
@@ -361,6 +443,53 @@ fn inactive_app_note(app: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_move_matches_the_actual_target_and_publishes_unverified_pid_delivery() {
+        use cua_driver_core::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery,
+        };
+        let request = crate::input::native_move::NativeMoveRequest {
+            pid: 123,
+            window_id: 456,
+            screen_point: Default::default(),
+            window_bounds: Default::default(),
+            window_uses_flipped_coordinates: false,
+            native_window_pixels: [37.5, 25.0],
+        };
+        let args = serde_json::json!({
+            "pid":123,"window_id":456,"scope":"window","delivery_mode":"background",
+            "x":37.5,"y":25.0,
+        });
+        assert!(super::native_move_arguments_match(&args, &request));
+        for (field, wrong) in [
+            ("pid", serde_json::json!(124)),
+            ("window_id", serde_json::json!(457)),
+            ("x", serde_json::json!(0)),
+            ("delivery_mode", serde_json::json!("foreground")),
+        ] {
+            let mut changed = args.clone();
+            changed[field] = wrong;
+            assert!(!super::native_move_arguments_match(&changed, &request));
+        }
+        let produced = super::native_move_posted_result(&request);
+        let record = ActionExecutionRecord::from_legacy(
+            "move_cursor",
+            &args,
+            produced.structured_content.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.transport, ActionTransport::MacosCgEventPid);
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Background));
+        let public = record.public_result().unwrap();
+        public.validate_invariants().unwrap();
+        assert_eq!(
+            public.route,
+            cua_driver_contract::ActionRoute::SyntheticEvents
+        );
+        assert!(public.evidence.is_none());
+    }
+
     #[test]
     fn the_background_hover_note_names_both_routes_and_the_alternatives() {
         let note = super::BACKGROUND_HOVER_NOTE;

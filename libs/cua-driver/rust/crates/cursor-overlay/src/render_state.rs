@@ -9,7 +9,7 @@
 //!
 //! - [`RenderStateCore`] — the platform-agnostic animation and semantic state.
 //! - [`RenderStateCore::tick_motion`] — advances the planned
-//!   [`Trajectory`](crate::trajectory::Trajectory), click effects and the
+//!   [`Trajectory`], click effects and the
 //!   idle fade on every platform; returns whether the cursor just arrived
 //!   (so the caller can fire arrival signals).
 //! - [`RenderStateCore::apply_command_base`] — the OverlayCommand match arms
@@ -2267,7 +2267,12 @@ mod backing_scale_tests {
         // Count strongly visible coverage, not the halo's feather pixels.
         // Low-alpha gradient coverage is quantized differently across scales
         // and is not useful evidence for the backing-scale regression.
-        pm.data().chunks_exact(4).filter(|px| px[3] > 96).count() as u32
+        pm.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[3] > 96)
+            .count() as u32
     }
 
     fn visible_bounds(pm: &tiny_skia::Pixmap) -> (u32, u32) {
@@ -2275,7 +2280,7 @@ mod backing_scale_tests {
         let mut min_y = u32::MAX;
         let mut max_x = 0;
         let mut max_y = 0;
-        for (index, pixel) in pm.data().chunks_exact(4).enumerate() {
+        for (index, pixel) in pm.data().as_chunks::<4>().0.iter().enumerate() {
             if pixel[3] <= 96 {
                 continue;
             }
@@ -2532,7 +2537,7 @@ mod pointer_anchor_tests {
             (300.0 * backing_scale) as u32,
         );
         let pm = render_frame(core, width, height, 0.0, 0.0, None, backing_scale);
-        let (weight, x_sum, y_sum) = pm.data().chunks_exact(4).enumerate().fold(
+        let (weight, x_sum, y_sum) = pm.data().as_chunks::<4>().0.iter().enumerate().fold(
             (0.0, 0.0, 0.0),
             |(weight, x_sum, y_sum), (index, pixel)| {
                 let alpha = f64::from(pixel[3]);

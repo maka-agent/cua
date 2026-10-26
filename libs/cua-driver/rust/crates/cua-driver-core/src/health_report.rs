@@ -240,6 +240,10 @@ pub struct Report {
 /// platform-specific TCC / UIA / AT-SPI / SCK plumbing stays out of the
 /// core. Implementations must return entries for every name in their
 /// `check_names()`; the dispatcher does not synthesize results.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait HealthCheckProvider: Send + Sync {
     /// The platform tag for the `Report.platform` field — `"darwin"`,

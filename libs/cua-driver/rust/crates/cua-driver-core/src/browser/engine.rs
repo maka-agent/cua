@@ -3,10 +3,10 @@
 //! Owns the target/ref store, the CDP connection pool, and every
 //! exact-or-refused decision. The platform adapter is consulted for OS
 //! identity only; nothing here trusts a cached fact across a mutation
-//! boundary — [`BrowserEngine::revalidate_for_mutation`] re-proves the
+//! boundary — `BrowserEngine::revalidate_for_mutation` re-proves the
 //! full chain (process fingerprint → native ownership/bounds → endpoint
 //! ownership → CDP target type/window) before any input or navigation,
-//! and [`BrowserEngine::frame_session_for_mutation`] additionally
+//! and `BrowserEngine::frame_session_for_mutation` additionally
 //! re-proves the ref's frame/document identity (frame id + loader id,
 //! and for OOPIFs the child target attached beneath the proven tab)
 //! before the ref is touched.
@@ -2936,7 +2936,9 @@ fn collect_interactive(
             .unwrap_or_default();
         let attr = |key: &str| -> Option<&str> {
             attrs
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .find(|kv| kv[0].eq_ignore_ascii_case(key))
                 .map(|kv| kv[1].as_str())
         };

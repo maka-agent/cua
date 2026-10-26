@@ -887,14 +887,18 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
 ) -> CuaDriverStatus {
     session_invoke_in_frame(
         handle,
-        name,
-        name_len,
-        arguments_json,
-        arguments_len,
-        callback,
-        context,
-        out_operation,
-        out_error,
+        SessionInvokeRequest {
+            name,
+            name_len,
+            arguments_json,
+            arguments_len,
+        },
+        SessionInvokeCompletion {
+            callback,
+            context,
+            out_operation,
+            out_error,
+        },
         crate::runtime::CoordinateFrame::Screenshot,
         #[cfg(target_os = "macos")]
         None,
@@ -905,21 +909,42 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
 enum NativeRequest {
     WindowCapture(platform_macos::capture::FrozenWindowCapture),
     PageScroll(platform_macos::input::page_scroll::NativePageScrollRequest),
+    Move(platform_macos::input::native_move::NativeMoveRequest),
 }
 
-unsafe fn session_invoke_in_frame(
-    handle: *mut CuaDriverSessionHandle,
+struct SessionInvokeRequest {
     name: *const u8,
     name_len: usize,
     arguments_json: *const u8,
     arguments_len: usize,
+}
+
+struct SessionInvokeCompletion {
     callback: Option<CuaDriverCompletionV1>,
     context: *mut c_void,
     out_operation: *mut *mut CuaDriverOperation,
     out_error: *mut CuaDriverBuffer,
+}
+
+unsafe fn session_invoke_in_frame(
+    handle: *mut CuaDriverSessionHandle,
+    request: SessionInvokeRequest,
+    completion: SessionInvokeCompletion,
     frame: crate::runtime::CoordinateFrame,
     #[cfg(target_os = "macos")] native_request: Option<NativeRequest>,
 ) -> CuaDriverStatus {
+    let SessionInvokeRequest {
+        name,
+        name_len,
+        arguments_json,
+        arguments_len,
+    } = request;
+    let SessionInvokeCompletion {
+        callback,
+        context,
+        out_operation,
+        out_error,
+    } = completion;
     with_ffi_guard(out_error, || {
         let session = required_session_handle(handle)?;
         let callback = callback.ok_or_else(|| {
@@ -979,6 +1004,10 @@ unsafe fn session_invoke_in_frame(
                             request, invocation,
                         )
                         .await
+                    }
+                    Some(NativeRequest::Move(request)) => {
+                        platform_macos::input::native_move::with_native_move(request, invocation)
+                            .await
                     }
                     None => invocation.await,
                 };
@@ -1650,6 +1679,21 @@ impl NativeAbiSession {
         .await
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn invoke_native_move(
+        &self,
+        arguments: Value,
+        request: platform_macos::input::native_move::NativeMoveRequest,
+    ) -> Result<Value, DriverError> {
+        self.invoke_in_frame(
+            "move_cursor",
+            arguments,
+            crate::runtime::CoordinateFrame::NativeWindow,
+            Some(NativeRequest::Move(request)),
+        )
+        .await
+    }
+
     async fn invoke_in_frame(
         &self,
         name: &str,
@@ -1693,16 +1737,20 @@ impl NativeAbiSession {
                 } else {
                     session_invoke_in_frame(
                         (*handle).cast(),
-                        name.as_ptr(),
-                        name.len(),
-                        arguments.as_ptr(),
-                        arguments.len(),
-                        Some(rust_completion),
-                        context,
-                        // The private entry allocates the same opaque operation
-                        // retained and released by the unchanged OperationGuard.
-                        (&mut operation as *mut *mut ffi::Operation).cast(),
-                        &mut error,
+                        SessionInvokeRequest {
+                            name: name.as_ptr(),
+                            name_len: name.len(),
+                            arguments_json: arguments.as_ptr(),
+                            arguments_len: arguments.len(),
+                        },
+                        SessionInvokeCompletion {
+                            callback: Some(rust_completion),
+                            context,
+                            // The private entry allocates the same opaque operation
+                            // retained and released by the unchanged OperationGuard.
+                            out_operation: (&mut operation as *mut *mut ffi::Operation).cast(),
+                            out_error: &mut error,
+                        },
                         frame,
                         #[cfg(target_os = "macos")]
                         native_request,

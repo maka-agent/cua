@@ -2873,8 +2873,10 @@ fn x11_visual_readback_reliable(
             matches!(reply.depth, 24 | 32)
                 && reply.data.len() == uploaded.len()
                 && uploaded
-                    .chunks_exact(4)
-                    .zip(reply.data.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(reply.data.as_chunks::<4>().0)
                     .all(|(ours, live)| ours[..3] == live[..3])
         };
         for pause in [None, Some(Duration::from_millis(80))] {
@@ -5411,7 +5413,7 @@ mod tests {
         assert_eq!(&bgra[8..12], &[66, 114, 206, 255]);
         assert_eq!(&bgra[12..16], &[50, 100, 200, 255]);
         // Every uploaded pixel is opaque: the server has nothing left to blend.
-        assert!(bgra.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(bgra.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
     }
 
     #[test]

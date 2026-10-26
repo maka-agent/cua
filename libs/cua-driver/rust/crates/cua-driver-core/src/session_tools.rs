@@ -533,9 +533,8 @@ impl Tool for EndSessionTool {
                     )
             }
         };
-        if owned {
-            if !cleanup.complete {
-                return ToolResult::error(if cleanup.in_progress {
+        if owned && !cleanup.complete {
+            return ToolResult::error(if cleanup.in_progress {
                     "Session is ending after its in-flight action completes; retry end_session for final cleanup status."
                 } else {
                     "Session ended, but one or more cleanup hooks failed; retry end_session."
@@ -554,7 +553,6 @@ impl Tool for EndSessionTool {
                         "error": "cleanup failed",
                     })).collect::<Vec<_>>(),
                 }));
-            }
         }
         let response_label = response_session_label(&args, &id);
         ToolResult::text(format!("✅ Session '{response_label}' ended.")).with_structured(

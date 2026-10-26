@@ -60,6 +60,10 @@ pub struct ForeignDriverBoundChannel {
 /// Identity is captured once when each channel is adapted. A bound channel
 /// must retain its parent's authenticated principal and connection generation.
 #[uniffi::export(with_foreign)]
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait ForeignDriverEnvelopeChannel: Send + Sync + 'static {
     fn identity(&self) -> Result<ForeignDriverChannelIdentity, ForeignDriverChannelError>;

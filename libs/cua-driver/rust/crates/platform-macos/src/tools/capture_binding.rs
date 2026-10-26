@@ -17,6 +17,15 @@ pub(crate) struct MacCaptureBindings {
     service: Arc<CaptureService>,
 }
 
+/// Encoded image and the native coordinate frame from the same capture.
+#[derive(Debug)]
+pub(super) struct CaptureImage {
+    pub encoded_bytes: Vec<u8>,
+    pub codec: ScreenshotCodec,
+    pub encoded_dimensions: (u32, u32),
+    pub native_dimensions: (u32, u32),
+}
+
 impl MacCaptureBindings {
     pub(super) fn new(service: Arc<CaptureService>) -> Self {
         Self { service }
@@ -27,24 +36,14 @@ impl MacCaptureBindings {
         args: &serde_json::Value,
         pid: i32,
         window_id: u32,
-        encoded_bytes: Vec<u8>,
-        codec: ScreenshotCodec,
-        encoded_dimensions: (u32, u32),
-        native_dimensions: (u32, u32),
+        image: CaptureImage,
     ) -> Result<String, ToolResult> {
         let target = CaptureTarget::Window {
             pid: u32::try_from(pid)
                 .map_err(|_| capture_error("invalid_target", "pid is negative"))?,
             window_id: u64::from(window_id),
         };
-        self.publish(
-            args,
-            target,
-            encoded_bytes,
-            codec,
-            encoded_dimensions,
-            native_dimensions,
-        )
+        self.publish(args, target, image)
     }
 
     pub(super) fn publish_desktop(
@@ -57,10 +56,12 @@ impl MacCaptureBindings {
         self.publish(
             args,
             CaptureTarget::PrimaryDesktop,
-            png_bytes,
-            ScreenshotCodec::Png,
-            encoded_dimensions,
-            native_dimensions,
+            CaptureImage {
+                encoded_bytes: png_bytes,
+                codec: ScreenshotCodec::Png,
+                encoded_dimensions,
+                native_dimensions,
+            },
         )
     }
 
@@ -68,11 +69,14 @@ impl MacCaptureBindings {
         &self,
         args: &serde_json::Value,
         target: CaptureTarget,
-        encoded_bytes: Vec<u8>,
-        codec: ScreenshotCodec,
-        encoded_dimensions: (u32, u32),
-        native_dimensions: (u32, u32),
+        image: CaptureImage,
     ) -> Result<String, ToolResult> {
+        let CaptureImage {
+            encoded_bytes,
+            codec,
+            encoded_dimensions,
+            native_dimensions,
+        } = image;
         let binding = self
             .service
             .binding_from_args(args)
@@ -441,10 +445,12 @@ mod tests {
                 &args,
                 8,
                 13,
-                png(4, 3),
-                ScreenshotCodec::Png,
-                (4, 3),
-                (8, 6),
+                CaptureImage {
+                    encoded_bytes: png(4, 3),
+                    codec: ScreenshotCodec::Png,
+                    encoded_dimensions: (4, 3),
+                    native_dimensions: (8, 6),
+                },
             )
             .unwrap();
         let mut dispatches = 0;

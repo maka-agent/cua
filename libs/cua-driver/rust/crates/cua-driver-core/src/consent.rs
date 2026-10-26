@@ -59,6 +59,10 @@ pub struct ConsentRequest {
 
 /// Trusted integration contract. The embedding host decides how to obtain
 /// authorization. Cua never requires the host to render a particular UI.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait ProtectedConsentProvider: Send + Sync + 'static {
     fn provider_id(&self) -> &'static str;

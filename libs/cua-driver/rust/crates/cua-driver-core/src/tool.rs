@@ -1018,6 +1018,10 @@ pub enum ProtectedResourceOwnership {
 }
 
 /// A callable tool handler. Object-safe — uses `Box<dyn Tool>`.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn def(&self) -> &ToolDef;

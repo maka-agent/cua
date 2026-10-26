@@ -59,6 +59,10 @@ pub enum DriverAuthorizationHostError {
 /// requires a host grant. Routine standard-mode automation and every
 /// in-manifest bounded operation bypass it.
 #[uniffi::export(with_foreign)]
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait DriverAuthorizationHost: Send + Sync {
     async fn authorize(

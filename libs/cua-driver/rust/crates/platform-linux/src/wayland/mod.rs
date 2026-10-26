@@ -133,7 +133,7 @@ pub fn is_wayland() -> bool {
 }
 
 /// True when input tools should attempt the Wayland input path (wlroots
-/// virtual-pointer, falling back to libei/portal via [`with_libei_fallback`]).
+/// virtual-pointer, falling back to libei/portal via `with_libei_fallback`).
 ///
 /// Input-specific alias retained to make dispatch intent explicit. The
 /// wlroots-vs-portal decision is made from live compositor capabilities inside
@@ -658,8 +658,10 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
 
 fn foreign_toplevel_state_is_activated(state: &[u8]) -> bool {
     state
-        .chunks_exact(std::mem::size_of::<u32>())
-        .any(|bytes| u32::from_ne_bytes(bytes.try_into().expect("four-byte state")) == 2)
+        .as_chunks::<{ std::mem::size_of::<u32>() }>()
+        .0
+        .iter()
+        .any(|bytes| u32::from_ne_bytes(*bytes) == 2)
 }
 
 /// Enumerate native Wayland toplevels via wlr-foreign-toplevel-management.
@@ -1317,7 +1319,7 @@ fn with_libei_fallback<T>(
                 tracing::info!(
                     "wlroots virtual-pointer unavailable ({e}); falling back to libei/portal"
                 );
-                return fallback();
+                fallback()
             }
             #[cfg(not(feature = "portal-input"))]
             {
@@ -1337,7 +1339,7 @@ pub struct VptrSession {
     pub seat: WlSeat,
     pub vptr: ZwlrVirtualPointerV1,
     /// `motion_absolute` extent, in the same frame as caller coordinates.
-    /// See [`virtual_pointer_space`].
+    /// See `virtual_pointer_space`.
     pub output_w: u32,
     pub output_h: u32,
     /// Layout position of pointer-space (0, 0). Callers pass layout
@@ -2152,14 +2154,13 @@ pub fn drag(
 /// Drag through desktop-absolute points without activating a named toplevel.
 pub fn drag_desktop(
     space: &DesktopInputSpace,
-    from_x: i32,
-    from_y: i32,
-    to_x: i32,
-    to_y: i32,
+    from: (i32, i32),
+    to: (i32, i32),
     steps: u32,
     duration_ms: u64,
     button: u8,
 ) -> anyhow::Result<()> {
+    let ((from_x, from_y), (to_x, to_y)) = (from, to);
     let (from_x, from_y) = space.input_layout(from_x, from_y)?;
     let (to_x, to_y) = space.input_layout(to_x, to_y)?;
     with_libei_fallback(
@@ -2385,14 +2386,14 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
             let stderr = other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned());
             #[cfg(feature = "portal-input")]
             {
-                return with_wtype_libei_fallback(
+                with_wtype_libei_fallback(
                     || {
                         libei::wait_keyboard_ready()?;
                         activate_window_for_input(window_id)?;
                         libei_hotkey(&mods, &final_key)
                     },
                     stderr,
-                );
+                )
             }
             #[cfg(not(feature = "portal-input"))]
             {
@@ -2425,13 +2426,13 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
             let stderr = other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned());
             #[cfg(feature = "portal-input")]
             {
-                return with_wtype_libei_fallback(
+                with_wtype_libei_fallback(
                     || {
                         libei::wait_keyboard_ready()?;
                         libei_hotkey(&mods, &final_key)
                     },
                     stderr,
-                );
+                )
             }
             #[cfg(not(feature = "portal-input"))]
             {
@@ -3164,7 +3165,7 @@ fn inject_window_origin(pid: u32) -> Option<(i32, i32)> {
 
 /// Resolve a window_id to its xdg app_id via the stable identity registry that
 /// [`list_windows`] populates (falling back to sway IPC / AT-SPI through
-/// [`identity_for`]) — the nested cua-compositor injection protocol addresses
+/// `identity_for`) — the nested cua-compositor injection protocol addresses
 /// windows by app_id. Returns `None` when no identity is registered or the
 /// resolved app_id is empty, so callers can surface a clear error.
 pub fn app_id_for_window(window_id: u64) -> Option<String> {

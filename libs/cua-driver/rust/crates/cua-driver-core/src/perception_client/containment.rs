@@ -2,7 +2,7 @@
 //!
 //! Containment is reported as platform capabilities rather than one misleading
 //! cross-platform boolean. Each implementation must install every boundary it
-//! advertises, or fail before worker code executes. [`spawn`] refuses to launch
+//! advertises, or fail before worker code executes. `spawn` refuses to launch
 //! a worker on any target whose reported capabilities do not meet
 //! [`ContainmentCapabilities::meets_contract`], so a partially contained
 //! platform is an explicit `unsupported_platform` result rather than a weaker
@@ -654,7 +654,7 @@ pub enum HookOutcome {
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 
 /// Run one auxiliary process — an installed extension's health or self-test
-/// hook — under exactly the boundary [`spawn`] installs for a perception parse.
+/// hook — under exactly the boundary `spawn` installs for a perception parse.
 ///
 /// The hook is not a protocol peer, so its request pipe is closed immediately
 /// and it observes end of file just as a null stdin would; its standard output

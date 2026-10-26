@@ -1,9 +1,9 @@
 //! Browser state, preparation, navigation, input, and page-owned dialog tools.
 //!
 //! Schemas, annotations, and exact-or-refused semantics live here; OS
-//! identity comes from the [`BrowserPlatform`] adapter; CDP mechanics
-//! from [`super::engine`]. All structured outputs share the shape
-//! `{"status": "ok" | "refused", ...}`.
+//! identity comes from the [`BrowserPlatform`](super::platform::BrowserPlatform)
+//! adapter; CDP mechanics from [`super::engine`]. All structured outputs
+//! share the shape `{"status": "ok" | "refused", ...}`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2977,7 +2977,7 @@ impl Tool for BrowserSetInputFilesTool {
         let is_file_input = node["nodeName"]
             .as_str()
             .is_some_and(|name| name.eq_ignore_ascii_case("input"))
-            && attributes.chunks_exact(2).any(|pair| {
+            && attributes.as_chunks::<2>().0.iter().any(|pair| {
                 pair[0]
                     .as_str()
                     .is_some_and(|name| name.eq_ignore_ascii_case("type"))

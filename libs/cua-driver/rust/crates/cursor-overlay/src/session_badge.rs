@@ -328,9 +328,7 @@ pub(crate) fn session_badge_layout_at_origin(
     input: SessionBadgeInput<'_>,
     clip_origin: (f32, f32),
 ) -> Option<SessionBadgeLayout> {
-    let Some(font) = font() else {
-        return None;
-    };
+    let font = font()?;
     let scale = input.backing_scale.max(1.0);
     let label_alpha = input.label_alpha.clamp(0.0, 1.0);
     let chip_alpha = input.chip_alpha.clamp(0.0, 1.0);
@@ -576,7 +574,9 @@ pub fn paint_session_badge(
             };
             for (pixel, coverage) in glyph_pixmap
                 .data_mut()
-                .chunks_exact_mut(4)
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .zip(bitmap.iter().copied())
             {
                 let alpha = ((coverage as f32) * label_opacity) as u8;
@@ -646,12 +646,21 @@ mod tests {
             paint_session_badge(&mut purple, &layout, [178, 132, 255, 255], 1.0);
             paint_session_badge(&mut hidden, &layout, [94, 192, 232, 255], 0.0);
             assert!(
-                blue.data().chunks_exact(4).any(|pixel| pixel[3] > 0),
+                blue.data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0),
                 "badge paints at {scale}x"
             );
             assert_ne!(blue.data(), purple.data(), "{scale}x");
             assert!(
-                hidden.data().chunks_exact(4).all(|pixel| pixel[3] == 0),
+                hidden
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 0),
                 "{scale}x"
             );
 

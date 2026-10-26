@@ -145,12 +145,12 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
 /// Errors that mean the request never reached the app (illegal argument,
 /// invalid element, cannot complete, API disabled) are not among them.
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
-    use crate::ax::bindings::{
-        kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
-    };
+    use crate::ax::bindings;
     matches!(
         err,
-        kAXErrorFailure | kAXErrorAttributeUnsupported | kAXErrorActionUnsupported
+        bindings::kAXErrorFailure
+            | bindings::kAXErrorAttributeUnsupported
+            | bindings::kAXErrorActionUnsupported
     )
 }
 

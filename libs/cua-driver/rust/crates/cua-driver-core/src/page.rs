@@ -69,6 +69,10 @@ pub struct ClickElementResult {
 /// All methods take `(pid, window_id)` for consistency across actions.
 /// `bundle_id` is resolved by the backend if needed (macOS uses it for
 /// AppleScript routing; Windows/Linux ignore it).
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait PageBackend: Send + Sync {
     /// Returns the visible text of the page (rough analog of

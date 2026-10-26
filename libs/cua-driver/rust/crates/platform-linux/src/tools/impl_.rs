@@ -1251,18 +1251,16 @@ impl Tool for GetWindowStateTool {
                 s
             }
         });
-        // Optional caps — when omitted, the AT-SPI walker uses its built-in
-        // defaults (#22865).
-        let max_elements = Some(
-            view.max_elements(
-                &args,
-                LINUX_DEFAULT_MAX_ELEMENTS,
-                display_only
-                    || args
-                        .get("_observation_only")
-                        .and_then(|value| value.as_bool())
-                        == Some(true),
-            ),
+        // Resolve the view's element cap before the walk. An omitted depth cap
+        // still lets the AT-SPI walker use its built-in default (#22865).
+        let max_elements = view.max_elements(
+            &args,
+            LINUX_DEFAULT_MAX_ELEMENTS,
+            display_only
+                || args
+                    .get("_observation_only")
+                    .and_then(|value| value.as_bool())
+                    == Some(true),
         );
         let max_depth = args
             .get("max_depth")
@@ -1357,7 +1355,7 @@ impl Tool for GetWindowStateTool {
                     pid,
                     xid,
                     query_for_walk.as_deref(),
-                    max_elements,
+                    Some(max_elements),
                     max_depth,
                     walk_timeout,
                 ))
@@ -1865,7 +1863,7 @@ impl Tool for GetWindowStateTool {
                             window_id: xid,
                             key: cua_driver_core::window_state_view::ViewKey {
                                 query: query.clone(),
-                                max_elements: max_elements.unwrap_or(LINUX_DEFAULT_MAX_ELEMENTS),
+                                max_elements,
                                 max_depth,
                             },
                             focus_probe: None,
@@ -11231,10 +11229,8 @@ impl Tool for DragTool {
                 if wayland {
                     crate::wayland::drag_desktop(
                         &space,
-                        from_x.round() as i32,
-                        from_y.round() as i32,
-                        to_x.round() as i32,
-                        to_y.round() as i32,
+                        (from_x.round() as i32, from_y.round() as i32),
+                        (to_x.round() as i32, to_y.round() as i32),
                         steps as u32,
                         duration_ms,
                         button,
@@ -11242,10 +11238,8 @@ impl Tool for DragTool {
                 } else {
                     let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     crate::input::send_drag_xtest_desktop_with_modifiers(
-                        from_x.round() as i32,
-                        from_y.round() as i32,
-                        to_x.round() as i32,
-                        to_y.round() as i32,
+                        (from_x.round() as i32, from_y.round() as i32),
+                        (to_x.round() as i32, to_y.round() as i32),
                         button,
                         duration_ms,
                         steps,
@@ -11635,10 +11629,8 @@ impl Tool for DragTool {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::with_x11_foreground(xid, 80, || {
                     crate::input::send_drag_xtest_desktop_with_modifiers(
-                        screen_from_x.round() as i32,
-                        screen_from_y.round() as i32,
-                        screen_to_x.round() as i32,
-                        screen_to_y.round() as i32,
+                        (screen_from_x.round() as i32, screen_from_y.round() as i32),
+                        (screen_to_x.round() as i32, screen_to_y.round() as i32),
                         button,
                         duration_ms,
                         steps,

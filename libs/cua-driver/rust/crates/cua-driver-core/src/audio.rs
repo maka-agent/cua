@@ -448,7 +448,7 @@ fn system_audio_scope(adapter: &str) -> Option<Value> {
 
 pub fn write_pcm16_stereo_wav(path: &Path, pcm_le: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
-    if pcm_le.len() % 4 != 0 {
+    if !pcm_le.len().is_multiple_of(4) {
         bail!("computer audio contains an incomplete stereo PCM16 frame");
     }
     let bytes = u32::try_from(pcm_le.len()).context("computer audio exceeds WAV length")?;
@@ -503,7 +503,7 @@ fn validate_wav(bytes: &[u8]) -> anyhow::Result<()> {
                 format = true;
             }
             Some(b"data") => {
-                if length % 4 != 0 {
+                if !length.is_multiple_of(4) {
                     bail!("computer audio has a partial stereo sample");
                 }
                 data = true;

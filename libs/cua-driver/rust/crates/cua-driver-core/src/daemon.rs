@@ -207,7 +207,7 @@ const DAEMON_OVERHEAD_ALLOWANCE: Duration = Duration::from_secs(30);
 
 /// Longest a client waits for the daemon's reply to one request. The largest
 /// budget a caller can ask any tool for ([`crate::tool_schema::TIMEOUT_MS_MAX`])
-/// fits under it with [`DAEMON_OVERHEAD_ALLOWANCE`] to spare, so a tool that
+/// fits under it with `DAEMON_OVERHEAD_ALLOWANCE` to spare, so a tool that
 /// legitimately uses its whole budget still gets its result delivered.
 pub const REPLY_DEADLINE: Duration = Duration::from_millis(crate::tool_schema::TIMEOUT_MS_MAX)
     .saturating_add(DAEMON_OVERHEAD_ALLOWANCE);

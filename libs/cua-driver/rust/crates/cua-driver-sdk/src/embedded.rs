@@ -1461,7 +1461,7 @@ mod tests {
             for (values, expected) in [
                 (merge_safe_environment(inherited.clone(), &[]), "inherited"),
                 (
-                    merge_safe_environment(std::iter::empty(), &[host.clone()]),
+                    merge_safe_environment(std::iter::empty(), std::slice::from_ref(&host)),
                     "host",
                 ),
                 (merge_safe_environment(inherited, &[host]), "host"),

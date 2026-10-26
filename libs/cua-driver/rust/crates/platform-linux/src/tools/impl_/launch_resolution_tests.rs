@@ -64,7 +64,14 @@ fn a_launcher_splash_waits_for_the_app_window() {
     let none = std::collections::HashSet::new();
     let is_splash = |w: &crate::x11::WindowInfo| w.xid == 10;
 
-    assert!(settle_launch(&[splash.clone()], 377, "libreoffice", &none, is_splash).is_none());
+    assert!(settle_launch(
+        std::slice::from_ref(&splash),
+        377,
+        "libreoffice",
+        &none,
+        is_splash
+    )
+    .is_none());
 
     let launched = settle_launch(&[splash, calc], 377, "libreoffice", &none, is_splash).unwrap();
     assert_eq!(launched.pid, Some(398));

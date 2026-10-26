@@ -18,8 +18,10 @@
 use std::time::Duration;
 
 use crate::ax::bindings::{
-    copy_element_attr, copy_string_attr, AXUIElementRef, AXUIElementSetAttributeValue,
+    copy_element_attr, copy_string_attr, kAXValueCFRangeType, AXUIElementRef,
+    AXUIElementSetAttributeValue, AXValueCreate,
 };
+use core_foundation::base::CFRange;
 
 /// What the document's edited mark showed after an AX text write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,18 +60,6 @@ impl DocumentEdited {
             DocumentEdited::Marked => Some(true),
         }
     }
-}
-
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXValueCreate(the_type: u32, value_ptr: *const std::ffi::c_void) -> *const std::ffi::c_void;
-}
-const AX_VALUE_CF_RANGE: u32 = 4;
-
-#[repr(C)]
-struct CfRange {
-    location: isize,
-    length: isize,
 }
 
 /// Whether `element` sits in a document window (its window has an
@@ -217,11 +207,11 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) {
     let len = copy_string_attr(element, "AXValue")
         .map(|v| v.encode_utf16().count())
         .unwrap_or(0);
-    let range = CfRange {
+    let range = CFRange {
         location: len as isize,
         length: 0,
     };
-    let value = AXValueCreate(AX_VALUE_CF_RANGE, &range as *const CfRange as *const _);
+    let value = AXValueCreate(kAXValueCFRangeType, (&range as *const CFRange).cast());
     if !value.is_null() {
         use core_foundation::{base::TCFType, string::CFString};
         let attr = CFString::new("AXSelectedTextRange");

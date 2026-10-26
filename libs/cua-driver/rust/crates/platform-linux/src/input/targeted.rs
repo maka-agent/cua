@@ -15,7 +15,8 @@
 //!   screen-space request and goes to the foreground.
 //! - **Auto** picks background whenever a window can be addressed and its
 //!   toolkit honours synthetic events, and foreground otherwise. Toolkits known
-//!   to drop XSendEvent input ([`synthetic_input_ignored_by`]: GTK3/4,
+//!   to drop XSendEvent input
+//!   ([`synthetic_input_ignored_by`](crate::input::targeted::synthetic_input_ignored_by): GTK3/4,
 //!   Chromium/Electron) get foreground XTest under AUTO when the caller allows
 //!   escalation, and an explicit background request to one of them is refused
 //!   with `WouldRequireActivation` rather than reported as delivered.

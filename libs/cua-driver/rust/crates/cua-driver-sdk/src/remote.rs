@@ -58,6 +58,10 @@ pub struct DriverChannelCapabilities {
 /// `bind_session` returns a new opaque channel already bound to the effective
 /// session context. It never returns a serialized lease, token, or session
 /// authority for the caller to replay on another connection.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait DriverEnvelopeChannel: Send + Sync {
     /// Report the carrier's compatible envelope range and lifecycle support.

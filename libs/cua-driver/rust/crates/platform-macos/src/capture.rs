@@ -895,7 +895,7 @@ fn core_cgimage_to_png(
 /// any pixel is visible (alpha > 0).
 fn unpremultiply_rgba(rgba: &mut [u8]) -> bool {
     let mut visible = false;
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha == 0 {
             continue;

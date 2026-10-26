@@ -3667,7 +3667,7 @@ pub fn send_button_down(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
         state: KeyButMask::from(0u16),
         same_screen: true,
     };
-    conn.send_event(false, target.window, EventMask::BUTTON_PRESS, &press)?
+    conn.send_event(false, target.window, EventMask::BUTTON_PRESS, press)?
         .check()?;
     settle_synthetic_events(&conn);
     Ok(())
@@ -3719,7 +3719,7 @@ pub fn send_button_up(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
         state: button_state_mask(button),
         same_screen: true,
     };
-    conn.send_event(false, target.window, EventMask::BUTTON_RELEASE, &release)?
+    conn.send_event(false, target.window, EventMask::BUTTON_RELEASE, release)?
         .check()?;
     settle_synthetic_events(&conn);
     Ok(())
@@ -3961,7 +3961,7 @@ pub fn send_type_text_xtest(text: &str) -> Result<()> {
 /// (Control_L/Shift_L/Alt_L/Super_L), then to keycodes that are in the server's
 /// modifier map, so the modifier mask actually engages. Sparse/headless keymaps
 /// that lack a keysym borrow a spare keycode via
-/// [`keycode_for_keysym`]; the returned guards restore the map on drop.
+/// `keycode_for_keysym`; the returned guards restore the map on drop.
 pub fn send_key_xtest(key: &str, modifiers: &[&str]) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, _) = connect_x11_for_input()?;
@@ -4221,10 +4221,8 @@ pub fn send_drag_xtest_desktop(
     steps: usize,
 ) -> Result<()> {
     send_drag_xtest_desktop_with_modifiers(
-        from_x,
-        from_y,
-        to_x,
-        to_y,
+        (from_x, from_y),
+        (to_x, to_y),
         button,
         duration_ms,
         steps,
@@ -4235,16 +4233,15 @@ pub fn send_drag_xtest_desktop(
 /// Screen-absolute drag via XTest with physical modifier transitions around
 /// the complete press/motion/release gesture.
 pub fn send_drag_xtest_desktop_with_modifiers(
-    from_x: i32,
-    from_y: i32,
-    to_x: i32,
-    to_y: i32,
+    from: (i32, i32),
+    to: (i32, i32),
     button: u8,
     duration_ms: u64,
     steps: usize,
     modifiers: &[&str],
 ) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
+    let ((from_x, from_y), (to_x, to_y)) = (from, to);
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
     let mut mapping = conn.get_keyboard_mapping(8, 248)?.reply()?;
@@ -4560,7 +4557,7 @@ mod own_dialog_tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    use x11rb::protocol::{xproto::*, Event};
+    use x11rb::protocol::Event;
     use x11rb::wrapper::ConnectionExt as _;
 
     struct Server(std::process::Child);

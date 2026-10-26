@@ -8,7 +8,7 @@
 //! `~/.cua-driver/config.json`. `set_config` cannot write those keys, so a
 //! model cannot turn it on or off.
 //!
-//! The script runs in an embedded QuickJS engine ([`engine`]) on its own
+//! The script runs in an embedded QuickJS engine (`engine`) on its own
 //! thread, with no filesystem, network, process or environment access. Its
 //! only reach outside the engine is the `cua` API, and every call that API
 //! makes is dispatched here, inside this tool call's task, through the same

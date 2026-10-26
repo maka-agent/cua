@@ -333,6 +333,10 @@ pub struct PrepareSideEffects {
 /// conditions the calling agent should see as a structured refusal
 /// (including infrastructure failures, which map naturally onto
 /// `browser_route_unavailable`).
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait BrowserPlatform: Send + Sync {
     /// Resolve a canonical installed Chromium-family executable for a

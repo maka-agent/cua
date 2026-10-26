@@ -166,6 +166,7 @@ impl RuntimeSession {
             .map_err(|error| format!("computer audio discard task failed: {error}"))?
     }
 
+    #[cfg(test)]
     pub(crate) async fn invoke(&self, name: &str, args: Value) -> Option<CoreToolResult> {
         self.invoke_in_frame(name, args, CoordinateFrame::Screenshot)
             .await

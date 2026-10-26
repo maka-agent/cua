@@ -9,9 +9,9 @@
 //! root `XGetImage`). Wayland-native per-window paths are not routed into XShm.
 //!
 //! x11rb MIT-SHM API (pinned 0.13.2):
-//! - https://docs.rs/x11rb/0.13.2/x11rb/protocol/shm/trait.ConnectionExt.html
-//! - https://docs.rs/x11rb/0.13.2/x11rb/protocol/shm/struct.GetImageReply.html
-//! - https://docs.rs/x11rb/0.13.2/x11rb/protocol/shm/struct.CreateSegmentReply.html
+//! - <https://docs.rs/x11rb/0.13.2/x11rb/protocol/shm/trait.ConnectionExt.html>
+//! - <https://docs.rs/x11rb/0.13.2/x11rb/protocol/shm/struct.GetImageReply.html>
+//! - <https://docs.rs/x11rb/0.13.2/x11rb/protocol/shm/struct.CreateSegmentReply.html>
 //!
 //! Request order: `shm_query_version().reply()` before any other SHM call;
 //! `generate_id`; `shm_create_segment(seg, size, false).reply()` → `OwnedFd`;
@@ -1009,12 +1009,11 @@ pub(crate) fn screenshot_display_bytes_x11() -> Result<Vec<u8>> {
         .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, w as u16, h as u16, !0u32)?
         .reply()?;
     let bytes = img.data;
-    let bpp = match img.depth {
-        32 | 24 => 4usize,
-        _ => anyhow::bail!("Unsupported depth"),
-    };
+    if !matches!(img.depth, 32 | 24) {
+        anyhow::bail!("Unsupported depth");
+    }
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for chunk in bytes.chunks_exact(bpp) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let (b, g, r) = (chunk[0], chunk[1], chunk[2]);
         rgba.extend_from_slice(&[r, g, b, 255]);
     }
@@ -1055,12 +1054,11 @@ pub fn screenshot_root_region_png(x: i32, y: i32, width: u32, height: u32) -> Re
             !0u32,
         )?
         .reply()?;
-    let bpp = match img.depth {
-        32 | 24 => 4usize,
-        _ => anyhow::bail!("Unsupported depth"),
-    };
+    if !matches!(img.depth, 32 | 24) {
+        anyhow::bail!("Unsupported depth");
+    }
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for chunk in img.data.chunks_exact(bpp) {
+    for chunk in img.data.as_chunks::<4>().0 {
         let (b, g, r) = (chunk[0], chunk[1], chunk[2]);
         rgba.extend_from_slice(&[r, g, b, 255]);
     }

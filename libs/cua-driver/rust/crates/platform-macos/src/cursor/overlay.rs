@@ -46,6 +46,8 @@ use cursor_overlay::{
 // own cursor key. A new animation only supersedes the SAME key's prior waiter,
 // so concurrent sessions never cross-cancel each other's arrivals.
 
+type CursorArrival = (CursorKey, tokio::sync::oneshot::Sender<()>);
+
 static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>>> =
     Mutex::new(None);
 
@@ -79,8 +81,7 @@ enum MacMsg {
 }
 static TOPOLOGY: AtomicU64 = AtomicU64::new(0);
 static RECONCILING: AtomicBool = AtomicBool::new(false);
-static PENDING_PRESENTATIONS: Mutex<Vec<(CursorKey, tokio::sync::oneshot::Sender<()>)>> =
-    Mutex::new(Vec::new());
+static PENDING_PRESENTATIONS: Mutex<Vec<CursorArrival>> = Mutex::new(Vec::new());
 
 static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<MacMsg>> = OnceLock::new();
 // Single-consumer slot; receiver is moved into run_on_main_thread().
@@ -1125,11 +1126,14 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
         && state.core.idle_alpha >= 0.004
 }
 
+// Both sides of the erased GCD context pointer must use the same boxed tuple.
+type LayerContentsPayload = (Vec<(usize, usize)>, Vec<CursorArrival>, u64);
+
 /// Convert a `tiny_skia::Pixmap` to a `CGImage` and set it as the contents
 /// of the given `CALayer` via `dispatch_async(main_queue, ...)`.
 fn dispatch_set_layer_contents(
     frames: Vec<(usize, tiny_skia::Pixmap)>,
-    arrivals: Vec<(CursorKey, tokio::sync::oneshot::Sender<()>)>,
+    arrivals: Vec<CursorArrival>,
     generation: u64,
 ) {
     let mut images = Vec::new();
@@ -1148,7 +1152,7 @@ fn dispatch_set_layer_contents(
             }
         }
     }
-    let payload = Box::new((images, arrivals, generation));
+    let payload: Box<LayerContentsPayload> = Box::new((images, arrivals, generation));
 
     // GCD symbols from libdispatch (part of the macOS system library stubs).
     // `dispatch_get_main_queue()` is an inline C function; the underlying
@@ -1167,11 +1171,7 @@ fn dispatch_set_layer_contents(
     }
 
     unsafe extern "C" fn set_contents_cb(ctx: *mut c_void) {
-        let (images, mut arrivals, generation): (
-            Vec<(usize, usize)>,
-            Vec<(CursorKey, tokio::sync::oneshot::Sender<()>)>,
-            u64,
-        ) = *Box::from_raw(ctx as *mut _);
+        let (images, mut arrivals, generation) = *Box::from_raw(ctx.cast::<LayerContentsPayload>());
         let stale = generation != TOPOLOGY.load(Ordering::Acquire);
         if stale || images.is_empty() {
             PENDING_PRESENTATIONS.lock().unwrap().extend(arrivals);

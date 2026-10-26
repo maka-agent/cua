@@ -293,7 +293,12 @@ fn background_keys_deliver_complete_sequences_without_changing_focus() -> Result
 
     send_type_text(u64::from(target), "az")?;
     let events = keyboard_events(&conn, 4)?;
-    for (pair, keysym) in events.chunks_exact(2).zip([u32::from('a'), u32::from('z')]) {
+    for (pair, keysym) in events
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip([u32::from('a'), u32::from('z')])
+    {
         assert!(pair[0].0 && !pair[1].0);
         assert_eq!(pair[0].1.event, target);
         assert_eq!(pair[1].1.event, target);
@@ -436,7 +441,7 @@ fn text_types_more_distinct_unmapped_characters_than_spare_keycodes() -> Result<
     for result in results {
         result?;
         let events = keyboard_events(&conn, 8)?;
-        for pair in events.chunks_exact(2) {
+        for pair in events.as_chunks::<2>().0 {
             assert!(pair[0].0 && !pair[1].0);
             assert_eq!((pair[0].1.detail, pair[1].1.detail), (free, free));
         }

@@ -15,6 +15,10 @@ use crate::tool::ToolRegistry;
 /// `ToolRegistry` implementation remains for core-level tests and embedders.
 /// Keeping the protocol dependent on this small contract prevents transports
 /// from reaching through the SDK into its private platform registry.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait::async_trait]
 pub trait ToolProvider: Send + Sync {
     fn tools_list(&self) -> serde_json::Value;

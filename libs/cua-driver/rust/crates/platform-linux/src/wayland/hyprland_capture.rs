@@ -339,7 +339,7 @@ pub fn frame_to_rgba8(frame: &RawFrame) -> Result<Vec<u8>> {
         // Memory order B,G,R,[A|X] — swap to R,G,B,A.
         wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {
             let opaque = frame.format == wl_shm::Format::Xrgb8888;
-            for px in rgba.chunks_exact_mut(4) {
+            for px in rgba.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
                 if opaque {
                     px[3] = 0xFF;
@@ -349,7 +349,7 @@ pub fn frame_to_rgba8(frame: &RawFrame) -> Result<Vec<u8>> {
         // Memory order already R,G,B,[A|X].
         wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888 => {
             if frame.format == wl_shm::Format::Xbgr8888 {
-                for px in rgba.chunks_exact_mut(4) {
+                for px in rgba.as_chunks_mut::<4>().0 {
                     px[3] = 0xFF;
                 }
             }

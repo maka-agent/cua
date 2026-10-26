@@ -1386,18 +1386,50 @@ mod tests {
         monitor
     }
 
-    // (output mode, scale, logical frame). 1.6666666 is the #4219 laptop.
-    const SCALED_OUTPUTS: [((u32, u32), f64, (u32, u32)); 5] = [
-        ((1920, 1080), 1.0, (1920, 1080)),
-        ((2560, 1600), 1.25, (2048, 1280)),
-        ((2880, 1800), 1.5, (1920, 1200)),
-        ((2160, 1350), 1.6666666, (1296, 810)),
-        ((3840, 2160), 2.0, (1920, 1080)),
+    #[derive(Clone, Copy, Debug)]
+    struct ScaledOutputCase {
+        mode: (u32, u32),
+        scale: f64,
+        expected_logical_size: (u32, u32),
+    }
+
+    // The 1.6666666 scale is the #4219 laptop.
+    const SCALED_OUTPUTS: [ScaledOutputCase; 5] = [
+        ScaledOutputCase {
+            mode: (1920, 1080),
+            scale: 1.0,
+            expected_logical_size: (1920, 1080),
+        },
+        ScaledOutputCase {
+            mode: (2560, 1600),
+            scale: 1.25,
+            expected_logical_size: (2048, 1280),
+        },
+        ScaledOutputCase {
+            mode: (2880, 1800),
+            scale: 1.5,
+            expected_logical_size: (1920, 1200),
+        },
+        ScaledOutputCase {
+            mode: (2160, 1350),
+            scale: 1.6666666,
+            expected_logical_size: (1296, 810),
+        },
+        ScaledOutputCase {
+            mode: (3840, 2160),
+            scale: 2.0,
+            expected_logical_size: (1920, 1080),
+        },
     ];
 
     #[test]
     fn display_identity_publishes_the_logical_frame_and_scale() {
-        for ((width, height), scale, logical) in SCALED_OUTPUTS {
+        for ScaledOutputCase {
+            mode: (width, height),
+            scale,
+            expected_logical_size: logical,
+        } in SCALED_OUTPUTS
+        {
             assert_eq!(
                 screen_size_from_monitors(vec![scaled_monitor(width, height, scale)]).unwrap(),
                 (logical.0, logical.1, scale),
@@ -1411,7 +1443,12 @@ mod tests {
     /// the pointer on the physical pixel the agent saw in the native capture.
     #[test]
     fn scaled_desktop_frame_and_virtual_pointer_extent_agree() {
-        for ((mode_w, mode_h), scale, _) in SCALED_OUTPUTS {
+        for ScaledOutputCase {
+            mode: (mode_w, mode_h),
+            scale,
+            ..
+        } in SCALED_OUTPUTS
+        {
             let (frame_w, frame_h, _) =
                 screen_size_from_monitors(vec![scaled_monitor(mode_w, mode_h, scale)]).unwrap();
             let layout =

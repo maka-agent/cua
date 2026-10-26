@@ -956,7 +956,7 @@ mod tests {
     }
 
     fn marker_centroid(pixmap: &tiny_skia::Pixmap) -> (f32, f32) {
-        let (weight, x_sum, y_sum) = pixmap.data().chunks_exact(4).enumerate().fold(
+        let (weight, x_sum, y_sum) = pixmap.data().as_chunks::<4>().0.iter().enumerate().fold(
             (0.0, 0.0, 0.0),
             |(weight, x_sum, y_sum), (index, pixel)| {
                 let alpha = f32::from(pixel[3]);

@@ -32,7 +32,6 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
-use foreign_types::ForeignType;
 
 const TEXT_EVENT_UTF16_UNITS: usize = 20;
 const SCROLL_PHASE_FIELD: u32 = 99;

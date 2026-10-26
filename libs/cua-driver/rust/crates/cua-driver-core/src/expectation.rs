@@ -44,6 +44,10 @@ pub struct ObservationSample {
     pub visual_evidence: Vec<Content>,
 }
 
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait emits redundant must_use attributes on boxed futures"
+)]
 #[async_trait]
 pub trait ObservationProvider: Send + Sync {
     async fn observe(

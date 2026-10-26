@@ -280,9 +280,9 @@ mod tests {
             [12, 34, 56, 255],
         );
 
-        let pixels = pixmap.data().chunks_exact(4).collect::<Vec<_>>();
-        assert!(pixels.iter().any(|pixel| *pixel == [12, 34, 56, 255]));
-        assert!(pixels.iter().any(|pixel| *pixel == [255, 255, 255, 255]));
+        let pixels = pixmap.data().as_chunks::<4>().0;
+        assert!(pixels.contains(&[12, 34, 56, 255]));
+        assert!(pixels.contains(&[255, 255, 255, 255]));
         assert!(pixels.iter().any(|pixel| pixel[2] > pixel[1]
             && pixel[1] > pixel[0]
             && pixel[0] > 0
@@ -310,7 +310,7 @@ mod tests {
 
         let bounds = |predicate: &dyn Fn(&[u8]) -> bool| {
             let mut result = (u32::MAX, u32::MAX, 0, 0);
-            for (index, pixel) in pixmap.data().chunks_exact(4).enumerate() {
+            for (index, pixel) in pixmap.data().as_chunks::<4>().0.iter().enumerate() {
                 if predicate(pixel) {
                     let x = index as u32 % pixmap.width();
                     let y = index as u32 / pixmap.width();
@@ -456,7 +456,11 @@ mod tests {
                 visual.elapsed_secs = action.duration_secs() * 0.4;
                 paint_default_theme(&mut pm, &visual, 128.0, 128.0, 0.0, scale, 1.0);
                 assert!(
-                    pm.data().chunks_exact(4).any(|pixel| pixel[3] != 0),
+                    pm.data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[3] != 0),
                     "{} did not render at {scale}x",
                     action.as_str()
                 );
