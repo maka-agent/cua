@@ -1672,6 +1672,39 @@ impl CuaDriverSession {
 }
 
 impl CuaDriverSession {
+    /// Observe one host-prepared macOS source frame through this exact session.
+    /// The request supplies data, never authority. This Rust-only method uses
+    /// the ordinary get_window_state authorization and operation lifecycle.
+    /// It returns the encoded image and prepared geometry metadata, without a
+    /// generic Cua action capture ID or screenshot-to-action transform. Input
+    /// against that source frame needs a dedicated typed route; that route is
+    /// not yet provided by this method.
+    #[cfg(target_os = "macos")]
+    pub async fn capture_prepared_window(
+        &self,
+        prepared: platform_macos::capture::FrozenWindowCapture,
+        include_accessibility_tree: bool,
+    ) -> Result<ToolResult, DriverError> {
+        let target = prepared.geometry();
+        let arguments = serde_json::json!({
+            "pid":target.pid,"window_id":target.window_id,
+            "include_accessibility_tree":include_accessibility_tree,
+            "include_screenshot":true,"tree_format":"both",
+            "full_output":true,"max_image_dimension":0
+        });
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                "get_window_state",
+                session
+                    .invoke_prepared_window_capture(arguments, prepared)
+                    .await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "prepared macOS capture requires an embedded trusted session".into(),
+            }),
+        }
+    }
+
     /// Trusted Rust-host observation of this binding's current native audio.
     ///
     /// Completes only after the native capture has exited/stopped and settled
@@ -1810,7 +1843,7 @@ fn validate_native_window_pixel_call(name: &str, args: &Value) -> Result<(), Dri
                 tool: name.into(),
                 reason: "native window pixels apply only to coordinate click, drag, or scroll"
                     .into(),
-            })
+            });
         }
     };
     if !coordinates.iter().all(|field| args.get(*field).is_some())

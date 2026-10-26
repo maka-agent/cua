@@ -896,6 +896,8 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
         out_operation,
         out_error,
         crate::runtime::CoordinateFrame::Screenshot,
+        #[cfg(target_os = "macos")]
+        None,
     )
 }
 
@@ -910,6 +912,9 @@ unsafe fn session_invoke_in_frame(
     out_operation: *mut *mut CuaDriverOperation,
     out_error: *mut CuaDriverBuffer,
     frame: crate::runtime::CoordinateFrame,
+    #[cfg(target_os = "macos")] frozen_capture: Option<
+        platform_macos::capture::FrozenWindowCapture,
+    >,
 ) -> CuaDriverStatus {
     with_ffi_guard(out_error, || {
         let session = required_session_handle(handle)?;
@@ -958,15 +963,23 @@ unsafe fn session_invoke_in_frame(
         *out_operation = spawn_completion(
             executor,
             async move {
-                let result = session
-                    .invoke_in_frame(&name, arguments, frame)
-                    .await
-                    .ok_or_else(|| {
-                        AbiFailure::new(
-                            CuaDriverStatus::Shutdown,
-                            "the owning Cua Driver runtime has been shut down",
-                        )
-                    })?;
+                let invocation = session.invoke_in_frame(&name, arguments, frame);
+                #[cfg(target_os = "macos")]
+                let result = match frozen_capture {
+                    Some(prepared) => {
+                        platform_macos::capture::with_frozen_window_capture(prepared, invocation)
+                            .await
+                    }
+                    None => invocation.await,
+                };
+                #[cfg(not(target_os = "macos"))]
+                let result = invocation.await;
+                let result = result.ok_or_else(|| {
+                    AbiFailure::new(
+                        CuaDriverStatus::Shutdown,
+                        "the owning Cua Driver runtime has been shut down",
+                    )
+                })?;
                 serde_json::to_string(&result)
                     .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
             },
@@ -1572,8 +1585,14 @@ impl NativeAbiSession {
     }
 
     pub(crate) async fn invoke(&self, name: &str, arguments: Value) -> Result<Value, DriverError> {
-        self.invoke_in_frame(name, arguments, crate::runtime::CoordinateFrame::Screenshot)
-            .await
+        self.invoke_in_frame(
+            name,
+            arguments,
+            crate::runtime::CoordinateFrame::Screenshot,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn invoke_with_native_window_pixels(
@@ -1585,6 +1604,23 @@ impl NativeAbiSession {
             name,
             arguments,
             crate::runtime::CoordinateFrame::NativeWindow,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn invoke_prepared_window_capture(
+        &self,
+        arguments: Value,
+        prepared: platform_macos::capture::FrozenWindowCapture,
+    ) -> Result<Value, DriverError> {
+        self.invoke_in_frame(
+            "get_window_state",
+            arguments,
+            crate::runtime::CoordinateFrame::Screenshot,
+            Some(prepared),
         )
         .await
     }
@@ -1594,6 +1630,9 @@ impl NativeAbiSession {
         name: &str,
         arguments: Value,
         frame: crate::runtime::CoordinateFrame,
+        #[cfg(target_os = "macos")] frozen_capture: Option<
+            platform_macos::capture::FrozenWindowCapture,
+        >,
     ) -> Result<Value, DriverError> {
         let arguments = serde_json::to_vec(&arguments).map_err(|error| DriverError::Protocol {
             reason: format!("serialize {name} session ABI arguments: {error}"),
@@ -1612,8 +1651,11 @@ impl NativeAbiSession {
             let context = Box::into_raw(Box::new(CallbackContext { sender })).cast::<c_void>();
             let mut operation = ptr::null_mut();
             let mut error = CuaDriverBuffer::empty();
+            let public_entry = frame == crate::runtime::CoordinateFrame::Screenshot;
+            #[cfg(target_os = "macos")]
+            let public_entry = public_entry && frozen_capture.is_none();
             let status = unsafe {
-                if frame == crate::runtime::CoordinateFrame::Screenshot {
+                if public_entry {
                     ffi::session_invoke(
                         *handle,
                         name.as_ptr(),
@@ -1639,6 +1681,8 @@ impl NativeAbiSession {
                         (&mut operation as *mut *mut ffi::Operation).cast(),
                         &mut error,
                         frame,
+                        #[cfg(target_os = "macos")]
+                        frozen_capture,
                     )
                 }
             };

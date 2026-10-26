@@ -467,7 +467,7 @@ impl NativeInputState {
             SCROLL_MOMENTUM_PHASE_FIELD,
             momentum_phase_value(momentum_phase),
         );
-        unsafe { CGEventSetLocation(event.as_ptr().cast(), point.x, point.y) };
+        super::set_event_location(&event, point);
 
         if self.is_foreground() {
             event.post(CGEventTapLocation::HID);
@@ -638,10 +638,6 @@ fn momentum_phase_value(phase: GesturePhase) -> i64 {
 
 fn native(message: &str) -> InteractiveInputError {
     InteractiveInputError::Native(message.to_owned())
-}
-
-extern "C" {
-    fn CGEventSetLocation(event: *mut std::ffi::c_void, x: f64, y: f64);
 }
 
 #[cfg(test)]

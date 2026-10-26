@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use cua_driver_core::capture_runtime::{
     CaptureActionRequest, CapturePublication, CaptureService, CaptureTarget,
-    EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotToActionTransform,
+    EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotCodec,
+    ScreenshotToActionTransform,
 };
 use serde_json::Value;
 
@@ -95,7 +96,8 @@ impl WindowsCaptureBridge {
             0.0,
         )?;
         let capture_id = self.service.publish(CapturePublication {
-            png_bytes,
+            encoded_bytes: png_bytes,
+            codec: ScreenshotCodec::Png,
             target: target.core(),
             encoded_dimensions,
             native_action_dimensions,

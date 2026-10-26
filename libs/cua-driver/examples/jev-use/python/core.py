@@ -141,7 +141,9 @@ def parse_visual_regions(
             "visual result has a mismatched window target", code="capture_mismatch"
         )
     screenshot = capture.get("screenshot")
-    if not isinstance(screenshot, dict) or screenshot.get("mime_type") != "image/png":
+    if not isinstance(screenshot, dict) or screenshot.get("mime_type") not in (
+        "image/png", "image/jpeg"
+    ):
         raise VisualObservationError("visual result has invalid screenshot provenance")
     screenshot_reference = _nonempty(screenshot.get("reference"))
     screenshot_width = _positive_int(screenshot.get("width"))

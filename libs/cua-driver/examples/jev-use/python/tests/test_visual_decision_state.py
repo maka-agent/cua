@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import unittest
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import (
     SUBMIT_IDS,
+    VisualObservationError,
     build_candidates,
     choose_mock,
     form_state,
@@ -60,6 +62,33 @@ class ReplayClient:
 
 
 class VisualFormStateTest(unittest.TestCase):
+    def test_png_and_jpeg_provenance_preserve_the_same_observation(self) -> None:
+        expected = observation()
+        for mime_type in ("image/png", "image/jpeg"):
+            with self.subTest(mime_type=mime_type):
+                payload = copy.deepcopy(PAYLOAD)
+                payload["capture"]["screenshot"]["mime_type"] = mime_type
+                self.assertEqual(
+                    parse_visual_regions(
+                        payload,
+                        expected_capture_id=expected.capture_id,
+                        expected_pid=expected.pid,
+                        expected_window_id=expected.window_id,
+                    ),
+                    expected,
+                )
+        for mime_type in ("image/gif", "image/webp", "image/jpg", "", None, []):
+            with self.subTest(mime_type=mime_type):
+                payload = copy.deepcopy(PAYLOAD)
+                payload["capture"]["screenshot"]["mime_type"] = mime_type
+                with self.assertRaisesRegex(VisualObservationError, "invalid screenshot provenance"):
+                    parse_visual_regions(
+                        payload,
+                        expected_capture_id=expected.capture_id,
+                        expected_pid=expected.pid,
+                        expected_window_id=expected.window_id,
+                    )
+
     def test_fixture_exposes_submit_only_as_text_and_as_one_visual_region(self) -> None:
         for snapshot in (BEFORE, AFTER):
             self.assertFalse(any(ref["role"] == "button" for ref in snapshot["refs"]))

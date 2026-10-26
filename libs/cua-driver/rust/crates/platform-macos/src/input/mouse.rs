@@ -1791,7 +1791,7 @@ fn scroll_wheel_at_xy_units(
 
         // Anchor the event at the target screen point so the renderer's wheel
         // hit-test routes the scroll to the element under the cursor.
-        unsafe { CGEventSetLocation(event_ptr, screen_x, screen_y) };
+        super::set_event_location(&event, CGPoint::new(screen_x, screen_y));
 
         // Background-delivery stamps (mirror post_mouse_event).
         if let Some((wx, wy)) = window_local {
@@ -1833,13 +1833,6 @@ extern "C" {
         button: core_graphics::event::CGMouseButton,
     ) -> core_graphics::sys::CGEventRef;
 
-    /// `void CGEventSetLocation(CGEventRef event, CGPoint location)`.
-    ///
-    /// `CGPoint { double x, double y }` is classified as two FP eightbytes on
-    /// arm64 / x86-64, so passing the two doubles as separate args is
-    /// ABI-identical to passing the struct by value — the same trick the
-    /// SkyLight bridge uses for `CGEventSetWindowLocation`.
-    fn CGEventSetLocation(event: *mut std::ffi::c_void, x: f64, y: f64);
 }
 
 fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {

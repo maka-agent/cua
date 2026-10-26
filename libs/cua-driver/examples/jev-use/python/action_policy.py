@@ -159,7 +159,7 @@ def authorize_exact_region_text_action(
     screenshot = capture.get("screenshot")
     if (
         not isinstance(screenshot, Mapping)
-        or screenshot.get("mime_type") != "image/png"
+        or screenshot.get("mime_type") not in ("image/png", "image/jpeg")
         or not isinstance(screenshot.get("reference"), str)
         or not screenshot["reference"]
         or any(

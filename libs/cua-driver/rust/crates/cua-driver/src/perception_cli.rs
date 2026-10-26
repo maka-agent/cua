@@ -16,6 +16,7 @@ use cua_driver_contract::{
     VisualCaptureProvenance, VisualCaptureSource, VisualParseError, VisualParseErrorCode,
     VisualScreenshotReference,
 };
+use cua_driver_core::capture_runtime::ScreenshotCodec;
 use cua_driver_core::perception_client::PerceptionCancellation;
 use cua_driver_core::perception_tools::build_local_output;
 
@@ -206,6 +207,7 @@ fn run_inner(args: &[String]) -> Result<(), CliError> {
             &capture_id,
             width,
             height,
+            ScreenshotCodec::Png,
             &png,
             &PerceptionCancellation::default(),
         ))

@@ -3280,7 +3280,11 @@
                     "type": "integer"
                   },
                   "mime_type": {
-                    "const": "image/png"
+                    "enum": [
+                      "image/png",
+                      "image/jpeg"
+                    ],
+                    "type": "string"
                   },
                   "reference": {
                     "type": "string"

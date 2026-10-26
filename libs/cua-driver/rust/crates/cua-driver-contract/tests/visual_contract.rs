@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 use cua_driver_contract::{
-    manifest, ParseVisualRegionsInput, ParseVisualRegionsOutput, VisualParseError,
-    VisualParseErrorCode,
+    manifest, ParseVisualRegionsInput, ParseVisualRegionsOutput, VisualContractValidationError,
+    VisualParseError, VisualParseErrorCode,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -42,6 +42,47 @@ fn versioned_output_fixture_covers_provenance_regions_warnings_and_optionals() {
                 (-1851.875, 10.25)
             );
         },
+    );
+}
+
+#[test]
+fn screenshot_provenance_accepts_png_and_jpeg_and_rejects_other_codecs() {
+    let mut value: Value = serde_json::from_str(include_str!(
+        "fixtures/parse-visual-regions-output-full-v1.json"
+    ))
+    .unwrap();
+    let original: ParseVisualRegionsOutput = serde_json::from_value(value.clone()).unwrap();
+    for mime_type in ["image/png", "image/jpeg"] {
+        value["capture"]["screenshot"]["mime_type"] = mime_type.into();
+        let output: ParseVisualRegionsOutput = serde_json::from_value(value.clone()).unwrap();
+        output.validate().unwrap();
+        assert_eq!(output.capture.screenshot.mime_type, mime_type);
+        assert_eq!(output.capture.source, original.capture.source);
+        assert_eq!(output.capture.capture_id, original.capture.capture_id);
+        assert_eq!(
+            output.capture.action_coordinate_space,
+            original.capture.action_coordinate_space
+        );
+        assert_eq!(output.regions, original.regions);
+    }
+    for mime_type in ["image/gif", "image/webp", "image/jpg", ""] {
+        value["capture"]["screenshot"]["mime_type"] = mime_type.into();
+        let output: ParseVisualRegionsOutput = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            output.validate(),
+            Err(VisualContractValidationError::UnsupportedScreenshotMimeType)
+        );
+    }
+
+    let contract = manifest()
+        .tools
+        .into_iter()
+        .find(|tool| tool.name == "parse_visual_regions")
+        .unwrap();
+    assert_eq!(
+        contract.success_output_schema.unwrap()["properties"]["capture"]["properties"]
+            ["screenshot"]["properties"]["mime_type"],
+        serde_json::json!({"enum": ["image/png", "image/jpeg"], "type": "string"})
     );
 }
 

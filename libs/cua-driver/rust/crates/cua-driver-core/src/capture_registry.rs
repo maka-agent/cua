@@ -9,14 +9,14 @@
 //! when the owning snapshot, session, or runtime generation is retired.
 //!
 //! The registry grants no screenshot or action permission. Callers must pass
-//! already-authorized PNG bytes and must independently authorize every action.
+//! already-authorized image bytes and must independently authorize every action.
 //! In particular, this foundation is not wired into platform adapters, action
 //! dispatch, session hooks, or permission checks. That P1 integration remains
 //! required before a capture ID can authorize or drive any production action.
 //! Target-specific bounds and coordinate semantics must be revalidated there.
 //!
 //! TTL cleanup is bounded and lazy: [`CaptureRegistry::prune_expired`] scans at
-//! most `max_captures` entries and drops expired PNG references. Registry size
+//! most `max_captures` entries and drops expired image references. Registry size
 //! metrics call it automatically. An eventual runtime owner must call it from
 //! its maintenance/metrics path if no store or lookup traffic is occurring.
 
@@ -33,6 +33,22 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub(crate) const DEFAULT_MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The producer's actual encoded image format, independent of facade labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreenshotCodec {
+    Png,
+    Jpeg,
+}
+
+impl ScreenshotCodec {
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct CaptureId {
@@ -398,7 +414,7 @@ pub enum CaptureStoreError {
     InvalidBinding,
     #[error("capture target is invalid")]
     InvalidTarget,
-    #[error("encoded screenshot dimensions are invalid or do not match the PNG")]
+    #[error("encoded screenshot dimensions are invalid or do not match the image")]
     InvalidEncodedDimensions,
     #[error("native action dimensions are invalid")]
     InvalidNativeActionDimensions,
@@ -406,10 +422,10 @@ pub enum CaptureStoreError {
     InvalidTransform,
     #[error("screenshot-to-action transform is not finite across the encoded image extent")]
     InvalidTransformExtent,
-    #[error("capture bytes are not a valid PNG")]
-    InvalidPng,
-    #[error("PNG dimensions or decoded allocation exceed registry limits")]
-    PngDecodeLimitExceeded,
+    #[error("capture bytes are not a valid image in the declared codec")]
+    InvalidEncodedImage,
+    #[error("image dimensions or decoded allocation exceed registry limits")]
+    DecodeLimitExceeded,
     #[error("capture exceeds the registry byte limit")]
     CaptureTooLarge,
     #[error("capture id space is exhausted")]
@@ -437,7 +453,8 @@ pub struct PruneOutcome {
 }
 
 pub struct CaptureRegistration {
-    pub png_bytes: Vec<u8>,
+    pub encoded_bytes: Vec<u8>,
+    pub codec: ScreenshotCodec,
     pub target: CaptureTarget,
     pub encoded_dimensions: EncodedScreenshotDimensions,
     pub native_action_dimensions: NativeActionDimensions,
@@ -446,7 +463,8 @@ pub struct CaptureRegistration {
 }
 
 pub struct CapturePublication {
-    pub png_bytes: Vec<u8>,
+    pub encoded_bytes: Vec<u8>,
+    pub codec: ScreenshotCodec,
     pub target: CaptureTarget,
     pub encoded_dimensions: EncodedScreenshotDimensions,
     pub native_action_dimensions: NativeActionDimensions,
@@ -540,7 +558,8 @@ pub fn admission_error_code(error: &anyhow::Error) -> &'static str {
 #[derive(Clone)]
 struct StoredCapture {
     id: CaptureId,
-    png_bytes: Arc<[u8]>,
+    encoded_bytes: Arc<[u8]>,
+    codec: ScreenshotCodec,
     digest: ContentDigest,
     target: CaptureTarget,
     encoded_dimensions: EncodedScreenshotDimensions,
@@ -556,7 +575,8 @@ impl fmt::Debug for StoredCapture {
         formatter
             .debug_struct("StoredCapture")
             .field("id", &self.id)
-            .field("byte_len", &self.png_bytes.len())
+            .field("byte_len", &self.encoded_bytes.len())
+            .field("codec", &self.codec)
             .field("digest", &self.digest)
             .field("target", &self.target)
             .field("encoded_dimensions", &self.encoded_dimensions)
@@ -577,8 +597,12 @@ impl PerceptionCapture {
         self.0.id
     }
 
-    pub fn png_bytes(&self) -> Arc<[u8]> {
-        self.0.png_bytes.clone()
+    pub fn encoded_bytes(&self) -> Arc<[u8]> {
+        self.0.encoded_bytes.clone()
+    }
+
+    pub fn codec(&self) -> ScreenshotCodec {
+        self.0.codec
     }
 
     pub fn digest(&self) -> ContentDigest {
@@ -621,8 +645,12 @@ impl ActionCapture {
         self.0.id
     }
 
-    pub fn png_bytes(&self) -> Arc<[u8]> {
-        self.0.png_bytes.clone()
+    pub fn encoded_bytes(&self) -> Arc<[u8]> {
+        self.0.encoded_bytes.clone()
+    }
+
+    pub fn codec(&self) -> ScreenshotCodec {
+        self.0.codec
     }
 
     pub fn digest(&self) -> ContentDigest {
@@ -698,37 +726,35 @@ impl CaptureRegistry {
 
     pub fn store(&self, registration: CaptureRegistration) -> Result<CaptureId, CaptureStoreError> {
         registration.target.validate()?;
-        if registration.png_bytes.len() > self.config.max_total_bytes {
+        if registration.encoded_bytes.len() > self.config.max_total_bytes {
             return Err(CaptureStoreError::CaptureTooLarge);
         }
         let mut limits = Limits::default();
         limits.max_image_width = Some(self.config.max_encoded_width);
         limits.max_image_height = Some(self.config.max_encoded_height);
         limits.max_alloc = Some(self.config.max_decoded_bytes);
-        let decoder = image::codecs::png::PngDecoder::with_limits(
-            Cursor::new(&registration.png_bytes),
-            limits,
-        )
-        .map_err(map_png_admission_error)?;
-        let decoded_dimensions = decoder.dimensions();
-        if decoded_dimensions
-            != (
-                registration.encoded_dimensions.width,
-                registration.encoded_dimensions.height,
-            )
-        {
-            return Err(CaptureStoreError::InvalidEncodedDimensions);
+        match registration.codec {
+            ScreenshotCodec::Png => {
+                let decoder = image::codecs::png::PngDecoder::with_limits(
+                    Cursor::new(&registration.encoded_bytes),
+                    limits,
+                )
+                .map_err(map_image_admission_error)?;
+                validate_capture_decoder(decoder, &registration, self.config.max_decoded_bytes)?;
+            }
+            ScreenshotCodec::Jpeg => {
+                let mut decoder =
+                    image::codecs::jpeg::JpegDecoder::new(Cursor::new(&registration.encoded_bytes))
+                        .map_err(map_image_admission_error)?;
+                decoder
+                    .set_limits(limits)
+                    .map_err(map_image_admission_error)?;
+                validate_capture_decoder(decoder, &registration, self.config.max_decoded_bytes)?;
+            }
         }
-        if decoder.total_bytes() > self.config.max_decoded_bytes {
-            return Err(CaptureStoreError::PngDecodeLimitExceeded);
-        }
-        registration
-            .screenshot_to_action
-            .validate_extent(registration.encoded_dimensions)?;
-        image::DynamicImage::from_decoder(decoder).map_err(map_png_admission_error)?;
-        let png_bytes: Arc<[u8]> = registration.png_bytes.into();
-        let byte_len = png_bytes.len();
-        let digest = ContentDigest(Sha256::digest(&png_bytes).into());
+        let encoded_bytes: Arc<[u8]> = registration.encoded_bytes.into();
+        let byte_len = encoded_bytes.len();
+        let digest = ContentDigest(Sha256::digest(&encoded_bytes).into());
         let created_at = self.clock.now();
         let expires_at = created_at
             .checked_add(self.config.ttl)
@@ -755,7 +781,8 @@ impl CaptureRegistry {
         };
         let capture = StoredCapture {
             id,
-            png_bytes,
+            encoded_bytes,
+            codec: registration.codec,
             digest,
             target: registration.target,
             encoded_dimensions: registration.encoded_dimensions,
@@ -1052,7 +1079,7 @@ impl CaptureRegistry {
     fn remove_capture(&self, inner: &mut RegistryInner, id: CaptureId) -> usize {
         let mut removed_bytes = 0;
         if let Some(capture) = inner.captures.remove(&id) {
-            removed_bytes = capture.png_bytes.len();
+            removed_bytes = capture.encoded_bytes.len();
             inner.total_bytes = inner.total_bytes.saturating_sub(removed_bytes);
         }
         if let Some(index) = inner
@@ -1155,7 +1182,8 @@ impl CaptureService {
     pub fn publish(&self, publication: CapturePublication) -> Result<CaptureId, CaptureStoreError> {
         let binding = self.binding(publication.session_id, publication.session_generation)?;
         self.registry.store(CaptureRegistration {
-            png_bytes: publication.png_bytes,
+            encoded_bytes: publication.encoded_bytes,
+            codec: publication.codec,
             target: publication.target,
             encoded_dimensions: publication.encoded_dimensions,
             native_action_dimensions: publication.native_action_dimensions,
@@ -1264,11 +1292,34 @@ impl Drop for CaptureService {
     }
 }
 
-fn map_png_admission_error(error: image::ImageError) -> CaptureStoreError {
+fn validate_capture_decoder<D: ImageDecoder>(
+    decoder: D,
+    registration: &CaptureRegistration,
+    max_decoded_bytes: u64,
+) -> Result<(), CaptureStoreError> {
+    if decoder.dimensions()
+        != (
+            registration.encoded_dimensions.width,
+            registration.encoded_dimensions.height,
+        )
+    {
+        return Err(CaptureStoreError::InvalidEncodedDimensions);
+    }
+    if decoder.total_bytes() > max_decoded_bytes {
+        return Err(CaptureStoreError::DecodeLimitExceeded);
+    }
+    registration
+        .screenshot_to_action
+        .validate_extent(registration.encoded_dimensions)?;
+    image::DynamicImage::from_decoder(decoder).map_err(map_image_admission_error)?;
+    Ok(())
+}
+
+fn map_image_admission_error(error: image::ImageError) -> CaptureStoreError {
     if matches!(error, image::ImageError::Limits(_)) {
-        CaptureStoreError::PngDecodeLimitExceeded
+        CaptureStoreError::DecodeLimitExceeded
     } else {
-        CaptureStoreError::InvalidPng
+        CaptureStoreError::InvalidEncodedImage
     }
 }
 
@@ -1320,13 +1371,22 @@ mod tests {
         .unwrap()
     }
 
+    fn encoded(codec: ScreenshotCodec, width: u32, height: u32, value: u8) -> Vec<u8> {
+        let bytes = png(width, height, value);
+        match codec {
+            ScreenshotCodec::Png => bytes,
+            ScreenshotCodec::Jpeg => crate::image_utils::png_bytes_to_jpeg(&bytes, 80).unwrap(),
+        }
+    }
+
     fn registration(
-        png_bytes: Vec<u8>,
+        encoded_bytes: Vec<u8>,
         target: CaptureTarget,
         binding: CaptureBinding,
     ) -> CaptureRegistration {
         CaptureRegistration {
-            png_bytes,
+            encoded_bytes,
+            codec: ScreenshotCodec::Png,
             target,
             encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
             native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),
@@ -1353,31 +1413,36 @@ mod tests {
     }
 
     #[test]
-    fn stores_immutable_png_metadata_and_never_reuses_ids() {
-        let registry = CaptureRegistry::new(config(2, 10_000)).unwrap();
-        let owner = binding(1, "session-a", 1);
-        let target = CaptureTarget::Window {
-            pid: 7,
-            window_id: 9,
-        };
-        let bytes = png(2, 2, 42);
-        let expected_digest = Sha256::digest(&bytes);
-        let first = registry
-            .store(registration(bytes.clone(), target.clone(), owner.clone()))
-            .unwrap();
-        let capture = registry
-            .read_for_perception(first, &owner, &target)
-            .unwrap();
-        assert_eq!(capture.png_bytes().as_ref(), bytes.as_slice());
-        assert_eq!(capture.digest().as_bytes(), expected_digest.as_slice());
-        assert_eq!(
-            capture.encoded_dimensions(),
-            EncodedScreenshotDimensions::new(2, 2).unwrap()
-        );
+    fn stores_immutable_image_metadata_and_never_reuses_ids() {
+        for codec in [ScreenshotCodec::Png, ScreenshotCodec::Jpeg] {
+            let registry = CaptureRegistry::new(config(2, 10_000)).unwrap();
+            let owner = binding(1, "session-a", 1);
+            let target = CaptureTarget::Window {
+                pid: 7,
+                window_id: 9,
+            };
+            let bytes = encoded(codec, 2, 2, 42);
+            let expected_digest = Sha256::digest(&bytes);
+            let mut input = registration(bytes.clone(), target.clone(), owner.clone());
+            input.codec = codec;
+            let first = registry.store(input).unwrap();
+            let capture = registry
+                .read_for_perception(first, &owner, &target)
+                .unwrap();
+            assert_eq!(capture.encoded_bytes().as_ref(), bytes.as_slice());
+            assert_eq!(capture.codec(), codec);
+            assert_eq!(capture.digest().as_bytes(), expected_digest.as_slice());
+            assert_eq!(
+                capture.encoded_dimensions(),
+                EncodedScreenshotDimensions::new(2, 2).unwrap()
+            );
 
-        registry.retire(first, &owner).unwrap();
-        let second = registry.store(registration(bytes, target, owner)).unwrap();
-        assert_ne!(first, second);
+            registry.retire(first, &owner).unwrap();
+            let mut input = registration(bytes, target, owner);
+            input.codec = codec;
+            let second = registry.store(input).unwrap();
+            assert_ne!(first, second);
+        }
     }
 
     #[test]
@@ -1388,7 +1453,7 @@ mod tests {
         let mut invalid_png = registration(b"not a png".to_vec(), target.clone(), owner.clone());
         assert_eq!(
             registry.store(invalid_png),
-            Err(CaptureStoreError::InvalidPng)
+            Err(CaptureStoreError::InvalidEncodedImage)
         );
 
         invalid_png = registration(png(3, 2, 1), target, owner.clone());
@@ -1417,26 +1482,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pngs_before_decode_when_dimensions_or_allocation_exceed_limits() {
-        let bytes = png(2, 2, 1);
-        let owner = binding(1, "session-a", 1);
+    fn declared_codec_must_match_valid_supported_image_bytes() {
+        let registry = CaptureRegistry::new(config(4, 10_000)).unwrap();
         let target = CaptureTarget::PrimaryDesktop;
+        let owner = binding(1, "session-a", 1);
+        for (codec, bytes) in [
+            (
+                ScreenshotCodec::Png,
+                encoded(ScreenshotCodec::Jpeg, 2, 2, 1),
+            ),
+            (
+                ScreenshotCodec::Jpeg,
+                encoded(ScreenshotCodec::Png, 2, 2, 1),
+            ),
+            (ScreenshotCodec::Png, b"GIF89a unsupported format".to_vec()),
+            (ScreenshotCodec::Jpeg, b"not an image".to_vec()),
+        ] {
+            let mut input = registration(bytes, target.clone(), owner.clone());
+            input.codec = codec;
+            assert_eq!(
+                registry.store(input),
+                Err(CaptureStoreError::InvalidEncodedImage)
+            );
+            assert!(registry.is_empty());
+        }
+    }
 
-        let mut dimension_config = config(2, 10_000);
-        dimension_config.max_encoded_width = 1;
-        let registry = CaptureRegistry::new(dimension_config).unwrap();
-        assert_eq!(
-            registry.store(registration(bytes.clone(), target.clone(), owner.clone())),
-            Err(CaptureStoreError::PngDecodeLimitExceeded)
-        );
+    #[test]
+    fn rejects_images_before_decode_when_dimensions_or_allocation_exceed_limits() {
+        for codec in [ScreenshotCodec::Png, ScreenshotCodec::Jpeg] {
+            let bytes = encoded(codec, 2, 2, 1);
+            let owner = binding(1, "session-a", 1);
+            let target = CaptureTarget::PrimaryDesktop;
+            let input = |bytes, target, owner| {
+                let mut input = registration(bytes, target, owner);
+                input.codec = codec;
+                input
+            };
 
-        let mut allocation_config = config(2, 10_000);
-        allocation_config.max_decoded_bytes = 8;
-        let registry = CaptureRegistry::new(allocation_config).unwrap();
-        assert_eq!(
-            registry.store(registration(bytes, target, owner)),
-            Err(CaptureStoreError::PngDecodeLimitExceeded)
-        );
+            let mut dimension_config = config(2, 10_000);
+            dimension_config.max_encoded_width = 1;
+            let registry = CaptureRegistry::new(dimension_config).unwrap();
+            assert_eq!(
+                registry.store(input(bytes.clone(), target.clone(), owner.clone())),
+                Err(CaptureStoreError::DecodeLimitExceeded)
+            );
+
+            let mut allocation_config = config(2, 10_000);
+            allocation_config.max_decoded_bytes = 8;
+            let registry = CaptureRegistry::new(allocation_config).unwrap();
+            assert_eq!(
+                registry.store(input(bytes, target, owner)),
+                Err(CaptureStoreError::DecodeLimitExceeded)
+            );
+        }
     }
 
     #[test]
@@ -1455,31 +1554,36 @@ mod tests {
 
     #[test]
     fn downscaled_capture_keeps_encoded_and_native_action_dimensions_distinct() {
-        let registry = CaptureRegistry::new(config(2, 10_000)).unwrap();
-        let owner = binding(1, "session-a", 1);
-        let target = CaptureTarget::PrimaryDesktop;
-        let transform = ScreenshotToActionTransform::new(2.0, 0.0, 0.0, 3.0, 0.0, 0.0).unwrap();
-        let id = registry
-            .store(CaptureRegistration {
-                png_bytes: png(2, 2, 1),
-                target: target.clone(),
-                encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
-                native_action_dimensions: NativeActionDimensions::new(4, 6).unwrap(),
-                screenshot_to_action: transform,
-                binding: owner.clone(),
-            })
-            .unwrap();
+        for codec in [ScreenshotCodec::Png, ScreenshotCodec::Jpeg] {
+            let registry = CaptureRegistry::new(config(2, 10_000)).unwrap();
+            let owner = binding(1, "session-a", 1);
+            let target = CaptureTarget::PrimaryDesktop;
+            let transform = ScreenshotToActionTransform::new(2.0, 0.0, 0.0, 3.0, 0.0, 0.0).unwrap();
+            let id = registry
+                .store(CaptureRegistration {
+                    encoded_bytes: encoded(codec, 2, 2, 1),
+                    codec,
+                    target: target.clone(),
+                    encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                    native_action_dimensions: NativeActionDimensions::new(4, 6).unwrap(),
+                    screenshot_to_action: transform,
+                    binding: owner.clone(),
+                })
+                .unwrap();
 
-        let capture = registry.consume_for_action(id, &owner, &target).unwrap();
-        assert_eq!(
-            capture.encoded_dimensions(),
-            EncodedScreenshotDimensions::new(2, 2).unwrap()
-        );
-        assert_eq!(
-            capture.native_action_dimensions(),
-            NativeActionDimensions::new(4, 6).unwrap()
-        );
-        assert_eq!(capture.screenshot_to_action().apply(1.0, 1.0), (2.0, 3.0));
+            let capture = registry.consume_for_action(id, &owner, &target).unwrap();
+            assert_eq!(capture.codec(), codec);
+            assert_eq!(capture.encoded_bytes().as_ref(), encoded(codec, 2, 2, 1));
+            assert_eq!(
+                capture.encoded_dimensions(),
+                EncodedScreenshotDimensions::new(2, 2).unwrap()
+            );
+            assert_eq!(
+                capture.native_action_dimensions(),
+                NativeActionDimensions::new(4, 6).unwrap()
+            );
+            assert_eq!(capture.screenshot_to_action().apply(1.0, 1.0), (2.0, 3.0));
+        }
     }
 
     #[test]
@@ -1711,7 +1815,7 @@ mod tests {
         let bytes = registry
             .read_for_perception(id, &owner, &target)
             .unwrap()
-            .png_bytes();
+            .encoded_bytes();
         let weak_bytes = Arc::downgrade(&bytes);
         let byte_len = bytes.len();
         drop(bytes);
@@ -1791,53 +1895,61 @@ mod tests {
 
     #[test]
     fn service_round_trips_ids_and_applies_full_affine_once() {
-        let service = CaptureService::new(config(4, 10_000)).unwrap();
-        let target = CaptureTarget::Window {
-            pid: 42,
-            window_id: 7,
-        };
-        let transform = ScreenshotToActionTransform::new(2.0, 0.5, -0.25, 3.0, 11.0, -4.0).unwrap();
-        let id = service
-            .publish(CapturePublication {
-                png_bytes: png(4, 3, 9),
-                target: target.clone(),
-                encoded_dimensions: EncodedScreenshotDimensions::new(4, 3).unwrap(),
-                native_action_dimensions: NativeActionDimensions::new(40, 30).unwrap(),
-                screenshot_to_action: transform,
-                session_id: Arc::from("session-a"),
-                session_generation: 2,
-            })
-            .unwrap();
-        assert_eq!(service.parse_capture_id(&id.to_string()).unwrap(), id);
-        let binding = service.binding("session-a", 2).unwrap();
-        let admission = service
-            .admit_action(CaptureActionRequest {
-                capture_id: id,
-                binding: binding.clone(),
-                target: target.clone(),
-                current_native_action_dimensions: NativeActionDimensions::new(40, 30).unwrap(),
-                screenshot_x: 2.5,
-                screenshot_y: 1.5,
-            })
-            .unwrap();
-        assert_eq!((admission.action_x, admission.action_y), (16.75, -0.125));
-        assert_eq!(admission.target, target);
-        assert_eq!(
-            service
+        for codec in [ScreenshotCodec::Png, ScreenshotCodec::Jpeg] {
+            let service = CaptureService::new(config(4, 10_000)).unwrap();
+            let target = CaptureTarget::Window {
+                pid: 42,
+                window_id: 7,
+            };
+            let transform =
+                ScreenshotToActionTransform::new(2.0, 0.5, -0.25, 3.0, 11.0, -4.0).unwrap();
+            let id = service
+                .publish(CapturePublication {
+                    encoded_bytes: encoded(codec, 4, 3, 9),
+                    codec,
+                    target: target.clone(),
+                    encoded_dimensions: EncodedScreenshotDimensions::new(4, 3).unwrap(),
+                    native_action_dimensions: NativeActionDimensions::new(40, 30).unwrap(),
+                    screenshot_to_action: transform,
+                    session_id: Arc::from("session-a"),
+                    session_generation: 2,
+                })
+                .unwrap();
+            assert_eq!(service.parse_capture_id(&id.to_string()).unwrap(), id);
+            let binding = service.binding("session-a", 2).unwrap();
+            let capture = service.read_for_perception(id, &binding).unwrap();
+            assert_eq!(capture.codec(), codec);
+            assert_eq!(capture.encoded_bytes().as_ref(), encoded(codec, 4, 3, 9));
+            let admission = service
                 .admit_action(CaptureActionRequest {
                     capture_id: id,
-                    binding,
-                    target: CaptureTarget::Window {
-                        pid: 42,
-                        window_id: 7,
-                    },
+                    binding: binding.clone(),
+                    target: target.clone(),
                     current_native_action_dimensions: NativeActionDimensions::new(40, 30).unwrap(),
                     screenshot_x: 2.5,
                     screenshot_y: 1.5,
                 })
-                .unwrap_err(),
-            CaptureActionError::Lookup(CaptureLookupError::Unknown)
-        );
+                .unwrap();
+            assert_eq!((admission.action_x, admission.action_y), (16.75, -0.125));
+            assert_eq!(admission.target, target);
+            assert_eq!(
+                service
+                    .admit_action(CaptureActionRequest {
+                        capture_id: id,
+                        binding,
+                        target: CaptureTarget::Window {
+                            pid: 42,
+                            window_id: 7,
+                        },
+                        current_native_action_dimensions: NativeActionDimensions::new(40, 30)
+                            .unwrap(),
+                        screenshot_x: 2.5,
+                        screenshot_y: 1.5,
+                    })
+                    .unwrap_err(),
+                CaptureActionError::Lookup(CaptureLookupError::Unknown)
+            );
+        }
     }
 
     #[test]
@@ -1846,7 +1958,8 @@ mod tests {
         let target = CaptureTarget::PrimaryDesktop;
         let id = service
             .publish(CapturePublication {
-                png_bytes: png(2, 2, 5),
+                encoded_bytes: png(2, 2, 5),
+                codec: ScreenshotCodec::Png,
                 target: target.clone(),
                 encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
                 native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),
@@ -2003,7 +2116,8 @@ mod tests {
         let publish = || {
             service
                 .publish(CapturePublication {
-                    png_bytes: png(2, 2, 1),
+                    encoded_bytes: png(2, 2, 1),
+                    codec: ScreenshotCodec::Png,
                     target: CaptureTarget::PrimaryDesktop,
                     encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
                     native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),

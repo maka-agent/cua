@@ -108,6 +108,22 @@ test('visual fixture builds a candidate without claiming interactivity', () => {
   });
 });
 
+test('PNG and JPEG provenance preserve the same observation and reject other codecs', () => {
+  const payload = fixture('parse-visual-regions-submit-v1.json');
+  const expected = parseVisualRegions(payload, 'capture-submit', 7, 9);
+  for (const mimeType of ['image/png', 'image/jpeg']) {
+    payload.capture.screenshot.mime_type = mimeType;
+    assert.deepEqual(parseVisualRegions(payload, 'capture-submit', 7, 9), expected);
+  }
+  for (const mimeType of ['image/gif', 'image/webp', 'image/jpg', '', null, []]) {
+    payload.capture.screenshot.mime_type = mimeType;
+    assert.throws(
+      () => parseVisualRegions(payload, 'capture-submit', 7, 9),
+      /invalid screenshot provenance/
+    );
+  }
+});
+
 test('Retina affine mapping keeps the original screenshot point (#4289)', () => {
   // Driver reports a non-identity capture as `affine` (never `scaled_top_left`).
   // A Retina-like 2x capture of a window at (100, 200) maps pixels to points

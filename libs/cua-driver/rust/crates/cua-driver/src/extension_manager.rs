@@ -5671,6 +5671,7 @@ mod tests {
     #[tokio::test]
     async fn live_perception_client_follows_install_update_and_remove() {
         use cua_driver_contract::VisualParseErrorCode;
+        use cua_driver_core::capture_runtime::ScreenshotCodec;
         use cua_driver_core::perception_client::{PerceptionCancellation, PerceptionClientHandle};
 
         async fn parse_code(handle: &PerceptionClientHandle) -> VisualParseErrorCode {
@@ -5681,6 +5682,7 @@ mod tests {
                     "capture-test",
                     1,
                     1,
+                    ScreenshotCodec::Png,
                     &[1, 2, 3, 4],
                     &PerceptionCancellation::default(),
                 )

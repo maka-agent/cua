@@ -26,3 +26,21 @@ pub use interactive::{
 };
 pub use keyboard::{hotkey, press_key, type_text};
 pub use mouse::click_at_xy;
+
+/// Set a retained event's screen location without posting it.
+pub(crate) fn set_event_location(
+    event: &core_graphics::event::CGEvent,
+    location: core_graphics::geometry::CGPoint,
+) {
+    use foreign_types::ForeignType;
+    // SAFETY: CGEvent retains the native event. The SDK takes CGPoint by value.
+    unsafe { CGEventSetLocation(event.as_ptr(), location) };
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventSetLocation(
+        event: core_graphics::sys::CGEventRef,
+        location: core_graphics::geometry::CGPoint,
+    );
+}

@@ -6,7 +6,7 @@
 
 mod math;
 
-pub use math::{DeltaError, PageDirection, page_deltas};
+pub use math::{page_deltas, DeltaError, PageDirection};
 
 use core_graphics::{
     event::{CGEvent, EventField, ScrollEventUnit},
@@ -77,8 +77,7 @@ pub fn prepare_page_scroll(request: PageScrollRequest) -> anyhow::Result<Prepare
         .map_err(|_| anyhow::anyhow!("native page scroll event source unavailable"))?;
     let event = CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 1, delta_y, delta_x, 0)
         .map_err(|_| anyhow::anyhow!("native page scroll event creation failed"))?;
-    // SAFETY: `event` retains a valid CGEventRef and CGPoint is its C ABI type.
-    unsafe { CGEventSetLocation(event.as_ptr(), point) };
+    super::set_event_location(&event, point);
     event.set_integer_value_field(51, i64::from(request.window_id));
     event.set_integer_value_field(
         EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER,
@@ -142,6 +141,5 @@ fn set_window_location(event: CGEventRef, point: CGPoint) -> anyhow::Result<()> 
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGEventSetLocation(event: CGEventRef, location: CGPoint);
     fn CGEventSetTimestamp(event: CGEventRef, timestamp: u64);
 }

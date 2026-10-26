@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use cua_driver_core::{
+    capture_runtime::ScreenshotCodec,
     protocol::{Content, ToolResult},
     tool::{Tool, ToolDef},
 };
@@ -15,6 +16,77 @@ pub struct GetWindowStateTool {
 impl GetWindowStateTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
+    }
+}
+
+type WindowScreenshot = (
+    Vec<u8>,
+    Option<String>,
+    u32,
+    u32,
+    Option<(u32, u32)>,
+    crate::windows::WindowBounds,
+    f64,
+    ScreenshotCodec,
+    Option<Value>,
+);
+
+fn screenshot_resize_scale(screenshot: &WindowScreenshot) -> Option<f64> {
+    screenshot
+        .4
+        .map(|(native_width, _)| f64::from(native_width) / f64::from(screenshot.2))
+}
+
+fn publish_action_capture(
+    bindings: &super::capture_binding::MacCaptureBindings,
+    args: &Value,
+    pid: i32,
+    window_id: u32,
+    snapshot_id: Option<u32>,
+    screenshot: Option<&WindowScreenshot>,
+) -> Result<Option<String>, ToolResult> {
+    match (snapshot_id, screenshot) {
+        (Some(_), Some((bytes, _, width, height, Some(native), _, _, codec, _))) => bindings
+            .publish_window(
+                args,
+                pid,
+                window_id,
+                bytes.clone(),
+                *codec,
+                (*width, *height),
+                *native,
+            )
+            .map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn apply_screenshot_metadata(
+    structured: &mut Value,
+    dimensions: Option<(u32, u32)>,
+    codec: Option<ScreenshotCodec>,
+    frame: Option<(crate::windows::WindowBounds, f64)>,
+    prepared: Option<Value>,
+) {
+    if let Some((width, height)) = dimensions {
+        structured["screenshot_width"] = serde_json::json!(width);
+        structured["screenshot_height"] = serde_json::json!(height);
+        structured["screenshot_mime_type"] = serde_json::json!(codec.unwrap().mime_type());
+    }
+    if let Some((bounds, scale)) = frame {
+        structured["window_bounds"] = serde_json::json!({
+            "x": bounds.x,
+            "y": bounds.y,
+            "width": bounds.width,
+            "height": bounds.height
+        });
+        structured["screenshot_scale"] = serde_json::json!(scale);
+        if prepared.is_none() {
+            structured["screenshot_frame_valid"] = serde_json::json!(true);
+        }
+    }
+    if let Some(prepared) = prepared {
+        structured["prepared_capture"] = prepared;
     }
 }
 
@@ -191,6 +263,10 @@ impl Tool for GetWindowStateTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let frozen_capture = match crate::capture::take_for_target(pid, window_id) {
+            Ok(prepared) => prepared,
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
 
         // Issue #2237: pre-flight the requested window against WindowServer
         // BEFORE the (timeout_ms-bounded) AX walk. An id that no window carries, or
@@ -210,7 +286,7 @@ impl Tool for GetWindowStateTool {
                 Err(e) => {
                     return ToolResult::error(format!(
                         "window ownership lookup for window_id {window_id} failed: {e}"
-                    ))
+                    ));
                 }
             };
             if let Some(scope) = crate::ax::window_scope::scope_from_owner(&owner) {
@@ -318,9 +394,14 @@ impl Tool for GetWindowStateTool {
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.
-        let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
-            crate::capture::screenshot_window_bytes(window_id)
-        });
+        let frozen_capture_requested = frozen_capture.is_some();
+        let prefetched_frozen =
+            frozen_capture.map(|prepared| tokio::task::spawn_blocking(move || prepared.capture()));
+        let prefetched_capture = prefetch_capture(
+            should_capture && !frozen_capture_requested,
+            want_tree,
+            move || crate::capture::screenshot_window_bytes(window_id),
+        );
         let (tree_result, prepared_snapshot) = if want_tree {
             let q = query.clone();
             // `timeout_ms` bounds the walk itself: it returns the partial tree
@@ -346,8 +427,16 @@ impl Tool for GetWindowStateTool {
                 std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
                 Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
-                Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
+                Ok(Err(e)) => {
+                    if let Some(capture) = prefetched_frozen {
+                        let _ = capture.await;
+                    }
+                    return ToolResult::error(format!("AX tree walk failed: {e}"));
+                }
                 Err(_elapsed) => {
+                    if let Some(capture) = prefetched_frozen {
+                        let _ = capture.await;
+                    }
                     return ToolResult::error(format!(
                         "AX tree walk for pid={pid} did not return within {} s: an \
                          accessibility call stopped answering past the {timeout_ms} ms \
@@ -367,6 +456,9 @@ impl Tool for GetWindowStateTool {
         let window_scope = tree_result.as_ref().and_then(|r| r.window_scope.clone());
         if let Some(ref scope) = window_scope {
             if let Some(refusal) = window_scope_refusal(pid, window_id, scope) {
+                if let Some(capture) = prefetched_frozen {
+                    let _ = capture.await;
+                }
                 return refusal;
             }
         }
@@ -396,85 +488,117 @@ impl Tool for GetWindowStateTool {
         // and native dimensions, the WindowServer bounds it was validated
         // against, and the raw capture's backing scale.
         let mut screenshot_frame_error = None;
-        let mut screenshot_resize_scale = None;
         let prefetched_raw = match prefetched_capture {
             Some(handle) => Some(handle.await.unwrap_or_else(|e| Err(anyhow::anyhow!(e)))),
             None => None,
         };
+        let frozen_captured = match prefetched_frozen {
+            Some(capture) => match capture.await {
+                Ok(Ok(capture)) => Some(capture),
+                Ok(Err(error)) => {
+                    return ToolResult::error(format!("prepared capture failed: {error:#}"));
+                }
+                Err(error) => {
+                    return ToolResult::error(format!("prepared capture worker failed: {error}"));
+                }
+            },
+            None => None,
+        };
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
-            let res = tokio::task::spawn_blocking(move || -> Result<
-                (
-                    Vec<u8>,
-                    Option<String>,
-                    u32,
-                    u32,
-                    u32,
-                    u32,
-                    crate::windows::WindowBounds,
-                    f64,
-                ),
-                super::px_frame::PxFrameError,
-            > {
-                let bounds = crate::windows::window_bounds_by_id(window_id)
-                    .filter(|b| b.width > 0.0 && b.height > 0.0)
-                    .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
-                let (raw, orig_w, orig_h, scale) = verified_capture(
-                    window_id,
-                    prefetched_raw,
-                    &bounds,
-                    || crate::capture::screenshot_window_bytes(window_id),
-                )?;
-                let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
+            let res = tokio::task::spawn_blocking(
+                move || -> Result<WindowScreenshot, super::px_frame::PxFrameError> {
+                    if let Some(captured) = frozen_captured {
+                        let geometry = captured.prepared.geometry();
+                        let bounds = geometry.bounds.clone();
+                        let scale = geometry.native_scale;
+                        let prepared =
+                            serde_json::to_value(&captured.prepared).map_err(|error| {
+                                super::px_frame::PxFrameError::CaptureUnavailable {
+                                    window_id,
+                                    reason: error.to_string(),
+                                }
+                            })?;
+                        if let Some(ref path) = out_file {
+                            std::fs::write(path, &captured.encoded_bytes).map_err(|error| {
+                                super::px_frame::PxFrameError::CaptureUnavailable {
+                                    window_id,
+                                    reason: error.to_string(),
+                                }
+                            })?;
+                        }
+                        let [width, height] = captured.dimensions;
+                        return Ok((
+                            captured.encoded_bytes,
+                            out_file,
+                            width,
+                            height,
+                            None,
+                            bounds,
+                            scale,
+                            captured.codec,
+                            Some(prepared),
+                        ));
                     }
-                })?;
-                let (w, h) = crate::capture::png_dimensions(&png).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                if let Some(ref path) = out_file {
-                    std::fs::write(path, &png).map_err(|e| {
+                    let bounds = crate::windows::window_bounds_by_id(window_id)
+                        .filter(|b| b.width > 0.0 && b.height > 0.0)
+                        .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
+                    let (raw, orig_w, orig_h, scale) =
+                        verified_capture(window_id, prefetched_raw, &bounds, || {
+                            crate::capture::screenshot_window_bytes(window_id)
+                        })?;
+                    let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|e| {
                         super::px_frame::PxFrameError::CaptureUnavailable {
                             window_id,
                             reason: e.to_string(),
                         }
                     })?;
-                    Ok((
-                        png,
-                        Some(path.clone()),
-                        w,
-                        h,
-                        orig_w,
-                        orig_h,
-                        bounds,
-                        scale,
-                    ))
-                } else {
-                    Ok((
-                        png,
-                        None,
-                        w,
-                        h,
-                        orig_w,
-                        orig_h,
-                        bounds,
-                        scale,
-                    ))
-                }
-            }).await;
-            match res {
-                Ok(Ok((png, file_path, w, h, orig_w, orig_h, bounds, scale))) => {
-                    if !observation_only {
-                        screenshot_resize_scale = Some(orig_w as f64 / w as f64);
+                    let (w, h) = crate::capture::png_dimensions(&png).map_err(|e| {
+                        super::px_frame::PxFrameError::CaptureUnavailable {
+                            window_id,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    if let Some(ref path) = out_file {
+                        std::fs::write(path, &png).map_err(|e| {
+                            super::px_frame::PxFrameError::CaptureUnavailable {
+                                window_id,
+                                reason: e.to_string(),
+                            }
+                        })?;
+                        Ok((
+                            png,
+                            Some(path.clone()),
+                            w,
+                            h,
+                            Some((orig_w, orig_h)),
+                            bounds,
+                            scale,
+                            ScreenshotCodec::Png,
+                            None,
+                        ))
+                    } else {
+                        Ok((
+                            png,
+                            None,
+                            w,
+                            h,
+                            Some((orig_w, orig_h)),
+                            bounds,
+                            scale,
+                            ScreenshotCodec::Png,
+                            None,
+                        ))
                     }
-                    Some((png, file_path, w, h, orig_w, orig_h, bounds, scale))
-                }
+                },
+            )
+            .await;
+            match res {
+                Ok(Ok(screenshot)) => Some(screenshot),
                 Ok(Err(e)) => {
+                    if frozen_capture_requested {
+                        return ToolResult::error(format!("prepared capture failed: {e:?}"));
+                    }
                     tracing::warn!(
                         "Screenshot frame could not be verified for window {window_id}: {e:?}"
                     );
@@ -482,6 +606,9 @@ impl Tool for GetWindowStateTool {
                     None
                 }
                 Err(e) => {
+                    if frozen_capture_requested {
+                        return ToolResult::error(format!("prepared capture worker failed: {e}"));
+                    }
                     tracing::warn!("Screenshot task error for window {window_id}: {e}");
                     None
                 }
@@ -489,23 +616,40 @@ impl Tool for GetWindowStateTool {
         } else {
             None
         };
+        let screenshot_resize_scale = if observation_only {
+            None
+        } else {
+            screenshot.as_ref().and_then(screenshot_resize_scale)
+        };
 
         // Capture screenshot dimensions before consuming.
-        let screenshot_dims = screenshot.as_ref().map(|(_, _, w, h, _, _, _, _)| (*w, *h));
+        let screenshot_dims = screenshot
+            .as_ref()
+            .map(|(_, _, w, h, _, _, _, _, _)| (*w, *h));
+        let screenshot_codec = screenshot
+            .as_ref()
+            .map(|(_, _, _, _, _, _, _, codec, _)| *codec);
+        let prepared_capture = screenshot
+            .as_ref()
+            .and_then(|(_, _, _, _, _, _, _, _, prepared)| prepared.clone());
         let screenshot_file_path = screenshot
             .as_ref()
-            .and_then(|(_, fp, _, _, _, _, _, _)| fp.clone());
+            .and_then(|(_, fp, _, _, _, _, _, _, _)| fp.clone());
         let screenshot_frame = screenshot
             .as_ref()
-            .map(|(_, _, _, _, _, _, bounds, scale)| (bounds.clone(), *scale));
+            .map(|(_, _, _, _, _, bounds, scale, _, _)| (bounds.clone(), *scale));
 
         // Build response.
         let mut content: Vec<Content> = Vec::new();
 
-        if let Some((png, ref file_path, w, h, _, _, _, _)) = screenshot.as_ref() {
+        if let Some((png, ref file_path, w, h, _, _, _, codec, _)) = screenshot.as_ref() {
             if file_path.is_none() {
                 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-                content.push(Content::image_png(BASE64.encode(png)));
+                content.push(Content::Image {
+                    data: BASE64.encode(png),
+                    mime_type: codec.mime_type().into(),
+                    annotations: None,
+                });
             }
 
             // Summary text line (matching Swift reference format).
@@ -586,26 +730,21 @@ impl Tool for GetWindowStateTool {
                         payload,
                         session_id.as_deref(),
                         screenshot_resize_scale,
-                        window_size,
+                        (!frozen_capture_requested).then_some(window_size).flatten(),
                     )
                 })
                 .unzip(),
         };
-        let capture_id = match (snapshot_id, screenshot.as_ref()) {
-            (Some(_), Some((png, _, width, height, native_width, native_height, _, _))) => {
-                match self.state.capture_bindings.publish_window(
-                    &args,
-                    pid,
-                    window_id,
-                    png.clone(),
-                    (*width, *height),
-                    (*native_width, *native_height),
-                ) {
-                    Ok(capture_id) => Some(capture_id),
-                    Err(error) => return error,
-                }
-            }
-            _ => None,
+        let capture_id = match publish_action_capture(
+            &self.state.capture_bindings,
+            &args,
+            pid,
+            window_id,
+            snapshot_id,
+            screenshot.as_ref(),
+        ) {
+            Ok(capture_id) => capture_id,
+            Err(error) => return error,
         };
 
         // Build the structured `elements` array — one entry per actionable
@@ -630,7 +769,9 @@ impl Tool for GetWindowStateTool {
         // Screenshot pixels of the delivered capture: window origin in screen
         // points, delivered pixels per point (backing scale x downsizing).
         let elements_json = match (screenshot_frame.as_ref(), screenshot_dims) {
-            (Some((bounds, _)), Some((width, _))) if bounds.width > 0.0 => {
+            (Some((bounds, _)), Some((width, _)))
+                if bounds.width > 0.0 && !frozen_capture_requested =>
+            {
                 cua_driver_core::element_frame::with_screenshot_frames(
                     elements_json,
                     (bounds.x, bounds.y),
@@ -788,6 +929,17 @@ impl Tool for GetWindowStateTool {
                 });
             }
         }
+        if frozen_capture_requested
+            && !matches!(degradation, Degradation::None | Degradation::ScreenLocked)
+        {
+            structured["escalation"] = serde_json::json!({
+                "recommended": "resnapshot",
+                "reason": "This host-prepared source frame is an observation. It does not \
+                           provide the portable screenshot-to-action mapping. Input against \
+                           this frame requires a dedicated typed route, which is not yet \
+                           implemented; re-snapshot for fresh accessibility data."
+            });
+        }
         // Additive read-only `background_input` capability section (macOS
         // background input v1): the same fresh facts that gate every
         // background mutation, reported per route so an agent can choose
@@ -795,7 +947,7 @@ impl Tool for GetWindowStateTool {
         // not a promise. Old consumers ignore the extra field.
         // A display-only frame cannot ground input, so skip the input probe:
         // previews poll several times a second.
-        if !display_only {
+        if !display_only && !frozen_capture_requested {
             let capture_available = screenshot_dims.is_some();
             let report = tokio::task::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
@@ -810,27 +962,13 @@ impl Tool for GetWindowStateTool {
                 structured["background_input"] = report;
             }
         }
-        if let Some((sw, sh)) = screenshot_dims {
-            structured["screenshot_width"] = serde_json::json!(sw);
-            structured["screenshot_height"] = serde_json::json!(sh);
-            // Surface 7: emit an explicit `screenshot_mime_type` on the
-            // structured payload so consumers don't have to sniff the magic
-            // bytes off the base64 PNG (`iVBOR` = PNG, `/9j/` = JPEG) to
-            // know what they're holding. `Content::image_png` already carries
-            // `mimeType` on the protocol image part — this mirrors it onto
-            // the structured side. Additive: keeps every existing field.
-            structured["screenshot_mime_type"] = serde_json::json!("image/png");
-        }
-        if let Some((bounds, scale)) = screenshot_frame {
-            structured["window_bounds"] = serde_json::json!({
-                "x": bounds.x,
-                "y": bounds.y,
-                "width": bounds.width,
-                "height": bounds.height
-            });
-            structured["screenshot_scale"] = serde_json::json!(scale);
-            structured["screenshot_frame_valid"] = serde_json::json!(true);
-        }
+        apply_screenshot_metadata(
+            &mut structured,
+            screenshot_dims,
+            screenshot_codec,
+            screenshot_frame,
+            prepared_capture,
+        );
         if let Some(error) = screenshot_frame_error {
             structured["screenshot_frame_valid"] = serde_json::json!(false);
             structured["screenshot_error"] = super::px_frame::error_structured(&error);
@@ -1429,6 +1567,110 @@ mod window_scope_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resized_prepared_observation_keeps_source_metadata_without_portable_action_frame() {
+        use cua_driver_core::capture_runtime::{
+            CaptureActionRequest, CaptureService, CaptureTarget, NativeActionDimensions,
+        };
+
+        let service = Arc::new(CaptureService::default());
+        let bindings = super::super::capture_binding::MacCaptureBindings::new(service.clone());
+        let args = serde_json::json!({"_session_id":"prepared-frame-observation"});
+        let geometry = crate::geometry::NativeWindowGeometry {
+            window_id: 7,
+            pid: 42,
+            layer: 1,
+            bounds: crate::windows::WindowBounds {
+                x: -10.5,
+                y: 20.25,
+                width: 100.25,
+                height: 80.125,
+            },
+            native_scale: 2.0,
+        };
+        let prepared = serde_json::to_value(
+            crate::capture::FrozenWindowCapture::source_defaults(geometry.clone(), [50.5, 40.25])
+                .unwrap(),
+        )
+        .unwrap();
+        let png = cua_driver_core::image_utils::encode_rgba_to_png(&vec![255; 51 * 41 * 4], 51, 41)
+            .unwrap();
+        let bytes = cua_driver_core::image_utils::png_bytes_to_jpeg(&png, 80).unwrap();
+        let mut screenshot = (
+            bytes.clone(),
+            None,
+            51,
+            41,
+            None,
+            geometry.bounds.clone(),
+            geometry.native_scale,
+            ScreenshotCodec::Jpeg,
+            Some(prepared.clone()),
+        );
+        assert!(screenshot_resize_scale(&screenshot).is_none());
+        assert!(
+            publish_action_capture(&bindings, &args, 42, 7, Some(1), Some(&screenshot))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(service.retire_runtime(), 0);
+
+        let mut structured = serde_json::json!({"pid":42,"window_id":7});
+        apply_screenshot_metadata(
+            &mut structured,
+            Some((51, 41)),
+            Some(ScreenshotCodec::Jpeg),
+            Some((geometry.bounds.clone(), geometry.native_scale)),
+            Some(prepared.clone()),
+        );
+        assert_eq!(structured["screenshot_width"], 51);
+        assert_eq!(structured["screenshot_height"], 41);
+        assert_eq!(structured["screenshot_mime_type"], "image/jpeg");
+        assert_eq!(structured["window_bounds"]["x"], -10.5);
+        assert_eq!(structured["window_bounds"]["width"], 100.25);
+        assert_eq!(structured["screenshot_scale"], 2.0);
+        assert_eq!(structured["prepared_capture"], prepared);
+        assert!(structured.get("screenshot_frame_valid").is_none());
+        assert!(structured.get("capture_id").is_none());
+        assert!(structured.get("background_input").is_none());
+
+        screenshot.4 = Some((102, 82));
+        screenshot.8 = None;
+        assert_eq!(screenshot_resize_scale(&screenshot), Some(2.0));
+        let id = publish_action_capture(&bindings, &args, 42, 7, Some(1), Some(&screenshot))
+            .unwrap()
+            .unwrap();
+        let binding = service.binding_from_args(&args).unwrap();
+        let capture = service
+            .read_for_perception(id.parse().unwrap(), &binding)
+            .unwrap();
+        assert_eq!(&*capture.encoded_bytes(), bytes.as_slice());
+        let admission = service
+            .admit_action(CaptureActionRequest {
+                capture_id: id.parse().unwrap(),
+                binding,
+                target: CaptureTarget::Window {
+                    pid: 42,
+                    window_id: 7,
+                },
+                current_native_action_dimensions: NativeActionDimensions::new(102, 82).unwrap(),
+                screenshot_x: 10.5,
+                screenshot_y: 20.25,
+            })
+            .unwrap();
+        assert_eq!((admission.action_x, admission.action_y), (21.0, 40.5));
+        let mut portable = serde_json::json!({});
+        apply_screenshot_metadata(
+            &mut portable,
+            Some((51, 41)),
+            Some(ScreenshotCodec::Jpeg),
+            Some((geometry.bounds, geometry.native_scale)),
+            None,
+        );
+        assert_eq!(portable["screenshot_frame_valid"], true);
+        assert!(portable.get("prepared_capture").is_none());
+    }
 
     #[test]
     fn verified_capture_reuses_or_recovers_prefetch() {

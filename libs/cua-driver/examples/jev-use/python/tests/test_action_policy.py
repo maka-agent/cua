@@ -76,8 +76,12 @@ class ActionPolicyTest(unittest.TestCase):
         )
 
     def test_matching_text_authorizes(self) -> None:
-        click = self.authorize(*inputs())
-        self.assertEqual((click.capture_id, click.x, click.y), ("capture-1", 48.0, 36.0))
+        for mime_type in ("image/png", "image/jpeg"):
+            with self.subTest(mime_type=mime_type):
+                request, decision, parsed, action = inputs()
+                parsed["capture"]["screenshot"]["mime_type"] = mime_type
+                click = self.authorize(request, decision, parsed, action)
+                self.assertEqual((click.capture_id, click.x, click.y), ("capture-1", 48.0, 36.0))
 
     def test_selected_wrong_text_never_reaches_dispatch(self) -> None:
         request, decision, parsed, action = inputs("Send", "Save")
@@ -195,7 +199,7 @@ class ActionPolicyTest(unittest.TestCase):
                 if case == "source":
                     parsed["capture"]["source"]["window_id"] = 21
                 elif case == "screenshot":
-                    parsed["capture"]["screenshot"]["mime_type"] = "image/jpeg"
+                    parsed["capture"]["screenshot"]["mime_type"] = "image/gif"
                 elif case == "outside":
                     parsed["regions"][0]["bounds"]["x"] = 90
                     request["regions"][0]["bounds"]["x"] = 90

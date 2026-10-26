@@ -1,6 +1,7 @@
 use cua_driver_core::capture_runtime::{
     CaptureActionRequest, CapturePublication, CaptureService, CaptureTarget,
-    EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotToActionTransform,
+    EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotCodec,
+    ScreenshotToActionTransform,
 };
 use serde_json::Value;
 
@@ -19,7 +20,8 @@ fn publish(
 ) -> anyhow::Result<String> {
     let binding = service.binding_from_args(args)?;
     let capture_id = service.publish(CapturePublication {
-        png_bytes: png_bytes.to_vec(),
+        encoded_bytes: png_bytes.to_vec(),
+        codec: ScreenshotCodec::Png,
         target,
         encoded_dimensions: EncodedScreenshotDimensions::new(
             encoded_dimensions.0,
@@ -305,7 +307,7 @@ mod tests {
             .read_for_perception(service.parse_capture_id(&id).unwrap(), &binding)
             .expect("read published capture");
 
-        assert_eq!(capture.png_bytes().as_ref(), delivered.as_slice());
+        assert_eq!(capture.encoded_bytes().as_ref(), delivered.as_slice());
         let expected: [u8; 32] = Sha256::digest(&delivered).into();
         assert_eq!(capture.digest().as_bytes(), &expected);
     }
@@ -426,7 +428,7 @@ mod tests {
             .read_for_perception(service.parse_capture_id(&id).unwrap(), &binding)
             .unwrap();
 
-        assert_eq!(capture.png_bytes().as_ref(), normalized.as_slice());
+        assert_eq!(capture.encoded_bytes().as_ref(), normalized.as_slice());
         assert_eq!(
             admit_desktop(&service, &args("desktop"), &id, (2.0, 1.0), (4, 3)).unwrap(),
             (2.0, 1.0)

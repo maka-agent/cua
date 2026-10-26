@@ -48,6 +48,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod frozen;
+pub(crate) use frozen::take_for_target;
+pub use frozen::{with_frozen_window_capture, FrozenWindowCapture, NativeScreenshotEncoding};
+
 /// Bounded TTL map keyed by insertion time. Std-only; used for the warm SCK
 /// window filter/config cache and unit-tested independently of ScreenCaptureKit.
 struct TimedCache<K, V> {
@@ -412,6 +416,29 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
+    let receiver = start_native_capture_worker(gate, work)?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!(
+                "ScreenCaptureKit capture timed out after {} ms",
+                timeout.as_millis()
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("ScreenCaptureKit worker ended without a result")
+        }
+    }
+}
+
+fn start_native_capture_worker<T, F>(
+    gate: &'static NativeCaptureGate,
+    work: F,
+) -> anyhow::Result<mpsc::Receiver<anyhow::Result<T>>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
     let permit = gate
         .try_acquire()
         .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit capture already in flight"))?;
@@ -425,18 +452,7 @@ where
         })
         .map_err(|error| anyhow::anyhow!("failed to start ScreenCaptureKit worker: {error}"))?;
 
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!(
-                "ScreenCaptureKit capture timed out after {} ms",
-                timeout.as_millis()
-            )
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("ScreenCaptureKit worker ended without a result")
-        }
-    }
+    Ok(receiver)
 }
 
 fn window_plan_cache() -> &'static Mutex<TimedCache<u32, std::sync::Arc<WindowCapturePlan>>> {
@@ -1561,6 +1577,37 @@ mod tests {
             .expect_err("work error flows through")
             .to_string()
             .contains("boom"));
+    }
+
+    #[test]
+    fn host_worker_stays_pending_past_portable_timeout_and_releases_permit_before_ready() {
+        use std::sync::atomic::AtomicUsize;
+
+        // This exercises worker ownership with channel-controlled work only;
+        // it never creates AppKit objects, captures a desktop or sends input.
+        static GATE: NativeCaptureGate = NativeCaptureGate::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let receiver = start_native_capture_worker(&GATE, move || {
+            worker_calls.fetch_add(1, Ordering::SeqCst);
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok(7u8)
+        })
+        .unwrap();
+        started_receiver.recv().unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(WINDOW_CAPTURE_NATIVE_TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(GATE.active.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release_sender.send(()).unwrap();
+        assert_eq!(receiver.recv().unwrap().unwrap(), 7);
+        assert!(!GATE.active.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

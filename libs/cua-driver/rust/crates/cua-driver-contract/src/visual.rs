@@ -5,7 +5,7 @@
 //!
 //! This module is a transport-free public contract: it defines the callable
 //! tool schema, and `cua-driver-core` implements dispatch. The Driver-owned
-//! capture registry retains an immutable PNG together with its exact target and
+//! capture registry retains an immutable PNG or JPEG with its exact target and
 //! screenshot-to-action transform for every `capture_id`. `get_window_state`
 //! and `get_desktop_state` return such a `capture_id` with their screenshot; a
 //! `snapshot_id` alone does not retain screenshot pixels.
@@ -39,8 +39,8 @@ fn confidence_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({ "type": "number", "minimum": 0, "maximum": 1 })
 }
 
-fn png_mime_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({ "const": "image/png" })
+fn screenshot_mime_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({ "type": "string", "enum": ["image/png", "image/jpeg"] })
 }
 
 fn primary_display_schema(_: &mut SchemaGenerator) -> Schema {
@@ -83,7 +83,7 @@ pub struct VisualScreenshotReference {
     pub width: u32,
     #[schemars(schema_with = "positive_integer_schema")]
     pub height: u32,
-    #[schemars(schema_with = "png_mime_schema")]
+    #[schemars(schema_with = "screenshot_mime_schema")]
     pub mime_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
@@ -459,7 +459,9 @@ impl std::fmt::Display for VisualContractValidationError {
             }
             Self::EmptyScreenshotReference => "screenshot reference must not be empty",
             Self::InvalidScreenshotDimensions => "screenshot dimensions must be positive",
-            Self::UnsupportedScreenshotMimeType => "screenshot mime_type must be image/png",
+            Self::UnsupportedScreenshotMimeType => {
+                "screenshot mime_type must be image/png or image/jpeg"
+            }
             Self::InvalidScreenshotDigest => "screenshot sha256 must be a 64-character hex digest",
             Self::InvalidCaptureMetadata => "optional capture metadata must not be empty",
             Self::InvalidCoordinateSpace => {
@@ -509,7 +511,7 @@ impl VisualScreenshotReference {
         if self.width == 0 || self.height == 0 {
             return Err(VisualContractValidationError::InvalidScreenshotDimensions);
         }
-        if self.mime_type != "image/png" {
+        if !matches!(self.mime_type.as_str(), "image/png" | "image/jpeg") {
             return Err(VisualContractValidationError::UnsupportedScreenshotMimeType);
         }
         if self.sha256.as_ref().is_some_and(|digest| {

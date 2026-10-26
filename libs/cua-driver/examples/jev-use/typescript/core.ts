@@ -180,7 +180,7 @@ export function parseVisualRegions(
     );
   }
   const screenshot = record(capture.screenshot, 'visual result has no screenshot provenance');
-  if (screenshot.mime_type !== 'image/png') {
+  if (screenshot.mime_type !== 'image/png' && screenshot.mime_type !== 'image/jpeg') {
     throw new Error('visual result has invalid screenshot provenance');
   }
   const screenshotReference = nonempty(screenshot.reference);

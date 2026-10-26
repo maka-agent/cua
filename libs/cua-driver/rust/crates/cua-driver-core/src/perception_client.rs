@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
+use crate::capture_registry::ScreenshotCodec;
 use cua_driver_contract::{VisualParseError, VisualParseErrorCode};
 
 #[cfg(test)]
@@ -20,7 +21,7 @@ use containment::ContainmentLimits;
 use containment::{ContainedChild, WorkerExit, WorkerStdin, WorkerStdout};
 
 const PROTOCOL_VERSION: &str = "cua-perception/1";
-// A default-registry capture expands to four base64 bytes per three PNG bytes.
+// A default-registry capture expands to four base64 bytes per three encoded image bytes.
 // Leave a fixed envelope for the bounded request metadata and capture ID.
 const DEFAULT_MAX_FRAME_BYTES: usize =
     crate::capture_registry::DEFAULT_MAX_CAPTURE_BYTES.div_ceil(3) * 4 + 64 * 1024;
@@ -31,7 +32,8 @@ struct WarmFrame<'a> {
     capture_id: &'a str,
     width: u32,
     height: u32,
-    png_bytes: &'a [u8],
+    codec: ScreenshotCodec,
+    encoded_bytes: &'a [u8],
 }
 
 /// Signed extension identity the launched worker must echo in every result.
@@ -301,7 +303,8 @@ impl PerceptionClient {
         capture_id: &str,
         width: u32,
         height: u32,
-        png_bytes: &[u8],
+        codec: ScreenshotCodec,
+        encoded_bytes: &[u8],
         cancellation: &PerceptionCancellation,
     ) -> Result<Value, VisualParseError> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -325,14 +328,15 @@ impl PerceptionClient {
                         capture_id,
                         width,
                         height,
-                        png_bytes,
+                        codec,
+                        encoded_bytes,
                     },
                     cancellation,
                 )
                 .await;
         }
 
-        let operation = self.parse_cold(config, capture_id, width, height, png_bytes);
+        let operation = self.parse_cold(config, capture_id, width, height, codec, encoded_bytes);
         tokio::select! {
             _ = cancellation.cancelled() => Err(cancelled_error()),
             result = tokio::time::timeout(config.request_timeout, operation) => {
@@ -355,11 +359,12 @@ impl PerceptionClient {
         capture_id: &str,
         width: u32,
         height: u32,
-        png_bytes: &[u8],
+        codec: ScreenshotCodec,
+        encoded_bytes: &[u8],
     ) -> Result<Value, VisualParseError> {
         let mut worker = WarmWorker::launch(config).await?;
         let result = worker
-            .parse(config, capture_id, width, height, png_bytes)
+            .parse(config, capture_id, width, height, codec, encoded_bytes)
             .await?;
         // Dropping the writer closes the pipe on every platform, which is what
         // the worker observes as end of file; a named-pipe shutdown would not.
@@ -381,7 +386,8 @@ impl PerceptionClient {
             capture_id,
             width,
             height,
-            png_bytes,
+            codec,
+            encoded_bytes,
         } = frame;
         let epoch = self.state.cancellation_epoch.load(Ordering::Acquire);
         let mut slot = tokio::select! {
@@ -414,10 +420,14 @@ impl PerceptionClient {
             *slot = Some(worker);
         }
 
-        let operation = slot
-            .as_mut()
-            .expect("warm worker was initialized")
-            .parse(config, capture_id, width, height, png_bytes);
+        let operation = slot.as_mut().expect("warm worker was initialized").parse(
+            config,
+            capture_id,
+            width,
+            height,
+            codec,
+            encoded_bytes,
+        );
         let result = tokio::select! {
             _ = cancellation.cancelled() => Err(cancelled_error()),
             _ = runtime_cancelled(&self.state, epoch) => Err(cancelled_error()),
@@ -701,7 +711,8 @@ impl WarmWorker {
         capture_id: &str,
         width: u32,
         height: u32,
-        png_bytes: &[u8],
+        codec: ScreenshotCodec,
+        encoded_bytes: &[u8],
     ) -> Result<Value, VisualParseError> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
@@ -723,11 +734,11 @@ impl WarmWorker {
                 "params": {
                     "capture_id": capture_id,
                     "image": {
-                        "media_type": "image/png",
+                        "media_type": codec.mime_type(),
                         "width": width,
                         "height": height,
-                        "byte_length": png_bytes.len(),
-                        "data_base64": BASE64.encode(png_bytes),
+                        "byte_length": encoded_bytes.len(),
+                        "data_base64": BASE64.encode(encoded_bytes),
                     }
                 }
             }),
@@ -1201,13 +1212,25 @@ fn macos_fixture_executable_candidates(interpreter: &std::path::Path) -> Vec<Pat
         PathBuf::from("/usr/bin/python3"),
         PathBuf::from("/usr/local/bin/python3"),
         PathBuf::from("/Applications/Xcode.app/Contents/Developer/usr/bin/python3"),
-        PathBuf::from("/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"),
-        PathBuf::from("/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Python3"),
-        PathBuf::from("/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python"),
+        PathBuf::from(
+            "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
+        ),
+        PathBuf::from(
+            "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Python3",
+        ),
+        PathBuf::from(
+            "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python",
+        ),
         PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/python3"),
-        PathBuf::from("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"),
-        PathBuf::from("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Python3"),
-        PathBuf::from("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python"),
+        PathBuf::from(
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
+        ),
+        PathBuf::from(
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Python3",
+        ),
+        PathBuf::from(
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python",
+        ),
     ]
 }
 
@@ -1309,6 +1332,8 @@ elif mode == 'crash':
 elif mode == 'oversized':
     sys.stdout.buffer.write(struct.pack('>I', 1024 * 1024))
     sys.stdout.buffer.flush()
+elif mode == 'echo_image':
+    write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'status':'ok','result':request['params']['image']})
 elif mode == 'mismatch':
     write_frame({'protocol':'cua-perception/1','request_id':'wrong','status':'ok','result':{}})
 else:
@@ -1829,6 +1854,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 &targets,
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -1883,6 +1909,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
             "capture-test",
             2,
             2,
+            ScreenshotCodec::Png,
             &[1, 2, 3, 4],
             &PerceptionCancellation::default(),
         )
@@ -1918,6 +1945,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2026,6 +2054,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2048,6 +2077,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2055,6 +2085,38 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
             .unwrap();
         assert_eq!(result["runtime"], "fixture");
         assert_eq!(std::fs::read_to_string(counter).unwrap(), "parse\n");
+    }
+
+    #[tokio::test]
+    async fn worker_receives_actual_codec_and_exact_encoded_payload() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let png = crate::image_utils::encode_rgba_to_png(&[7, 8, 9, 255], 1, 1).unwrap();
+        let jpeg = crate::image_utils::png_bytes_to_jpeg(&png, 80).unwrap();
+        for (codec, bytes) in [(ScreenshotCodec::Png, png), (ScreenshotCodec::Jpeg, jpeg)] {
+            let (directory, worker) = fixture_worker("echo_image", None);
+            let result = client(&directory, worker, Duration::from_secs(10), 1024 * 1024)
+                .parse(
+                    "capture-codec",
+                    1,
+                    1,
+                    codec,
+                    &bytes,
+                    &PerceptionCancellation::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["media_type"], codec.mime_type());
+            assert_eq!(result["width"], 1);
+            assert_eq!(result["height"], 1);
+            assert_eq!(result["byte_length"], bytes.len());
+            assert_eq!(
+                BASE64
+                    .decode(result["data_base64"].as_str().unwrap())
+                    .unwrap(),
+                bytes
+            );
+        }
     }
 
     struct FixtureResolver(std::sync::Mutex<(String, PerceptionClient)>);
@@ -2091,6 +2153,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                         "capture-test",
                         2,
                         2,
+                        ScreenshotCodec::Png,
                         &[1, 2, 3, 4],
                         &PerceptionCancellation::default(),
                     )
@@ -2113,6 +2176,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2134,6 +2198,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2151,6 +2216,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2164,6 +2230,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2177,6 +2244,7 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
                 "capture-test",
                 2,
                 2,
+                ScreenshotCodec::Png,
                 &[1, 2, 3, 4],
                 &PerceptionCancellation::default(),
             )
@@ -2187,7 +2255,14 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
         let cancellation = PerceptionCancellation::default();
         cancellation.cancel();
         let failure = PerceptionClient::unavailable()
-            .parse("capture-test", 2, 2, &[1, 2, 3, 4], &cancellation)
+            .parse(
+                "capture-test",
+                2,
+                2,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &cancellation,
+            )
             .await
             .unwrap_err();
         assert_eq!(failure.code, VisualParseErrorCode::NotInstalled);
@@ -2201,7 +2276,14 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
             trigger.cancel();
         });
         let failure = client
-            .parse("capture-test", 2, 2, &[1, 2, 3, 4], &cancellation)
+            .parse(
+                "capture-test",
+                2,
+                2,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &cancellation,
+            )
             .await
             .unwrap_err();
         assert_eq!(failure.code, VisualParseErrorCode::WorkerCancelled);
@@ -2225,14 +2307,28 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
         );
         for capture in ["one", "two"] {
             client
-                .parse(capture, 1, 1, &[1, 2, 3, 4], &Default::default())
+                .parse(
+                    capture,
+                    1,
+                    1,
+                    ScreenshotCodec::Png,
+                    &[1, 2, 3, 4],
+                    &Default::default(),
+                )
                 .await
                 .unwrap();
         }
         assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 1);
         tokio::time::sleep(Duration::from_millis(250)).await;
         client
-            .parse("three", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "three",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 2);
@@ -2259,12 +2355,26 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
             },
         );
         let failure = client
-            .parse("crash", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "crash",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(failure.code, VisualParseErrorCode::WorkerCrashed);
         client
-            .parse("after-crash", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "after-crash",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2279,12 +2389,26 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
             trigger.cancel();
         });
         let failure = client
-            .parse("hang", 1, 1, &[1, 2, 3, 4], &cancellation)
+            .parse(
+                "hang",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &cancellation,
+            )
             .await
             .unwrap_err();
         assert_eq!(failure.code, VisualParseErrorCode::WorkerCancelled);
         client
-            .parse("after-cancel", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "after-cancel",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap();
         let calls = std::fs::read_to_string(counter).unwrap();
@@ -2311,7 +2435,14 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
         let shutdown = client.clone();
         let observed_counter = counter.clone();
         let original_pid = client
-            .parse("before-shutdown", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "before-shutdown",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap()["pid"]
             .as_u64()
@@ -2328,12 +2459,26 @@ write_frame({'protocol':'cua-perception/1','request_id':request['request_id'],'s
             shutdown.shutdown_now();
         });
         let failure = client
-            .parse("hang", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "hang",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(failure.code, VisualParseErrorCode::WorkerCancelled);
         let replacement_pid = client
-            .parse("after-shutdown", 1, 1, &[1, 2, 3, 4], &Default::default())
+            .parse(
+                "after-shutdown",
+                1,
+                1,
+                ScreenshotCodec::Png,
+                &[1, 2, 3, 4],
+                &Default::default(),
+            )
             .await
             .unwrap()["pid"]
             .as_u64()

@@ -6,7 +6,7 @@
 use cua_driver_core::{
     capture_runtime::{
         CaptureActionRequest, CaptureIdParseError, CapturePublication, CaptureService,
-        CaptureTarget, EncodedScreenshotDimensions, NativeActionDimensions,
+        CaptureTarget, EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotCodec,
         ScreenshotToActionTransform,
     },
     protocol::ToolResult,
@@ -27,7 +27,8 @@ impl MacCaptureBindings {
         args: &serde_json::Value,
         pid: i32,
         window_id: u32,
-        png_bytes: Vec<u8>,
+        encoded_bytes: Vec<u8>,
+        codec: ScreenshotCodec,
         encoded_dimensions: (u32, u32),
         native_dimensions: (u32, u32),
     ) -> Result<String, ToolResult> {
@@ -39,7 +40,8 @@ impl MacCaptureBindings {
         self.publish(
             args,
             target,
-            png_bytes,
+            encoded_bytes,
+            codec,
             encoded_dimensions,
             native_dimensions,
         )
@@ -56,6 +58,7 @@ impl MacCaptureBindings {
             args,
             CaptureTarget::PrimaryDesktop,
             png_bytes,
+            ScreenshotCodec::Png,
             encoded_dimensions,
             native_dimensions,
         )
@@ -65,7 +68,8 @@ impl MacCaptureBindings {
         &self,
         args: &serde_json::Value,
         target: CaptureTarget,
-        png_bytes: Vec<u8>,
+        encoded_bytes: Vec<u8>,
+        codec: ScreenshotCodec,
         encoded_dimensions: (u32, u32),
         native_dimensions: (u32, u32),
     ) -> Result<String, ToolResult> {
@@ -80,7 +84,8 @@ impl MacCaptureBindings {
         let transform = scale_transform(encoded_dimensions, native_dimensions)?;
         self.service
             .publish(CapturePublication {
-                png_bytes,
+                encoded_bytes,
+                codec,
                 target,
                 encoded_dimensions: encoded,
                 native_action_dimensions: native,
@@ -345,7 +350,7 @@ mod tests {
         let capture = service
             .read_for_perception(capture_id.parse().unwrap(), &binding)
             .unwrap();
-        assert_eq!(&*capture.png_bytes(), png.as_slice());
+        assert_eq!(&*capture.encoded_bytes(), png.as_slice());
         assert_eq!(capture.digest().hex().len(), 64);
     }
 
@@ -432,7 +437,15 @@ mod tests {
         let bindings = MacCaptureBindings::new(service.clone());
         let args = args("resize-session");
         let capture_id = bindings
-            .publish_window(&args, 8, 13, png(4, 3), (4, 3), (8, 6))
+            .publish_window(
+                &args,
+                8,
+                13,
+                png(4, 3),
+                ScreenshotCodec::Png,
+                (4, 3),
+                (8, 6),
+            )
             .unwrap();
         let mut dispatches = 0;
         let refusal = admit_window(&bindings, &capture_id, &args, (8, 13), 1.25, 1.5, (9, 6));
