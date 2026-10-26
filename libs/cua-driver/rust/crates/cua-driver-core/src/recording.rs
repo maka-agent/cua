@@ -1701,40 +1701,44 @@ mod tests {
                     .delivered_count(completed);
             }
             let record = record.build().unwrap();
-            with_unreplayable_native_input("linux_native_click", original_input.clone(), async {
-                tokio::task::yield_now().await;
-                let pending = session
-                    .begin_private_turn(
-                        "click",
-                        &serde_json::json!({
-                            "pid": 1, "window_id": 2, "x": 37, "y": 41,
-                            "count": 1, "_session_id": "private-lifecycle",
-                        }),
-                        0,
-                        RecordingCaller::default(),
-                    )
-                    .unwrap();
-                assert!(take_native_input_recording().is_none());
-                session.finish_turn_with_outcome(
-                    pending,
-                    "native outcome",
-                    Some(&record),
-                    is_error,
-                );
-            })
+            with_unreplayable_native_input(
+                "linux_native_window_input",
+                original_input.clone(),
+                async {
+                    tokio::task::yield_now().await;
+                    let pending = session
+                        .begin_private_turn(
+                            "click",
+                            &serde_json::json!({
+                                "pid": 1, "window_id": 2, "x": 37, "y": 41,
+                                "count": count, "_session_id": "private-lifecycle",
+                            }),
+                            0,
+                            RecordingCaller::default(),
+                        )
+                        .unwrap();
+                    assert!(take_native_input_recording().is_none());
+                    session.finish_turn_with_outcome(
+                        pending,
+                        "native outcome",
+                        Some(&record),
+                        is_error,
+                    );
+                },
+            )
             .await;
 
             let turn = directory.path().join("turn-00001");
             let action: Value =
                 serde_json::from_slice(&std::fs::read(turn.join("action.json")).unwrap()).unwrap();
-            assert_eq!(action["arguments"]["count"], 1);
+            assert_eq!(action["arguments"]["count"], count);
             assert!(action["arguments"].get("_session_id").is_none());
             assert_eq!(action["result_error"], is_error);
             assert_eq!(action["action_truth"], record.debug_json());
             assert_eq!(
                 action["native_input"],
                 serde_json::json!({
-                    "profile": "linux_native_click", "original_input": original_input,
+                    "profile": "linux_native_window_input", "original_input": original_input,
                     "replay": {
                         "status": "unavailable", "code": "native_input_requires_trusted_sdk",
                     },
@@ -1777,7 +1781,7 @@ mod tests {
             inner.owner = Some("owner".into());
         }
         with_unreplayable_native_input(
-            "linux_native_click",
+            "linux_native_window_input",
             serde_json::json!({"count": 4}),
             async {
                 assert!(session
@@ -1797,7 +1801,7 @@ mod tests {
 
         let (first, second) = tokio::join!(
             with_unreplayable_native_input(
-                "linux_native_click",
+                "linux_native_window_input",
                 serde_json::json!({"count": 0}),
                 async {
                     tokio::task::yield_now().await;

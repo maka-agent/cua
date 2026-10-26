@@ -742,8 +742,8 @@ mod tests {
         let action_path = turn.join("action.json");
         let ordinary = json!({"tool": "probe", "arguments": {"marker": 7}});
         for descriptor in [
-            json!({"profile":"linux_native_click","original_input":{"count":0},"replay":{"status":"unavailable","code":"native_input_requires_trusted_sdk"}}),
-            json!({"profile":"linux_native_click","original_input":{"count":4},"replay":{"status":"unavailable","code":"native_input_requires_trusted_sdk"}}),
+            json!({"profile":"linux_native_window_input","original_input":{"count":0},"replay":{"status":"unavailable","code":"native_input_requires_trusted_sdk"}}),
+            json!({"profile":"linux_native_window_input","original_input":{"count":4},"replay":{"status":"unavailable","code":"native_input_requires_trusted_sdk"}}),
             json!({"profile":"macos_native_move","original_input":{"native_window_pixels":[37.5,41.0]}}),
             json!({"profile":"macos_native_pages","original_input":{"pages":2.5}}),
             // A damaged or unknown private descriptor must also fail closed.

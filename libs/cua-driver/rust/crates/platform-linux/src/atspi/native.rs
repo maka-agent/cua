@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
@@ -51,6 +51,9 @@ tokio::task_local! {
 /// Time left on the current operation's deadline, or [`CALL_TIMEOUT`] when no
 /// deadline is in scope.
 fn remaining_budget() -> Duration {
+    if let Some(observation) = super::native_observation::current() {
+        return observation.remaining().unwrap_or(CALL_TIMEOUT);
+    }
     OP_DEADLINE
         .try_with(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
         .unwrap_or(CALL_TIMEOUT)
@@ -59,6 +62,9 @@ fn remaining_budget() -> Duration {
 /// True once the current operation's deadline has passed (never for callers
 /// that did not set one).
 fn deadline_passed() -> bool {
+    if let Some(observation) = super::native_observation::current() {
+        return observation.stop_reason().is_some();
+    }
     OP_DEADLINE
         .try_with(|deadline| tokio::time::Instant::now() >= *deadline)
         .unwrap_or(false)
@@ -72,7 +78,28 @@ async fn call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
     if budget.is_zero() {
         return None;
     }
-    tokio::time::timeout(budget, fut).await.ok()
+    if let Some(observation) = super::native_observation::current() {
+        if let Some(reason) = observation.stop_reason() {
+            observation.mark_incomplete(reason);
+            return None;
+        }
+        tokio::select! {
+            biased;
+            reason = observation.stopped() => {
+                observation.mark_incomplete(reason);
+                None
+            }
+            result = tokio::time::timeout(budget, fut) => match result {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    observation.mark_incomplete("timeout");
+                    None
+                }
+            }
+        }
+    } else {
+        tokio::time::timeout(budget, fut).await.ok()
+    }
 }
 
 /// Run a *synchronous, blocking* closure (typically a raw X11 round-trip via
@@ -158,6 +185,33 @@ fn bounded_for<T>(
 /// must never stall the action on a slow app: a miss simply falls through to
 /// the next delivery rung.
 pub(crate) const INPUT_QUERY_BUDGET: Duration = Duration::from_millis(1500);
+/// Run a snapshot phase without extending the native caller's lifetime.
+async fn snapshot_phase<T>(
+    deadline: Option<tokio::time::Instant>,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, &'static str> {
+    let work = async {
+        match deadline {
+            Some(deadline) => before_snapshot_deadline(deadline, work)
+                .await
+                .map_err(|_| "timeout"),
+            None => Ok(work.await),
+        }
+    };
+    if let Some(observation) = super::native_observation::current() {
+        if let Some(reason) = observation.stop_reason() {
+            return Err(reason);
+        }
+        tokio::select! {
+            biased;
+            reason = observation.stopped() => Err(reason),
+            value = work => value,
+        }
+    } else {
+        work.await
+    }
+}
+
 /// Budget for resolving an element index against a fresh walk when no cached
 /// snapshot answers it. Larger than [`INPUT_QUERY_BUDGET`] because the caller
 /// named a specific element and a miss is an error, not a fallback.
@@ -350,8 +404,8 @@ mod listener_startup_tests {
     use super::wait_for_listener_startup;
     use anyhow::anyhow;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
     };
     use std::time::{Duration, Instant};
 
@@ -376,9 +430,11 @@ mod listener_startup_tests {
         })
         .expect_err("unreachable listener must fail");
 
-        assert!(error
-            .to_string()
-            .contains("synthetic AT-SPI connection failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic AT-SPI connection failure")
+        );
     }
 
     #[test]
@@ -900,7 +956,9 @@ async fn resolve_app_for_pid<'a>(
     match selection.into_selected() {
         Ok(Some(app)) => Ok(Some(app)),
         Ok(None) => {
-            dlog!("no application accessible matched pid {pid} by exact pid; trying WM_CLASS/process-name fallback");
+            dlog!(
+                "no application accessible matched pid {pid} by exact pid; trying WM_CLASS/process-name fallback"
+            );
             // Exact-pid match failed. Fall back to matching by process
             // executable name across every OTHER AT-SPI-registered
             // application; accept it only when exactly one candidate shares
@@ -923,7 +981,9 @@ async fn resolve_app_for_pid<'a>(
                 return Ok(None);
             }
             let (child, fallback_pid) = name_matches.into_iter().next().unwrap();
-            dlog!("process-name fallback matched pid {pid} ({target_name}) to AT-SPI app pid {fallback_pid}");
+            dlog!(
+                "process-name fallback matched pid {pid} ({target_name}) to AT-SPI app pid {fallback_pid}"
+            );
             let child = match RawObjectRef::from_atspi(&child) {
                 Some(child) => child,
                 None => return Ok(None),
@@ -1297,6 +1357,45 @@ async fn resolve_window_frame(
     resolved
 }
 
+/// Generic snapshots budget indexed controls; native snapshots budget every
+/// admitted attempt, including objects whose properties cannot be read.
+#[derive(Debug)]
+enum VisitBudget {
+    Indexed(usize),
+    Admitted(usize),
+}
+
+impl VisitBudget {
+    fn admit(&mut self) -> bool {
+        match self {
+            Self::Indexed(remaining) => *remaining > 0,
+            Self::Admitted(remaining) => match remaining.checked_sub(1) {
+                Some(next) => {
+                    *remaining = next;
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    fn indexed_node(&mut self) {
+        if let Self::Indexed(remaining) = self {
+            *remaining = remaining.saturating_sub(1);
+        }
+    }
+}
+
+fn walk_stop_reason(deadline: Option<tokio::time::Instant>) -> Option<&'static str> {
+    super::native_observation::current()
+        .and_then(|observation| observation.stop_reason())
+        .or_else(|| {
+            deadline
+                .filter(|deadline| tokio::time::Instant::now() >= *deadline)
+                .map(|_| "timeout")
+        })
+}
+
 /// `collect_visited` with caller-supplied caps.
 /// - `max_elements = None` keeps the historical 5 000-node budget.
 /// - `max_depth = None` keeps depth uncapped (the historical behaviour);
@@ -1402,6 +1501,11 @@ async fn collect_visited_bounded_opts<'a>(
         resolve_window_frame(conn, pid, xid, &seeds).await
     };
 
+    let native_observation = super::native_observation::current();
+    if native_observation.is_some() && scoped_frame.is_none() {
+        return Err(anyhow!("native_observation_window_identity_unproven"));
+    }
+
     // Walk the caller's window FIRST when it was resolved: under a short
     // budget an application-wide pre-order (main window, then dialogs) could
     // exhaust the budget before ever reaching the dialog the caller asked
@@ -1423,6 +1527,9 @@ async fn collect_visited_bounded_opts<'a>(
             ordered.insert(0, scoped);
         }
     }
+    if native_observation.is_some() {
+        ordered.retain(|(_, _, _, ordinal)| Some(*ordinal) == scoped_frame);
+    }
     let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = ordered.into_iter().rev().collect();
     // Direct children of a `menu bar`: a top-level menu whose popup is not
     // open keeps its child count but is not descended into.
@@ -1433,7 +1540,11 @@ async fn collect_visited_bounded_opts<'a>(
     let mut identity_owners = std::collections::HashMap::new();
     // Guard against pathological/looping trees. Defaults to 5 000 (the
     // historical hard-coded budget); callers can override via max_elements.
-    let mut budget = max_elements.unwrap_or(5000usize);
+    let mut budget = if native_observation.is_some() {
+        VisitBudget::Admitted(super::native_observation::MAX_NODE_ATTEMPTS)
+    } else {
+        VisitBudget::Indexed(max_elements.unwrap_or(5000usize))
+    };
     // Time budget alongside the node budget: when an app is unresponsive to
     // AT-SPI (most commonly because it holds a modal grab and isn't servicing
     // D-Bus), every per-node `call()` burns the full CALL_TIMEOUT before being
@@ -1444,10 +1555,10 @@ async fn collect_visited_bounded_opts<'a>(
     // on modal dialogs (#1936).
     // The caller's operation deadline (when one is in scope) wins over the
     // historical OP_TIMEOUT so a 1 s tool budget bounds the whole walk.
-    let deadline = {
+    let deadline = native_observation.is_none().then(|| {
         let legacy = tokio::time::Instant::now() + OP_TIMEOUT;
         OP_DEADLINE.try_with(|d| (*d).min(legacy)).unwrap_or(legacy)
-    };
+    });
     // Fast bail for an app that has stopped answering AT-SPI entirely (modal
     // grab): if several consecutive nodes each burn the full CALL_TIMEOUT, the
     // app is unresponsive and the remaining ~OP_TIMEOUT of walking would all
@@ -1458,20 +1569,24 @@ async fn collect_visited_bounded_opts<'a>(
     // Containers left unexpanded because their child count exceeded the cap:
     // (child count, position in `visited` of the container).
     let mut huge_containers: Vec<(usize, usize)> = Vec::new();
-    let child_cap = max_elements
-        .map(|cap| cap.max(CHILD_ENUMERATION_CAP))
-        .unwrap_or(CHILD_ENUMERATION_CAP);
+    let child_cap = native_observation.is_none().then(|| {
+        max_elements
+            .map(|cap| cap.max(CHILD_ENUMERATION_CAP))
+            .unwrap_or(CHILD_ENUMERATION_CAP)
+    });
+    let mut depth_pending = 0usize;
 
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
-        if budget == 0 {
+        // Original admits after budget/depth checks and before property reads.
+        // A failed read still consumes this admitted node's slot.
+        if !budget.admit() {
             dlog!("node budget exhausted; truncating walk");
             truncation = Some("node_budget");
             stack.push((oref, depth, inherited_web_doc, frame_ordinal));
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            dlog!("collect_visited time budget exhausted; returning partial walk");
-            truncation = Some("timeout");
+        if let Some(reason) = walk_stop_reason(deadline) {
+            truncation = Some(reason);
             stack.push((oref, depth, inherited_web_doc, frame_ordinal));
             break;
         }
@@ -1498,16 +1613,19 @@ async fn collect_visited_bounded_opts<'a>(
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
+                if let Some(observation) = &native_observation {
+                    observation.mark_incomplete("node_error");
+                }
                 continue;
             }
             None => {
-                if tokio::time::Instant::now() >= deadline {
-                    truncation = Some("timeout");
+                if let Some(reason) = walk_stop_reason(deadline) {
+                    truncation = Some(reason);
                     stack.push((oref, depth, inherited_web_doc, frame_ordinal));
                     break;
                 }
                 consecutive_timeouts += 1;
-                if consecutive_timeouts >= 3 {
+                if consecutive_timeouts >= 3 && native_observation.is_none() {
                     dlog!(
                         "{} consecutive AT-SPI timeouts (accessible_for); app unresponsive, bailing walk",
                         consecutive_timeouts
@@ -1530,18 +1648,21 @@ async fn collect_visited_bounded_opts<'a>(
             // A completed-but-errored call is node-specific; keep walking.
             Some(Err(error)) => {
                 dlog!("  get_interfaces failed: {error:#}");
+                if let Some(observation) = &native_observation {
+                    observation.mark_incomplete("node_error");
+                }
                 continue;
             }
             // A timeout means the app didn't answer in CALL_TIMEOUT. A run of
             // these means the whole app is wedged — bail so callers fall back.
             None => {
-                if tokio::time::Instant::now() >= deadline {
-                    truncation = Some("timeout");
+                if let Some(reason) = walk_stop_reason(deadline) {
+                    truncation = Some(reason);
                     stack.push((oref, depth, inherited_web_doc, frame_ordinal));
                     break;
                 }
                 consecutive_timeouts += 1;
-                if consecutive_timeouts >= 3 {
+                if consecutive_timeouts >= 3 && native_observation.is_none() {
                     dlog!(
                         "{} consecutive AT-SPI timeouts; app unresponsive, bailing walk",
                         consecutive_timeouts
@@ -1584,12 +1705,21 @@ async fn collect_visited_bounded_opts<'a>(
             call(acc.get_state()),
             call(raw_child_count(zconn, &oref)),
         );
+        if let Some(observation) = &native_observation {
+            if role_r.as_ref().is_some_and(Result::is_err)
+                || name_r.as_ref().is_some_and(Result::is_err)
+                || state_r.as_ref().is_some_and(Result::is_err)
+                || count_r.as_ref().is_some_and(Result::is_err)
+            {
+                observation.mark_incomplete("node_error");
+            }
+        }
         // Fetch the child list only for real containers within the cap: leaves
         // (the majority of nodes) save a round-trip, and a huge container is
         // never enumerated (see CHILD_ENUMERATION_CAP).
         let children_r: Option<Result<Vec<RawObjectRef>>> = match count_r {
             Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
-            Some(Ok(count)) if count as usize > child_cap => {
+            Some(Ok(count)) if child_cap.is_some_and(|cap| count as usize > cap) => {
                 huge_containers.push((count as usize, visited.len()));
                 Some(Ok(Vec::new()))
             }
@@ -1760,6 +1890,14 @@ async fn collect_visited_bounded_opts<'a>(
         // Honor max_depth (#22865): skip enqueueing descendants whose depth
         // would exceed the cap.
         let descend = max_depth.map(|d| depth < d).unwrap_or(true);
+        if native_observation.is_some() && !descend {
+            if let Some(Ok(children)) = children_r.as_ref() {
+                depth_pending = depth_pending.saturating_add(children.len());
+                if !children.is_empty() {
+                    truncation.get_or_insert("depth_limit");
+                }
+            }
+        }
         // A menu that is not open (a menubar entry that is not expanded, or
         // any menu that is not showing) keeps its child count and is not
         // walked: its items are hidden, never indexed, and cost a round-trip
@@ -1856,7 +1994,12 @@ async fn collect_visited_bounded_opts<'a>(
                         stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
                     }
                 }
-                Some(Err(error)) => dlog!("  get_children failed: {error:#}"),
+                Some(Err(error)) => {
+                    dlog!("  get_children failed: {error:#}");
+                    if let Some(observation) = &native_observation {
+                        observation.mark_incomplete("node_error");
+                    }
+                }
                 None => dlog!("  get_children timed out"),
             }
         }
@@ -1874,7 +2017,7 @@ async fn collect_visited_bounded_opts<'a>(
                 enabled,
             )
         {
-            budget -= 1;
+            budget.indexed_node();
         }
         visited.push(Visited {
             depth,
@@ -1922,10 +2065,15 @@ async fn collect_visited_bounded_opts<'a>(
         }
         truncation = Some("huge_container");
     }
+    let truncation = truncation.or_else(|| {
+        native_observation
+            .as_ref()
+            .and_then(|observation| observation.incomplete_reason())
+    });
     let truncation = truncation.map(|reason| Truncation {
         reason,
         visited: visited.len(),
-        pending: stack.len(),
+        pending: stack.len().saturating_add(depth_pending),
     });
     dlog!(
         "walked pid {pid}: {} node(s), truncation={:?}",
@@ -2102,7 +2250,14 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
     let parents = true_parents(visited);
     let mut index_of: Vec<Option<usize>> = vec![None; visited.len()];
 
+    let native_observation = super::native_observation::current();
     for (pos, v) in visited.iter().enumerate() {
+        if let Some(observation) = &native_observation {
+            if let Some(reason) = observation.stop_reason() {
+                observation.mark_incomplete(reason);
+                break;
+            }
+        }
         let emit = only_frame.is_none_or(|frame| frame == v.frame_ordinal);
         let indent = "  ".repeat(v.depth);
         let parent_element_index = {
@@ -2397,6 +2552,8 @@ pub struct WalkedTree {
     pub truncation: Option<Truncation>,
     /// False when the bounds phase ran out of time; some indexed elements
     /// then carry no frame even though they exist.
+    /// Fully visited objects, including passive nodes omitted by rendering.
+    pub nodes_visited: usize,
     pub bounds_complete: bool,
     /// Wall time of the walk + bounds phases.
     pub elapsed: Duration,
@@ -2421,121 +2578,170 @@ pub(super) fn walk_tree_bounded_with_timeout(
     max_depth: Option<usize>,
     timeout: Duration,
 ) -> Result<Option<WalkedTree>> {
-    runtime().block_on(async {
-        // Tree traversal and bounds collection form one snapshot. Keep one
-        // deadline for both phases so a dead AT-SPI peer cannot outlive the
-        // operation timeout while resolving geometry. The deadline is installed
-        // as the task-local operation deadline so every per-node call clamps
-        // to it and the walk returns *partial* results instead of being
-        // dropped wholesale by the outer timeout.
-        let walk_started = std::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + timeout;
-        // Backstop only: the walk observes `deadline` itself and returns its
-        // partial result; this guards the few un-wrapped awaits.
-        let backstop = deadline + Duration::from_millis(500);
-        let walk = OP_DEADLINE.scope(deadline, async {
+    runtime().block_on(walk_tree_snapshot(
+        pid,
+        xid,
+        max_elements,
+        max_depth,
+        Some(timeout),
+    ))
+}
+
+pub(super) fn walk_tree_native_observation(
+    pid: u32,
+    xid: u64,
+    observation: super::native_observation::Observation,
+) -> Result<Option<WalkedTree>> {
+    runtime().block_on(observation.scope(walk_tree_snapshot(
+        pid,
+        xid,
+        None,
+        Some(super::native_observation::MAX_DEPTH),
+        None,
+    )))
+}
+
+async fn walk_tree_snapshot(
+    pid: u32,
+    xid: u64,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+    timeout: Option<Duration>,
+) -> Result<Option<WalkedTree>> {
+    // Tree traversal and bounds collection form one snapshot. Keep one
+    // deadline for both phases so a dead AT-SPI peer cannot outlive the
+    // operation timeout while resolving geometry. The deadline is installed
+    // as the task-local operation deadline so every per-node call clamps
+    // to it and the walk returns *partial* results instead of being
+    // dropped wholesale by the outer timeout.
+    let walk_started = std::time::Instant::now();
+    let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    // Backstop only: the walk observes `deadline` itself and returns its
+    // partial result; this guards the few un-wrapped awaits.
+    let backstop = deadline.map(|deadline| deadline + Duration::from_millis(500));
+    let walk = async {
+        let collect = async {
             let conn = shared_connection().await?;
             collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await
-        });
-        let walked = match before_snapshot_deadline(backstop, walk).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) if error.to_string() == "app_lookup_timeout" => {
-                dlog!("walk_tree: application lookup timed out for pid {pid}");
-                return Ok(Some(WalkedTree {
-                    markdown: String::new(),
-                    nodes: Vec::new(),
-                    bounds: Vec::new(),
-                    window_scoped: false,
-                    truncation: Some(Truncation {
-                        reason: "app_lookup_timeout",
-                        visited: 0,
-                        pending: 0,
-                    }),
-                    bounds_complete: false,
-                    elapsed: walk_started.elapsed(),
-                }));
+        };
+        match deadline {
+            Some(deadline) => OP_DEADLINE.scope(deadline, collect).await,
+            None => collect.await,
+        }
+    };
+    let walked = match snapshot_phase(backstop, walk).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) if error.to_string() == "app_lookup_timeout" => {
+            dlog!("walk_tree: application lookup timed out for pid {pid}");
+            return Ok(Some(WalkedTree {
+                markdown: String::new(),
+                nodes: Vec::new(),
+                bounds: Vec::new(),
+                window_scoped: false,
+                truncation: Some(Truncation {
+                    reason: "app_lookup_timeout",
+                    visited: 0,
+                    pending: 0,
+                }),
+                bounds_complete: false,
+                nodes_visited: 0,
+                elapsed: walk_started.elapsed(),
+            }));
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(reason) => {
+            dlog!("walk_tree stopped for pid {pid}: {reason}");
+            return Ok(Some(WalkedTree {
+                markdown: String::new(),
+                nodes: Vec::new(),
+                bounds: Vec::new(),
+                window_scoped: false,
+                truncation: Some(Truncation {
+                    reason,
+                    visited: 0,
+                    pending: 0,
+                }),
+                bounds_complete: false,
+                nodes_visited: 0,
+                elapsed: walk_started.elapsed(),
+            }));
+        }
+    };
+    let Some(Collected {
+        visited,
+        scoped_frame,
+        truncation,
+    }) = walked
+    else {
+        return Ok(None);
+    };
+    let walk_elapsed = walk_started.elapsed();
+    let (markdown, nodes) = render(&visited, scoped_frame);
+    let bounds_started = std::time::Instant::now();
+    // Bounds resolution shares the deadline, but a walk that consumed the
+    // whole budget must still yield *some* frames (element-index clicks
+    // resolve against them without a re-walk), so grant the bounds phase a
+    // small grace of up to half the budget. The tool documents this.
+    let bounds_deadline = timeout.zip(deadline).map(|(timeout, deadline)| {
+        deadline.max(tokio::time::Instant::now() + (timeout / 2).min(Duration::from_millis(1500)))
+    });
+    let bounds_backstop = bounds_deadline.map(|deadline| deadline + Duration::from_millis(500));
+    let bounds_work = async {
+        let work = element_bounds_for_visited(&visited, pid, xid, scoped_frame);
+        match bounds_deadline {
+            Some(deadline) => OP_DEADLINE.scope(deadline, work).await,
+            None => work.await,
+        }
+    };
+    let (bounds, bounds_complete) = match snapshot_phase(bounds_backstop, bounds_work).await {
+        Ok((bounds, complete)) => (bounds, complete),
+        Err(reason) => {
+            dlog!("element bounds stopped for pid {pid}: {reason}");
+            if let Some(observation) = super::native_observation::current() {
+                observation.mark_incomplete(reason);
             }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                dlog!("walk_tree timed out for pid {pid}");
-                return Ok(Some(WalkedTree {
-                    markdown: String::new(),
-                    nodes: Vec::new(),
-                    bounds: Vec::new(),
-                    window_scoped: false,
-                    truncation: Some(Truncation {
-                        reason: "timeout",
-                        visited: 0,
-                        pending: 0,
-                    }),
-                    bounds_complete: false,
-                    elapsed: walk_started.elapsed(),
-                }));
-            }
-        };
-        let Some(Collected {
-            visited,
-            scoped_frame,
-            truncation,
-        }) = walked
-        else {
-            return Ok(None);
-        };
-        let walk_elapsed = walk_started.elapsed();
-        let (markdown, nodes) = render(&visited, scoped_frame);
-        let bounds_started = std::time::Instant::now();
-        // Bounds resolution shares the deadline, but a walk that consumed the
-        // whole budget must still yield *some* frames (element-index clicks
-        // resolve against them without a re-walk), so grant the bounds phase a
-        // small grace of up to half the budget. The tool documents this.
-        let bounds_deadline = deadline
-            .max(tokio::time::Instant::now() + (timeout / 2).min(Duration::from_millis(1500)));
-        let bounds_backstop = bounds_deadline + Duration::from_millis(500);
-        let (bounds, bounds_complete) = match before_snapshot_deadline(
-            bounds_backstop,
-            OP_DEADLINE.scope(
-                bounds_deadline,
-                element_bounds_for_visited(&visited, pid, xid, scoped_frame),
-            ),
-        )
-        .await
-        {
-            Ok((bounds, complete)) => (bounds, complete),
-            Err(_) => {
-                dlog!("element bounds timed out for pid {pid}");
-                (Vec::new(), false)
-            }
-        };
-        dlog!(
-            "snapshot phases pid {pid}: walk_ms={} bounds_ms={} visited={} bounds={} complete={}",
-            walk_elapsed.as_millis(),
-            bounds_started.elapsed().as_millis(),
-            visited.len(),
-            bounds.len(),
-            bounds_complete
-        );
-        // Bounds are keyed by the application-wide element index, so drop the
-        // entries for windows this snapshot no longer shows.
-        let bounds = if scoped_frame.is_some() {
-            let emitted: std::collections::HashSet<usize> =
-                nodes.iter().filter_map(|node| node.element_index).collect();
-            bounds
-                .into_iter()
-                .filter(|(index, ..)| emitted.contains(index))
-                .collect()
-        } else {
-            bounds
-        };
-        Ok(Some(WalkedTree {
-            markdown,
-            nodes,
-            bounds,
-            window_scoped: scoped_frame.is_some(),
-            truncation,
-            bounds_complete,
-            elapsed: walk_started.elapsed(),
-        }))
-    })
+            (Vec::new(), false)
+        }
+    };
+    dlog!(
+        "snapshot phases pid {pid}: walk_ms={} bounds_ms={} visited={} bounds={} complete={}",
+        walk_elapsed.as_millis(),
+        bounds_started.elapsed().as_millis(),
+        visited.len(),
+        bounds.len(),
+        bounds_complete
+    );
+    // Bounds are keyed by the application-wide element index, so drop the
+    // entries for windows this snapshot no longer shows.
+    let bounds = if scoped_frame.is_some() {
+        let emitted: std::collections::HashSet<usize> =
+            nodes.iter().filter_map(|node| node.element_index).collect();
+        bounds
+            .into_iter()
+            .filter(|(index, ..)| emitted.contains(index))
+            .collect()
+    } else {
+        bounds
+    };
+    let truncation = truncation.or_else(|| {
+        super::native_observation::current()
+            .and_then(|observation| observation.incomplete_reason())
+            .map(|reason| Truncation {
+                reason,
+                visited: visited.len(),
+                pending: 0,
+            })
+    });
+    Ok(Some(WalkedTree {
+        markdown,
+        nodes,
+        bounds,
+        window_scoped: scoped_frame.is_some(),
+        truncation,
+        bounds_complete,
+        nodes_visited: visited.len(),
+        elapsed: walk_started.elapsed(),
+    }))
 }
 
 /// Enumerate top-level windows from the AT-SPI registry — the window-listing
@@ -2966,7 +3172,9 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
             // GTK3 fallback: the toolkit exposes entry/text nodes in the tree (so
             // get_text reads work) but gates EditableText on focus/activation. Try
             // finding an entry/text role with Component bounds and use X11 click+type.
-            dlog!("AT-SPI EditableText unavailable; checking for entry/text with Component for X11 fallback");
+            dlog!(
+                "AT-SPI EditableText unavailable; checking for entry/text with Component for X11 fallback"
+            );
 
             let entry_candidate = visited.iter().find(|v| {
                 let r = v.role.to_ascii_lowercase();
@@ -2975,9 +3183,9 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
 
             if let Some(entry) = entry_candidate {
                 dlog!(
-                "GTK3 fallback: found entry role={:?} with Component; attempting X11 click+type",
-                entry.role
-            );
+                    "GTK3 fallback: found entry role={:?} with Component; attempting X11 click+type",
+                    entry.role
+                );
 
                 // Get the entry widget's screen bounds via Component.GetExtents.
                 if let Ok(proxies) = entry.acc.proxies().await {
@@ -2988,7 +3196,9 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
                             // Click the center of the entry to establish widget focus (not window focus).
                             let cx = x + (w.max(0) / 2);
                             let cy = y + (h.max(0) / 2);
-                            dlog!("GTK3 fallback: entry bounds ({x},{y} {w}x{h}), clicking center ({cx},{cy})");
+                            dlog!(
+                                "GTK3 fallback: entry bounds ({x},{y} {w}x{h}), clicking center ({cx},{cy})"
+                            );
 
                             // Get the window XID for this app so we can send X11 events to it.
                             let Some(xid) = entry_find_window_xid(pid).await else {
@@ -3637,14 +3847,14 @@ async fn live_accessible<'a>(
     let acc = match call(accessible_for(conn, &raw_ref(object_ref))).await {
         Some(Ok(acc)) => acc,
         Some(Err(error)) => {
-            return Err(CachedElementGone(format!("cached element unreachable: {error}")).into())
+            return Err(CachedElementGone(format!("cached element unreachable: {error}")).into());
         }
         None => return Err(anyhow!("cached element did not answer in time")),
     };
     let role = match call(acc.get_role_name()).await {
         Some(Ok(role)) => role,
         Some(Err(error)) => {
-            return Err(CachedElementGone(format!("cached element is gone: {error}")).into())
+            return Err(CachedElementGone(format!("cached element is gone: {error}")).into());
         }
         None => return Err(anyhow!("cached element did not answer in time")),
     };
@@ -4930,7 +5140,7 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
             let accepted = match call(component.grab_focus()).await {
                 Some(Ok(focused)) => focused,
                 Some(Err(e)) => {
-                    return Err(anyhow!("Component.GrabFocus failed for element {idx}: {e}"))
+                    return Err(anyhow!("Component.GrabFocus failed for element {idx}: {e}"));
                 }
                 None => return Err(anyhow!("Component.GrabFocus timed out for element {idx}")),
             };
@@ -7077,7 +7287,7 @@ mod stacking_z_index_tests {
 
 #[cfg(test)]
 mod frame_correlation_tests {
-    use super::{correlate_frame_to_window, FRAME_MATCH_TOLERANCE_PX};
+    use super::{FRAME_MATCH_TOLERANCE_PX, correlate_frame_to_window};
     use crate::x11::WindowInfo;
 
     fn window(x: i32, y: i32, width: u32, height: u32) -> WindowInfo {
@@ -7180,16 +7390,16 @@ mod frame_correlation_tests {
 
 #[cfg(test)]
 mod coord_tests {
-    use super::parse_gtk_frame_extents;
     use super::OP_DEADLINE;
+    use super::parse_gtk_frame_extents;
     use super::{
-        activation_index, before_snapshot_deadline, bounded_blocking,
+        ApplicationSelection, activation_index, before_snapshot_deadline, bounded_blocking,
         combine_wayland_content_offsets, counts_as_showing, hyprland_document_top_inset,
         is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
         is_showing_state, is_web_process_bus, listing_state, passive_marker,
         prefer_authoritative_wayland_origin, project_screen_extents, rebase_renderer_window_offset,
         scoped_component_nodes, screen_extent_rebase, select_click_target, select_web_document,
-        wayland_window_origin, ApplicationSelection,
+        wayland_window_origin,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -7969,9 +8179,11 @@ mod budget_tests {
                     assert!(deadline_passed());
                     // Once the deadline has passed, calls short-circuit.
                     let started = std::time::Instant::now();
-                    assert!(call(tokio::time::sleep(Duration::from_secs(10)))
-                        .await
-                        .is_none());
+                    assert!(
+                        call(tokio::time::sleep(Duration::from_secs(10)))
+                            .await
+                            .is_none()
+                    );
                     assert!(started.elapsed() < Duration::from_millis(50));
                 })
                 .await;
@@ -8140,9 +8352,11 @@ mod at_point_rules_tests {
             selected: Some("file.txt".into()),
             selection_verified: true,
         };
-        assert!(selected
-            .describe()
-            .starts_with("selected: canvas \"file.txt\""));
+        assert!(
+            selected
+                .describe()
+                .starts_with("selected: canvas \"file.txt\"")
+        );
         assert!(selected.describe().contains("read back as selected"));
     }
 }
@@ -8150,9 +8364,9 @@ mod at_point_rules_tests {
 #[cfg(test)]
 mod window_scope_tests {
     use super::{
-        accessibility_window_id, gnome_window_scope_proven, lone_top_level_renders,
-        project_screen_extents, scoped_component_nodes, select_click_target, window_bound_element,
-        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN,
+        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN, accessibility_window_id,
+        gnome_window_scope_proven, lone_top_level_renders, project_screen_extents,
+        scoped_component_nodes, select_click_target, window_bound_element,
     };
 
     /// `(frame_ordinal, has_component, window-local extents)`.
@@ -8476,9 +8690,9 @@ mod window_scope_tests {
 #[cfg(test)]
 mod token_scope_tests {
     use super::{
-        gnome_window_scope_proven, is_window_membership_unproven, lone_top_level_renders,
-        snapshot_binds_window, window_element_membership, ELEMENT_OUTSIDE_WINDOW,
-        WINDOW_SCOPE_UNPROVEN,
+        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN, gnome_window_scope_proven,
+        is_window_membership_unproven, lone_top_level_renders, snapshot_binds_window,
+        window_element_membership,
     };
 
     // One PID owns Shell windows A and B; `get_window_state` reads B.
@@ -8560,12 +8774,51 @@ mod token_scope_tests {
         .unwrap_err();
         assert!(is_window_membership_unproven(&outside));
         assert_eq!(outside.to_string(), ELEMENT_OUTSIDE_WINDOW);
-        assert!(window_element_membership(
-            Some(1),
-            Some(1),
-            proven(Some(1), vec![SIBLING_A, REQUESTED_B])
-        )
-        .is_ok());
+        assert!(
+            window_element_membership(
+                Some(1),
+                Some(1),
+                proven(Some(1), vec![SIBLING_A, REQUESTED_B])
+            )
+            .is_ok()
+        );
         assert!(window_element_membership(Some(0), None, proven(None, vec![REQUESTED_B])).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_observation_budget_tests {
+    use super::VisitBudget;
+
+    #[test]
+    fn failed_and_passive_reads_consume_native_admissions_not_indexed_slots() {
+        // The first two admitted objects fail or are passive; the third is a
+        // control. Counting only controls would erroneously admit the fourth.
+        let mut native = VisitBudget::Admitted(3);
+        let mut generic = VisitBudget::Indexed(1);
+        for indexed in [false, false, true] {
+            assert!(native.admit());
+            assert!(generic.admit());
+            if indexed {
+                native.indexed_node();
+                generic.indexed_node();
+            }
+        }
+        assert!(
+            !native.admit(),
+            "all three native attempts consumed their slots"
+        );
+        assert!(
+            !generic.admit(),
+            "only the control consumed the indexed slot"
+        );
+    }
+
+    #[test]
+    fn last_native_admission_is_readable_but_the_next_is_refused() {
+        let mut budget = VisitBudget::Admitted(super::super::native_observation::MAX_NODE_ATTEMPTS);
+        let admitted = std::iter::from_fn(|| budget.admit().then_some(())).count();
+        assert_eq!(admitted, 5_000, "Original admits attempts0 through4999");
+        assert!(!budget.admit(), "an exhausted budget remains exhausted");
     }
 }

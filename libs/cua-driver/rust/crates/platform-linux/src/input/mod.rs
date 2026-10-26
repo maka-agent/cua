@@ -20,8 +20,8 @@ pub mod foreground;
 pub mod interactive;
 mod mpx_keyboard;
 mod mpx_owner;
-/// Exact-window native clicks for trusted Embedded SDK calls.
-pub mod native_click;
+/// Exact-window native pointer input for trusted Embedded SDK calls.
+pub mod native_window;
 /// One-shot targeted pointer/keyboard delivery with explicit
 /// auto/background/foreground semantics (embedders).
 pub mod targeted;
@@ -62,7 +62,7 @@ struct ButtonTiming<'a> {
     hold_ms: u64,
     gap_ms: u64,
     native_wheel: bool,
-    native_click: Option<&'a native_click::NativeClickContext>,
+    native_window: Option<&'a native_window::NativeWindowContext>,
 }
 
 #[derive(Debug)]
@@ -3464,7 +3464,7 @@ pub fn send_click_with_modifiers(
             hold_ms: CLICK_DELAY_MS,
             gap_ms: 80,
             native_wheel: false,
-            native_click: None,
+            native_window: None,
         },
     )
 }
@@ -3492,7 +3492,7 @@ fn send_button_sequence(
     timing: ButtonTiming<'_>,
 ) -> Result<()> {
     let root = timing
-        .native_click
+        .native_window
         .context("native button sequence requires its selected screen context")?
         .root();
     send_button_sequence_on_root((conn, root), xid, point, count, button, modifiers, timing)
@@ -3508,8 +3508,8 @@ fn send_button_sequence_on_root(
     timing: ButtonTiming<'_>,
 ) -> Result<()> {
     let modifier_state = modifiers_to_state(modifiers);
-    let native_window = timing.native_wheel || timing.native_click.is_some();
-    let clock = if let Some(context) = timing.native_click {
+    let native_window = timing.native_wheel || timing.native_window.is_some();
+    let clock = if let Some(context) = timing.native_window {
         Some(context.clock())
     } else {
         timing
@@ -3532,11 +3532,15 @@ fn send_button_sequence_on_root(
     let mut completed = 0;
     let result = (|| -> Result<()> {
         for _ in 0..count {
-            if let Some(context) = timing.native_click {
+            if let Some(context) = timing.native_window {
                 context.check()?;
             }
-            let target = if let Some(context) = timing.native_click {
-                context.move_to(conn)?
+            let target = if let Some(context) = timing.native_window {
+                if context.refreshes_target_per_pair() {
+                    context.move_to(conn)?
+                } else {
+                    context.cached_target()?
+                }
             } else if timing.native_wheel {
                 build_event_target((conn, root), xid, x, y, xid as Window, x, y)?
             } else {
@@ -3580,23 +3584,23 @@ fn send_button_sequence_on_root(
             // so a press-only toolkit binding receives one coherent click.
             // Native profiles address their selected window with NO_EVENT.
             attempted = true;
-            if let Some(context) = timing.native_click {
+            if let Some(context) = timing.native_window {
                 context.mark_attempted();
             }
             conn.send_event(timing.native_wheel, target.window, mask, press)?
                 .check()?;
-            if let Some(context) = timing.native_click {
+            if let Some(context) = timing.native_window {
                 context.mark_pressed(button);
             }
             sleep(Duration::from_millis(timing.hold_ms));
             release.time = timestamp();
             conn.send_event(timing.native_wheel, target.window, mask, release)?
                 .check()?;
-            if let Some(context) = timing.native_click {
+            if let Some(context) = timing.native_window {
                 context.mark_released();
             }
             completed += 1;
-            if let Some(context) = timing.native_click {
+            if let Some(context) = timing.native_window {
                 context.mark_completed();
             }
 
@@ -3625,7 +3629,7 @@ pub fn send_scroll_window(xid: u64, x: i32, y: i32, direction: &str, detents: us
             hold_ms: WHEEL_HOLD_MS,
             gap_ms: 0,
             native_wheel: true,
-            native_click: None,
+            native_window: None,
         },
     )
 }
@@ -4177,7 +4181,7 @@ pub fn send_click_xtest_desktop_with_modifiers(
             hold_ms: CLICK_DELAY_MS,
             gap_ms: DOUBLE_CLICK_DELAY_MS,
             native_wheel: false,
-            native_click: None,
+            native_window: None,
         },
     )
 }
@@ -4295,7 +4299,7 @@ pub fn send_scroll_xtest_desktop(x: i32, y: i32, direction: &str, amount: usize)
             hold_ms: WHEEL_HOLD_MS,
             gap_ms: 0,
             native_wheel: true,
-            native_click: None,
+            native_window: None,
         },
     )
 }

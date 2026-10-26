@@ -17,8 +17,8 @@ use cua_driver_contract::{
     ToolOutput, TypeTextInput, VerifyStateInput, VerifyStateOutput, WindowStateOutput,
 };
 use cua_driver_core::daemon::{
-    is_daemon_listening, request_daemon_metadata, send_request, socket_path_for_namespace,
-    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin,
+    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin, is_daemon_listening,
+    request_daemon_metadata, send_request, socket_path_for_namespace,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,8 +48,8 @@ pub use cursor_motion::*;
 pub use embedded::*;
 use remote::{DriverEnvelopeChannel, RemoteBoundSession, RemoteDriverClient};
 pub use remote_mcp::{
-    open_mcp_driver_channel, DriverServiceHeader, DriverServiceRequest, DriverServiceResponse,
-    DriverServiceTransport, DriverServiceTransportError, McpDriverChannel,
+    DriverServiceHeader, DriverServiceRequest, DriverServiceResponse, DriverServiceTransport,
+    DriverServiceTransportError, McpDriverChannel, open_mcp_driver_channel,
 };
 use runtime::RuntimeOptions;
 use service_session::ServiceSessionClient;
@@ -70,8 +70,8 @@ pub fn configure_perception_client_resolver(
     let _ = PERCEPTION_CLIENT_RESOLVER.set(resolver);
 }
 
-pub(crate) fn configured_perception_client(
-) -> cua_driver_core::perception_client::PerceptionClientHandle {
+pub(crate) fn configured_perception_client()
+-> cua_driver_core::perception_client::PerceptionClientHandle {
     use cua_driver_core::perception_client::{PerceptionClient, PerceptionClientHandle};
     PERCEPTION_CLIENT_RESOLVER.get().map_or_else(
         || PerceptionClientHandle::fixed(PerceptionClient::unavailable()),
@@ -1594,6 +1594,36 @@ impl CuaDriver {
 desktop_tool_methods!(define_desktop_tool_methods);
 desktop_tool_methods!(define_session_desktop_tool_methods);
 
+/// Output choices for a trusted native Linux window observation.
+///
+/// Accessibility is always requested. Native traversal admission and its deadline
+/// come from the typed request rather than public query limits.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeObservationOptions {
+    /// Include the selected window's screenshot in the ordinary result.
+    pub include_screenshot: bool,
+    /// Maximum image dimension; `Some(0)` retains the native image dimensions.
+    pub max_image_dimension: Option<u32>,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn native_observation_arguments(
+    request: &platform_linux::atspi::native_observation::NativeObservationRequest,
+    options: NativeObservationOptions,
+) -> Value {
+    let mut arguments = serde_json::json!({
+        "pid":request.pid,"window_id":request.window_id,
+        "include_accessibility_tree":true,
+        "include_screenshot":options.include_screenshot,
+        "tree_format":"both","full_output":true,
+    });
+    if let Some(max_image_dimension) = options.max_image_dimension {
+        arguments["max_image_dimension"] = max_image_dimension.into();
+    }
+    arguments
+}
+
 #[cfg(target_os = "macos")]
 fn native_page_scroll_arguments(
     request: &platform_macos::input::page_scroll::NativePageScrollRequest,
@@ -1641,20 +1671,6 @@ fn native_move_arguments(
         "x":number(request.native_window_pixels[0], "native_window_pixels.x")?,
         "y":number(request.native_window_pixels[1], "native_window_pixels.y")?,
     }))
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "musl")))]
-fn native_click_arguments(
-    request: &platform_linux::input::native_click::NativeClickRequest,
-) -> Value {
-    serde_json::json!({
-        "pid":request.pid,"window_id":request.window_id,
-        "scope":"window","delivery_mode":"background",
-        "x":request.point[0],"y":request.point[1],"button":request.button.as_str(),
-        // The ordinary click contract stays 1..=3. The private typed request
-        // carries the native u32 count, including zero, across this exact call.
-        "count":1,
-    })
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1735,25 +1751,62 @@ impl CuaDriverSession {
 }
 
 impl CuaDriverSession {
-    /// Send native Linux clicks through this exact authorized window binding.
+    /// Observe the exact native Linux window through this authorized binding.
     ///
-    /// This Rust-only Embedded entry carries client-local i16 coordinates and
-    /// the original u32 count without changing the ordinary click schema. The
-    /// private request supplies data, never authority; target ownership and
-    /// live client bounds are checked even when the count is zero.
+    /// This Rust-only Embedded entry uses ordinary `get_window_state`
+    /// authorization, read recording and operation lifetime. The request's
+    /// deadline stays in memory and never becomes a public argument. Native
+    /// traversal receives no generic element or depth limit from this method.
+    ///
+    /// # Errors
+    /// Returns an error for a non-Embedded backend, a closed binding, or failed
+    /// authorization/dispatch through the owning runtime.
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    pub async fn click_native_window(
+    pub async fn observe_native_window(
         &self,
-        request: platform_linux::input::native_click::NativeClickRequest,
+        request: platform_linux::atspi::native_observation::NativeObservationRequest,
+        options: NativeObservationOptions,
     ) -> Result<ToolResult, DriverError> {
-        let arguments = native_click_arguments(&request);
+        let arguments = native_observation_arguments(&request, options);
         match &self.backend {
             SessionBackend::Embedded(session) => normalize_result(
-                "click",
-                session.invoke_native_click(arguments, request).await?,
+                "get_window_state",
+                session
+                    .invoke_native_window_observation(arguments, request, options)
+                    .await?,
             ),
             _ => Err(DriverError::Protocol {
-                reason: "native Linux click input requires an embedded trusted session".into(),
+                reason: "native Linux observation requires an embedded trusted session".into(),
+            }),
+        }
+    }
+
+    /// Post native Linux pointer input through this exact authorized binding.
+    ///
+    /// This Rust-only Embedded entry retains the selected target, original
+    /// integer input and admitted operation lifetime. Click counts, optional
+    /// scroll coordinates and pixel distances remain exact in authorization
+    /// and recording; no public JSON field selects this native profile.
+    ///
+    /// # Errors
+    /// Returns a driver error for an unsupported backend or failed transport.
+    /// Tool refusals remain available in the returned [`ToolResult`].
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub async fn input_native_window(
+        &self,
+        request: platform_linux::input::native_window::NativeWindowInputRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let name = request.tool_name();
+        let arguments = request.arguments();
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                name,
+                session
+                    .invoke_native_window_input(arguments, request)
+                    .await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native Linux pointer input requires an embedded trusted session".into(),
             }),
         }
     }
@@ -2331,27 +2384,167 @@ mod snapshot_lifecycle_tests;
 #[cfg(test)]
 mod tests {
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    #[test]
-    fn native_click_arguments_bind_the_target_and_keep_the_generic_count_valid() {
-        use platform_linux::input::native_click::{NativeClickButton, NativeClickRequest};
+    struct NativeObservationProbe;
 
-        for count in [0, 4, u32::MAX] {
-            let request = NativeClickRequest {
-                pid: 123,
-                window_id: 456,
-                point: [i16::MIN, i16::MAX],
-                button: NativeClickButton::Right,
-                count,
-            };
-            assert_eq!(
-                native_click_arguments(&request),
-                serde_json::json!({
-                    "pid":123,"window_id":456,"scope":"window","delivery_mode":"background",
-                    "x":i16::MIN,"y":i16::MAX,"button":"right","count":1,
-                })
-            );
-            assert_eq!(request.count, count);
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for NativeObservationProbe {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            static DEF: OnceLock<cua_driver_core::tool::ToolDef> = OnceLock::new();
+            DEF.get_or_init(|| cua_driver_core::tool::ToolDef {
+                name: "get_window_state".into(),
+                description: "test-only native observation argument probe".into(),
+                input_schema: serde_json::json!({
+                    "type":"object","additionalProperties":false,"properties":{
+                        "session":{"type":"string"},
+                        "pid":{"type":"integer"},"window_id":{"type":"integer"},
+                        "include_accessibility_tree":{"type":"boolean"},
+                        "include_screenshot":{"type":"boolean"},
+                        "tree_format":{"type":"string"},"full_output":{"type":"boolean"},
+                        "max_image_dimension":{"type":"integer"},
+                    }
+                }),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            })
         }
+
+        async fn invoke(&self, arguments: Value) -> cua_driver_core::protocol::ToolResult {
+            cua_driver_core::protocol::ToolResult::text(arguments.to_string())
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    fn register_native_observation_probe(registry: &mut cua_driver_core::tool::ToolRegistry) {
+        registry.register(Box::new(NativeObservationProbe));
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[tokio::test]
+    async fn native_observation_uses_the_bound_read_path_and_exact_canonical_arguments() {
+        use platform_linux::atspi::native_observation::NativeObservationRequest;
+
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
+        let observer = Arc::new(RecordingActivityObserver::default());
+        let driver = CuaDriver::try_create_configured_for_host(
+            ConfiguredDriverOptions {
+                audio_enabled: false,
+                claude_code_compatibility: false,
+                authorization: RuntimeAuthorizationOptions {
+                    allowed_modes: vec![SessionPermissionMode::Standard],
+                    compatibility_mode: SessionPermissionMode::Standard,
+                    compatibility_capability_manifest_path: None,
+                    compatibility_bounded_manifest_path: None,
+                    unrestricted_acknowledged: false,
+                    max_session_ttl_seconds: 60,
+                    max_idle_ttl_seconds: 30,
+                },
+            },
+            DriverHostOptions {
+                cursor: cursor_overlay::CursorConfig {
+                    enabled: false,
+                    ..cursor_overlay::CursorConfig::default()
+                },
+                host_owns_permission_ux: false,
+                host_bundle_id: None,
+                claude_code_compatibility: false,
+                prepare_desktop_environment: false,
+                register_host_tools: Some(register_native_observation_probe),
+                authorization_host: None,
+                activity_observer: Some(observer.clone()),
+            },
+        )
+        .unwrap();
+        let session = driver
+            .create_trusted_session(TrustedSessionOptions {
+                public_session: "native-observation-test".into(),
+                mode: SessionPermissionMode::Standard,
+                ttl_seconds: 60,
+                idle_ttl_seconds: 30,
+                capability_manifest_path: None,
+                bounded_manifest_path: None,
+            })
+            .unwrap();
+        let request = NativeObservationRequest {
+            pid: 123,
+            window_id: 456,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        };
+        let ordinary = session
+            .call_tool(
+                "get_window_state".into(),
+                native_observation_arguments(&request, NativeObservationOptions::default())
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(!ordinary.is_error, "{ordinary:?}");
+        assert!(ordinary.action.is_none());
+
+        for options in [
+            NativeObservationOptions::default(),
+            NativeObservationOptions {
+                include_screenshot: true,
+                max_image_dimension: Some(0),
+            },
+        ] {
+            let result = session
+                .observe_native_window(request, options)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert!(
+                result.action.is_none(),
+                "observation became an input action"
+            );
+            let received: Value = serde_json::from_str(&result.text).unwrap();
+            assert_eq!(received["pid"], 123);
+            assert_eq!(received["window_id"], 456);
+            assert_eq!(received["include_accessibility_tree"], true);
+            assert_eq!(received["include_screenshot"], options.include_screenshot);
+            assert_eq!(received["tree_format"], "both");
+            assert_eq!(received["full_output"], true);
+            assert_eq!(
+                received.get("max_image_dimension"),
+                options.max_image_dimension.map(Value::from).as_ref()
+            );
+            for absent in ["max_elements", "max_depth", "deadline", "deadline_present"] {
+                assert!(
+                    received.get(absent).is_none(),
+                    "unexpected {absent}: {received}"
+                );
+            }
+        }
+
+        let options = NativeObservationOptions::default();
+        let mut substituted = native_observation_arguments(&request, options);
+        substituted["window_id"] = 789.into();
+        let SessionBackend::Embedded(embedded) = &session.backend else {
+            panic!("trusted host fixture did not create an embedded session");
+        };
+        assert!(matches!(
+            embedded
+                .invoke_native_window_observation(substituted, request, options)
+                .await,
+            Err(DriverError::Protocol { reason })
+                if reason == "native Linux observation data does not match its canonical request"
+        ));
+        {
+            let events = observer.events.lock().unwrap();
+            let reads = events
+                .iter()
+                .filter(|event| event.tool_name == "get_window_state")
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 3, "{events:?}");
+            assert!(reads.iter().all(|event| {
+                event.kind == DriverActivityKind::AuthorizedAction
+                    && event.risk_class == reads[0].risk_class
+            }));
+        }
+        session.close();
+        driver.shutdown().await.unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -2651,9 +2844,11 @@ mod tests {
             authorization_host: None,
             activity_observer: None,
         });
-        assert!(inventory["tools"]
-            .as_array()
-            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click")));
+        assert!(
+            inventory["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click"))
+        );
 
         let driver = CuaDriver::create(None).unwrap();
         driver.shutdown().await.unwrap();
@@ -3893,9 +4088,11 @@ mod tests {
         let driver = CuaDriver::connect_remote(Arc::new(LegacyRemoteChannel)).unwrap();
         let error = driver.metadata().await.unwrap_err();
         assert!(matches!(error, DriverError::Protocol { .. }));
-        assert!(error
-            .to_string()
-            .contains("does not support request cancellation"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not support request cancellation")
+        );
     }
 
     struct CancellableRemoteChannel {

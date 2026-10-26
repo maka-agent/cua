@@ -8,10 +8,10 @@ use cua_driver_contract::{
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef, ToolRegistry},
-    tool_args::{parse_legacy_click_input, parse_typed_input, parse_typed_projection, ArgsExt},
+    tool_args::{ArgsExt, parse_legacy_click_input, parse_typed_input, parse_typed_projection},
     window_target::{PidOnlyWindowTargetGuard, WindowTargetCandidate, WindowTargetCandidates},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -21,7 +21,7 @@ use cursor_overlay::CursorRegistry;
 
 mod pixel_scroll;
 use pixel_scroll::PixelScroll;
-mod native_click;
+mod native_window;
 
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
@@ -1184,11 +1184,20 @@ impl Tool for GetWindowStateTool {
                     None => {
                         return ToolResult::error(format!(
                             "No windows found for pid {pid}. Provide window_id."
-                        ))
+                        ));
                     }
                 }
             }
         };
+        let native_observation = match crate::atspi::native_observation::for_window(pid, xid) {
+            Ok(observation) => observation,
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
+        let native_profile = native_observation.is_some();
+        let caller_remaining_ms = native_observation
+            .as_ref()
+            .and_then(|observation| observation.remaining())
+            .map(|remaining| u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
         // Retain the legacy additive cap, but let the canonical per-call field
         // replace the configured ceiling entirely (including 0 = native size).
         let max_dimension = args
@@ -1242,6 +1251,10 @@ impl Tool for GetWindowStateTool {
             .get("include_accessibility_tree")
             .and_then(|v| v.as_bool())
             != Some(false);
+        if native_profile && !want_tree {
+            return ToolResult::error("native_observation_requires_accessibility_tree")
+                .with_structured(json!({"code":"invalid_arguments"}));
+        }
         // screenshot_out_file: when set, write the PNG to disk and surface the
         // path instead of embedding base64 in the response. `~` expands.
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
@@ -1347,24 +1360,40 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let state_for_capture = state.clone();
         let query_for_walk = query.clone();
+        let native_for_walk = native_observation.clone();
+        let native_for_capture = native_observation.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let capture_work = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             // Skip the AT-SPI walk on the capture-only path
             // (include_accessibility_tree:false).
             let tree_result = if want_tree {
-                Some(crate::atspi::walk_tree_bounded_within(
-                    pid,
-                    xid,
-                    query_for_walk.as_deref(),
-                    Some(max_elements),
-                    max_depth,
-                    walk_timeout,
-                ))
+                Some(match native_for_walk {
+                    Some(observation) => crate::atspi::walk_tree_native_observation(
+                        pid,
+                        xid,
+                        query_for_walk.as_deref(),
+                        observation,
+                    )?,
+                    None => crate::atspi::walk_tree_bounded_within(
+                        pid,
+                        xid,
+                        query_for_walk.as_deref(),
+                        Some(max_elements),
+                        max_depth,
+                        walk_timeout,
+                    ),
+                })
             } else {
                 None
             };
             let binds_window = tree_result.as_ref().is_some_and(|tree| {
-                crate::atspi::snapshot_binds_window(pid, xid, tree.window_scoped, tree.trusted)
+                (!native_profile || tree.trusted)
+                    && crate::atspi::snapshot_binds_window(
+                        pid,
+                        xid,
+                        tree.window_scoped,
+                        tree.trusted,
+                    )
             });
             // Bounds and element indices come from the same captured AT-SPI
             // traversal. Joining two live walks by ordinal mis-associated
@@ -1391,6 +1420,12 @@ impl Tool for GetWindowStateTool {
             } else {
                 window_overlays(pid, xid)
             };
+            if let Some(reason) = native_for_capture
+                .as_ref()
+                .and_then(|observation| observation.stop_reason())
+            {
+                return Err(anyhow::anyhow!(reason));
+            }
             let screenshot = if should_capture {
                 // A screenshot-only read with a size cap (a live preview) asks
                 // a GNOME helper with API 10 to downscale in the compositor,
@@ -1416,6 +1451,12 @@ impl Tool for GetWindowStateTool {
                 };
                 match captured {
                     Ok((raw, original_size)) => {
+                        if let Some(reason) = native_for_capture
+                            .as_ref()
+                            .and_then(|observation| observation.stop_reason())
+                        {
+                            return Err(anyhow::anyhow!(reason));
+                        }
                         let (orig_w, orig_h) = match original_size {
                             Some(size) => size,
                             None => crate::capture::png_dimensions_pub(&raw)?,
@@ -1435,13 +1476,25 @@ impl Tool for GetWindowStateTool {
                         };
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
+                        if let Some(reason) = native_for_capture
+                            .as_ref()
+                            .and_then(|observation| observation.stop_reason())
+                        {
+                            return Err(anyhow::anyhow!(reason));
+                        }
                         let (b64, file_path) = if let Some(ref path) = screenshot_out_file {
                             std::fs::write(path, &png)?;
                             (None, Some(path.clone()))
                         } else {
-                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                            use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
                             (Some(B64.encode(&png)), None)
                         };
+                        if let Some(reason) = native_for_capture
+                            .as_ref()
+                            .and_then(|observation| observation.stop_reason())
+                        {
+                            return Err(anyhow::anyhow!(reason));
+                        }
                         let capture_id = if observation_only {
                             None
                         } else {
@@ -1487,11 +1540,27 @@ impl Tool for GetWindowStateTool {
                 overlays,
                 binds_window,
             ))
-        })
-        .await;
+        });
+        let result = if let Some(observation) = &native_observation {
+            tokio::select! {
+                biased;
+                reason = observation.stopped() => return ToolResult::error(reason)
+                    .with_structured(json!({"code":reason,"pid":pid,"window_id":xid})),
+                result = capture_work => result,
+            }
+        } else {
+            capture_work.await
+        };
 
         match result {
             Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, binds_window))) => {
+                if let Some(reason) = native_observation
+                    .as_ref()
+                    .and_then(|observation| observation.stop_reason())
+                {
+                    return ToolResult::error(reason)
+                        .with_structured(json!({"code":reason,"pid":pid,"window_id":xid}));
+                }
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1513,13 +1582,22 @@ impl Tool for GetWindowStateTool {
                         tr.elapsed_ms
                     );
                     if tr.truncated {
-                        header.push_str(&cua_driver_core::walk_budget::truncation_note(
-                            tr.truncation_reason.as_deref(),
-                            timeout_ms,
-                            tr.nodes_visited,
-                            tr.nodes_pending,
-                        ));
+                        if native_profile {
+                            header.push_str(&format!(
+                                "Native accessibility observation incomplete: {}",
+                                tr.truncation_reason.as_deref().unwrap_or("partial_tree")
+                            ));
+                        } else {
+                            header.push_str(&cua_driver_core::walk_budget::truncation_note(
+                                tr.truncation_reason.as_deref(),
+                                timeout_ms,
+                                tr.nodes_visited,
+                                tr.nodes_pending,
+                            ));
+                        }
                         header.push('\n');
+                    } else if !tr.bounds_complete && native_profile {
+                        header.push_str("Native element bounds are incomplete.\n");
                     } else if !tr.bounds_complete {
                         header.push_str(
                             "⚠️ bounds phase ran out of time: some elements have no frame \
@@ -1545,7 +1623,22 @@ impl Tool for GetWindowStateTool {
                     structured["nodes_pending"] = json!(tr.nodes_pending);
                     structured["bounds_complete"] = json!(tr.bounds_complete);
                     structured["walk_elapsed_ms"] = json!(tr.elapsed_ms as u64);
-                    structured["timeout_ms"] = json!(timeout_ms);
+                    if native_profile {
+                        structured["native_observation"] = json!({
+                            "source":if tr.trusted { "at_spi" } else { "x11" },
+                            "trusted":tr.trusted,
+                            "ax_available":tr.trusted,
+                            "node_budget_kind":"admitted_attempts",
+                            "max_node_attempts":crate::atspi::native_observation::MAX_NODE_ATTEMPTS,
+                            "max_depth":crate::atspi::native_observation::MAX_DEPTH,
+                            "deadline_kind":"caller",
+                            "caller_remaining_ms_at_start":caller_remaining_ms,
+                        });
+                        structured["ax_tree_source"] =
+                            json!(if tr.trusted { "at_spi" } else { "x11" });
+                    } else {
+                        structured["timeout_ms"] = json!(timeout_ms);
+                    }
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
                     // Elements bind to this window only when the walk proved
@@ -1665,13 +1758,19 @@ impl Tool for GetWindowStateTool {
                     // daemon isn't on the desktop session bus so the registry is
                     // empty), or it's a non-AX surface (canvas/WebGL). Mark it
                     // degraded so callers don't read `elements: []` as authoritative.
-                    if !target_scoped {
+                    if native_profile && !source_trusted {
                         structured["degraded"] = json!(true);
-                        structured["degraded_reason"] = json!("accessibility_window_identity_unproven: tree is application-scoped; exact-window element tokens and bounds are unavailable");
+                        structured["degraded_reason"] =
+                            json!("x11_window_metadata_only: no AT-SPI element authority");
+                    } else if !target_scoped {
+                        structured["degraded"] = json!(true);
+                        structured["degraded_reason"] = json!(
+                            "accessibility_window_identity_unproven: tree is application-scoped; exact-window element tokens and bounds are unavailable"
+                        );
                     } else if !source_trusted {
                         structured["degraded"] = json!(true);
-                        structured["degraded_reason"] = json!(source_degraded_reason
-                            .unwrap_or_else(|| {
+                        structured["degraded_reason"] =
+                            json!(source_degraded_reason.unwrap_or_else(|| {
                                 "x11_property_fallback_partial: AT-SPI was unavailable and \
                                  Cua Driver only recovered window metadata. Treat it as \
                                  discovery evidence; it cannot prove checked state."
@@ -1856,7 +1955,9 @@ impl Tool for GetWindowStateTool {
                     .with_structured(structured);
                 }
 
-                if !observation_only {
+                // Native observations publish the complete single-walk result;
+                // generic view defaults must not crop it again to250/1000 rows.
+                if !observation_only && !native_profile {
                     cua_driver_core::window_state_view::apply(
                         &view,
                         &cua_driver_core::window_state_view::ViewContext {
@@ -3817,11 +3918,13 @@ impl PointerRoute {
                 v["popup"] = popup.to_json();
             }
             if !effect.popups.is_empty() {
-                v["popups"] = json!(effect
-                    .popups
-                    .iter()
-                    .map(|p| p.to_json())
-                    .collect::<Vec<_>>());
+                v["popups"] = json!(
+                    effect
+                        .popups
+                        .iter()
+                        .map(|p| p.to_json())
+                        .collect::<Vec<_>>()
+                );
             }
             // Evidence the action record can publish. A popup (menu, popover,
             // combo list) appearing is a window change the public contract
@@ -4109,7 +4212,7 @@ fn x11_pixel_click_no_focus_steal(
                             .downcast_ref::<crate::input::PointOutsideWindow>()
                             .is_some() =>
                 {
-                    return Err(error)
+                    return Err(error);
                 }
                 // The synthetic fallback is a silent no-op on GTK/VCL/Qt:
                 // report the real-input failure instead of a click that
@@ -4117,7 +4220,9 @@ fn x11_pixel_click_no_focus_steal(
                 Err(error)
                     if crate::x11::window_pid(xid).is_some_and(synthetic_pointer_is_dropped) =>
                 {
-                    tracing::warn!("MPX click failed on a toolkit that drops synthetic pointer events: {error:#}");
+                    tracing::warn!(
+                        "MPX click failed on a toolkit that drops synthetic pointer events: {error:#}"
+                    );
                     return Err(BackgroundPointerFailed {
                         reason: format!("{error:#}"),
                     }
@@ -4383,7 +4488,7 @@ async fn close_window_background(pid: u32, xid: u64, display: &str) -> ToolResul
                 "code": "close_window_failed",
                 "effect": "none",
                 "detail": error.to_string(),
-            }))
+            }));
         }
         Err(error) => return ToolResult::error(format!("Task error: {error}")),
     }
@@ -4721,8 +4826,8 @@ fn isolated_hyprland_task_error(error: tokio::task::JoinError, acknowledged: boo
 fn spawn_isolated_hyprland(
     args: &Value,
     work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<Value>
-        + Send
-        + 'static,
+    + Send
+    + 'static,
 ) -> Result<
     (
         crate::wayland::hyprland_input::CancelOnDrop,
@@ -5206,12 +5311,14 @@ fn coordinate_less_mouse_button_up_survives_snapshot_replacement() {
     );
 
     clear_mouse_hold_after_release(&state, cursor_id);
-    assert!(state
-        .mouse_hold
-        .lock()
-        .unwrap()
-        .insert(cursor_id.to_owned(), hold)
-        .is_none());
+    assert!(
+        state
+            .mouse_hold
+            .lock()
+            .unwrap()
+            .insert(cursor_id.to_owned(), hold)
+            .is_none()
+    );
 }
 
 #[cfg(test)]
@@ -5321,12 +5428,14 @@ fn failed_session_end_release_remains_retryable_and_bounded() {
     })
     .unwrap();
     assert_eq!(attempts, 2);
-    assert!(state
-        .mouse_hold
-        .lock()
-        .unwrap()
-        .insert(session_id.to_owned(), hold)
-        .is_none());
+    assert!(
+        state
+            .mouse_hold
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), hold)
+            .is_none()
+    );
 }
 
 #[cfg(test)]
@@ -5337,13 +5446,14 @@ fn isolated_hyprland_refused_partial_and_unknown_outcomes_stay_distinct() {
     assert_eq!(content["reason"], "lane_busy");
     assert_eq!(content["effect"], "refused");
     assert!(content.get("delivery").is_none());
-    assert!(busy
-        .action_record
-        .unwrap()
-        .public_result()
-        .unwrap()
-        .delivery
-        .is_none());
+    assert!(
+        busy.action_record
+            .unwrap()
+            .public_result()
+            .unwrap()
+            .delivery
+            .is_none()
+    );
 
     let refused = isolated_hyprland_result(Ok(
         json!({"ok":false,"code":"stale_target","detail":"stale_target"}),
@@ -6604,8 +6714,8 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if let Some(request) = crate::input::native_click::take_native_click() {
-            return self.invoke_native_click(args, request).await;
+        if let Some(request) = crate::input::native_window::take_native_window_input() {
+            return native_window::invoke("click", args, request).await;
         }
         if args.get("by").and_then(Value::as_str) == Some("pixel") {
             return ToolResult::error(
@@ -6655,7 +6765,7 @@ impl Tool for ClickTool {
             let space = match desktop_input_space().await {
                 Ok(space) => space,
                 Err(error) => {
-                    return ToolResult::error(format!("desktop-scope click failed: {error}"))
+                    return ToolResult::error(format!("desktop-scope click failed: {error}"));
                 }
             };
             let (action_x, action_y) = if let Some(capture_id) = args.opt_str("capture_id") {
@@ -7005,7 +7115,7 @@ impl Tool for ClickTool {
                     _ => {
                         return foreground_hyprland_refusal(
                             "could not resolve exact element coordinates",
-                        )
+                        );
                     }
                 };
                 return foreground_hyprland_action(
@@ -7227,7 +7337,7 @@ impl Tool for ClickTool {
                 Ok(Err(e)) => {
                     return ToolResult::error(format!(
                         "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
+                    ));
                 }
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
@@ -7751,7 +7861,7 @@ impl Tool for TypeTextTool {
                     None => {
                         return ToolResult::error(format!(
                             "No windows found for pid {pid}. Provide window_id."
-                        ))
+                        ));
                     }
                 }
             }
@@ -7891,7 +8001,7 @@ impl Tool for TypeTextTool {
                     Err(_) => {
                         return foreground_hyprland_refusal(
                             "authenticated admitted lifecycle required",
-                        )
+                        );
                     }
                 };
             return hyprland_input_result(
@@ -8243,7 +8353,7 @@ impl Tool for TypeTextTool {
             .await;
             match result {
                 Ok(Ok(Some(KeyRoute::Mpx(report)))) => {
-                    return type_text_mpx_result(text_len, report)
+                    return type_text_mpx_result(text_len, report);
                 }
                 Ok(Err(e)) => return input_error_result(e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
@@ -8703,7 +8813,7 @@ impl Tool for PressKeyTool {
                     None => {
                         return ToolResult::error(format!(
                             "No windows found for pid {pid}. Provide window_id."
-                        ))
+                        ));
                     }
                 }
             }
@@ -9131,7 +9241,7 @@ impl Tool for HotkeyTool {
                     None => {
                         return ToolResult::error(format!(
                             "No windows found for pid {pid}. Provide window_id."
-                        ))
+                        ));
                     }
                 }
             }
@@ -9173,7 +9283,9 @@ impl Tool for HotkeyTool {
                 || args.get("x").is_some()
                 || args.get("y").is_some()
             {
-                return isolated_hyprland_refusal("isolated hotkeys address the exact top-level; first click the child explicitly");
+                return isolated_hyprland_refusal(
+                    "isolated hotkeys address the exact top-level; first click the child explicitly",
+                );
             }
             if let Some(keys) = args.get("keys").and_then(Value::as_array) {
                 if keys
@@ -9341,11 +9453,11 @@ impl Tool for HotkeyTool {
                 Ok(Ok(false)) => {
                     return ToolResult::error(format!(
                         "AT-SPI Component.GrabFocus returned false for element {element_index}"
-                    ))
+                    ));
                 }
                 Ok(Err(error)) => {
                     return stale_observed_element("hotkey", element_index, &error)
-                        .unwrap_or_else(|| ToolResult::error(error.to_string()))
+                        .unwrap_or_else(|| ToolResult::error(error.to_string()));
                 }
                 Err(error) => return ToolResult::error(format!("Task error: {error}")),
             }
@@ -9463,7 +9575,7 @@ impl Tool for SetValueTool {
             Some(Value::Number(number)) => number.to_string(),
             _ => {
                 return ToolResult::error("set_value: 'value' must be a string or a number.")
-                    .with_structured(json!({ "code": "invalid_arguments" }))
+                    .with_structured(json!({ "code": "invalid_arguments" }));
             }
         };
         let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
@@ -9482,7 +9594,7 @@ impl Tool for SetValueTool {
             _ => {
                 return ToolResult::error(
                     "set_value requires element_token to address the target element.",
-                )
+                );
             }
         };
         let idx = token.index;
@@ -9518,11 +9630,11 @@ impl Tool for SetValueTool {
             }
             Ok(Err(error)) if crate::atspi::native::is_no_value_route(&error) => error,
             Ok(Err(error)) if crate::atspi::native::is_no_such_option(&error) => {
-                return no_such_option_result(idx, &error)
+                return no_such_option_result(idx, &error);
             }
             Ok(Err(error)) => {
                 return stale_observed_element("set_value", idx, &error)
-                    .unwrap_or_else(|| input_error_result(error))
+                    .unwrap_or_else(|| input_error_result(error));
             }
             Err(error) => return ToolResult::error(format!("Task error: {error}")),
         };
@@ -9877,7 +9989,11 @@ fn atspi_scroll_result(progress: crate::atspi::ScrollProgress, foreground: bool)
             progress.acknowledged
         )
     } else {
-        format!("AT-SPI scroll stopped after {} acknowledged action(s): {}. Refresh state before another action.", progress.acknowledged, progress.detail.as_deref().unwrap_or("unknown outcome"))
+        format!(
+            "AT-SPI scroll stopped after {} acknowledged action(s): {}. Refresh state before another action.",
+            progress.acknowledged,
+            progress.detail.as_deref().unwrap_or("unknown outcome")
+        )
     };
     let record = record
         .detail(text.clone())
@@ -9960,6 +10076,9 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(request) = crate::input::native_window::take_native_window_input() {
+            return native_window::invoke("scroll", args, request).await;
+        }
         let cursor_id = resolve_cursor_key(&args);
         let pixels = match PixelScroll::from_arguments(&args) {
             Ok(pixels) => pixels,
@@ -10104,7 +10223,7 @@ impl Tool for ScrollTool {
                     None => {
                         return ToolResult::error(format!(
                             "No windows found for pid {pid}. Provide window_id."
-                        ))
+                        ));
                     }
                 }
             }
@@ -10125,7 +10244,7 @@ impl Tool for ScrollTool {
                     Ok(Err(e)) => {
                         return ToolResult::error(format!(
                             "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                        ))
+                        ));
                     }
                     Err(e) => return ToolResult::error(format!("Task error: {e}")),
                 }
@@ -10201,7 +10320,9 @@ impl Tool for ScrollTool {
                                 .unwrap_or_else(|| input_error_result(error));
                         }
                         Err(error) => {
-                            return ToolResult::error(format!("scroll bounds task failed: {error}"))
+                            return ToolResult::error(format!(
+                                "scroll bounds task failed: {error}"
+                            ));
                         }
                     }
                 }
@@ -10211,7 +10332,7 @@ impl Tool for ScrollTool {
                         return invalid_pointer_arguments(
                             "scroll",
                             "pixel scrolling requires coordinates or element_token",
-                        )
+                        );
                     }
                 },
             };
@@ -10260,7 +10381,7 @@ impl Tool for ScrollTool {
                 }
                 match ax_result {
                     Ok(Ok(progress)) => {
-                        return atspi_scroll_result(progress, delivery.is_foreground())
+                        return atspi_scroll_result(progress, delivery.is_foreground());
                     }
                     Err(error) => {
                         return atspi_scroll_result(
@@ -10270,7 +10391,7 @@ impl Tool for ScrollTool {
                                 detail: Some(error.to_string()),
                             },
                             delivery.is_foreground(),
-                        )
+                        );
                     }
                     Ok(Err(_)) => {}
                 }
@@ -10292,7 +10413,7 @@ impl Tool for ScrollTool {
                     _ => {
                         return foreground_hyprland_refusal(
                             "could not resolve exact element coordinates",
-                        )
+                        );
                     }
                 }
             } else {
@@ -10387,12 +10508,12 @@ impl Tool for ScrollTool {
                         Ok(Err(error)) => {
                             return ToolResult::error(format!(
                                 "Could not resolve scroll element [{idx}] coordinates: {error}"
-                            ))
+                            ));
                         }
                         Err(error) => {
                             return ToolResult::error(format!(
                                 "Scroll element coordinate task failed: {error}"
-                            ))
+                            ));
                         }
                     }
                 }
@@ -10441,12 +10562,12 @@ impl Tool for ScrollTool {
                     Ok(Err(e)) => {
                         return ToolResult::error(format!(
                             "Could not resolve scroll element [{idx}] coordinates: {e}"
-                        ))
+                        ));
                     }
                     Err(e) => {
                         return ToolResult::error(format!(
                             "Scroll element coordinate task failed: {e}"
-                        ))
+                        ));
                     }
                 }
             }
@@ -10504,7 +10625,7 @@ impl Tool for ScrollTool {
                         ) {
                             Ok(()) => return Ok(()),
                             Err(error) if crate::input::is_uinput_unavailable(&error) => {
-                                return Err(error)
+                                return Err(error);
                             }
                             Err(e) => tracing::warn!("MPX scroll fell back to XSendEvent: {e}"),
                         }
@@ -10754,7 +10875,7 @@ impl Tool for DoubleClickTool {
                 Ok(Err(e)) => {
                     return ToolResult::error(format!(
                         "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
+                    ));
                 }
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
@@ -11041,7 +11162,7 @@ impl Tool for RightClickTool {
                 Ok(Err(e)) => {
                     return ToolResult::error(format!(
                         "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
+                    ));
                 }
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
@@ -11329,7 +11450,7 @@ impl Tool for DragTool {
                 return invalid_pointer_arguments(
                     "drag",
                     "from_x is missing (from_x/from_y/to_x/to_y are all required)",
-                )
+                );
             }
         };
         let mut from_y = match coerce("from_y") {
@@ -11338,7 +11459,7 @@ impl Tool for DragTool {
                 return invalid_pointer_arguments(
                     "drag",
                     "from_y is missing (from_x/from_y/to_x/to_y are all required)",
-                )
+                );
             }
         };
         let mut to_x = match coerce("to_x") {
@@ -11384,7 +11505,7 @@ impl Tool for DragTool {
                 Ok(Err(e)) => {
                     return ToolResult::error(format!(
                         "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
+                    ));
                 }
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
@@ -11432,7 +11553,7 @@ impl Tool for DragTool {
                     Err(_) => {
                         return foreground_hyprland_refusal(
                             "authenticated admitted lifecycle required",
-                        )
+                        );
                     }
                 };
             let acknowledged = acknowledged.await.is_ok();
@@ -11955,7 +12076,7 @@ impl Tool for MouseButtonDownTool {
                 Ok(Err(e)) => {
                     return ToolResult::error(format!(
                         "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
+                    ));
                 }
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
@@ -12326,11 +12447,11 @@ impl Tool for MouseButtonUpTool {
                     return ToolResult::error(format!(
                         "desktop-frame coordinates could not be mapped into window {xid}: {e}"
                     ))
-                    .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
+                    .with_structured(mouse_hold_json(&cursor_id, Some(&hold)));
                 }
                 Err(e) => {
                     return ToolResult::error(format!("Task error: {e}"))
-                        .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
+                        .with_structured(mouse_hold_json(&cursor_id, Some(&hold)));
                 }
             }
         }
@@ -12427,7 +12548,7 @@ async fn parallel_drag_inject(args: &Value) -> ToolResult {
                 _ => {
                     return ToolResult::error(
                         "each drag item requires path[] or from_x/from_y/to_x/to_y.",
-                    )
+                    );
                 }
             }
         };
@@ -12582,9 +12703,18 @@ impl Tool for ParallelMouseDragTool {
                 }
             } else {
                 let coerce = |k: &str| item.get(k).and_then(|v| v.as_f64());
-                match (coerce("from_x"), coerce("from_y"), coerce("to_x"), coerce("to_y")) {
+                match (
+                    coerce("from_x"),
+                    coerce("from_y"),
+                    coerce("to_x"),
+                    coerce("to_y"),
+                ) {
                     (Some(fx), Some(fy), Some(tx), Some(ty)) => vec![(fx, fy), (tx, ty)],
-                    _ => return ToolResult::error("each drag item requires either `fn`+x_from+x_to, or from_x/from_y/to_x/to_y."),
+                    _ => {
+                        return ToolResult::error(
+                            "each drag item requires either `fn`+x_from+x_to, or from_x/from_y/to_x/to_y.",
+                        );
+                    }
                 }
             };
 
@@ -12993,7 +13123,7 @@ impl Tool for GetDesktopStateTool {
             } else {
                 None
             };
-            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
             let b64 = if written.is_some() {
                 None
             } else {
@@ -13599,10 +13729,15 @@ impl Tool for CheckPermissionsTool {
         };
         let status_text = format!(
             "X11 display: {}\nWayland: {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
-            if x11_ok { "✅ connected" } else { "❌ DISPLAY not set or X11 unavailable" },
+            if x11_ok {
+                "✅ connected"
+            } else {
+                "❌ DISPLAY not set or X11 unavailable"
+            },
             match &wayland_display {
-                Some(s) if crate::wayland::wayland_enabled() =>
-                    format!("✅ native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend ENABLED"),
+                Some(s) if crate::wayland::wayland_enabled() => format!(
+                    "✅ native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend ENABLED"
+                ),
                 Some(s) => format!(
                     "⚠️  native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend OFF; \
                      set {}=1 to enable it",
@@ -13611,7 +13746,11 @@ impl Tool for CheckPermissionsTool {
                 None => "❌ not a Wayland session".to_string(),
             },
             atspi_status,
-            if x11_ok { "✅ available" } else { "❌ requires X11" }
+            if x11_ok {
+                "✅ available"
+            } else {
+                "❌ requires X11"
+            }
         );
         ToolResult::text(status_text)
             .with_structured(json!({ "x11": x11_ok, "wayland": wayland_display.is_some(), "wayland_enabled": crate::wayland::wayland_enabled(), "atspi": atspi_ok, "dbus_session_bus_address": dbus_address, "xsend_event": x11_ok }))
@@ -13978,7 +14117,7 @@ impl Tool for ZoomTool {
                 ) {
                     return refusal;
                 }
-                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
                 let b64 = B64.encode(&crop.jpeg_bytes);
                 let (w, h) = (crop.out_w, crop.out_h);
                 use cua_driver_core::protocol::Content;
@@ -14083,7 +14222,7 @@ impl Tool for TypeTextCharsTool {
                     None => {
                         return ToolResult::error(format!(
                             "No windows found for pid {pid}. Provide window_id."
-                        ))
+                        ));
                     }
                 }
             }
@@ -14184,12 +14323,12 @@ impl Tool for KillAppTool {
         let pid_i = match args.get("pid").and_then(|v| v.as_i64()) {
             Some(p) if p > 0 && p <= i32::MAX as i64 => p as i32,
             Some(_) => {
-                return ToolResult::error("kill_app: `pid` must be a positive integer".to_string())
+                return ToolResult::error("kill_app: `pid` must be a positive integer".to_string());
             }
             None => {
                 return ToolResult::error(
                     "kill_app: missing required integer field `pid`".to_string(),
-                )
+                );
             }
         };
         // Read the instance before signaling so the confirmation below can
@@ -14201,7 +14340,7 @@ impl Tool for KillAppTool {
                     pid_i,
                     "process_not_found",
                     format!("kill_app: pid {pid_i} does not exist; no signal was sent."),
-                )
+                );
             }
             Err(error) => {
                 return kill_app_failure(
@@ -14211,7 +14350,7 @@ impl Tool for KillAppTool {
                         "kill_app: cannot read /proc/{pid_i}/stat to verify termination: \
                          {error}; no signal was sent."
                     ),
-                )
+                );
             }
         };
         // SAFETY: libc::kill is a thin syscall wrapper, no thread-safety concerns.
@@ -14428,10 +14567,10 @@ impl Tool for InvokeMenuTool {
                 Ok(Err(error)) => {
                     return menu_refusal(format!(
                         "invoke_menu: target window could not be activated: {error}"
-                    ))
+                    ));
                 }
                 Err(error) => {
-                    return menu_refusal(format!("invoke_menu: activation task failed: {error}"))
+                    return menu_refusal(format!("invoke_menu: activation task failed: {error}"));
                 }
             }
         } else {
@@ -14444,10 +14583,10 @@ impl Tool for InvokeMenuTool {
                 Ok(Err(error)) => {
                     return menu_refusal(format!(
                         "invoke_menu: target window could not be activated: {error}"
-                    ))
+                    ));
                 }
                 Err(error) => {
-                    return menu_refusal(format!("invoke_menu: activation task failed: {error}"))
+                    return menu_refusal(format!("invoke_menu: activation task failed: {error}"));
                 }
             }
         };
@@ -14519,8 +14658,8 @@ impl Tool for SetWindowFrameTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_contract::SetWindowFrameInput;
         use cua_driver_core::action_record::{
-            effect_from_value_readback, ActionEvidence, ActionExecutionRecord, ActionTransport,
-            ActualDelivery, EvidenceKind, RequestedDelivery,
+            ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery, EvidenceKind,
+            RequestedDelivery, effect_from_value_readback,
         };
 
         let input: SetWindowFrameInput =
@@ -14680,7 +14819,7 @@ impl Tool for BringToFrontTool {
                     None => {
                         return ToolResult::error(format!(
                             "bring_to_front: no window_id given and no Wayland windows found for pid {pid}."
-                        ))
+                        ));
                     }
                 },
             };
@@ -14726,8 +14865,8 @@ impl Tool for BringToFrontTool {
                     Some(w) => w.xid,
                     None => {
                         return ToolResult::error(format!(
-                        "bring_to_front: no window_id given and no windows found for pid {pid}."
-                    ))
+                            "bring_to_front: no window_id given and no windows found for pid {pid}."
+                        ));
                     }
                 }
             }
@@ -15067,7 +15206,7 @@ mod visibility_tests;
 #[cfg(test)]
 mod cursor_hook_emission_tests {
     use super::emit_cursor_hook;
-    use cua_driver_core::cursor_hook::{set_cursor_hook_fn, CursorHookEvent};
+    use cua_driver_core::cursor_hook::{CursorHookEvent, set_cursor_hook_fn};
     use std::sync::{Arc, Mutex};
 
     /// Linux pointer actions report the agent cursor to an embedder's hook

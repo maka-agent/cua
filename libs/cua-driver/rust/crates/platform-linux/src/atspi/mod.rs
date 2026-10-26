@@ -13,6 +13,7 @@ use self::snapshot as cache;
 use anyhow::Result;
 
 pub mod native;
+pub mod native_observation;
 pub mod snapshot;
 pub use native::ensure_listener_active;
 pub use snapshot::Snapshots;
@@ -109,7 +110,7 @@ impl AtspiTreeResult {
         let (truncated, truncation_reason, nodes_visited, nodes_pending) = match &walked.truncation
         {
             Some(t) => (true, Some(t.reason.to_owned()), t.visited, t.pending),
-            None => (false, None, walked.nodes.len(), 0),
+            None => (false, None, walked.nodes_visited, 0),
         };
         AtspiTreeResult {
             tree_markdown: md,
@@ -173,6 +174,51 @@ pub fn walk_tree_bounded(
         max_depth,
         DEFAULT_WALK_TIMEOUT,
     )
+}
+
+/// Observe one proven native window with the invocation's original node budget.
+/// This uses the native walker and its identities. A missing AT-SPI application
+/// returns real X11 window metadata without element authority; failed scope or
+/// cancellation remains an error and never enters the fallback.
+pub(crate) fn walk_tree_native_observation(
+    pid: u32,
+    xid: u64,
+    query: Option<&str>,
+    observation: native_observation::Observation,
+) -> Result<AtspiTreeResult> {
+    let walked = native::walk_tree_native_observation(pid, xid, observation.clone())?;
+    if let Some(reason) = observation.stop_reason() {
+        return Err(anyhow::anyhow!(reason));
+    }
+    let result =
+        native_observation_or_metadata(walked, query, || walk_via_x11_properties(xid, query));
+    if let Some(reason) = observation.stop_reason() {
+        return Err(anyhow::anyhow!(reason));
+    }
+    Ok(result)
+}
+
+fn native_observation_or_metadata(
+    walked: Option<native::WalkedTree>,
+    query: Option<&str>,
+    metadata: impl FnOnce() -> AtspiTreeResult,
+) -> AtspiTreeResult {
+    match walked {
+        Some(walked) => AtspiTreeResult::from_walked(walked, query),
+        None => {
+            // Original observes non-AT-SPI windows through X11 properties.
+            // Those rows describe the exact window but grant no AX authority.
+            let mut tree = metadata();
+            tree.trusted = false;
+            for node in &mut tree.nodes {
+                node.element_index = None;
+                node.actions.clear();
+                node.identity = None;
+                node.object_ref = None;
+            }
+            tree
+        }
+    }
 }
 
 /// [`walk_tree_bounded`] with an explicit wall-clock budget for the WHOLE
@@ -370,8 +416,8 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
     perform_action_at_point_in(pid, 0, win_x, win_y, false)
 }
 
-pub use native::is_focus_taking_role;
 pub use native::AtPointHit;
+pub use native::is_focus_taking_role;
 
 /// [`perform_action_at_point`] for a known window, in three rungs that never
 /// re-walk the tree first:
@@ -429,7 +475,7 @@ pub fn perform_action_at_point_in(
                                 element.role.clone(),
                                 String::new(),
                                 object_ref.path.clone(),
-                            )))
+                            )));
                         }
                         Err(error) => tracing::debug!(
                             "cached hit-test element {idx} (pid {pid}) failed: {error:#}"
@@ -559,7 +605,7 @@ fn cached_bounds(pid: u32, xid: Option<u64>, idx: usize) -> Option<(i32, i32, u3
     }
 }
 
-pub use native::{is_window_membership_unproven, WindowElement, WindowProof};
+pub use native::{WindowElement, WindowProof, is_window_membership_unproven};
 
 /// Whether `get_window_state` may bind this snapshot's elements to window
 /// `xid` as element tokens. See [`native::snapshot_binds_window_for`].
@@ -746,7 +792,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
                 nodes_pending: 0,
                 bounds_complete: true,
                 elapsed_ms: 0,
-            }
+            };
         }
     };
 
@@ -758,6 +804,15 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
     // Read WM_CLASS.
     let wm_class = get_x11_wm_class(&conn, window).unwrap_or_default();
 
+    x11_property_tree(xid, title, wm_class, query)
+}
+
+fn x11_property_tree(
+    xid: u64,
+    title: String,
+    wm_class: String,
+    query: Option<&str>,
+) -> AtspiTreeResult {
     let mut md = String::new();
     let mut nodes = vec![];
 
@@ -933,17 +988,56 @@ mod budget_tests {
             window_scoped: true,
             truncation,
             bounds_complete: false,
+            nodes_visited: 3,
             elapsed: std::time::Duration::from_millis(1234),
         }
     }
 
     #[test]
-    fn complete_walk_reports_no_truncation_and_counts_nodes() {
+    fn missing_native_tree_keeps_window_metadata_without_ax_authority() {
+        let calls = std::cell::Cell::new(0);
+        let result = native_observation_or_metadata(None, None, || {
+            calls.set(calls.get() + 1);
+            x11_property_tree(42, "Owned window".into(), "OwnedFixture".into(), None)
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "read properties once without a second native walk"
+        );
+        assert!(result.tree_markdown.contains("Owned window"));
+        assert!(
+            result.window_scoped,
+            "properties name this exact X11 window"
+        );
+        assert!(
+            !result.trusted,
+            "window properties cannot grant AX authority"
+        );
+        assert_eq!(result.nodes_visited, 0);
+        assert_eq!(result.nodes[0].description.as_deref(), Some("OwnedFixture"));
+        assert!(result.nodes.iter().all(|node| node.element_index.is_none()
+            && node.actions.is_empty()
+            && node.identity.is_none()
+            && node.object_ref.is_none()));
+    }
+
+    #[test]
+    fn native_observation_never_reads_property_fallback_when_tree_exists() {
+        let result = native_observation_or_metadata(Some(walked(None)), None, || {
+            panic!("a native tree must not cause a second property observation")
+        });
+        assert!(result.trusted);
+        assert_eq!(result.nodes_visited, 3);
+    }
+
+    #[test]
+    fn complete_walk_counts_passive_visits_missing_from_indexed_rows() {
         let result = AtspiTreeResult::from_walked(walked(None), None);
         assert!(result.trusted);
         assert!(!result.truncated);
         assert_eq!(result.truncation_reason, None);
-        assert_eq!(result.nodes_visited, 2);
+        assert_eq!(result.nodes_visited, 3);
         assert_eq!(result.nodes_pending, 0);
         assert!(!result.bounds_complete);
         assert_eq!(result.elapsed_ms, 1234);

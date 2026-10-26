@@ -22,7 +22,7 @@ impl PixelScroll {
             return Err(invalid("pixels must be non-zero"));
         }
         // Original Linux native service: u16 -> f32, divss 100, roundf, max 1.
-        let detents = (f32::from(pixels) / 100.0).round().max(1.0) as usize;
+        let detents = crate::input::native_window::scroll_detents(pixels) as usize;
         Ok(Some(Self { detents }))
     }
 }

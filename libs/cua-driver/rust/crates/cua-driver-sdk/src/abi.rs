@@ -9,26 +9,26 @@ use crate::runtime::{DriverRuntime, RuntimeCreateError, RuntimeOptions, RuntimeS
 use crate::{DriverError, DriverMetadata};
 use cua_driver_core::{
     authorization::{
-        PermissionMode, DANGEROUS_BYPASS_ENV, DISABLE_UNRESTRICTED_ENV, PERMISSION_MODE_ENV,
+        DANGEROUS_BYPASS_ENV, DISABLE_UNRESTRICTED_ENV, PERMISSION_MODE_ENV, PermissionMode,
     },
     session_authorization::{DelegatedSessionRequest, SessionModeCeiling},
     session_manifest::{
-        load_manifest, CAPABILITY_MANIFEST_APPROVED_ENV, CAPABILITY_MANIFEST_FILE_ENV,
-        SESSION_POLICY_APPROVED_ENV, SESSION_POLICY_FILE_ENV,
+        CAPABILITY_MANIFEST_APPROVED_ENV, CAPABILITY_MANIFEST_FILE_ENV,
+        SESSION_POLICY_APPROVED_ENV, SESSION_POLICY_FILE_ENV, load_manifest,
     },
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::ffi::c_void;
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{Notify, oneshot};
 
 pub const CUA_DRIVER_ABI_MAJOR: u16 = 1;
 pub const CUA_DRIVER_ABI_MINOR: u16 = 1;
@@ -920,7 +920,12 @@ enum NativeRequest {
     #[cfg(target_os = "macos")]
     Move(platform_macos::input::native_move::NativeMoveRequest),
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    LinuxClick(platform_linux::input::native_click::NativeClickRequest),
+    LinuxWindowInput(platform_linux::input::native_window::NativeWindowInputRequest),
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    LinuxObservation {
+        request: platform_linux::atspi::native_observation::NativeObservationRequest,
+        options: crate::NativeObservationOptions,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -1032,12 +1037,23 @@ impl NativeRequest {
                 }),
             ),
             #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-            Self::LinuxClick(request) => (
-                "linux_native_click",
+            Self::LinuxWindowInput(request) => (
+                "linux_native_window_input",
+                serde_json::json!({
+                    "tool":request.tool_name(),"arguments":request.arguments(),
+                    "point_unit":"window_local_physical_pixels",
+                }),
+            ),
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            Self::LinuxObservation { request, options } => (
+                "linux_native_observation",
                 serde_json::json!({
                     "pid":request.pid,"window_id":request.window_id,
-                    "point":request.point,"point_unit":"window_local_physical_pixels",
-                    "button":request.button.as_str(),"count":request.count,
+                    "deadline_present":request.deadline.is_some(),
+                    "options":{
+                        "include_screenshot":options.include_screenshot,
+                        "max_image_dimension":options.max_image_dimension,
+                    },
                 }),
             ),
         }
@@ -1160,8 +1176,15 @@ unsafe fn session_invoke_in_frame(
                                     .await
                                 }
                                 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-                                NativeRequest::LinuxClick(request) => {
-                                    platform_linux::input::native_click::with_native_click(
+                                NativeRequest::LinuxWindowInput(request) => {
+                                    platform_linux::input::native_window::with_native_window_input(
+                                        request, invocation,
+                                    )
+                                    .await
+                                }
+                                #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+                                NativeRequest::LinuxObservation { request, .. } => {
+                                    platform_linux::atspi::native_observation::with_native_observation(
                                         request, invocation,
                                     )
                                     .await
@@ -1293,7 +1316,7 @@ extern "C" fn rust_completion(
 // keeps the safe Rust SDK on the same ABI seam as Python, TypeScript, and C
 // consumers instead of reaching around the boundary through Rust functions.
 mod ffi {
-    use super::{c_void, CuaDriverBuffer, CuaDriverCompletionV1, CuaDriverStatus};
+    use super::{CuaDriverBuffer, CuaDriverCompletionV1, CuaDriverStatus, c_void};
 
     #[repr(C)]
     pub(super) struct Handle {
@@ -1870,16 +1893,37 @@ impl NativeAbiSession {
     }
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    pub(crate) async fn invoke_native_click(
+    pub(crate) async fn invoke_native_window_observation(
         &self,
         arguments: Value,
-        request: platform_linux::input::native_click::NativeClickRequest,
+        request: platform_linux::atspi::native_observation::NativeObservationRequest,
+        options: crate::NativeObservationOptions,
+    ) -> Result<Value, DriverError> {
+        if arguments != crate::native_observation_arguments(&request, options) {
+            return Err(DriverError::Protocol {
+                reason: "native Linux observation data does not match its canonical request".into(),
+            });
+        }
+        self.invoke_in_frame(
+            "get_window_state",
+            arguments,
+            crate::runtime::CoordinateFrame::Screenshot,
+            Some(NativeRequest::LinuxObservation { request, options }),
+        )
+        .await
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub(crate) async fn invoke_native_window_input(
+        &self,
+        arguments: Value,
+        request: platform_linux::input::native_window::NativeWindowInputRequest,
     ) -> Result<Value, DriverError> {
         self.invoke_in_frame(
-            "click",
+            request.tool_name(),
             arguments,
             crate::runtime::CoordinateFrame::NativeWindow,
-            Some(NativeRequest::LinuxClick(request)),
+            Some(NativeRequest::LinuxWindowInput(request)),
         )
         .await
     }
@@ -2048,24 +2092,69 @@ pub(crate) mod tests {
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[test]
-    fn native_click_recording_keeps_the_real_count_and_exact_typed_target() {
-        use platform_linux::input::native_click::{NativeClickButton, NativeClickRequest};
-
-        for count in [0, 4, u32::MAX] {
-            let request = NativeRequest::LinuxClick(NativeClickRequest {
+    fn native_observation_recording_keeps_only_scalar_read_configuration() {
+        for deadline in [None, Some(std::time::Instant::now())] {
+            let request = platform_linux::atspi::native_observation::NativeObservationRequest {
                 pid: 123,
                 window_id: 456,
+                deadline,
+            };
+            let options = crate::NativeObservationOptions {
+                include_screenshot: true,
+                max_image_dimension: Some(0),
+            };
+            let (profile, recorded) =
+                NativeRequest::LinuxObservation { request, options }.recording_input();
+            assert_eq!(profile, "linux_native_observation");
+            assert_eq!(
+                recorded,
+                serde_json::json!({
+                    "pid":123,"window_id":456,
+                    "deadline_present":deadline.is_some(),
+                    "options":{"include_screenshot":true,"max_image_dimension":0},
+                })
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn native_window_recording_keeps_exact_input_without_a_replay_projection() {
+        use platform_linux::input::native_window::{
+            NativeClickButton, NativeScrollDirection, NativeWindowInput, NativeWindowInputRequest,
+        };
+        let inputs = [
+            NativeWindowInput::Click {
                 point: [i16::MIN, i16::MAX],
                 button: NativeClickButton::Right,
-                count,
-            });
-            let (profile, original_input) = request.recording_input();
-            assert_eq!(profile, "linux_native_click");
+                count: 0,
+            },
+            NativeWindowInput::Click {
+                point: [37, 41],
+                button: NativeClickButton::Left,
+                count: u32::MAX,
+            },
+            NativeWindowInput::Scroll {
+                x: None,
+                y: Some(41),
+                direction: NativeScrollDirection::Down,
+                pixels: 150,
+            },
+        ];
+        for input in inputs {
+            let request = NativeWindowInputRequest {
+                pid: 123,
+                window_id: 456,
+                input,
+            };
+            let (profile, original_input) =
+                NativeRequest::LinuxWindowInput(request).recording_input();
+            assert_eq!(profile, "linux_native_window_input");
             assert_eq!(
                 original_input,
                 serde_json::json!({
-                    "pid":123,"window_id":456,"point":[i16::MIN,i16::MAX],
-                    "point_unit":"window_local_physical_pixels","button":"right","count":count,
+                    "tool":request.tool_name(),"arguments":request.arguments(),
+                    "point_unit":"window_local_physical_pixels",
                 })
             );
             let encoded = serde_json::to_string(&original_input).unwrap();
