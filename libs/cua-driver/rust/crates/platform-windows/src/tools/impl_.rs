@@ -4022,7 +4022,7 @@ impl Tool for ClickTool {
                         if let Ok(pattern) = invoke_result {
                             if let Ok(inv) = pattern.cast::<IUIAutomationInvokePattern>() {
                                 let outcome = crate::uia::fg_bypass::run_with_uwp_bypass(
-                                    hwnd as isize, || unsafe { inv.Invoke() });
+                                    hwnd as isize, || crate::uia::patterns::invoke(&inv));
                                 match outcome {
                                     Ok(()) => {
                                         std::mem::forget(elem);
@@ -6289,8 +6289,8 @@ impl Tool for SetValueTool {
                 if let Ok(pattern) = unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) } {
                     if let Ok(vp) = pattern.cast::<IUIAutomationValuePattern>() {
                         let set =
-                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                vp.SetValue(&BSTR::from(value.as_str()))
+                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || {
+                                crate::uia::patterns::set_value(&vp, &BSTR::from(value.as_str()))
                             });
                         if set.is_ok() {
                             return Ok(if is_combo {

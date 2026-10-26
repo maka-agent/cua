@@ -30,6 +30,7 @@ use windows::Win32::UI::Accessibility::{
 
 pub mod fg_bypass;
 pub(crate) mod focused_document;
+pub mod patterns;
 pub mod scroll;
 pub mod snapshot;
 pub mod windows_enum;
@@ -727,39 +728,100 @@ unsafe fn node_cache_request(
 pub fn walk_native_tree(hwnd: u64) -> Result<Vec<UiaNode>, String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-                .map_err(|e| format!("UIA init failed: {e}"))?;
-        let (cache_req, _) = node_cache_request(&automation)
-            .map_err(|e| format!("CreateCacheRequest failed: {e}"))?;
-        let _ = cache_req.SetTreeScope(TreeScope(TreeScope_Element.0 | TreeScope_Children.0));
-        if let Ok(ctrl_cond) = automation.ControlViewCondition() {
-            let _ = cache_req.SetTreeFilter(&ctrl_cond);
+        walk_native_tree_in_apartment(hwnd, None)
+    }
+}
+
+/// Walk the existing native tree only after its root proves an exact HWND/PID.
+///
+/// This entry point never enumerates the desktop or selects another root. It
+/// requires an existing MTA apartment: callers must keep that apartment alive
+/// until all returned node references and retained snapshots have been dropped.
+/// The HWND's generation and desktop assignment remain the caller's responsibility.
+pub fn walk_native_tree_checked(hwnd: u64, expected_pid: u32) -> Result<Vec<UiaNode>, String> {
+    use windows::Win32::System::Com::{CoGetApartmentType, APTTYPE, APTTYPEQUALIFIER, APTTYPE_MTA};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    if hwnd == 0 || expected_pid == 0 {
+        return Err("native UIA root requires a nonzero HWND and expected PID".into());
+    }
+    unsafe {
+        let mut owner = 0;
+        let thread = GetWindowThreadProcessId(
+            windows::Win32::Foundation::HWND(hwnd as *mut _),
+            Some(&mut owner),
+        );
+        if thread == 0 || owner != expected_pid {
+            return Err("native UIA HWND owner does not match expected PID".into());
         }
+        let mut apartment = APTTYPE::default();
+        let mut qualifier = APTTYPEQUALIFIER::default();
+        CoGetApartmentType(&mut apartment, &mut qualifier)
+            .map_err(|error| format!("native UIA caller must own an MTA apartment: {error}"))?;
+        if apartment != APTTYPE_MTA {
+            return Err("native UIA caller must own an MTA apartment".into());
+        }
+        walk_native_tree_in_apartment(hwnd, Some(expected_pid))
+    }
+}
+
+unsafe fn walk_native_tree_in_apartment(
+    hwnd: u64,
+    expected_pid: Option<u32>,
+) -> Result<Vec<UiaNode>, String> {
+    let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        .map_err(|e| format!("UIA init failed: {e}"))?;
+    // The checked entry resolves once, proves only intrinsic identity,
+    // then uses that same element for the cache and the existing walker.
+    // Keep the legacy entry's cache-before-resolve order unchanged.
+    let checked_root = if let Some(expected_pid) = expected_pid {
         let root = automation
             .ElementFromHandle(windows::Win32::Foundation::HWND(hwnd as *mut _))
-            .and_then(|element| element.BuildUpdatedCache(&cache_req))
-            .map_err(|e| format!("native UIA root could not be read: {e}"))?;
-        let mut nodes = Vec::new();
-        let mut lines = Vec::new();
-        let mut counter = 0usize;
-        let mut budget = WalkBudget::nodes_only(DEFAULT_MAX_TOTAL_ELEMENTS);
-        let walked = walk_native_level(
-            &root,
-            &cache_req,
-            0,
-            None,
-            &mut nodes,
-            &mut lines,
-            &mut counter,
-            &mut budget,
-        );
-        match walked {
-            Ok(()) => Ok(nodes),
-            Err(error) => {
-                release_walk_nodes(nodes);
-                Err(error)
-            }
+            .map_err(|error| format!("native UIA root could not be resolved: {error}"))?;
+        let root_hwnd = root
+            .CurrentNativeWindowHandle()
+            .map_err(|error| format!("native UIA root HWND is unavailable: {error}"))?;
+        let root_pid = root
+            .CurrentProcessId()
+            .map_err(|error| format!("native UIA root PID is unavailable: {error}"))?;
+        if root_hwnd.0 as usize as u64 != hwnd || root_pid as u32 != expected_pid {
+            return Err("native UIA root identity does not match the admitted HWND/PID".into());
+        }
+        Some(root)
+    } else {
+        None
+    };
+    let (cache_req, _) =
+        node_cache_request(&automation).map_err(|e| format!("CreateCacheRequest failed: {e}"))?;
+    let _ = cache_req.SetTreeScope(TreeScope(TreeScope_Element.0 | TreeScope_Children.0));
+    if let Ok(ctrl_cond) = automation.ControlViewCondition() {
+        let _ = cache_req.SetTreeFilter(&ctrl_cond);
+    }
+    let root = match checked_root {
+        Some(root) => Ok(root),
+        None => automation.ElementFromHandle(windows::Win32::Foundation::HWND(hwnd as *mut _)),
+    }
+    .and_then(|element| element.BuildUpdatedCache(&cache_req))
+    .map_err(|e| format!("native UIA root could not be read: {e}"))?;
+    let mut nodes = Vec::new();
+    let mut lines = Vec::new();
+    let mut counter = 0usize;
+    let mut budget = WalkBudget::nodes_only(DEFAULT_MAX_TOTAL_ELEMENTS);
+    let walked = walk_native_level(
+        &root,
+        &cache_req,
+        0,
+        None,
+        &mut nodes,
+        &mut lines,
+        &mut counter,
+        &mut budget,
+    );
+    match walked {
+        Ok(()) => Ok(nodes),
+        Err(error) => {
+            release_walk_nodes(nodes);
+            Err(error)
         }
     }
 }
