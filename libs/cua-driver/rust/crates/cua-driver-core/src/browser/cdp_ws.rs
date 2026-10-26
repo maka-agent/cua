@@ -417,7 +417,8 @@ impl CdpConnection {
 
     /// Issue a known observation whose late reply can be discarded after its
     /// complete request is sent. Callers must not use this for input or mutation.
-    pub(super) async fn call_observation(
+    /// Method policy and partial-send cleanup remain identical to `call`.
+    pub async fn call_observation(
         &self,
         session_id: Option<&str>,
         method: &str,
