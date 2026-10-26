@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
@@ -1766,18 +1766,35 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
             || repaint_after_capture
         {
             repaint_after_capture = false;
-            let tiles = {
+            let render_requested = Instant::now();
+            let rendered = {
                 let mut guard = RENDER.lock().unwrap();
+                let lock_wait = render_requested.elapsed();
                 guard.as_mut().map(|map| {
                     // A cursor created since the tick above must not paint
                     // translucent effects for one frame on bare X11.
                     set_x11_effects_capable(map, compositor_present && !software_only);
-                    render_x11_tiles(map)
+                    let raster_started = Instant::now();
+                    let tiles = render_x11_tiles(map);
+                    (
+                        tiles,
+                        map.cursors.len(),
+                        lock_wait,
+                        raster_started.elapsed(),
+                    )
                 })
             };
 
-            if let Some(tiles) = tiles {
-                match paint_x11_tiles(
+            if let Some((tiles, cursors, lock_wait, raster_elapsed)) = rendered {
+                tracing::debug!(
+                    cursors,
+                    tiles = tiles.len(),
+                    lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+                    raster_ms = raster_elapsed.as_secs_f64() * 1000.0,
+                    "X11 cursor tile rasterization"
+                );
+                let paint_started = Instant::now();
+                let painted = paint_x11_tiles(
                     &conn,
                     &paint_target,
                     &tiles,
@@ -1788,7 +1805,14 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
                     compositor_present && !software_only,
                     screen_changed,
                     &mut backdrop,
-                ) {
+                );
+                tracing::debug!(
+                    cursors,
+                    tiles = tiles.len(),
+                    paint_ms = paint_started.elapsed().as_secs_f64() * 1000.0,
+                    "X11 cursor backdrop and upload"
+                );
+                match painted {
                     Ok(outcome) => {
                         paint_deferred = outcome == X11PaintOutcome::Deferred;
                         if outcome == X11PaintOutcome::Painted {
@@ -2014,12 +2038,22 @@ const X11_BADGED_CURSOR_HORIZONTAL_MARGIN: f64 =
     cursor_overlay::session_badge_extents().horizontal as f64 + 2.0;
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct X11TileBounds {
     x: i16,
     y: i16,
     width: u16,
     height: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl X11TileBounds {
+    fn intersects(self, other: Self) -> bool {
+        i32::from(self.x) < i32::from(other.x) + i32::from(other.width)
+            && i32::from(other.x) < i32::from(self.x) + i32::from(self.width)
+            && i32::from(self.y) < i32::from(other.y) + i32::from(other.height)
+            && i32::from(other.y) < i32::from(self.y) + i32::from(self.height)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2609,25 +2643,36 @@ fn render_x11_tiles(map: &RenderMap) -> Vec<X11PaintTile> {
     ) else {
         return Vec::new();
     };
-    let mut bounds = Vec::new();
-    for rs in map.cursors.values() {
-        if let Some(tile) = cursor_tile_bounds(&rs.core, map.platform.scr_w, map.platform.scr_h) {
-            if !bounds.contains(&tile) {
-                bounds.push(tile);
-            }
-        }
-    }
+    let cursors: Vec<_> = map
+        .cursors
+        .values()
+        .map(|cursor| {
+            (
+                cursor,
+                cursor_tile_bounds(&cursor.core, map.platform.scr_w, map.platform.scr_h),
+            )
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    let bounds: Vec<_> = cursors
+        .iter()
+        .filter_map(|(_, bounds)| *bounds)
+        .filter(|bounds| seen.insert(*bounds))
+        .collect();
 
     bounds
         .into_iter()
         .filter_map(|bounds| {
             let mut pixmap = tiny_skia::Pixmap::new(bounds.width.into(), bounds.height.into())?;
-            // Paint every cursor into every intersecting tile. tiny-skia clips
-            // automatically, so overlapping cursor tiles carry the same
+            // Cull only disjoint conservative bounds before rasterizing.
+            // Keep paint order, so overlapping cursor tiles carry the same
             // composite pixels regardless of upload order — and identical
             // backdrops, because every root read for a frame is issued before
             // any upload.
-            for rs in map.cursors.values() {
+            for (rs, cursor_bounds) in &cursors {
+                if cursor_bounds.is_some_and(|cursor_bounds| !cursor_bounds.intersects(bounds)) {
+                    continue;
+                }
                 cursor_overlay::paint_cursor_in_viewport(
                     &mut pixmap,
                     &rs.core,
@@ -5020,6 +5065,142 @@ mod tests {
                     "positions={positions:?} pixel=({}, {}) expected={expected:?} actual={actual:?}",
                     index % 1024,
                     index / 1024,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_tile_culling_preserves_unculled_pixels() {
+        fn unculled_tiles(map: &RenderMap) -> Vec<X11PaintTile> {
+            let viewport = tiny_skia::Rect::from_xywh(
+                0.0,
+                0.0,
+                map.platform.scr_w as f32,
+                map.platform.scr_h as f32,
+            )
+            .unwrap();
+            let mut bounds = Vec::new();
+            for cursor in map.cursors.values() {
+                if let Some(tile) =
+                    cursor_tile_bounds(&cursor.core, map.platform.scr_w, map.platform.scr_h)
+                {
+                    if !bounds.contains(&tile) {
+                        bounds.push(tile);
+                    }
+                }
+            }
+            bounds
+                .into_iter()
+                .map(|bounds| {
+                    let mut pixmap =
+                        tiny_skia::Pixmap::new(bounds.width.into(), bounds.height.into()).unwrap();
+                    for cursor in map.cursors.values() {
+                        cursor_overlay::paint_cursor_in_viewport(
+                            &mut pixmap,
+                            &cursor.core,
+                            f64::from(bounds.x),
+                            f64::from(bounds.y),
+                            None,
+                            1.0,
+                            viewport,
+                        );
+                    }
+                    X11PaintTile { bounds, pixmap }
+                })
+                .collect()
+        }
+
+        let scenarios = [
+            (
+                "overlapping badges and cursor shadows",
+                1024,
+                768,
+                vec![(160.0, 160.0), (200.5, 180.25), (288.0, 160.0)],
+            ),
+            (
+                "screen-edge badges and duplicate tiles",
+                1024,
+                768,
+                vec![(10.0, 12.0), (10.0, 12.0), (1020.0, 760.0)],
+            ),
+            (
+                "65 disjoint cursors",
+                3456,
+                1024,
+                (0..65)
+                    .map(|index| {
+                        (
+                            128.0 + f64::from(index % 13) * 256.0,
+                            128.0 + f64::from(index / 13) * 180.0,
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "wide-screen badge across the signed X11 coordinate boundary",
+                40000,
+                768,
+                vec![(32750.0, 160.0), (32900.0, 160.0)],
+            ),
+        ];
+        for (scenario, width, height, positions) in scenarios {
+            let mut map = default_render_map();
+            map.platform.scr_w = width;
+            map.platform.scr_h = height;
+            map.cursors.clear();
+            for (index, position) in positions.into_iter().enumerate() {
+                let key = format!("cursor-{index}");
+                let mut cursor = map.state_for_key(&key);
+                cursor.core.pos = position;
+                cursor.core.placed = true;
+                cursor.core.badge_mode_override = Some(cursor_overlay::BadgeMode::Verbose);
+                cursor.apply_command(OverlayCommand::SetSessionLabel(format!("Research {index}")));
+                cursor.apply_command(OverlayCommand::BeginAction {
+                    action: CursorAction::Click,
+                    delivery: Some(cursor_overlay::DeliveryModifier::Background),
+                    target: Some(cursor_overlay::TargetModifier::Ax),
+                });
+                cursor.apply_command(OverlayCommand::ClickPulse {
+                    x: position.0,
+                    y: position.1,
+                });
+                cursor.tick(0.016);
+                map.cursors.insert(key, cursor);
+            }
+
+            let expected = unculled_tiles(&map);
+            if width == 40000 {
+                assert!(cursor_tile_bounds(
+                    &map.cursors["cursor-1"].core,
+                    map.platform.scr_w,
+                    map.platform.scr_h,
+                )
+                .is_none());
+                map.cursors.get_mut("cursor-1").unwrap().core.visible = false;
+                let omitted = unculled_tiles(&map);
+                map.cursors.get_mut("cursor-1").unwrap().core.visible = true;
+                assert!(
+                    expected
+                        .iter()
+                        .zip(omitted)
+                        .any(|(expected, omitted)| expected.pixmap.data() != omitted.pixmap.data()),
+                    "the unrepresentable cursor must contribute to a neighboring tile"
+                );
+            }
+            let actual = render_x11_tiles(&map);
+            assert_eq!(actual.len(), expected.len(), "{scenario}");
+            assert!(expected.iter().all(|tile| tile
+                .pixmap
+                .pixels()
+                .iter()
+                .any(|pixel| pixel.alpha() > 0)));
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.bounds, expected.bounds, "{scenario}");
+                assert!(
+                    actual.pixmap.data() == expected.pixmap.data(),
+                    "{scenario}: raster bytes differ at {:?}",
+                    actual.bounds
                 );
             }
         }
