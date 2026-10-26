@@ -900,16 +900,148 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
             out_error,
         },
         crate::runtime::CoordinateFrame::Screenshot,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "musl"))
+        ))]
         None,
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
 enum NativeRequest {
+    #[cfg(target_os = "macos")]
     WindowCapture(platform_macos::capture::FrozenWindowCapture),
+    #[cfg(target_os = "macos")]
     PageScroll(platform_macos::input::page_scroll::NativePageScrollRequest),
+    #[cfg(target_os = "macos")]
     Move(platform_macos::input::native_move::NativeMoveRequest),
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    LinuxClick(platform_linux::input::native_click::NativeClickRequest),
+}
+
+#[cfg(target_os = "macos")]
+fn native_recording_f64(value: f64) -> Value {
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "non_finite_bits":format!("0x{:016x}", value.to_bits()),
+            })
+        })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+impl NativeRequest {
+    /// Record only existing numeric target/geometry and closed enum fields.
+    /// Frame bytes, titles, text, credentials and platform objects stay out of
+    /// this diagnostic; it cannot supply native replay authority.
+    fn recording_input(&self) -> (&'static str, Value) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::WindowCapture(prepared) => {
+                let geometry = prepared.geometry();
+                // FrozenWindowCapture's existing Serialize implementation has
+                // scalar capture configuration, never pixels. Select fields
+                // explicitly so future fields do not enter the recording.
+                let config = serde_json::to_value(prepared)
+                    .expect("frozen capture configuration contains serializable scalar metadata");
+                (
+                    "macos_native_capture",
+                    serde_json::json!({
+                        "geometry":{
+                            "pid":geometry.pid,"window_id":geometry.window_id,"layer":geometry.layer,
+                            "bounds":{
+                                "x":native_recording_f64(geometry.bounds.x),
+                                "y":native_recording_f64(geometry.bounds.y),
+                                "width":native_recording_f64(geometry.bounds.width),
+                                "height":native_recording_f64(geometry.bounds.height),
+                            },
+                            "native_scale":native_recording_f64(geometry.native_scale),
+                        },
+                        "requested_image_size":config["requested_image_size"],
+                        "output_dimensions":config["output_dimensions"],
+                        "encoding":config["encoding"],
+                    }),
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::PageScroll(request) => {
+                use platform_macos::input::page_scroll::PageDirection;
+                let event = &request.event;
+                let direction = match event.direction {
+                    PageDirection::Up => "up",
+                    PageDirection::Down => "down",
+                    PageDirection::Left => "left",
+                    PageDirection::Right => "right",
+                };
+                (
+                    "macos_native_pages",
+                    serde_json::json!({
+                        "pid":event.pid,"window_id":event.window_id,
+                        "direction":direction,"pages":native_recording_f64(event.pages),
+                        "extent":native_recording_f64(event.extent),
+                        "native_window_pixels":[
+                            native_recording_f64(request.native_window_pixels[0]),
+                            native_recording_f64(request.native_window_pixels[1]),
+                        ],
+                        "native_window_pixels_unit":"window_local_physical_pixels",
+                        "screen_point":[
+                            native_recording_f64(event.screen_point.x),
+                            native_recording_f64(event.screen_point.y),
+                        ],
+                        "screen_point_unit":"global_logical_points",
+                        "window_bounds":[
+                            native_recording_f64(event.window_bounds.origin.x),
+                            native_recording_f64(event.window_bounds.origin.y),
+                            native_recording_f64(event.window_bounds.size.width),
+                            native_recording_f64(event.window_bounds.size.height),
+                        ],
+                        "window_uses_flipped_coordinates":event.window_uses_flipped_coordinates,
+                    }),
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::Move(request) => (
+                "macos_native_move",
+                serde_json::json!({
+                    "pid":request.pid,"window_id":request.window_id,
+                    "native_window_pixels":[
+                        native_recording_f64(request.native_window_pixels[0]),
+                        native_recording_f64(request.native_window_pixels[1]),
+                    ],
+                    "native_window_pixels_unit":"window_local_physical_pixels",
+                    "screen_point":[
+                        native_recording_f64(request.screen_point.x),
+                        native_recording_f64(request.screen_point.y),
+                    ],
+                    "screen_point_unit":"global_logical_points",
+                    "window_bounds":[
+                        native_recording_f64(request.window_bounds.origin.x),
+                        native_recording_f64(request.window_bounds.origin.y),
+                        native_recording_f64(request.window_bounds.size.width),
+                        native_recording_f64(request.window_bounds.size.height),
+                    ],
+                    "window_uses_flipped_coordinates":request.window_uses_flipped_coordinates,
+                }),
+            ),
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            Self::LinuxClick(request) => (
+                "linux_native_click",
+                serde_json::json!({
+                    "pid":request.pid,"window_id":request.window_id,
+                    "point":request.point,"point_unit":"window_local_physical_pixels",
+                    "button":request.button.as_str(),"count":request.count,
+                }),
+            ),
+        }
+    }
 }
 
 struct SessionInvokeRequest {
@@ -931,7 +1063,11 @@ unsafe fn session_invoke_in_frame(
     request: SessionInvokeRequest,
     completion: SessionInvokeCompletion,
     frame: crate::runtime::CoordinateFrame,
-    #[cfg(target_os = "macos")] native_request: Option<NativeRequest>,
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    native_request: Option<NativeRequest>,
 ) -> CuaDriverStatus {
     let SessionInvokeRequest {
         name,
@@ -993,25 +1129,58 @@ unsafe fn session_invoke_in_frame(
             executor,
             async move {
                 let invocation = session.invoke_in_frame(&name, arguments, frame);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(
+                    target_os = "macos",
+                    all(target_os = "linux", not(target_env = "musl"))
+                ))]
                 let result = match native_request {
-                    Some(NativeRequest::WindowCapture(prepared)) => {
-                        platform_macos::capture::with_frozen_window_capture(prepared, invocation)
-                            .await
-                    }
-                    Some(NativeRequest::PageScroll(request)) => {
-                        platform_macos::input::page_scroll::with_native_page_scroll(
-                            request, invocation,
+                    Some(request) => {
+                        let (profile, original_input) = request.recording_input();
+                        let invocation = async move {
+                            match request {
+                                #[cfg(target_os = "macos")]
+                                NativeRequest::WindowCapture(prepared) => {
+                                    platform_macos::capture::with_frozen_window_capture(
+                                        prepared, invocation,
+                                    )
+                                    .await
+                                }
+                                #[cfg(target_os = "macos")]
+                                NativeRequest::PageScroll(request) => {
+                                    platform_macos::input::page_scroll::with_native_page_scroll(
+                                        request, invocation,
+                                    )
+                                    .await
+                                }
+                                #[cfg(target_os = "macos")]
+                                NativeRequest::Move(request) => {
+                                    platform_macos::input::native_move::with_native_move(
+                                        request, invocation,
+                                    )
+                                    .await
+                                }
+                                #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+                                NativeRequest::LinuxClick(request) => {
+                                    platform_linux::input::native_click::with_native_click(
+                                        request, invocation,
+                                    )
+                                    .await
+                                }
+                            }
+                        };
+                        cua_driver_core::recording::with_unreplayable_native_input(
+                            profile,
+                            original_input,
+                            invocation,
                         )
                         .await
                     }
-                    Some(NativeRequest::Move(request)) => {
-                        platform_macos::input::native_move::with_native_move(request, invocation)
-                            .await
-                    }
                     None => invocation.await,
                 };
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(
+                    target_os = "macos",
+                    all(target_os = "linux", not(target_env = "musl"))
+                )))]
                 let result = invocation.await;
                 let result = result.ok_or_else(|| {
                     AbiFailure::new(
@@ -1628,7 +1797,10 @@ impl NativeAbiSession {
             name,
             arguments,
             crate::runtime::CoordinateFrame::Screenshot,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(
+                target_os = "macos",
+                all(target_os = "linux", not(target_env = "musl"))
+            ))]
             None,
         )
         .await
@@ -1643,7 +1815,10 @@ impl NativeAbiSession {
             name,
             arguments,
             crate::runtime::CoordinateFrame::NativeWindow,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(
+                target_os = "macos",
+                all(target_os = "linux", not(target_env = "musl"))
+            ))]
             None,
         )
         .await
@@ -1694,12 +1869,31 @@ impl NativeAbiSession {
         .await
     }
 
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub(crate) async fn invoke_native_click(
+        &self,
+        arguments: Value,
+        request: platform_linux::input::native_click::NativeClickRequest,
+    ) -> Result<Value, DriverError> {
+        self.invoke_in_frame(
+            "click",
+            arguments,
+            crate::runtime::CoordinateFrame::NativeWindow,
+            Some(NativeRequest::LinuxClick(request)),
+        )
+        .await
+    }
+
     async fn invoke_in_frame(
         &self,
         name: &str,
         arguments: Value,
         frame: crate::runtime::CoordinateFrame,
-        #[cfg(target_os = "macos")] native_request: Option<NativeRequest>,
+        #[cfg(any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "musl"))
+        ))]
+        native_request: Option<NativeRequest>,
     ) -> Result<Value, DriverError> {
         let arguments = serde_json::to_vec(&arguments).map_err(|error| DriverError::Protocol {
             reason: format!("serialize {name} session ABI arguments: {error}"),
@@ -1719,7 +1913,10 @@ impl NativeAbiSession {
             let mut operation = ptr::null_mut();
             let mut error = CuaDriverBuffer::empty();
             let public_entry = frame == crate::runtime::CoordinateFrame::Screenshot;
-            #[cfg(target_os = "macos")]
+            #[cfg(any(
+                target_os = "macos",
+                all(target_os = "linux", not(target_env = "musl"))
+            ))]
             let public_entry = public_entry && native_request.is_none();
             let status = unsafe {
                 if public_entry {
@@ -1752,7 +1949,10 @@ impl NativeAbiSession {
                             out_error: &mut error,
                         },
                         frame,
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(
+                            target_os = "macos",
+                            all(target_os = "linux", not(target_env = "musl"))
+                        ))]
                         native_request,
                     )
                 }
@@ -1845,6 +2045,166 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
 pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn native_click_recording_keeps_the_real_count_and_exact_typed_target() {
+        use platform_linux::input::native_click::{NativeClickButton, NativeClickRequest};
+
+        for count in [0, 4, u32::MAX] {
+            let request = NativeRequest::LinuxClick(NativeClickRequest {
+                pid: 123,
+                window_id: 456,
+                point: [i16::MIN, i16::MAX],
+                button: NativeClickButton::Right,
+                count,
+            });
+            let (profile, original_input) = request.recording_input();
+            assert_eq!(profile, "linux_native_click");
+            assert_eq!(
+                original_input,
+                serde_json::json!({
+                    "pid":123,"window_id":456,"point":[i16::MIN,i16::MAX],
+                    "point_unit":"window_local_physical_pixels","button":"right","count":count,
+                })
+            );
+            let encoded = serde_json::to_string(&original_input).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&encoded).unwrap(),
+                original_input
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_recording_floats_keep_exact_invalid_bits_instead_of_null() {
+        for value in [0.12345678901234569, -0.0] {
+            assert_eq!(
+                native_recording_f64(value).as_f64().unwrap().to_bits(),
+                value.to_bits()
+            );
+        }
+        for bits in [
+            0x7ff8_0000_0000_0042,
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+        ] {
+            let recorded = native_recording_f64(f64::from_bits(bits));
+            assert_eq!(
+                recorded,
+                serde_json::json!({"non_finite_bits":format!("0x{bits:016x}")})
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_recording_keeps_the_event_recipe_and_distinct_point_frames() {
+        use platform_macos::input::{
+            native_move::NativeMoveRequest,
+            page_scroll::{NativePageScrollRequest, PageDirection, PageScrollRequest},
+        };
+
+        let mut movement = NativeMoveRequest {
+            pid: 123,
+            window_id: 456,
+            screen_point: Default::default(),
+            window_bounds: Default::default(),
+            window_uses_flipped_coordinates: true,
+            native_window_pixels: [37.5, 25.0],
+        };
+        movement.screen_point.x = -1.25;
+        movement.screen_point.y = 42.5;
+        movement.window_bounds.size.width = 640.0;
+        let (profile, recorded) = NativeRequest::Move(movement).recording_input();
+        assert_eq!(profile, "macos_native_move");
+        assert_eq!(
+            recorded["native_window_pixels"],
+            serde_json::json!([37.5, 25.0])
+        );
+        assert_eq!(recorded["screen_point"], serde_json::json!([-1.25, 42.5]));
+        assert_eq!(
+            recorded["window_bounds"],
+            serde_json::json!([0.0, 0.0, 640.0, 0.0])
+        );
+        assert_eq!(recorded["window_uses_flipped_coordinates"], true);
+
+        let (profile, recorded) = NativeRequest::PageScroll(NativePageScrollRequest {
+            event: PageScrollRequest {
+                pid: 123,
+                window_id: 456,
+                screen_point: movement.screen_point,
+                window_bounds: movement.window_bounds,
+                window_uses_flipped_coordinates: true,
+                direction: PageDirection::Left,
+                pages: 51.25,
+                extent: 400.125,
+            },
+            native_window_pixels: movement.native_window_pixels,
+        })
+        .recording_input();
+        assert_eq!(profile, "macos_native_pages");
+        assert_eq!(recorded["direction"], "left");
+        assert_eq!(recorded["pages"], 51.25);
+        assert_eq!(recorded["extent"], 400.125);
+        assert_eq!(recorded["screen_point"], serde_json::json!([-1.25, 42.5]));
+        assert_eq!(
+            recorded["native_window_pixels"],
+            serde_json::json!([37.5, 25.0])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_capture_recording_contains_only_existing_scalar_configuration() {
+        let prepared = platform_macos::capture::FrozenWindowCapture::source_defaults(
+            platform_macos::geometry::NativeWindowGeometry {
+                pid: 123,
+                window_id: 456,
+                layer: 0,
+                bounds: platform_macos::windows::WindowBounds {
+                    x: f64::from_bits(0x7ff8_0000_0000_0042),
+                    y: 42.5,
+                    width: 640.0,
+                    height: 480.0,
+                },
+                native_scale: 2.0,
+            },
+            [320.0, 240.0],
+        )
+        .unwrap();
+        let (profile, recorded) = NativeRequest::WindowCapture(prepared).recording_input();
+        assert_eq!(profile, "macos_native_capture");
+        let keys: std::collections::BTreeSet<_> = recorded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::BTreeSet<_> = [
+            "geometry",
+            "requested_image_size",
+            "output_dimensions",
+            "encoding",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            recorded["geometry"]["bounds"]["x"],
+            serde_json::json!({"non_finite_bits":"0x7ff8000000000042"})
+        );
+        assert_eq!(
+            recorded["requested_image_size"],
+            serde_json::json!([320.0, 240.0])
+        );
+        assert_eq!(recorded["output_dimensions"], serde_json::json!([320, 240]));
+        assert_eq!(
+            recorded["encoding"],
+            serde_json::json!({"kind":"jpeg","quality":0.8})
+        );
+    }
 
     pub(crate) fn own_runtime_session(session: Arc<RuntimeSession>) -> NativeAbiSession {
         // Reuse a real fixture's immutable authorization binding. Only handle

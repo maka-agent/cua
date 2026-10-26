@@ -9,7 +9,9 @@
 //!   { tool, arguments, result_summary, result_error, timestamp,
 //!     t_ms_from_session_start, t_start_ms_from_session_start }
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +22,61 @@ use serde_json::Value;
 
 use crate::cursor_sampler::CursorSampler;
 use crate::video::{self, VideoBackend, VideoMetadata};
+
+tokio::task_local! {
+    static NATIVE_INPUT_RECORDING: RefCell<Option<NativeInputRecording>>;
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct NativeInputRecording {
+    profile: &'static str,
+    original_input: Value,
+    replay: ReplayDisposition,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ReplayDisposition {
+    Unavailable { code: &'static str },
+}
+
+pub(crate) const NATIVE_INPUT_REPLAY_ERROR: &str =
+    "native_input_requires_trusted_sdk: native input requires its original trusted SDK request";
+
+/// Retain a trusted native request without treating its generic arguments as replayable.
+///
+/// The descriptor is consumed by the first recording reservation in this
+/// invocation; nested ordinary calls do not inherit it. Callers must supply
+/// only the request's non-sensitive scalar and geometry fields, applying the
+/// ordinary recording redactions before calling this helper. Image bytes,
+/// credentials, and arbitrary application text must never enter the descriptor.
+/// This in-memory scope changes neither tool arguments nor input authority.
+#[doc(hidden)]
+pub async fn with_unreplayable_native_input<F: Future>(
+    profile: &'static str,
+    original_input: Value,
+    operation: F,
+) -> F::Output {
+    NATIVE_INPUT_RECORDING
+        .scope(
+            RefCell::new(Some(NativeInputRecording {
+                profile,
+                original_input,
+                replay: ReplayDisposition::Unavailable {
+                    code: "native_input_requires_trusted_sdk",
+                },
+            })),
+            operation,
+        )
+        .await
+}
+
+fn take_native_input_recording() -> Option<NativeInputRecording> {
+    NATIVE_INPUT_RECORDING
+        .try_with(|record| record.borrow_mut().take())
+        .ok()
+        .flatten()
+}
 
 // ── Platform screenshot callback ─────────────────────────────────────────────
 //
@@ -437,6 +494,7 @@ pub struct PendingTurn {
     turn_dir: PathBuf,
     tool_name: String,
     args: Value,
+    native_input: Option<NativeInputRecording>,
     start_ms: u64,
     session_start_ms: u64,
     window_id: Option<u64>,
@@ -894,6 +952,9 @@ impl RecordingSession {
         capture_visual_state: bool,
         predicted_refusal: Option<&'static str>,
     ) -> Option<PendingTurn> {
+        // Consume even when recording is disabled or owned by another caller,
+        // so a nested call cannot claim the outer native request's provenance.
+        let native_input = take_native_input_recording();
         let (turn_dir, session_start_ms, generation, state_budget) = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.enabled {
@@ -969,6 +1030,7 @@ impl RecordingSession {
             turn_dir,
             tool_name: tool_name.to_owned(),
             args,
+            native_input,
             start_ms,
             session_start_ms,
             window_id,
@@ -1367,6 +1429,7 @@ fn write_turn_with_after(
         turn_dir,
         tool_name,
         args,
+        native_input,
         start_ms,
         session_start_ms,
         window_id: _,
@@ -1442,6 +1505,9 @@ fn write_turn_with_after(
         "t_ms_from_session_start": now.saturating_sub(session_start_ms),
         "t_start_ms_from_session_start": start_ms.saturating_sub(session_start_ms),
     });
+    if let Some(native_input) = native_input {
+        payload["native_input"] = serde_json::to_value(native_input)?;
+    }
     if let Some((cx, cy)) = click_point {
         payload["click_point"] = serde_json::json!({"x": cx, "y": cy});
     }
@@ -1601,6 +1667,157 @@ fn validate_video_metadata(meta: VideoMetadata) -> anyhow::Result<VideoMetadata>
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn native_input_keeps_requested_counts_without_enabling_private_capture() {
+        use crate::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+
+        for (count, effect, completed, is_error) in [
+            (0, ActionEffect::Unverifiable, Some(0), false),
+            (4, ActionEffect::Unverifiable, Some(4), false),
+            (4, ActionEffect::Partial, Some(2), true),
+            (4, ActionEffect::Refused, None, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let session = RecordingSession::new();
+            {
+                let mut inner = session.inner.lock().unwrap();
+                inner.enabled = true;
+                inner.output_dir = Some(directory.path().to_owned());
+            }
+            let original_input = serde_json::json!({
+                "pid": 1, "window_id": 2, "point": [37, 41],
+                "button": "left", "count": count,
+            });
+            let mut record = ActionExecutionRecord::builder(
+                effect,
+                ActionTransport::LinuxXSendEvent,
+                RequestedDelivery::Background,
+            );
+            if let Some(completed) = completed {
+                record = record
+                    .actual_delivery(ActualDelivery::Background)
+                    .delivered_count(completed);
+            }
+            let record = record.build().unwrap();
+            with_unreplayable_native_input("linux_native_click", original_input.clone(), async {
+                tokio::task::yield_now().await;
+                let pending = session
+                    .begin_private_turn(
+                        "click",
+                        &serde_json::json!({
+                            "pid": 1, "window_id": 2, "x": 37, "y": 41,
+                            "count": 1, "_session_id": "private-lifecycle",
+                        }),
+                        0,
+                        RecordingCaller::default(),
+                    )
+                    .unwrap();
+                assert!(take_native_input_recording().is_none());
+                session.finish_turn_with_outcome(
+                    pending,
+                    "native outcome",
+                    Some(&record),
+                    is_error,
+                );
+            })
+            .await;
+
+            let turn = directory.path().join("turn-00001");
+            let action: Value =
+                serde_json::from_slice(&std::fs::read(turn.join("action.json")).unwrap()).unwrap();
+            assert_eq!(action["arguments"]["count"], 1);
+            assert!(action["arguments"].get("_session_id").is_none());
+            assert_eq!(action["result_error"], is_error);
+            assert_eq!(action["action_truth"], record.debug_json());
+            assert_eq!(
+                action["native_input"],
+                serde_json::json!({
+                    "profile": "linux_native_click", "original_input": original_input,
+                    "replay": {
+                        "status": "unavailable", "code": "native_input_requires_trusted_sdk",
+                    },
+                }),
+            );
+            for name in [
+                "before.png",
+                "after.png",
+                "screenshot.png",
+                "click.png",
+                "before_state.json",
+                "after_state.json",
+                "app_state.json",
+            ] {
+                assert!(!turn.join(name).exists(), "{name}");
+            }
+            let evidence: Value =
+                serde_json::from_slice(&std::fs::read(turn.join("evidence.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                evidence["before"]["screenshot"]["classification"],
+                "privacy_suppressed"
+            );
+            assert_eq!(
+                evidence["after"]["screenshot"]["classification"],
+                "privacy_suppressed"
+            );
+            assert!(take_native_input_recording().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_input_is_single_use_and_scoped_to_the_recording_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = RecordingSession::new();
+        {
+            let mut inner = session.inner.lock().unwrap();
+            inner.enabled = true;
+            inner.output_dir = Some(directory.path().to_owned());
+            inner.owner = Some("owner".into());
+        }
+        with_unreplayable_native_input(
+            "linux_native_click",
+            serde_json::json!({"count": 4}),
+            async {
+                assert!(session
+                    .begin_private_turn(
+                        "click",
+                        &serde_json::json!({}),
+                        0,
+                        RecordingCaller::default()
+                    )
+                    .is_none());
+                assert!(take_native_input_recording().is_none());
+            },
+        )
+        .await;
+        assert!(take_native_input_recording().is_none());
+        assert!(!directory.path().join("turn-00001").exists());
+
+        let (first, second) = tokio::join!(
+            with_unreplayable_native_input(
+                "linux_native_click",
+                serde_json::json!({"count": 0}),
+                async {
+                    tokio::task::yield_now().await;
+                    take_native_input_recording().unwrap().original_input
+                }
+            ),
+            with_unreplayable_native_input(
+                "macos_native_move",
+                serde_json::json!({"point": [1, 2]}),
+                async {
+                    tokio::task::yield_now().await;
+                    take_native_input_recording().unwrap().original_input
+                }
+            ),
+        );
+        assert_eq!(first, serde_json::json!({"count": 0}));
+        assert_eq!(second, serde_json::json!({"point": [1, 2]}));
+        assert!(take_native_input_recording().is_none());
+    }
+
     #[test]
     fn pixel_mappers_follow_registry_lifetimes_and_concurrent_runtime_state() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1684,6 +1901,7 @@ mod tests {
             turn_dir: root.to_path_buf(),
             tool_name: "click".into(),
             args: serde_json::json!({"pid": 901, "window_id": 902, "element_token": "s00000001:3"}),
+            native_input: None,
             start_ms: 0,
             session_start_ms: 0,
             window_id: Some(902),
@@ -2070,6 +2288,7 @@ mod tests {
                 turn_dir: root.path().to_path_buf(),
                 tool_name: "click".into(),
                 args: serde_json::json!({"pid":1,"element_token": "s00000001:3"}),
+                native_input: None,
                 start_ms: 0,
                 session_start_ms: 0,
                 window_id: None,
@@ -2137,6 +2356,7 @@ mod tests {
                         turn_dir: root.path().to_path_buf(),
                         tool_name: "click".into(),
                         args,
+                        native_input: None,
                         start_ms: 0,
                         session_start_ms: 0,
                         window_id: None,
@@ -2599,6 +2819,7 @@ mod tests {
             turn_dir: root.to_path_buf(),
             tool_name: "click".into(),
             args: serde_json::json!({"pid": 1, "window_id": 2, "x": 0, "y": 0}),
+            native_input: None,
             start_ms: 0,
             session_start_ms: 0,
             window_id: Some(2),

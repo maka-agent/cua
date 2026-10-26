@@ -1643,6 +1643,20 @@ fn native_move_arguments(
     }))
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn native_click_arguments(
+    request: &platform_linux::input::native_click::NativeClickRequest,
+) -> Value {
+    serde_json::json!({
+        "pid":request.pid,"window_id":request.window_id,
+        "scope":"window","delivery_mode":"background",
+        "x":request.point[0],"y":request.point[1],"button":request.button.as_str(),
+        // The ordinary click contract stays 1..=3. The private typed request
+        // carries the native u32 count, including zero, across this exact call.
+        "count":1,
+    })
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl CuaDriverSession {
     pub async fn call_tool(
@@ -1721,6 +1735,29 @@ impl CuaDriverSession {
 }
 
 impl CuaDriverSession {
+    /// Send native Linux clicks through this exact authorized window binding.
+    ///
+    /// This Rust-only Embedded entry carries client-local i16 coordinates and
+    /// the original u32 count without changing the ordinary click schema. The
+    /// private request supplies data, never authority; target ownership and
+    /// live client bounds are checked even when the count is zero.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub async fn click_native_window(
+        &self,
+        request: platform_linux::input::native_click::NativeClickRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = native_click_arguments(&request);
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                "click",
+                session.invoke_native_click(arguments, request).await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native Linux click input requires an embedded trusted session".into(),
+            }),
+        }
+    }
+
     /// Observe one host-prepared macOS source frame through this exact session.
     /// The request supplies data, never authority. This Rust-only method uses
     /// the ordinary get_window_state authorization and operation lifecycle.
@@ -2293,6 +2330,30 @@ mod snapshot_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn native_click_arguments_bind_the_target_and_keep_the_generic_count_valid() {
+        use platform_linux::input::native_click::{NativeClickButton, NativeClickRequest};
+
+        for count in [0, 4, u32::MAX] {
+            let request = NativeClickRequest {
+                pid: 123,
+                window_id: 456,
+                point: [i16::MIN, i16::MAX],
+                button: NativeClickButton::Right,
+                count,
+            };
+            assert_eq!(
+                native_click_arguments(&request),
+                serde_json::json!({
+                    "pid":123,"window_id":456,"scope":"window","delivery_mode":"background",
+                    "x":i16::MIN,"y":i16::MAX,"button":"right","count":1,
+                })
+            );
+            assert_eq!(request.count, count);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn native_move_arguments_use_the_authorized_typed_window_target_and_true_pixels() {

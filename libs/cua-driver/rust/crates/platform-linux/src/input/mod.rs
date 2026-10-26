@@ -20,6 +20,8 @@ pub mod foreground;
 pub mod interactive;
 mod mpx_keyboard;
 mod mpx_owner;
+/// Exact-window native clicks for trusted Embedded SDK calls.
+pub mod native_click;
 /// One-shot targeted pointer/keyboard delivery with explicit
 /// auto/background/foreground semantics (embedders).
 pub mod targeted;
@@ -56,10 +58,11 @@ const PING_TIMEOUT: Duration = Duration::from_secs(1);
 static PING_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Copy)]
-struct ButtonTiming {
+struct ButtonTiming<'a> {
     hold_ms: u64,
     gap_ms: u64,
     native_wheel: bool,
+    native_click: Option<&'a native_click::NativeClickContext>,
 }
 
 #[derive(Debug)]
@@ -117,16 +120,21 @@ fn finish_button_sequence(
     })
 }
 
-fn native_wheel_clock() -> Result<(u32, Instant)> {
-    // Reuse the existing server-time probe. Native window wheel events use
-    // server time plus elapsed monotonic time, rather than CurrentTime(0).
+fn native_window_clock(root: Option<Window>) -> Result<(u32, Instant)> {
+    // Native window events use server time plus elapsed monotonic time. The
+    // click profile pins its probe to the connection's selected screen root;
+    // the existing wheel profile retains its default-screen probe.
     unsafe {
         let display = open_display()?;
-        let time = x_server_time(display) as u32;
+        let time = match root {
+            Some(root) => x_server_time_at_root(display, root.into()),
+            None => x_server_time(display),
+        } as u32;
         let observed = Instant::now();
         x11::xlib::XCloseDisplay(display);
         if time == 0 {
-            bail!("X11 did not return a wheel event timestamp");
+            let profile = if root.is_some() { "click" } else { "wheel" };
+            bail!("X11 did not return a {profile} event timestamp");
         }
         Ok((time, observed))
     }
@@ -1454,8 +1462,15 @@ fn ewmh_active_window(display: *mut x11::xlib::Display) -> Option<x11::xlib::Win
 /// EWMH activation requests stamped CurrentTime(0) lose to the WM's
 /// focus-stealing prevention whenever any newer input exists.
 fn x_server_time(display: *mut x11::xlib::Display) -> x11::xlib::Time {
+    let root = unsafe { x11::xlib::XDefaultRootWindow(display) };
+    x_server_time_at_root(display, root)
+}
+
+fn x_server_time_at_root(
+    display: *mut x11::xlib::Display,
+    root: x11::xlib::Window,
+) -> x11::xlib::Time {
     unsafe {
-        let root = x11::xlib::XDefaultRootWindow(display);
         let win = x11::xlib::XCreateSimpleWindow(display, root, -1, -1, 1, 1, 0, 0, 0);
         x11::xlib::XSelectInput(display, win, x11::xlib::PropertyChangeMask);
         let atom = x11::xlib::XInternAtom(display, c"CUA_TIME_PROBE".as_ptr(), x11::xlib::False);
@@ -3280,7 +3295,7 @@ fn click_event_target(path: &[(Window, i32, i32, EventMask)]) -> (Window, i32, i
 }
 
 fn build_event_target(
-    conn: &RustConnection,
+    (conn, root): (&RustConnection, Window),
     xid: u64,
     x: i32,
     y: i32,
@@ -3289,8 +3304,10 @@ fn build_event_target(
     local_y: i32,
 ) -> Result<EventTarget> {
     let top = xid as Window;
-    let root = conn.setup().roots[0].root;
     let root_pos = conn.translate_coordinates(top, root, 0, 0)?.reply()?;
+    if !root_pos.same_screen {
+        bail!("input target window is on a different X11 screen");
+    }
     Ok(EventTarget {
         window,
         local_x: local_x as i16,
@@ -3300,14 +3317,19 @@ fn build_event_target(
     })
 }
 
-fn resolve_event_target(conn: &RustConnection, xid: u64, x: i32, y: i32) -> Result<EventTarget> {
+fn resolve_event_target(
+    (conn, root): (&RustConnection, Window),
+    xid: u64,
+    x: i32,
+    y: i32,
+) -> Result<EventTarget> {
     let top = xid as Window;
     let (window, local_x, local_y) = deepest_child_at_point(conn, top, x, y)?;
-    build_event_target(conn, xid, x, y, window, local_x, local_y)
+    build_event_target((conn, root), xid, x, y, window, local_x, local_y)
 }
 
 fn resolve_click_event_target(
-    conn: &RustConnection,
+    (conn, root): (&RustConnection, Window),
     xid: u64,
     x: i32,
     y: i32,
@@ -3319,7 +3341,7 @@ fn resolve_click_event_target(
     // window: splitting release onto a different geometric leaf does not form a
     // coherent toolkit click sequence.
     let target = click_event_target(&path);
-    build_event_target(conn, xid, x, y, target.0, target.1, target.2)
+    build_event_target((conn, root), xid, x, y, target.0, target.1, target.2)
 }
 
 fn button_state_mask(button: u8) -> KeyButMask {
@@ -3351,12 +3373,27 @@ fn connect_x11_for_input() -> Result<(RustConnection, usize)> {
     })
 }
 
+fn connect_x11_with_root() -> Result<(RustConnection, Window)> {
+    let (conn, screen) = connect_x11_for_input()?;
+    let root = conn.setup().roots[screen].root;
+    Ok((conn, root))
+}
+
+fn ensure_window_on_root(conn: &RustConnection, root: Window, window: Window) -> Result<()> {
+    let actual = conn.get_geometry(window)?.reply()?.root;
+    if actual != root {
+        bail!("input target window is on a different X11 screen");
+    }
+    Ok(())
+}
+
 /// Send a synthetic FocusIn event to a window without changing the actual X11 input focus.
 /// This can trigger toolkit-level focus handlers (e.g., Qt5's AT-SPI bridge) without
 /// moving the window manager's active window. Use with send_focus_out to restore state.
 pub fn send_focus_in(xid: u64) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
+    let (conn, root) = connect_x11_with_root()?;
     let window = xid as u32;
+    ensure_window_on_root(&conn, root, window)?;
 
     let focus_in = FocusInEvent {
         response_type: FOCUS_IN_EVENT,
@@ -3373,8 +3410,9 @@ pub fn send_focus_in(xid: u64) -> Result<()> {
 
 /// Send a synthetic FocusOut event to restore focus state after send_focus_in.
 pub fn send_focus_out(xid: u64) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
+    let (conn, root) = connect_x11_with_root()?;
     let window = xid as u32;
+    ensure_window_on_root(&conn, root, window)?;
 
     let focus_out = FocusOutEvent {
         response_type: FOCUS_OUT_EVENT,
@@ -3426,6 +3464,7 @@ pub fn send_click_with_modifiers(
             hold_ms: CLICK_DELAY_MS,
             gap_ms: 80,
             native_wheel: false,
+            native_click: None,
         },
     )
 }
@@ -3437,18 +3476,53 @@ fn send_click_with_timing(
     count: usize,
     button: u8,
     modifiers: &[&str],
-    timing: ButtonTiming,
+    timing: ButtonTiming<'_>,
 ) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
-    let root = conn.setup().roots[0].root;
+    let (conn, root) = connect_x11_with_root()?;
+    send_button_sequence_on_root((&conn, root), xid, [x, y], count, button, modifiers, timing)
+}
+
+fn send_button_sequence(
+    conn: &RustConnection,
+    xid: u64,
+    point: [i32; 2],
+    count: usize,
+    button: u8,
+    modifiers: &[&str],
+    timing: ButtonTiming<'_>,
+) -> Result<()> {
+    let root = timing
+        .native_click
+        .context("native button sequence requires its selected screen context")?
+        .root();
+    send_button_sequence_on_root((conn, root), xid, point, count, button, modifiers, timing)
+}
+
+fn send_button_sequence_on_root(
+    (conn, root): (&RustConnection, Window),
+    xid: u64,
+    [x, y]: [i32; 2],
+    count: usize,
+    button: u8,
+    modifiers: &[&str],
+    timing: ButtonTiming<'_>,
+) -> Result<()> {
     let modifier_state = modifiers_to_state(modifiers);
-    let clock = timing.native_wheel.then(native_wheel_clock).transpose()?;
+    let native_window = timing.native_wheel || timing.native_click.is_some();
+    let clock = if let Some(context) = timing.native_click {
+        Some(context.clock())
+    } else {
+        timing
+            .native_wheel
+            .then(|| native_window_clock(None))
+            .transpose()?
+    };
     let timestamp = || {
         clock.map_or(x11rb::CURRENT_TIME, |(base, observed)| {
             base.wrapping_add(observed.elapsed().as_millis() as u32)
         })
     };
-    let mask = if timing.native_wheel {
+    let mask = if native_window {
         EventMask::NO_EVENT
     } else {
         EventMask::BUTTON_PRESS
@@ -3458,10 +3532,15 @@ fn send_click_with_timing(
     let mut completed = 0;
     let result = (|| -> Result<()> {
         for _ in 0..count {
-            let target = if timing.native_wheel {
-                build_event_target(&conn, xid, x, y, xid as Window, x, y)?
+            if let Some(context) = timing.native_click {
+                context.check()?;
+            }
+            let target = if let Some(context) = timing.native_click {
+                context.move_to(conn)?
+            } else if timing.native_wheel {
+                build_event_target((conn, root), xid, x, y, xid as Window, x, y)?
             } else {
-                resolve_click_event_target(&conn, xid, x, y)?
+                resolve_click_event_target((conn, root), xid, x, y)?
             };
             let press = ButtonPressEvent {
                 response_type: BUTTON_PRESS_EVENT,
@@ -3497,17 +3576,29 @@ fn send_click_with_timing(
                 same_screen: true,
             };
 
-            // The event mask selects recipients independently of the payload type.
-            // Select the press client for both payloads so a press-only toolkit
-            // binding (such as Tk's <Button-1>) receives one coherent click.
+            // The ordinary route selects the press client for both payloads
+            // so a press-only toolkit binding receives one coherent click.
+            // Native profiles address their selected window with NO_EVENT.
             attempted = true;
+            if let Some(context) = timing.native_click {
+                context.mark_attempted();
+            }
             conn.send_event(timing.native_wheel, target.window, mask, press)?
                 .check()?;
+            if let Some(context) = timing.native_click {
+                context.mark_pressed(button);
+            }
             sleep(Duration::from_millis(timing.hold_ms));
             release.time = timestamp();
             conn.send_event(timing.native_wheel, target.window, mask, release)?
                 .check()?;
+            if let Some(context) = timing.native_click {
+                context.mark_released();
+            }
             completed += 1;
+            if let Some(context) = timing.native_click {
+                context.mark_completed();
+            }
 
             if count > 1 && timing.gap_ms > 0 {
                 sleep(Duration::from_millis(timing.gap_ms));
@@ -3516,7 +3607,7 @@ fn send_click_with_timing(
         Ok(())
     })();
     finish_button_sequence(result, timing.native_wheel, attempted, completed, false)?;
-    settle_synthetic_events(&conn);
+    settle_synthetic_events(conn);
     Ok(())
 }
 
@@ -3534,6 +3625,7 @@ pub fn send_scroll_window(xid: u64, x: i32, y: i32, direction: &str, detents: us
             hold_ms: WHEEL_HOLD_MS,
             gap_ms: 0,
             native_wheel: true,
+            native_click: None,
         },
     )
 }
@@ -3562,15 +3654,14 @@ pub fn send_drag(
     button: u8,
 ) -> Result<()> {
     let ((from_x, from_y), (to_x, to_y)) = (from, to);
-    let (conn, _) = connect_x11_for_input()?;
-    let root = conn.setup().roots[0].root;
+    let (conn, root) = connect_x11_with_root()?;
     let steps = steps.max(1);
     let step_delay_ms = if steps > 1 {
         duration_ms / steps as u64
     } else {
         duration_ms
     };
-    let press_target = resolve_event_target(&conn, xid, from_x, from_y)?;
+    let press_target = resolve_event_target((&conn, root), xid, from_x, from_y)?;
 
     // ButtonPress at start.
     let press = ButtonPressEvent {
@@ -3597,7 +3688,7 @@ pub fn send_drag(
         let t = i as f64 / steps as f64;
         let ix = from_x + ((to_x - from_x) as f64 * t).round() as i32;
         let iy = from_y + ((to_y - from_y) as f64 * t).round() as i32;
-        let target = resolve_event_target(&conn, xid, ix, iy)?;
+        let target = resolve_event_target((&conn, root), xid, ix, iy)?;
         let motion = MotionNotifyEvent {
             response_type: MOTION_NOTIFY_EVENT,
             detail: Motion::NORMAL,
@@ -3621,7 +3712,7 @@ pub fn send_drag(
     }
 
     // ButtonRelease at end.
-    let release_target = resolve_event_target(&conn, xid, to_x, to_y)?;
+    let release_target = resolve_event_target((&conn, root), xid, to_x, to_y)?;
     let release = ButtonReleaseEvent {
         response_type: BUTTON_RELEASE_EVENT,
         detail: button,
@@ -3649,9 +3740,8 @@ pub fn send_drag(
 }
 
 pub fn send_button_down(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
-    let root = conn.setup().roots[0].root;
-    let target = resolve_event_target(&conn, xid, x, y)?;
+    let (conn, root) = connect_x11_with_root()?;
+    let target = resolve_event_target((&conn, root), xid, x, y)?;
     let press = ButtonPressEvent {
         response_type: BUTTON_PRESS_EVENT,
         detail: button,
@@ -3674,9 +3764,8 @@ pub fn send_button_down(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
 }
 
 pub fn send_motion(xid: u64, x: i32, y: i32, button: Option<u8>) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
-    let root = conn.setup().roots[0].root;
-    let target = resolve_event_target(&conn, xid, x, y)?;
+    let (conn, root) = connect_x11_with_root()?;
+    let target = resolve_event_target((&conn, root), xid, x, y)?;
     let motion = MotionNotifyEvent {
         response_type: MOTION_NOTIFY_EVENT,
         detail: Motion::NORMAL,
@@ -3701,9 +3790,8 @@ pub fn send_motion(xid: u64, x: i32, y: i32, button: Option<u8>) -> Result<()> {
 }
 
 pub fn send_button_up(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
-    let root = conn.setup().roots[0].root;
-    let target = resolve_event_target(&conn, xid, x, y)?;
+    let (conn, root) = connect_x11_with_root()?;
+    let target = resolve_event_target((&conn, root), xid, x, y)?;
     let release = ButtonReleaseEvent {
         response_type: BUTTON_RELEASE_EVENT,
         detail: button,
@@ -3835,11 +3923,11 @@ fn type_text_in_spare_batches<G>(
 
 /// Type a string with an additional `inter_char_ms` delay between each character.
 pub fn send_type_text_with_delay(xid: u64, text: &str, inter_char_ms: u64) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
+    let (conn, root) = connect_x11_with_root()?;
     let window = xid as u32;
-    let root = conn.setup().roots[0].root;
+    ensure_window_on_root(&conn, root, window)?;
     let mapping = conn.get_keyboard_mapping(8, 248)?.reply()?;
-    let client = RefCell::new(TextClient::new(&conn, Some(window)));
+    let client = RefCell::new(TextClient::new(&conn, Some((root, window))));
     type_text_in_spare_batches(
         text,
         &mapping,
@@ -3920,6 +4008,8 @@ pub fn send_type_text_xtest(text: &str) -> Result<()> {
         .get(..kpm)
         .and_then(|s| s.iter().copied().find(|&k| k != 0))
         .unwrap_or(50);
+    // XTest follows global keyboard focus. Only acknowledgement uses that
+    // exact recipient's root; no input is rerouted to another screen.
     let client = RefCell::new(TextClient::new(&conn, None));
     type_text_in_spare_batches(
         text,
@@ -4087,6 +4177,7 @@ pub fn send_click_xtest_desktop_with_modifiers(
             hold_ms: CLICK_DELAY_MS,
             gap_ms: DOUBLE_CLICK_DELAY_MS,
             native_wheel: false,
+            native_click: None,
         },
     )
 }
@@ -4097,7 +4188,7 @@ fn send_click_xtest_desktop_with_timing(
     button: u8,
     count: usize,
     modifiers: &[&str],
-    timing: ButtonTiming,
+    timing: ButtonTiming<'_>,
 ) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
@@ -4204,6 +4295,7 @@ pub fn send_scroll_xtest_desktop(x: i32, y: i32, direction: &str, amount: usize)
             hold_ms: WHEEL_HOLD_MS,
             gap_ms: 0,
             native_wheel: true,
+            native_click: None,
         },
     )
 }
@@ -4372,12 +4464,12 @@ fn send_key_to_target(
     key: &str,
     modifiers: &[&str],
 ) -> Result<()> {
-    let (conn, _) = connect_x11_for_input()?;
+    let (conn, root) = connect_x11_with_root()?;
+    ensure_window_on_root(&conn, root, xid as Window)?;
     let target = point
-        .map(|(x, y)| resolve_event_target(&conn, xid, x, y))
+        .map(|(x, y)| resolve_event_target((&conn, root), xid, x, y))
         .transpose()?;
     let window = target.map(|target| target.window).unwrap_or(xid as u32);
-    let root = conn.setup().roots[0].root;
 
     // Resolve the named key to a keysym, then to a keycode. On sparse/headless
     // keymaps (e.g. a minimal Xwayland :0) the keysym may have no keycode at all
@@ -4995,8 +5087,20 @@ enum ClientSync {
     Unanswered,
 }
 
+fn ping_root(
+    required: Option<Window>,
+    observed: Option<Window>,
+) -> std::result::Result<Window, ClientSync> {
+    let root = observed.ok_or(ClientSync::Unanswered)?;
+    if required.is_some_and(|required| required != root) {
+        return Err(ClientSync::Unanswered);
+    }
+    Ok(root)
+}
+
 struct TextClient<'a> {
     conn: &'a RustConnection,
+    required_root: Option<Window>,
     target: Option<Window>,
     borrowed: Vec<RemappedKeycode<'a>>,
     sent: Vec<Window>,
@@ -5004,10 +5108,11 @@ struct TextClient<'a> {
 }
 
 impl<'a> TextClient<'a> {
-    fn new(conn: &'a RustConnection, target: Option<Window>) -> Self {
+    fn new(conn: &'a RustConnection, target: Option<(Window, Window)>) -> Self {
         Self {
             conn,
-            target,
+            required_root: target.map(|(root, _)| root),
+            target: target.map(|(_, window)| window),
             borrowed: Vec::new(),
             sent: Vec::new(),
             unanswered: Vec::new(),
@@ -5036,7 +5141,7 @@ impl<'a> TextClient<'a> {
         if self.unanswered.contains(&window) {
             return;
         }
-        if sync_client(self.conn, Some(window)) == ClientSync::Unanswered {
+        if sync_client(self.conn, self.required_root, Some(window)) == ClientSync::Unanswered {
             self.unanswered.push(window);
         }
     }
@@ -5058,7 +5163,29 @@ impl Drop for TextClient<'_> {
     }
 }
 
-fn sync_client(conn: &RustConnection, window: Option<Window>) -> ClientSync {
+fn sync_client(
+    conn: &RustConnection,
+    required_root: Option<Window>,
+    window: Option<Window>,
+) -> ClientSync {
+    let Some(window) = window
+        .filter(|window| *window != x11rb::NONE && *window != u32::from(InputFocus::POINTER_ROOT))
+    else {
+        return ClientSync::Unsupported;
+    };
+    let observed_root = |window| {
+        conn.get_geometry(window)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|geometry| geometry.root)
+    };
+    // Root proof precedes Unsupported protocol exits. A targeted recipient
+    // cannot escape its selected screen just because it does not support ping.
+    let root = match ping_root(required_root, observed_root(window)) {
+        Ok(root) => root,
+        Err(outcome) => return outcome,
+    };
     let atom = |name: &str| {
         conn.intern_atom(false, name.as_bytes())
             .ok()?
@@ -5066,15 +5193,15 @@ fn sync_client(conn: &RustConnection, window: Option<Window>) -> ClientSync {
             .ok()
             .map(|reply| reply.atom)
     };
-    let (Some(window), Some(protocols), Some(ping)) =
-        (window, atom("WM_PROTOCOLS"), atom("_NET_WM_PING"))
-    else {
+    let (Some(protocols), Some(ping)) = (atom("WM_PROTOCOLS"), atom("_NET_WM_PING")) else {
         return ClientSync::Unsupported;
     };
     let Some(window) = ping_window(conn, window, protocols, ping) else {
         return ClientSync::Unsupported;
     };
-    let root = conn.setup().roots[0].root;
+    if let Err(outcome) = ping_root(Some(root), observed_root(window)) {
+        return outcome;
+    }
     let listen = ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY);
     let serial = PING_SERIAL.fetch_add(1, Ordering::Relaxed).max(1);
     let event = ClientMessageEvent::new(32, window, protocols, [ping, serial, window, 0, 0]);
@@ -5093,7 +5220,10 @@ fn sync_client(conn: &RustConnection, window: Option<Window>) -> ClientSync {
                 if pong.type_ == protocols
                     && pong.data.as_data32()[..3] == [ping, serial, window] =>
             {
-                return ClientSync::Confirmed;
+                return match ping_root(Some(root), observed_root(pong.window)) {
+                    Ok(_) => ClientSync::Confirmed,
+                    Err(outcome) => outcome,
+                };
             }
             Ok(Some(_)) => {}
             Ok(None) => sleep(Duration::from_millis(1)),
@@ -5250,10 +5380,30 @@ mod path_tests {
         click_event_target, create_uinput_pointer, ensure_master_pointer_for_session,
         guarded_uinput_creation, is_uinput_unavailable, kde_x11_uinput_hotplug_is_unsafe,
         master_pointer_name, modifiers_to_state, mpx_op_guard, normalize_uinput_device_name,
-        path_cumulative, point_on_path, real_pointer_capabilities_available, sample_function,
-        slave_pointer_name, EVDEV_UINPUT_NAME_MAX_BYTES, UINPUT_POINTER_SUFFIX,
+        path_cumulative, ping_root, point_on_path, real_pointer_capabilities_available,
+        sample_function, slave_pointer_name, ClientSync, EVDEV_UINPUT_NAME_MAX_BYTES,
+        UINPUT_POINTER_SUFFIX,
     };
     use x11rb::protocol::xproto::{EventMask, KeyButMask};
+
+    #[test]
+    fn ping_proof_keeps_bound_and_global_focus_roots_distinct() {
+        let (first, second) = (0x100, 0x200);
+        for root in [first, second] {
+            assert_eq!(ping_root(Some(root), Some(root)), Ok(root));
+            assert_eq!(ping_root(None, Some(root)), Ok(root));
+            assert_eq!(ping_root(Some(root), None), Err(ClientSync::Unanswered));
+        }
+        assert_eq!(ping_root(None, None), Err(ClientSync::Unanswered));
+        assert_eq!(
+            ping_root(Some(first), Some(second)),
+            Err(ClientSync::Unanswered)
+        );
+        assert_eq!(
+            ping_root(Some(second), Some(first)),
+            Err(ClientSync::Unanswered)
+        );
+    }
 
     /// Regression for the `XSetErrorHandler` swap race: every caller that
     /// could swap the process-global X11 error handler while an MPX

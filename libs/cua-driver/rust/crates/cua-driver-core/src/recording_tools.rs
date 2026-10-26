@@ -570,6 +570,12 @@ fn parse_action_json(path: &std::path::Path) -> anyhow::Result<(String, Value)> 
     }
     let text = std::fs::read_to_string(path)?;
     let obj: Value = serde_json::from_str(&text)?;
+    // Private SDK requests can carry semantics absent from generic arguments
+    // (including zero or more than three clicks). Never replay their generic
+    // authorization projection, even if the descriptor is malformed.
+    if obj.get("native_input").is_some() {
+        anyhow::bail!(crate::recording::NATIVE_INPUT_REPLAY_ERROR);
+    }
     let tool = obj
         .get("tool")
         .and_then(|v| v.as_str())
@@ -676,6 +682,112 @@ impl Tool for InstallFfmpegTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReplayInputProbe {
+        definition: ToolDef,
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ReplayInputProbe {
+        fn def(&self) -> &ToolDef {
+            &self.definition
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.seen.lock().unwrap().push(args);
+            ToolResult::text("replayed")
+        }
+    }
+
+    #[tokio::test]
+    async fn native_recordings_refuse_generic_replay_before_any_tool_dispatch() {
+        use crate::authorization::PermissionMode;
+        use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+        use std::time::Duration;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReplayInputProbe {
+            definition: ToolDef {
+                name: "probe".into(),
+                description: "hermetic replay dispatch probe".into(),
+                input_schema: json!({
+                    "type": "object", "properties": {"marker": {"type": "integer"}},
+                    "additionalProperties": false,
+                }),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            seen: seen.clone(),
+        }));
+        registry.register_recording_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Unrestricted],
+            true,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+            .compatibility_context(PermissionMode::Unrestricted, None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let turn = directory.path().join("turn-00001");
+        std::fs::create_dir(&turn).unwrap();
+        let action_path = turn.join("action.json");
+        let ordinary = json!({"tool": "probe", "arguments": {"marker": 7}});
+        for descriptor in [
+            json!({"profile":"linux_native_click","original_input":{"count":0},"replay":{"status":"unavailable","code":"native_input_requires_trusted_sdk"}}),
+            json!({"profile":"linux_native_click","original_input":{"count":4},"replay":{"status":"unavailable","code":"native_input_requires_trusted_sdk"}}),
+            json!({"profile":"macos_native_move","original_input":{"native_window_pixels":[37.5,41.0]}}),
+            json!({"profile":"macos_native_pages","original_input":{"pages":2.5}}),
+            // A damaged or unknown private descriptor must also fail closed.
+            json!({"profile":"unknown_native_input","replay":{"status":"available"}}),
+            Value::Null,
+        ] {
+            let mut action = ordinary.clone();
+            action["native_input"] = descriptor;
+            std::fs::write(&action_path, serde_json::to_vec(&action).unwrap()).unwrap();
+            let result = registry
+                .invoke_with_context(
+                    "replay_trajectory",
+                    json!({"dir":directory.path(),"delay_ms":0}),
+                    context.clone(),
+                )
+                .await;
+            let report = result.structured_content.unwrap();
+            assert_eq!(report["attempted"], 0, "{report}");
+            assert_eq!(report["failed"], 1, "{report}");
+            assert_eq!(
+                report["first_failure"]["error"],
+                "native_input_requires_trusted_sdk: native input requires its original trusted SDK request",
+                "{report}",
+            );
+            assert!(seen.lock().unwrap().is_empty());
+        }
+
+        // Keep the ordinary trajectory reader and owning-registry dispatch intact.
+        std::fs::write(&action_path, serde_json::to_vec(&ordinary).unwrap()).unwrap();
+        let result = registry
+            .invoke_with_context(
+                "replay_trajectory",
+                json!({"dir":directory.path(),"delay_ms":0}),
+                context,
+            )
+            .await;
+        let report = result.structured_content.unwrap();
+        assert_eq!(report["attempted"], 1, "{report}");
+        assert_eq!(report["succeeded"], 1, "{report}");
+        assert_eq!(report["failed"], 0, "{report}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["marker"], 7);
+    }
 
     #[tokio::test]
     async fn start_recording_resolves_the_per_turn_state_budget() {

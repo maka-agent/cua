@@ -36,6 +36,44 @@ tokio::task_local! {
     /// Opaque generation for runtime-owned mutable resources. Nested
     /// dispatches inherit this key, while public arguments can never select it.
     static DISPATCH_RUNTIME_SCOPE: String;
+    /// Original registry admissions retained only by this invocation and any
+    /// native worker that explicitly captures them before leaving the task.
+    static DISPATCH_NATIVE_INPUT_WORKER_LEASE: NativeInputWorkerLease;
+}
+
+/// Keeps the current invocation's original admissions alive for a native worker.
+///
+/// Capture this lease before spawning a worker that can outlive its invoking
+/// future, then keep it until the worker has released all input and finished
+/// using the desktop session. It must not be stored on a driver or session.
+/// Cloning authorization contexts never clones this per-invocation lease.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct NativeInputWorkerLease {
+    // Release input ownership before session teardown can run cleanup hooks.
+    _desktop_action: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    _cursor_action: Option<Arc<CursorActionAdmission>>,
+    _lifecycle_dispatch: Option<Arc<crate::session::SessionDispatchGuard>>,
+}
+
+impl std::fmt::Debug for NativeInputWorkerLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeInputWorkerLease")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Capture the admissions already owned by the current registry invocation.
+///
+/// The opaque handle grants no new admission and does not propagate into
+/// spawned tasks. Native adapters must capture it before spawning and release
+/// it after their final input release and platform synchronization.
+#[doc(hidden)]
+pub fn current_native_input_worker_lease() -> Option<NativeInputWorkerLease> {
+    DISPATCH_NATIVE_INPUT_WORKER_LEASE
+        .try_with(Clone::clone)
+        .ok()
 }
 
 /// Return the immutable authorization context bound to the current dispatch.
@@ -71,9 +109,9 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
-    static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
+fn desktop_action_coordinator() -> &'static Arc<tokio::sync::Mutex<()>> {
+    static COORDINATOR: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    COORDINATOR.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
 }
 
 // One visible agent cursor cannot represent overlapping actions at different
@@ -2332,7 +2370,7 @@ impl ToolRegistry {
                     ),
                 };
                 match admitted {
-                    Ok(guard) => Some(guard),
+                    Ok(guard) => Some(Arc::new(guard)),
                     Err(message) => {
                         return protected_refusal("session_ended", message);
                     }
@@ -2343,7 +2381,7 @@ impl ToolRegistry {
 
         let _cursor_action =
             match try_admit_cursor_action(resolved_name, &args, tool.def().read_only) {
-                Ok(guard) => guard,
+                Ok(guard) => guard.map(Arc::new),
                 Err(refusal) => return refusal,
             };
 
@@ -2389,10 +2427,10 @@ impl ToolRegistry {
             // which the foreground target can lose keyboard eligibility
             // between the fixture's focus proof and SendInput. Contended
             // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
+            Some(Arc::new(match Arc::clone(coordinator).try_lock_owned() {
                 Ok(guard) => guard,
-                Err(_) => coordinator.lock().await,
-            })
+                Err(_) => Arc::clone(coordinator).lock_owned().await,
+            }))
         } else {
             None
         };
@@ -2434,11 +2472,19 @@ impl ToolRegistry {
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
         crate::tool_activity::note_tool_activity();
-        let mut result = crate::recording::scope_dispatch_click_capture(
-            pending_turn.as_ref(),
-            tool.invoke(args.clone()),
-        )
-        .await;
+        let mut result = DISPATCH_NATIVE_INPUT_WORKER_LEASE
+            .scope(
+                NativeInputWorkerLease {
+                    _desktop_action: _desktop_action.clone(),
+                    _cursor_action: _cursor_action.clone(),
+                    _lifecycle_dispatch: lifecycle_dispatch.clone(),
+                },
+                crate::recording::scope_dispatch_click_capture(
+                    pending_turn.as_ref(),
+                    tool.invoke(args.clone()),
+                ),
+            )
+            .await;
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -6097,6 +6143,153 @@ resources:
             }
             ToolResult::text("operation settled")
         }
+    }
+
+    struct DetachedInputProbe {
+        def: super::ToolDef,
+        started: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for DetachedInputProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn protected_resource_ownership(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> super::ProtectedResourceOwnership {
+            super::ProtectedResourceOwnership::DriverOwned
+        }
+
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            let lease = super::current_native_input_worker_lease()
+                .expect("registry dispatch supplies the original admissions");
+            let started = self.started.clone();
+            let finished = self.finished.clone();
+            let _worker = tokio::task::spawn_blocking(move || {
+                let (release, wait) = tokio::sync::oneshot::channel();
+                if started.send(release).is_ok() {
+                    let _ = wait.blocking_recv();
+                }
+                drop(lease);
+                let _ = finished.send(());
+            });
+            std::future::pending().await
+        }
+    }
+
+    // The blocking worker models a platform input pair still finishing after
+    // cancellation. It retains the actual registry guards, so both existing
+    // admission boundaries remain closed without a second coordination lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_input_retains_original_admissions_until_worker_exit() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            assert!(super::current_native_input_worker_lease().is_none());
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let (finished, mut finishes) = tokio::sync::mpsc::unbounded_channel();
+            let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+            let definition = |name: &str| super::ToolDef {
+                name: name.into(),
+                description: "hermetic detached input probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            };
+            let mut registry = super::ToolRegistry::new();
+            registry.register(Box::new(DetachedInputProbe {
+                def: definition("click"),
+                started,
+                finished,
+            }));
+            for name in ["browser_click", "right_click"] {
+                registry.register(Box::new(CursorOperationProbe {
+                    def: definition(name),
+                    entered: entered.clone(),
+                    release: None,
+                }));
+            }
+            let registry = Arc::new(registry);
+            let context = unrestricted_context();
+            let args = serde_json::json!({"session":"detached-input-owner"});
+            let spawn_native = || {
+                let registry = registry.clone();
+                let context = context.clone();
+                let args = args.clone();
+                tokio::spawn(
+                    async move { registry.invoke_with_context("click", args, context).await },
+                )
+            };
+            let outer = spawn_native();
+            let release_worker = starts.recv().await.expect("blocking worker entered");
+            outer.abort();
+            assert!(outer.await.unwrap_err().is_cancelled());
+
+            let overlap = registry
+                .invoke_with_context("browser_click", args.clone(), context.clone())
+                .await;
+            assert_eq!(
+                overlap
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.pointer("/refusal/code"))
+                    .and_then(serde_json::Value::as_str),
+                Some("input_busy"),
+                "{overlap:?}"
+            );
+            // Inspect the original coordinator itself, not a mirrored busy flag.
+            assert!(desktop_action_coordinator().try_lock().is_err());
+            let next = registry.invoke_with_context(
+                "right_click",
+                serde_json::json!({"session":"detached-input-other"}),
+                context.clone(),
+            );
+            tokio::pin!(next);
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            assert!(matches!(
+                entries.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+
+            release_worker.send(()).expect("worker is still alive");
+            finishes.recv().await.expect("worker released its lease");
+            let next = next.await;
+            assert_ne!(next.is_error, Some(true), "{next:?}");
+            assert_eq!(entries.recv().await.as_deref(), Some("right_click"));
+            let after_worker = registry
+                .invoke_with_context("browser_click", args.clone(), context.clone())
+                .await;
+            assert_ne!(after_worker.is_error, Some(true), "{after_worker:?}");
+            assert_eq!(entries.recv().await.as_deref(), Some("browser_click"));
+
+            // The same original lifecycle guard also keeps teardown from
+            // removing host services while a cancelled worker is using them.
+            let closing = spawn_native();
+            let release_worker = starts.recv().await.expect("closing worker entered");
+            closing.abort();
+            assert!(closing.await.unwrap_err().is_cancelled());
+            let runtime_session = context.runtime_session_key("detached-input-owner");
+            crate::session::request_session_end(&runtime_session);
+            assert!(crate::session::is_session_ending(&runtime_session));
+            assert!(!crate::session::is_session_ended(&runtime_session));
+            release_worker
+                .send(())
+                .expect("closing worker is still alive");
+            finishes
+                .recv()
+                .await
+                .expect("closing worker released its lease");
+            assert!(crate::session::is_session_ended(&runtime_session));
+            // Keeping the reusable context alive must not retain any lease.
+            assert!(super::current_native_input_worker_lease().is_none());
+        })
+        .await
+        .expect("detached worker releases the original registry admissions");
     }
 
     // Exercise the real shared dispatch boundary: the browser route has no

@@ -21,6 +21,7 @@ use cursor_overlay::CursorRegistry;
 
 mod pixel_scroll;
 use pixel_scroll::PixelScroll;
+mod native_click;
 
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
@@ -6603,6 +6604,9 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(request) = crate::input::native_click::take_native_click() {
+            return self.invoke_native_click(args, request).await;
+        }
         if args.get("by").and_then(Value::as_str) == Some("pixel") {
             return ToolResult::error(
                 "unsupported: pixel-unit input is unavailable on this native adapter",
