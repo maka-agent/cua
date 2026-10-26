@@ -1594,6 +1594,36 @@ impl CuaDriver {
 desktop_tool_methods!(define_desktop_tool_methods);
 desktop_tool_methods!(define_session_desktop_tool_methods);
 
+#[cfg(target_os = "macos")]
+fn native_page_scroll_arguments(
+    request: &platform_macos::input::page_scroll::NativePageScrollRequest,
+) -> Result<serde_json::Value, DriverError> {
+    use platform_macos::input::page_scroll::PageDirection;
+
+    let number = |value: f64, name: &str| {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| DriverError::Protocol {
+                reason: format!("native page scroll {name} must be finite"),
+            })
+    };
+    let event = &request.event;
+    let direction = match event.direction {
+        PageDirection::Up => "up",
+        PageDirection::Down => "down",
+        PageDirection::Left => "left",
+        PageDirection::Right => "right",
+    };
+    Ok(serde_json::json!({
+        "pid":event.pid,"window_id":event.window_id,
+        "scope":"window","delivery_mode":"background",
+        "direction":direction,"by":"page",
+        "amount":number(event.pages, "pages")?,
+        "x":number(request.native_window_pixels[0], "native_window_pixels.x")?,
+        "y":number(request.native_window_pixels[1], "native_window_pixels.y")?,
+    }))
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl CuaDriverSession {
     pub async fn call_tool(
@@ -1701,6 +1731,33 @@ impl CuaDriverSession {
             ),
             _ => Err(DriverError::Protocol {
                 reason: "prepared macOS capture requires an embedded trusted session".into(),
+            }),
+        }
+    }
+
+    /// Post one native macOS page event through this exact bound session.
+    ///
+    /// This Rust-only Embedded entry keeps the original authorization and
+    /// operation lifecycle. Canonical x/y are window-local physical pixels;
+    /// the event's global logical point stays separate in the typed request.
+    /// It does not move a cursor, resolve an app's out-of-process helpers, or
+    /// confer a parent's grants on the actual event PID/window. The ordinary
+    /// exact-window input gate still applies to that actual target.
+    #[cfg(target_os = "macos")]
+    pub async fn scroll_native_pages(
+        &self,
+        request: platform_macos::input::page_scroll::NativePageScrollRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = native_page_scroll_arguments(&request)?;
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                "scroll",
+                session
+                    .invoke_native_page_scroll(arguments, request)
+                    .await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native macOS page input requires an embedded trusted session".into(),
             }),
         }
     }
@@ -2196,6 +2253,51 @@ mod snapshot_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_page_arguments_keep_fractional_pages_and_distinct_point_frames() {
+        use platform_macos::input::page_scroll::{
+            NativePageScrollRequest, PageDirection, PageScrollRequest,
+        };
+
+        let mut request = NativePageScrollRequest {
+            event: PageScrollRequest {
+                pid: 123,
+                window_id: 456,
+                screen_point: Default::default(),
+                window_bounds: Default::default(),
+                window_uses_flipped_coordinates: true,
+                direction: PageDirection::Left,
+                pages: 51.25,
+                extent: 400.125,
+            },
+            native_window_pixels: [37.5, 25.0],
+        };
+        request.event.screen_point.x = -1.25;
+        request.event.screen_point.y = 42.5;
+        assert_eq!(
+            native_page_scroll_arguments(&request).unwrap(),
+            serde_json::json!({
+                "pid":123,"window_id":456,"scope":"window",
+                "delivery_mode":"background","direction":"left","by":"page",
+                "amount":51.25,"x":37.5,"y":25.0,
+            })
+        );
+        request.event.pages = f64::INFINITY;
+        assert!(matches!(
+            native_page_scroll_arguments(&request),
+            Err(DriverError::Protocol { reason })
+                if reason == "native page scroll pages must be finite"
+        ));
+        request.event.pages = 0.5;
+        request.native_window_pixels[0] = f64::NAN;
+        assert!(matches!(
+            native_page_scroll_arguments(&request),
+            Err(DriverError::Protocol { reason })
+                if reason == "native page scroll native_window_pixels.x must be finite"
+        ));
+    }
+
     #[test]
     fn connect_rejects_empty_socket_paths_for_every_client_kind() {
         for path in ["", "  \t"] {

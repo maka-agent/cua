@@ -901,6 +901,12 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
     )
 }
 
+#[cfg(target_os = "macos")]
+enum NativeRequest {
+    WindowCapture(platform_macos::capture::FrozenWindowCapture),
+    PageScroll(platform_macos::input::page_scroll::NativePageScrollRequest),
+}
+
 unsafe fn session_invoke_in_frame(
     handle: *mut CuaDriverSessionHandle,
     name: *const u8,
@@ -912,9 +918,7 @@ unsafe fn session_invoke_in_frame(
     out_operation: *mut *mut CuaDriverOperation,
     out_error: *mut CuaDriverBuffer,
     frame: crate::runtime::CoordinateFrame,
-    #[cfg(target_os = "macos")] frozen_capture: Option<
-        platform_macos::capture::FrozenWindowCapture,
-    >,
+    #[cfg(target_os = "macos")] native_request: Option<NativeRequest>,
 ) -> CuaDriverStatus {
     with_ffi_guard(out_error, || {
         let session = required_session_handle(handle)?;
@@ -965,10 +969,16 @@ unsafe fn session_invoke_in_frame(
             async move {
                 let invocation = session.invoke_in_frame(&name, arguments, frame);
                 #[cfg(target_os = "macos")]
-                let result = match frozen_capture {
-                    Some(prepared) => {
+                let result = match native_request {
+                    Some(NativeRequest::WindowCapture(prepared)) => {
                         platform_macos::capture::with_frozen_window_capture(prepared, invocation)
                             .await
+                    }
+                    Some(NativeRequest::PageScroll(request)) => {
+                        platform_macos::input::page_scroll::with_native_page_scroll(
+                            request, invocation,
+                        )
+                        .await
                     }
                     None => invocation.await,
                 };
@@ -1620,7 +1630,22 @@ impl NativeAbiSession {
             "get_window_state",
             arguments,
             crate::runtime::CoordinateFrame::Screenshot,
-            Some(prepared),
+            Some(NativeRequest::WindowCapture(prepared)),
+        )
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn invoke_native_page_scroll(
+        &self,
+        arguments: Value,
+        request: platform_macos::input::page_scroll::NativePageScrollRequest,
+    ) -> Result<Value, DriverError> {
+        self.invoke_in_frame(
+            "scroll",
+            arguments,
+            crate::runtime::CoordinateFrame::NativeWindow,
+            Some(NativeRequest::PageScroll(request)),
         )
         .await
     }
@@ -1630,9 +1655,7 @@ impl NativeAbiSession {
         name: &str,
         arguments: Value,
         frame: crate::runtime::CoordinateFrame,
-        #[cfg(target_os = "macos")] frozen_capture: Option<
-            platform_macos::capture::FrozenWindowCapture,
-        >,
+        #[cfg(target_os = "macos")] native_request: Option<NativeRequest>,
     ) -> Result<Value, DriverError> {
         let arguments = serde_json::to_vec(&arguments).map_err(|error| DriverError::Protocol {
             reason: format!("serialize {name} session ABI arguments: {error}"),
@@ -1653,7 +1676,7 @@ impl NativeAbiSession {
             let mut error = CuaDriverBuffer::empty();
             let public_entry = frame == crate::runtime::CoordinateFrame::Screenshot;
             #[cfg(target_os = "macos")]
-            let public_entry = public_entry && frozen_capture.is_none();
+            let public_entry = public_entry && native_request.is_none();
             let status = unsafe {
                 if public_entry {
                     ffi::session_invoke(
@@ -1682,7 +1705,7 @@ impl NativeAbiSession {
                         &mut error,
                         frame,
                         #[cfg(target_os = "macos")]
-                        frozen_capture,
+                        native_request,
                     )
                 }
             };
@@ -1771,9 +1794,18 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
+
+    pub(crate) fn own_runtime_session(session: Arc<RuntimeSession>) -> NativeAbiSession {
+        // Reuse a real fixture's immutable authorization binding. Only handle
+        // allocation belongs to this test fixture; invocation still enters the
+        // production JSON ABI, operation guard, and canonical runtime dispatch.
+        NativeAbiSession {
+            handle: Mutex::new(Box::into_raw(Box::new(CuaDriverSessionHandle { session })).cast()),
+        }
+    }
 
     #[test]
     fn abi_layout_and_status_values_are_stable() {

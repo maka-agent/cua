@@ -15,7 +15,7 @@ use core_graphics::{
     sys::CGEventRef,
 };
 use foreign_types::ForeignType;
-use std::{ffi::c_void, sync::OnceLock, time::Duration};
+use std::{cell::RefCell, ffi::c_void, future::Future, sync::OnceLock, time::Duration};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageScrollRequest {
@@ -28,6 +28,39 @@ pub struct PageScrollRequest {
     pub pages: f64,
     /// Selected element frame extent, or the cached visible frame extent.
     pub extent: f64,
+}
+
+/// Trusted Host data for one native page event. The two coordinate frames are
+/// deliberately separate: only `native_window_pixels` describes the ordinary
+/// SDK input record; the event consumes the original global logical point.
+/// This request does not authorize input or resolve an application's helpers.
+#[derive(Clone, Copy, Debug)]
+pub struct NativePageScrollRequest {
+    pub event: PageScrollRequest,
+    pub native_window_pixels: [f64; 2],
+}
+
+tokio::task_local! {
+    static NATIVE_PAGE_SCROLL: RefCell<Option<NativePageScrollRequest>>;
+}
+
+/// Attach request data to the same authorized bound-session scroll future.
+/// Public JSON has no way to construct this scope.
+#[doc(hidden)]
+pub async fn with_native_page_scroll<F: Future>(
+    request: NativePageScrollRequest,
+    operation: F,
+) -> F::Output {
+    NATIVE_PAGE_SCROLL
+        .scope(RefCell::new(Some(request)), operation)
+        .await
+}
+
+pub(crate) fn take_native_page_scroll() -> Option<NativePageScrollRequest> {
+    NATIVE_PAGE_SCROLL
+        .try_with(|request| request.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
 #[must_use = "preparing a page scroll does not send it"]
@@ -142,4 +175,51 @@ fn set_window_location(event: CGEventRef, point: CGPoint) -> anyhow::Result<()> 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventSetTimestamp(event: CGEventRef, timestamp: u64);
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use core_graphics::geometry::CGSize;
+
+    fn request(pid: i32) -> NativePageScrollRequest {
+        NativePageScrollRequest {
+            event: PageScrollRequest {
+                pid,
+                window_id: pid as u32,
+                screen_point: CGPoint::new(-1.25, 42.5),
+                window_bounds: CGRect::new(&CGPoint::new(-20.0, 30.0), &CGSize::new(0.0, 0.0)),
+                window_uses_flipped_coordinates: true,
+                direction: PageDirection::Down,
+                pages: 51.25,
+                extent: 100.25,
+            },
+            native_window_pixels: [37.5, 25.0],
+        }
+    }
+
+    #[tokio::test]
+    async fn native_page_data_is_single_use_and_isolated_between_tasks() {
+        assert!(take_native_page_scroll().is_none());
+        let (first, second) = tokio::join!(
+            with_native_page_scroll(request(11), async {
+                tokio::task::yield_now().await;
+                let request = take_native_page_scroll().unwrap();
+                assert!(take_native_page_scroll().is_none());
+                request
+            }),
+            with_native_page_scroll(request(22), async {
+                tokio::task::yield_now().await;
+                let request = take_native_page_scroll().unwrap();
+                assert!(take_native_page_scroll().is_none());
+                request
+            }),
+        );
+        assert_eq!((first.event.pid, second.event.pid), (11, 22));
+        assert_eq!(first.event.pages, 51.25);
+        assert_eq!(first.event.screen_point.x.to_bits(), (-1.25_f64).to_bits());
+        assert_eq!(first.event.screen_point.y.to_bits(), 42.5_f64.to_bits());
+        assert_eq!(first.native_window_pixels, [37.5, 25.0]);
+        assert!(take_native_page_scroll().is_none());
+    }
 }

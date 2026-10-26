@@ -45,6 +45,133 @@ impl ScrollTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
     }
+
+    async fn invoke_native_pages(
+        &self,
+        args: Value,
+        request: crate::input::page_scroll::NativePageScrollRequest,
+    ) -> ToolResult {
+        use crate::input::page_scroll::prepare_page_scroll;
+        use cua_driver_core::background_input::BackgroundAction;
+
+        if let Err(error) = native_page_arguments_match(&args, &request) {
+            return error;
+        }
+        // This is the actual event target, not an app PID substituted for a
+        // helper. A trusted Host must resolve that relationship separately.
+        let lease = match super::gate_background_window_action(
+            request.event.pid,
+            request.event.window_id,
+            None,
+            BackgroundAction::WindowPointer,
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(refusal) => return refusal,
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            // The native worker keeps its exact mutation lease even if a
+            // consumer abandons the asynchronous reply observer.
+            let _lease = lease;
+            let prepared = prepare_page_scroll(request.event).map_err(|error| {
+                native_page_refusal("native_page_preparation_failed", error.to_string())
+            })?;
+            prepared
+                .post()
+                .map_err(|error| native_page_refusal("input_outcome_unknown", error.to_string()))
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => native_page_posted_result(&request),
+            Ok(Err(refusal)) => refusal,
+            Err(error) => native_page_refusal(
+                "input_outcome_unknown",
+                format!("native page worker did not complete normally: {error}"),
+            ),
+        }
+    }
+}
+
+fn native_page_posted_result(
+    request: &crate::input::page_scroll::NativePageScrollRequest,
+) -> ToolResult {
+    ToolResult::text("Native page event posted.").with_structured(serde_json::json!({
+        "path":"cgevent","native_profile":"native_pages",
+        "effect":"unverifiable","verified":false,
+        "native_page_request":native_page_provenance(request),
+    }))
+}
+
+fn native_page_refusal(code: &str, reason: String) -> ToolResult {
+    ToolResult::error(reason).with_structured(serde_json::json!({"code":code}))
+}
+
+fn native_page_arguments_match(
+    args: &Value,
+    request: &crate::input::page_scroll::NativePageScrollRequest,
+) -> Result<(), ToolResult> {
+    use crate::input::page_scroll::{page_deltas, DeltaError, PageDirection};
+
+    let event = &request.event;
+    let direction = match event.direction {
+        PageDirection::Up => "up",
+        PageDirection::Down => "down",
+        PageDirection::Left => "left",
+        PageDirection::Right => "right",
+    };
+    if args.get("pid").and_then(Value::as_i64) != Some(i64::from(event.pid))
+        || args.get("window_id").and_then(Value::as_u64) != Some(u64::from(event.window_id))
+        || args.get("direction").and_then(Value::as_str) != Some(direction)
+        || args.get("by").and_then(Value::as_str) != Some("page")
+        || args.get("amount").and_then(Value::as_f64) != Some(event.pages)
+        || args.get("scope").and_then(Value::as_str) != Some("window")
+        || args.get("delivery_mode").and_then(Value::as_str) != Some("background")
+        || args.get("x").and_then(Value::as_f64) != Some(request.native_window_pixels[0])
+        || args.get("y").and_then(Value::as_f64) != Some(request.native_window_pixels[1])
+        || !request
+            .native_window_pixels
+            .iter()
+            .all(|value| value.is_finite())
+    {
+        return Err(native_page_refusal(
+            "native_page_request_mismatch",
+            "native page data does not match the authorized scroll arguments".into(),
+        ));
+    }
+    page_deltas(event.direction, event.pages, event.extent).map_err(|error| {
+        let code = match error {
+            DeltaError::InvalidPages => "invalid_arguments",
+            DeltaError::UnrepresentableDelta => "unsupported_native_delta",
+        };
+        native_page_refusal(code, error.to_string())
+    })?;
+    Ok(())
+}
+
+fn native_page_provenance(request: &crate::input::page_scroll::NativePageScrollRequest) -> Value {
+    let event = &request.event;
+    let direction = match event.direction {
+        crate::input::page_scroll::PageDirection::Up => "up",
+        crate::input::page_scroll::PageDirection::Down => "down",
+        crate::input::page_scroll::PageDirection::Left => "left",
+        crate::input::page_scroll::PageDirection::Right => "right",
+    };
+    serde_json::json!({
+        "pid":event.pid,"window_id":event.window_id,
+        "native_window_pixels":request.native_window_pixels,
+        "native_window_pixels_unit":"window_local_physical_pixels",
+        "screen_point":[event.screen_point.x,event.screen_point.y],
+        "screen_point_unit":"global_logical_points",
+        "window_bounds":{
+            "x":event.window_bounds.origin.x,"y":event.window_bounds.origin.y,
+            "width":event.window_bounds.size.width,"height":event.window_bounds.size.height,
+        },
+        "window_bounds_unit":"global_logical_points",
+        "window_uses_flipped_coordinates":event.window_uses_flipped_coordinates,
+        "direction":direction,"pages":event.pages,
+        "extent":event.extent,"extent_unit":"logical_points",
+    })
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -157,6 +284,9 @@ impl Tool for ScrollTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        if let Some(request) = crate::input::page_scroll::take_native_page_scroll() {
+            return self.invoke_native_pages(args, request).await;
+        }
         if args.get("pixels").is_some() {
             return ToolResult::error("unsupported: pixels is an X11-native scroll unit")
                 .with_structured(serde_json::json!({"code":"unsupported"}));
@@ -893,6 +1023,101 @@ unsafe fn collect_ax_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_pages_require_the_exact_recorded_target_amount_and_pixel_frame() {
+        use crate::input::page_scroll::{
+            NativePageScrollRequest, PageDirection, PageScrollRequest,
+        };
+        use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+
+        let request = NativePageScrollRequest {
+            event: PageScrollRequest {
+                pid: 123,
+                window_id: 456,
+                screen_point: CGPoint::new(-1.25, 42.5),
+                window_bounds: CGRect::new(&CGPoint::new(-20.0, 30.0), &CGSize::new(0.0, 0.0)),
+                window_uses_flipped_coordinates: true,
+                direction: PageDirection::Left,
+                pages: 51.25,
+                extent: 100.25,
+            },
+            native_window_pixels: [37.5, 25.0],
+        };
+        let args = serde_json::json!({
+            "pid":123,"window_id":456,"scope":"window",
+            "delivery_mode":"background","direction":"left","by":"page",
+            "amount":51.25,"x":37.5,"y":25.0,
+        });
+        native_page_arguments_match(&args, &request).unwrap();
+        assert!(scroll_parameters(&args).is_err());
+        for (field, value) in [
+            ("pid", serde_json::json!(124)),
+            ("window_id", serde_json::json!(457)),
+            ("direction", serde_json::json!("right")),
+            ("amount", serde_json::json!(51)),
+            ("x", serde_json::json!(-1.25)),
+            ("y", serde_json::json!(42.5)),
+        ] {
+            let mut wrong = args.clone();
+            wrong[field] = value;
+            assert_eq!(
+                native_page_arguments_match(&wrong, &request)
+                    .unwrap_err()
+                    .structured_content
+                    .unwrap()["code"],
+                "native_page_request_mismatch"
+            );
+        }
+        let provenance = native_page_provenance(&request);
+        assert_eq!(
+            provenance["native_window_pixels"],
+            serde_json::json!([37.5, 25.0])
+        );
+        assert_eq!(provenance["screen_point"], serde_json::json!([-1.25, 42.5]));
+        assert_eq!(
+            provenance["native_window_pixels_unit"],
+            "window_local_physical_pixels"
+        );
+        assert_eq!(provenance["screen_point_unit"], "global_logical_points");
+        assert_eq!(provenance["window_bounds"]["width"], 0.0);
+        assert_eq!(provenance["window_uses_flipped_coordinates"], true);
+
+        // This is the actual post-success producer, without creating or
+        // posting a native event. Its legacy payload must survive the core's
+        // existing execution-record and public-result projection.
+        use cua_driver_core::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        let produced = native_page_posted_result(&request);
+        assert_ne!(produced.is_error, Some(true));
+        let structured = produced.structured_content.as_ref().unwrap();
+        assert_eq!(structured["path"], "cgevent");
+        assert_eq!(structured["native_profile"], "native_pages");
+        assert_eq!(structured["native_page_request"], provenance);
+        let record = ActionExecutionRecord::from_legacy("scroll", &args, structured)
+            .expect("the native posted result must identify its existing CGEvent transport");
+        assert_eq!(record.transport, ActionTransport::MacosCgEventPid);
+        assert_eq!(record.requested_delivery, RequestedDelivery::Background);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Background));
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
+        let public = record.public_result().unwrap();
+        public.validate_invariants().unwrap();
+        assert_eq!(
+            public.effect,
+            cua_driver_contract::ActionEffect::Unverifiable
+        );
+        assert_eq!(
+            public.route,
+            cua_driver_contract::ActionRoute::SyntheticEvents
+        );
+        assert_eq!(
+            public.delivery.unwrap().mode,
+            cua_driver_contract::ActionDeliveryMode::Background
+        );
+        assert!(public.evidence.is_none());
+        assert!(public.error.is_none());
+    }
 
     #[test]
     fn amount_limits_preserve_pixel_deltas_and_refuse_invalid_repetitions() {
