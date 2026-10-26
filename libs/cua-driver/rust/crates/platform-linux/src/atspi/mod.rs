@@ -186,6 +186,9 @@ pub(crate) fn walk_tree_native_observation(
     query: Option<&str>,
     observation: native_observation::Observation,
 ) -> Result<AtspiTreeResult> {
+    if crate::wayland::is_wayland() {
+        anyhow::bail!(native_observation::X11_ROUTE_REQUIRED);
+    }
     let walked = native::walk_tree_native_observation(pid, xid, observation.clone())?;
     if let Some(reason) = observation.stop_reason() {
         return Err(anyhow::anyhow!(reason));

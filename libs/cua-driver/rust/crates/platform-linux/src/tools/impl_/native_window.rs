@@ -4,7 +4,7 @@ use cua_driver_core::action_record::{
     ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
 };
 use cua_driver_core::protocol::ToolResult;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::input::native_window::{
     NativeWindowCancellation, NativeWindowError, NativeWindowInputRequest,
@@ -15,6 +15,19 @@ pub(super) async fn invoke(
     args: Value,
     request: NativeWindowInputRequest,
 ) -> ToolResult {
+    invoke_on_route(tool, args, request, crate::wayland::is_wayland()).await
+}
+
+async fn invoke_on_route(
+    tool: &str,
+    args: Value,
+    request: NativeWindowInputRequest,
+    selected_wayland: bool,
+) -> ToolResult {
+    if selected_wayland {
+        let code = crate::atspi::native_observation::X11_ROUTE_REQUIRED;
+        return refusal(code, code);
+    }
     if !request.matches_arguments(tool, &args) {
         return refusal(
             "native_window_request_mismatch",
@@ -155,6 +168,42 @@ mod tests {
     use crate::input::native_window::{
         NativeClickButton, NativeScrollDirection, NativeWindowInput,
     };
+
+    #[tokio::test]
+    async fn selected_wayland_refuses_typed_input_before_lifecycle_or_worker_admission() {
+        let request = NativeWindowInputRequest {
+            pid: 123,
+            window_id: 456,
+            input: NativeWindowInput::Click {
+                point: [37, 41],
+                button: NativeClickButton::Left,
+                count: 1,
+            },
+        };
+        let result = invoke_on_route("click", request.arguments(), request, true).await;
+        assert_eq!(result.is_error, Some(true));
+        let details = result
+            .structured_content
+            .expect("typed refusal carries its code");
+        assert_eq!(
+            details["code"],
+            crate::atspi::native_observation::X11_ROUTE_REQUIRED
+        );
+        assert_eq!(details["effect"], "refused");
+        let record = result
+            .action_record
+            .expect("typed refusal records no delivery");
+        assert_eq!(record.effect, ActionEffect::Refused);
+        assert_eq!(record.actual_delivery, None);
+        assert_eq!(record.delivered_count, None);
+        assert!(record.public_result().is_ok());
+
+        let x11_result = invoke_on_route("click", request.arguments(), request, false).await;
+        let details = x11_result
+            .structured_content
+            .expect("X11 retains its existing lifecycle refusal before any worker");
+        assert_eq!(details["code"], "native_window_lifecycle_required");
+    }
 
     #[test]
     fn native_result_records_keep_actual_click_and_wheel_pair_counts() {

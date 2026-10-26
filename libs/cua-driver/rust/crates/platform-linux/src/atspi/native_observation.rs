@@ -20,6 +20,8 @@ use tokio::sync::Notify;
 pub(crate) const MAX_NODE_ATTEMPTS: usize = 5_000;
 /// Original Linux admission includes depth 63 and skips deeper nodes before properties.
 pub(crate) const MAX_DEPTH: usize = 63;
+/// Native profiles use X11 client identities, never compositor window handles.
+pub(crate) const X11_ROUTE_REQUIRED: &str = "native_profile_requires_x11";
 
 /// A trusted caller's exact native observation target and optional deadline.
 #[derive(Clone, Copy, Debug)]
@@ -83,9 +85,20 @@ pub(crate) fn current() -> Option<Observation> {
 /// A mismatched native request is an error, never permission to use the generic
 /// observation path instead.
 pub(crate) fn for_window(pid: u32, window_id: u64) -> Result<Option<Observation>> {
+    for_window_on_route(pid, window_id, crate::wayland::is_wayland())
+}
+
+fn for_window_on_route(
+    pid: u32,
+    window_id: u64,
+    selected_wayland: bool,
+) -> Result<Option<Observation>> {
     let Some(observation) = current() else {
         return Ok(None);
     };
+    if selected_wayland {
+        bail!(X11_ROUTE_REQUIRED);
+    }
     let request = observation.request;
     if request.pid != pid || request.window_id != window_id {
         bail!(
@@ -263,22 +276,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_wayland_refuses_native_context_without_changing_generic_observation() {
+        assert!(
+            for_window_on_route(PID, 15, true)
+                .expect("generic observation keeps the selected compositor route")
+                .is_none()
+        );
+        with_native_observation(request(15, None), async {
+            assert_eq!(
+                for_window_on_route(PID, 15, true)
+                    .expect_err("compositor IDs cannot enter the native X11 profile")
+                    .to_string(),
+                X11_ROUTE_REQUIRED
+            );
+            assert!(
+                for_window_on_route(PID, 15, false)
+                    .expect("the matching X11 target remains admitted")
+                    .is_some()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn nested_scope_restores_target_and_keeps_incomplete_causes_separate() {
         assert!(
-            for_window(PID, 13)
+            for_window_on_route(PID, 13, false)
                 .expect("no scoped request is generic")
                 .is_none()
         );
         with_native_observation(request(13, None), async {
-            let outer = for_window(PID, 13)
+            let outer = for_window_on_route(PID, 13, false)
                 .expect("outer target matches")
                 .expect("outer context exists");
             let inner = with_native_observation(request(14, None), async {
-                let inner = for_window(PID, 14)
+                let inner = for_window_on_route(PID, 14, false)
                     .expect("inner target matches")
                     .expect("inner context exists");
                 assert_eq!(
-                    for_window(PID, 13)
+                    for_window_on_route(PID, 13, false)
                         .expect_err("a scoped mismatch must not become generic")
                         .to_string(),
                     "native observation target mismatch: scoped pid=73 window_id=14, requested pid=73 window_id=13"
@@ -292,7 +328,9 @@ mod tests {
             assert_eq!(inner.stop_reason(), Some("cancelled"));
             assert_eq!(outer.stop_reason(), None);
             assert_eq!(outer.incomplete_reason(), None);
-            assert!(for_window(PID, 13).expect("outer context was restored").is_some());
+            assert!(for_window_on_route(PID, 13, false)
+                .expect("outer context was restored")
+                .is_some());
         })
         .await;
         assert!(current().is_none());
