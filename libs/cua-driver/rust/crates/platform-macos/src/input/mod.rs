@@ -14,6 +14,7 @@ pub mod hover;
 pub mod interactive;
 pub mod keyboard;
 pub mod mouse;
+pub mod page_scroll;
 pub mod pointer_toolkit;
 pub mod skylight;
 

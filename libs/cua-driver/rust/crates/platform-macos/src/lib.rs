@@ -38,6 +38,8 @@ pub mod focus_guard;
 #[cfg(target_os = "macos")]
 pub mod focus_steal;
 #[cfg(target_os = "macos")]
+pub mod geometry;
+#[cfg(target_os = "macos")]
 pub mod history;
 #[cfg(target_os = "macos")]
 pub mod input;

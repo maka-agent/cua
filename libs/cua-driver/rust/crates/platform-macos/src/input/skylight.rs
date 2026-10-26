@@ -411,7 +411,7 @@ fn ensure_skylight_loaded() {
 
 /// Look up a symbol by name via RTLD_DEFAULT (after loading SkyLight).
 /// Returns `None` when the symbol doesn't resolve.
-fn find_sym(name: &[u8]) -> Option<*mut c_void> {
+pub(super) fn find_sym(name: &[u8]) -> Option<*mut c_void> {
     ensure_skylight_loaded();
     let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const c_char) };
     if ptr.is_null() {
