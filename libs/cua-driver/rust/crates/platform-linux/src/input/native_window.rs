@@ -47,6 +47,42 @@ pub struct NativeWindowInputRequest {
     pub input: NativeWindowInput,
 }
 
+/// One selected live X11 client, independently of any coordinate operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeWindowTarget {
+    pub(crate) pid: u32,
+    pub(crate) window_id: u32,
+}
+
+/// Input attempted by the shared window context, not by its caller's actuator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeWindowPhase {
+    pub(crate) input_attempted: bool,
+    pub(crate) completed_button_pairs: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeWindowSetupFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) phase: NativeWindowPhase,
+}
+
+impl NativeWindowSetupFailure {
+    pub(crate) fn no_input(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            phase: NativeWindowPhase::default(),
+        }
+    }
+}
+
+/// Keep the callback's own error and actuator phase intact after cleanup.
+#[derive(Debug)]
+pub(crate) struct NativeWindowOutcome<T, E> {
+    pub(crate) result: Result<T, E>,
+    pub(crate) phase: NativeWindowPhase,
+}
+
 impl NativeWindowInputRequest {
     /// The existing tool whose target and policy admit this operation.
     #[doc(hidden)]
@@ -152,6 +188,7 @@ pub(crate) struct CancelOnDrop(Arc<AtomicBool>);
 pub(crate) struct NativeWindowCancellation {
     cancelled: Arc<AtomicBool>,
     session_id: String,
+    observation: Option<crate::atspi::native_observation::Observation>,
 }
 
 impl NativeWindowCancellation {
@@ -162,13 +199,33 @@ impl NativeWindowCancellation {
             Self {
                 cancelled,
                 session_id,
+                observation: None,
             },
         )
     }
 
-    pub(super) fn check(&self) -> Result<(), NativeWindowError> {
+    pub(crate) fn from_observation(
+        session_id: String,
+        observation: crate::atspi::native_observation::Observation,
+    ) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            session_id,
+            observation: Some(observation),
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), NativeWindowError> {
         if self.cancelled.load(Ordering::Acquire)
             || cua_driver_core::session::is_session_ending(&self.session_id)
+        {
+            return Err(NativeWindowError::Cancelled);
+        }
+        if self
+            .observation
+            .as_ref()
+            .and_then(|observation| observation.stop_reason())
+            .is_some()
         {
             return Err(NativeWindowError::Cancelled);
         }
@@ -201,11 +258,11 @@ impl NativeWindowInputRequest {
     }
 }
 
-fn validate_live_owner(request: &NativeWindowInputRequest) -> Result<(), NativeWindowError> {
-    if request.pid == 0
-        || request.window_id == 0
-        || !crate::proc_fs::is_process_live(request.pid)
-        || !crate::x11::window_belongs_to_pid(u64::from(request.window_id), request.pid)
+fn validate_live_owner(target: NativeWindowTarget) -> Result<(), NativeWindowError> {
+    if target.pid == 0
+        || target.window_id == 0
+        || !crate::proc_fs::is_process_live(target.pid)
+        || !crate::x11::window_belongs_to_pid(u64::from(target.window_id), target.pid)
     {
         return Err(NativeWindowError::TargetUnavailable);
     }
@@ -214,8 +271,8 @@ fn validate_live_owner(request: &NativeWindowInputRequest) -> Result<(), NativeW
 
 /// Native target state stays inside one worker and one X11 connection. It
 /// never moves the physical pointer or enters the generic fallback routes.
-pub(super) struct NativeWindowContext {
-    request: NativeWindowInputRequest,
+pub(crate) struct NativeWindowContext {
+    target: NativeWindowTarget,
     cancellation: NativeWindowCancellation,
     root: Window,
     clock: (u32, std::time::Instant),
@@ -225,6 +282,14 @@ pub(super) struct NativeWindowContext {
     held_button: Cell<Option<u8>>,
     cached_target: Cell<Option<super::EventTarget>>,
     root_point: Cell<Option<[i16; 2]>>,
+    pointer: Cell<PointerOperation>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PointerOperation {
+    FocusOnly,
+    Click,
+    Wheel,
 }
 
 impl NativeWindowContext {
@@ -242,12 +307,12 @@ impl NativeWindowContext {
             .wrapping_add(self.clock.1.elapsed().as_millis() as u32)
     }
 
-    pub(super) fn check(&self) -> Result<(), NativeWindowError> {
+    pub(crate) fn check(&self) -> Result<(), NativeWindowError> {
         self.cancellation.check()
     }
 
     pub(super) fn refreshes_target_per_pair(&self) -> bool {
-        matches!(self.request.input, NativeWindowInput::Click { .. })
+        self.pointer.get() == PointerOperation::Click
     }
 
     pub(super) fn mark_attempted(&self) {
@@ -275,11 +340,11 @@ impl NativeWindowContext {
             },
             detail: NotifyDetail::NONLINEAR,
             sequence: 0,
-            event: self.request.window_id,
+            event: self.target.window_id,
             mode: NotifyMode::NORMAL,
         };
         self.mark_attempted();
-        conn.send_event(false, self.request.window_id, EventMask::NO_EVENT, event)?
+        conn.send_event(false, self.target.window_id, EventMask::NO_EVENT, event)?
             .check()?;
         Ok(())
     }
@@ -289,7 +354,9 @@ impl NativeWindowContext {
             .root_point
             .get()
             .ok_or_else(|| anyhow::anyhow!("native window input has no translated root point"))?;
-        let target = resolve_event_target(conn, self.root, self.request.window_id, point)?;
+        let target = resolve_event_target(conn, self.root, self.target.window_id, point)?;
+        // Resolver roundtrips may outlive the caller. Stop before new input.
+        self.check()?;
         let root = self.root;
         let enter = EnterNotifyEvent {
             response_type: ENTER_NOTIFY_EVENT,
@@ -368,7 +435,7 @@ impl NativeWindowContext {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if self.virtual_focus.get()
             && matches!(
-                focus_is_within(conn, self.root, self.request.window_id),
+                focus_is_within(conn, self.root, self.target.window_id),
                 Ok(false)
             )
         {
@@ -376,6 +443,168 @@ impl NativeWindowContext {
         }
         super::settle_synthetic_events(conn);
     }
+
+    fn phase(&self) -> NativeWindowPhase {
+        NativeWindowPhase {
+            input_attempted: self.attempted.get(),
+            completed_button_pairs: self.completed.get(),
+        }
+    }
+
+    fn prepare_coordinate_pointer(
+        &self,
+        conn: &RustConnection,
+        point: [i16; 2],
+        input: NativeWindowInput,
+    ) -> anyhow::Result<()> {
+        self.pointer.set(match input {
+            NativeWindowInput::Click { .. } => PointerOperation::Click,
+            NativeWindowInput::Scroll { .. } => PointerOperation::Wheel,
+        });
+        self.root_point.set(Some(point));
+        self.move_to(conn)?;
+        Ok(())
+    }
+
+    /// The selected-window click helper receives a screen-i16 point directly.
+    /// One initial move precedes the same per-pair move/press/12ms/release train.
+    pub(crate) fn click_at_root(
+        &self,
+        conn: &RustConnection,
+        point: [i16; 2],
+        button: NativeClickButton,
+        count: u32,
+    ) -> anyhow::Result<()> {
+        self.check()?;
+        self.pointer.set(PointerOperation::Click);
+        self.root_point.set(Some(point));
+        let prepared = self.move_to(conn)?;
+        super::send_button_sequence(
+            conn,
+            u64::from(self.target.window_id),
+            [i32::from(prepared.local_x), i32::from(prepared.local_y)],
+            count as usize,
+            match button {
+                NativeClickButton::Left => 1,
+                NativeClickButton::Middle => 2,
+                NativeClickButton::Right => 3,
+            },
+            &[],
+            super::ButtonTiming {
+                hold_ms: 12,
+                gap_ms: 0,
+                native_wheel: false,
+                native_window: Some(self),
+            },
+        )
+    }
+
+    /// The caller already resolved a screen-i16 point. Keep it in that frame;
+    /// the existing event resolver still computes the wire-local payload.
+    pub(crate) fn scroll_at_root(
+        &self,
+        conn: &RustConnection,
+        point: [i16; 2],
+        direction: NativeScrollDirection,
+        pixels: u16,
+    ) -> anyhow::Result<()> {
+        self.check()?;
+        if pixels == 0 {
+            return Err(NativeWindowError::InvalidPixels.into());
+        }
+        self.pointer.set(PointerOperation::Wheel);
+        self.root_point.set(Some(point));
+        let prepared = self.move_to(conn)?;
+        super::send_button_sequence(
+            conn,
+            u64::from(self.target.window_id),
+            [i32::from(prepared.local_x), i32::from(prepared.local_y)],
+            scroll_detents(pixels) as usize,
+            super::scroll_button(direction.as_str())?,
+            &[],
+            super::ButtonTiming {
+                hold_ms: 36,
+                gap_ms: 0,
+                native_wheel: false,
+                native_window: Some(self),
+            },
+        )
+    }
+}
+
+struct NativeWindowLifetime {
+    conn: RustConnection,
+    context: NativeWindowContext,
+    finished: bool,
+}
+
+impl NativeWindowLifetime {
+    fn finish(&mut self) -> NativeWindowPhase {
+        if !self.finished {
+            self.finished = true;
+            self.context.finish(&self.conn);
+        }
+        self.context.phase()
+    }
+}
+
+impl Drop for NativeWindowLifetime {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Enter the existing focus lifetime on a blocking worker, outside Tokio.
+/// Native AT-SPI callers may enter the existing runtime inside `operation`.
+pub(crate) fn with_native_window_focus<T, E>(
+    target: NativeWindowTarget,
+    cancellation: NativeWindowCancellation,
+    operation: impl FnOnce(&RustConnection, &NativeWindowContext) -> Result<T, E>,
+) -> Result<NativeWindowOutcome<T, E>, NativeWindowSetupFailure> {
+    let setup_error = NativeWindowSetupFailure::no_input;
+    cancellation
+        .check()
+        .map_err(|error| setup_error(error.into()))?;
+    validate_live_owner(target).map_err(|error| setup_error(error.into()))?;
+    let (conn, screen) = super::connect_x11_for_input().map_err(setup_error)?;
+    let root = conn.setup().roots[screen].root;
+    let clock = super::native_window_clock(Some(root)).map_err(setup_error)?;
+    let mut lifetime = NativeWindowLifetime {
+        conn,
+        context: NativeWindowContext {
+            target,
+            cancellation,
+            root,
+            clock,
+            virtual_focus: Cell::new(false),
+            attempted: Cell::new(false),
+            completed: Cell::new(0),
+            held_button: Cell::new(None),
+            cached_target: Cell::new(None),
+            root_point: Cell::new(None),
+            pointer: Cell::new(PointerOperation::FocusOnly),
+        },
+        finished: false,
+    };
+    let setup = (|| -> anyhow::Result<()> {
+        lifetime.context.check()?;
+        let focused = focus_is_within(&lifetime.conn, root, target.window_id)?;
+        lifetime.context.check()?;
+        if !focused {
+            lifetime.context.virtual_focus.set(true);
+            lifetime.context.send_focus(&lifetime.conn, true)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = setup {
+        return Err(NativeWindowSetupFailure {
+            error,
+            phase: lifetime.finish(),
+        });
+    }
+    let result = operation(&lifetime.conn, &lifetime.context);
+    let phase = lifetime.finish();
+    Ok(NativeWindowOutcome { result, phase })
 }
 
 fn resolve_event_target(
@@ -463,82 +692,73 @@ pub(crate) fn execute(
     if matches!(request.input, NativeWindowInput::Scroll { pixels: 0, .. }) {
         return Err(NativeWindowError::InvalidPixels.into());
     }
-    cancellation.check()?;
-    validate_live_owner(&request)?;
-    let (conn, screen) = super::connect_x11_for_input()?;
-    let root = conn.setup().roots[screen].root;
-    let context = NativeWindowContext {
-        request,
-        cancellation,
-        root,
-        clock: super::native_window_clock(Some(root))?,
-        virtual_focus: Cell::new(false),
-        attempted: Cell::new(false),
-        completed: Cell::new(0),
-        held_button: Cell::new(None),
-        cached_target: Cell::new(None),
-        root_point: Cell::new(None),
+    let target = NativeWindowTarget {
+        pid: request.pid,
+        window_id: request.window_id,
     };
-    let result = (|| -> anyhow::Result<()> {
-        context.check()?;
-        if !focus_is_within(&conn, root, request.window_id)? {
-            context.virtual_focus.set(true);
-            context.send_focus(&conn, true)?;
-        }
-        let point = match request.point()? {
-            Some(point) => point,
-            None => {
-                // No supplied coordinate selects the live client center,
-                // after virtual focus setup and independently of any capture.
-                let geometry = conn.get_geometry(request.window_id)?.reply()?;
-                [(geometry.width / 2) as i16, (geometry.height / 2) as i16]
+    let outcome = with_native_window_focus(
+        target,
+        cancellation,
+        |conn, context| -> anyhow::Result<()> {
+            let point = match request.point()? {
+                Some(point) => point,
+                None => {
+                    // No supplied coordinate selects the live client center,
+                    // after virtual focus setup and independently of any capture.
+                    let geometry = conn.get_geometry(request.window_id)?.reply()?;
+                    [(geometry.width / 2) as i16, (geometry.height / 2) as i16]
+                }
+            };
+            let translated = conn
+                .translate_coordinates(request.window_id, context.root(), point[0], point[1])?
+                .reply()?;
+            if !translated.same_screen {
+                anyhow::bail!("native window input point is on a different X11 screen");
             }
-        };
-        let translated = conn
-            .translate_coordinates(request.window_id, root, point[0], point[1])?
-            .reply()?;
-        if !translated.same_screen {
-            anyhow::bail!("native window input point is on a different X11 screen");
-        }
-        context
-            .root_point
-            .set(Some([translated.dst_x, translated.dst_y]));
-        // A zero count still prepares one virtual move and validates its live
-        // client bounds; it emits no button edges and never moves the pointer.
-        context.move_to(&conn)?;
-        let (button, hold_ms) = match request.input {
-            NativeWindowInput::Click { button, .. } => (
-                match button {
-                    NativeClickButton::Left => 1,
-                    NativeClickButton::Middle => 2,
-                    NativeClickButton::Right => 3,
+            // A zero count still prepares one virtual move and validates its live
+            // client bounds; it emits no button edges and never moves the pointer.
+            context.prepare_coordinate_pointer(
+                conn,
+                [translated.dst_x, translated.dst_y],
+                request.input,
+            )?;
+            let (button, hold_ms) = match request.input {
+                NativeWindowInput::Click { button, .. } => (
+                    match button {
+                        NativeClickButton::Left => 1,
+                        NativeClickButton::Middle => 2,
+                        NativeClickButton::Right => 3,
+                    },
+                    12,
+                ),
+                NativeWindowInput::Scroll { direction, .. } => {
+                    (super::scroll_button(direction.as_str())?, 36)
+                }
+            };
+            super::send_button_sequence(
+                conn,
+                u64::from(request.window_id),
+                point.map(i32::from),
+                request.pairs() as usize,
+                button,
+                &[],
+                super::ButtonTiming {
+                    hold_ms,
+                    gap_ms: 0,
+                    native_wheel: false,
+                    native_window: Some(context),
                 },
-                12,
-            ),
-            NativeWindowInput::Scroll { direction, .. } => {
-                (super::scroll_button(direction.as_str())?, 36)
-            }
-        };
-        super::send_button_sequence(
-            &conn,
-            u64::from(request.window_id),
-            point.map(i32::from),
-            request.pairs() as usize,
-            button,
-            &[],
-            super::ButtonTiming {
-                hold_ms,
-                gap_ms: 0,
-                native_wheel: false,
-                native_window: Some(&context),
-            },
-        )
-    })();
-    context.finish(&conn);
+            )
+        },
+    );
+    let (result, phase) = match outcome {
+        Ok(outcome) => (outcome.result, outcome.phase),
+        Err(error) => (Err(error.error), error.phase),
+    };
     result.map_err(|cause| {
-        if context.attempted.get() {
+        if phase.input_attempted {
             NativeWindowError::Dispatch {
-                completed: context.completed.get(),
+                completed: phase.completed_button_pairs,
                 cause,
             }
             .into()
@@ -560,7 +780,9 @@ pub(crate) enum NativeWindowError {
     InvalidPixels,
     #[error("native window input invocation was cancelled")]
     Cancelled,
-    #[error("native window input input outcome is unknown after {completed} complete button pairs: {cause:#}")]
+    #[error(
+        "native window input input outcome is unknown after {completed} complete button pairs: {cause:#}"
+    )]
     Dispatch {
         completed: u32,
         #[source]
@@ -572,6 +794,46 @@ pub(crate) enum NativeWindowError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn retained_observation_cancellation_works_outside_its_task_local_scope() {
+        use crate::atspi::native_observation::{with_native_observation, NativeObservationRequest};
+
+        let observation = with_native_observation(
+            NativeObservationRequest {
+                pid: 123,
+                window_id: 456,
+                deadline: None,
+            },
+            async { crate::atspi::native_observation::current().expect("scoped observation") },
+        )
+        .await;
+        assert!(crate::atspi::native_observation::current().is_none());
+        let cancellation = NativeWindowCancellation::from_observation(String::new(), observation);
+        assert!(matches!(
+            cancellation.check(),
+            Err(NativeWindowError::Cancelled)
+        ));
+
+        with_native_observation(
+            NativeObservationRequest {
+                pid: 123,
+                window_id: 456,
+                deadline: Some(std::time::Instant::now()),
+            },
+            async {
+                let observation =
+                    crate::atspi::native_observation::current().expect("scoped deadline");
+                let cancellation =
+                    NativeWindowCancellation::from_observation(String::new(), observation);
+                assert!(matches!(
+                    cancellation.check(),
+                    Err(NativeWindowError::Cancelled)
+                ));
+            },
+        )
+        .await;
+    }
 
     fn click(count: u32) -> NativeWindowInputRequest {
         NativeWindowInputRequest {

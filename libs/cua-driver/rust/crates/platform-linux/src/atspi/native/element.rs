@@ -12,7 +12,9 @@ use crate::input::native_element::{
     NativeElementClickFailure, NativeElementClickRequest, NativeElementDelivery,
     NativeElementTransport,
 };
-use crate::input::native_window::NativeClickButton;
+use crate::input::native_window::{
+    with_native_window_focus, NativeClickButton, NativeWindowCancellation, NativeWindowTarget,
+};
 
 const NOT_MEMBER: &str = "element is not in this window's AT-SPI tree; refresh get_window_state()";
 const SEARCH_LIMIT: &str = "AT-SPI element search exceeded its tree limit";
@@ -30,7 +32,7 @@ pub(super) fn check(session_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn checked<T, E: std::fmt::Display>(
+pub(super) async fn checked<T, E: std::fmt::Display>(
     session_id: &str,
     future: impl std::future::Future<Output = std::result::Result<T, E>>,
 ) -> Result<T> {
@@ -44,18 +46,17 @@ async fn checked<T, E: std::fmt::Display>(
     }
 }
 
-struct SelectedWindow {
-    root: RawObjectRef,
-    window: crate::x11::WindowInfo,
+pub(super) struct SelectedWindow {
+    pub(super) root: RawObjectRef,
 }
 
-async fn selected_window(
+pub(super) async fn selected_window(
     conn: &AccessibilityConnection,
-    request: &NativeElementClickRequest,
+    target: NativeWindowTarget,
     session_id: &str,
 ) -> Result<SelectedWindow> {
     check(Some(session_id))?;
-    let (pid, xid) = (request.pid, u64::from(request.window_id));
+    let (pid, xid) = (target.pid, u64::from(target.window_id));
     let window = bounded_blocking(move || {
         if pid == 0
             || xid == 0
@@ -69,7 +70,7 @@ async fn selected_window(
     .await
     .flatten();
     check(Some(session_id))?;
-    let window = window.context("native element window owner is unavailable")?;
+    window.context("native element window owner is unavailable")?;
     let resolved = resolve_app_for_pid(conn, pid).await?;
     check(Some(session_id))?;
     if resolved.is_none()
@@ -93,12 +94,12 @@ async fn selected_window(
         .into_iter()
         .nth(frame)
         .context("window has no AT-SPI accessibility tree")?;
-    Ok(SelectedWindow { root, window })
+    Ok(SelectedWindow { root })
 }
 
-struct Located {
-    object: RawObjectRef,
-    ancestors: Vec<RawObjectRef>,
+pub(super) struct Located {
+    pub(super) object: RawObjectRef,
+    pub(super) ancestors: Vec<RawObjectRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -185,7 +186,7 @@ async fn find(
     Ok(None)
 }
 
-async fn locate(
+pub(super) async fn locate(
     conn: &AccessibilityConnection,
     root: &RawObjectRef,
     selector: Option<&str>,
@@ -200,7 +201,7 @@ async fn locate(
         .ok_or_else(|| anyhow!(NOT_MEMBER))
 }
 
-async fn pin(
+pub(super) async fn pin(
     conn: &AccessibilityConnection,
     located: Located,
     session_id: &str,
@@ -298,121 +299,123 @@ fn context_action<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<usize>
     matches.next().is_none().then_some(index)
 }
 
-async fn click(
+fn click_target(request: &NativeElementClickRequest) -> NativeWindowTarget {
+    NativeWindowTarget {
+        pid: request.pid,
+        window_id: request.window_id,
+    }
+}
+
+/// The shared context can attempt focus or pointer input before returning an
+/// error. Preserve an already-attempted accessibility actuator's error/route.
+fn after_window_input(
+    mut failure: NativeElementClickFailure,
+    window_input_attempted: bool,
+) -> NativeElementClickFailure {
+    if !failure.dispatched && window_input_attempted {
+        failure.dispatched = true;
+        failure.transport = NativeElementTransport::WindowSendEvent;
+    }
+    failure
+}
+
+fn check_retained(
+    observation: &super::super::native_observation::Observation,
+    session_id: &str,
+) -> Result<()> {
+    if let Some(reason) = observation.stop_reason() {
+        bail!(reason);
+    }
+    check(Some(session_id))
+}
+
+async fn lookup(
+    conn: &AccessibilityConnection,
     request: &NativeElementClickRequest,
     session_id: &str,
-) -> std::result::Result<NativeElementDelivery, NativeElementClickFailure> {
-    let initial = if request.button == NativeClickButton::Right {
-        NativeElementTransport::PhysicalPointer
-    } else {
-        NativeElementTransport::Accessibility
-    };
-    let prepare = async {
-        check(Some(session_id))?;
-        request.validate_options()?;
-        if crate::wayland::is_wayland() {
-            bail!(super::super::native_observation::X11_ROUTE_REQUIRED);
-        }
-        if super::super::native_observation::for_window(request.pid, u64::from(request.window_id))?
-            .is_none()
-        {
-            bail!("native element click requires its scoped lookup context");
-        }
-        if request
-            .element_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("x11:"))
-        {
-            bail!("element actions require AT-SPI; X11 fallback IDs only identify windows");
-        }
-        let conn = checked(session_id, shared_connection()).await?;
-        let selected = selected_window(conn, request, session_id).await?;
-        let located = pin(
+) -> Result<Located> {
+    let selected = selected_window(conn, click_target(request), session_id).await?;
+    pin(
+        conn,
+        locate(
             conn,
-            locate(
-                conn,
-                &selected.root,
-                request.element_id.as_deref(),
-                session_id,
-            )
-            .await?,
+            &selected.root,
+            request.element_id.as_deref(),
             session_id,
         )
-        .await?;
-        Ok::<_, anyhow::Error>((conn, selected, located))
-    }
-    .await
-    .map_err(|error| failure(error, false, initial))?;
-    let (conn, selected, located) = prepare;
-    if request.button == NativeClickButton::Left {
-        let proxy = action_proxy(conn, &located.object, session_id)
-            .await
-            .map_err(|error| failure(error, false, initial))?;
-        let actions = checked(session_id, proxy.get_actions())
-            .await
-            .map_err(|error| failure(error, false, initial))?;
-        if actions.is_empty() {
-            return Err(failure(
-                anyhow!("element has no primary accessibility action"),
-                false,
-                initial,
-            ));
-        }
-        return dispatch_action(&proxy, 0, request, session_id).await;
-    }
-    let position = super::element_position::position(
-        conn,
-        &located.object,
-        &located.ancestors,
-        &selected.window,
+        .await?,
         session_id,
     )
-    .await;
-    match position {
-        Ok([x, y]) => {
-            verify_owner(request, session_id)
-                .await
-                .map_err(|error| failure(error, false, initial))?;
-            check(Some(session_id)).map_err(|error| failure(error, false, initial))?;
-            // Existing XTest primitive preserves the press/release pair. Its
-            // outcome is final; an error must never trigger a second actuator.
-            crate::input::send_native_element_click_xtest([x, y], || check(Some(session_id)))
-                .map(|()| NativeElementDelivery::PhysicalPointer)
-                .map_err(|error| failure(error.error, error.dispatched, initial))
-        }
-        Err(preparation_error) => {
-            check(Some(session_id)).map_err(|error| failure(error, false, initial))?;
-            // Original right-click fallback repeats membership after positional
-            // preparation fails. Action enumeration failure keeps that error.
-            let fallback = async {
-                let selected = selected_window(conn, request, session_id).await?;
-                let located = pin(
-                    conn,
-                    locate(
-                        conn,
-                        &selected.root,
-                        request.element_id.as_deref(),
-                        session_id,
-                    )
-                    .await?,
-                    session_id,
-                )
-                .await?;
-                let proxy = action_proxy(conn, &located.object, session_id).await?;
-                let actions = checked(session_id, proxy.get_actions()).await?;
-                let index = context_action(actions.iter().map(|action| action.name.as_str()));
-                Ok::<_, anyhow::Error>((proxy, index))
-            }
-            .await;
-            check(Some(session_id)).map_err(|error| failure(error, false, initial))?;
-            match fallback {
-                Ok((proxy, Some(index))) => {
-                    dispatch_action(&proxy, index, request, session_id).await
-                }
-                _ => Err(failure(preparation_error, false, initial)),
-            }
-        }
+    .await
+}
+
+async fn prepare(
+    request: &NativeElementClickRequest,
+    session_id: &str,
+) -> Result<(&'static AccessibilityConnection, Located)> {
+    check(Some(session_id))?;
+    request.validate_options()?;
+    if crate::wayland::is_wayland() {
+        bail!(super::super::native_observation::X11_ROUTE_REQUIRED);
     }
+    if super::super::native_observation::for_window(request.pid, u64::from(request.window_id))?
+        .is_none()
+    {
+        bail!("native element click requires its scoped lookup context");
+    }
+    if request
+        .element_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("x11:"))
+    {
+        bail!("element actions require AT-SPI; X11 fallback IDs only identify windows");
+    }
+    let conn = checked(session_id, shared_connection()).await?;
+    let located = lookup(conn, request, session_id).await?;
+    Ok((conn, located))
+}
+
+/// ReadActions has already succeeded before entering this target lifetime.
+fn dispatch_action_with_focus(
+    proxy: &ActionProxy<'_>,
+    index: usize,
+    request: &NativeElementClickRequest,
+    observation: &super::super::native_observation::Observation,
+    session_id: &str,
+    previous_window_input_attempted: bool,
+) -> std::result::Result<NativeElementDelivery, NativeElementClickFailure> {
+    let transport = NativeElementTransport::Accessibility;
+    let outcome = with_native_window_focus(
+        click_target(request),
+        NativeWindowCancellation::from_observation(session_id.to_owned(), observation.clone()),
+        |_, context| {
+            context
+                .check()
+                .map_err(|error| failure(error.into(), false, transport))?;
+            runtime()
+                .block_on(observation.scope(dispatch_action(proxy, index, request, session_id)))
+        },
+    );
+    match outcome {
+        Ok(outcome) => outcome.result.map_err(|error| {
+            after_window_input(
+                error,
+                previous_window_input_attempted || outcome.phase.input_attempted,
+            )
+        }),
+        Err(error) => Err(after_window_input(
+            failure(error.error, false, transport),
+            previous_window_input_attempted || error.phase.input_attempted,
+        )),
+    }
+}
+
+/// Positional/setup errors may take the original context-action fallback.
+/// Once the selected-window click helper is entered its result is final,
+/// including an error from its first move before any button edge.
+enum RightClickFailure {
+    Preparation(anyhow::Error),
+    Final(NativeElementClickFailure),
 }
 
 pub(crate) fn click_native_element(
@@ -420,12 +423,158 @@ pub(crate) fn click_native_element(
     observation: super::super::native_observation::Observation,
     session_id: &str,
 ) -> std::result::Result<NativeElementDelivery, NativeElementClickFailure> {
-    runtime().block_on(observation.scope(click(request, session_id)))
+    let initial = if request.button == NativeClickButton::Right {
+        NativeElementTransport::WindowSendEvent
+    } else {
+        NativeElementTransport::Accessibility
+    };
+    // The input worker, rather than an async runtime frame, owns the focus
+    // lifetime. Each AT-SPI phase enters the same existing runtime separately.
+    let (conn, located) = runtime()
+        .block_on(observation.scope(prepare(request, session_id)))
+        .map_err(|error| failure(error, false, initial))?;
+    if request.button == NativeClickButton::Left {
+        let proxy = runtime()
+            .block_on(observation.scope(async {
+                let proxy = action_proxy(conn, &located.object, session_id).await?;
+                let actions = checked(session_id, proxy.get_actions()).await?;
+                if actions.is_empty() {
+                    bail!("element has no primary accessibility action");
+                }
+                Ok::<_, anyhow::Error>(proxy)
+            }))
+            .map_err(|error| failure(error, false, initial))?;
+        return dispatch_action_with_focus(&proxy, 0, request, &observation, session_id, false);
+    }
+
+    let window_click = with_native_window_focus(
+        click_target(request),
+        NativeWindowCancellation::from_observation(session_id.to_owned(), observation.clone()),
+        |x11, context| {
+            let final_failure = |error| RightClickFailure::Final(failure(error, false, initial));
+            context
+                .check()
+                .map_err(|error| final_failure(error.into()))?;
+            let position =
+                runtime().block_on(observation.scope(super::element_position::position(
+                    conn,
+                    &located.object,
+                    &located.ancestors,
+                    request.window_id,
+                    session_id,
+                )));
+            // A stopped caller never starts fallback, including a stop that
+            // happened while a failing position RPC was in flight.
+            context
+                .check()
+                .map_err(|error| final_failure(error.into()))?;
+            let [x, y] = position.map_err(RightClickFailure::Preparation)?;
+            runtime()
+                .block_on(observation.scope(verify_owner(request, session_id)))
+                .map_err(final_failure)?;
+            context
+                .check()
+                .map_err(|error| final_failure(error.into()))?;
+            context
+                .click_at_root(x11, [x, y], request.button, request.count)
+                .map(|()| NativeElementDelivery::WindowSendEvent)
+                .map_err(|error| RightClickFailure::Final(failure(error, false, initial)))
+        },
+    );
+    // Returning from the shared lifetime completes release/100ms/FocusOut
+    // before any fallback lookup, ReadActions or second target construction.
+    let (preparation_error, previous_window_input_attempted) = match window_click {
+        Ok(outcome) => match outcome.result {
+            Ok(delivery) => return Ok(delivery),
+            Err(RightClickFailure::Final(error)) => {
+                return Err(after_window_input(error, outcome.phase.input_attempted));
+            }
+            Err(RightClickFailure::Preparation(error)) => (error, outcome.phase.input_attempted),
+        },
+        // Original target-constructor errors join the positional fallback too.
+        Err(error) => (error.error, error.phase.input_attempted),
+    };
+    check_retained(&observation, session_id).map_err(|error| {
+        after_window_input(
+            failure(error, false, initial),
+            previous_window_input_attempted,
+        )
+    })?;
+    let fallback = runtime().block_on(observation.scope(async {
+        let located = lookup(conn, request, session_id).await?;
+        let proxy = action_proxy(conn, &located.object, session_id).await?;
+        let actions = checked(session_id, proxy.get_actions()).await?;
+        let index = context_action(actions.iter().map(|action| action.name.as_str()));
+        Ok::<_, anyhow::Error>((proxy, index))
+    }));
+    check_retained(&observation, session_id).map_err(|error| {
+        after_window_input(
+            failure(error, false, initial),
+            previous_window_input_attempted,
+        )
+    })?;
+    match fallback {
+        Ok((proxy, Some(index))) => dispatch_action_with_focus(
+            &proxy,
+            index,
+            request,
+            &observation,
+            session_id,
+            previous_window_input_attempted,
+        ),
+        // As in the original route, failure to enumerate a unique fallback
+        // action keeps the initial setup/position error.
+        _ => Err(after_window_input(
+            failure(preparation_error, false, initial),
+            previous_window_input_attempted,
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_input_phase_preserves_primary_failures_and_marks_pre_primary_input() {
+        for primary_attempted in [false, true] {
+            for window_input_attempted in [false, true] {
+                let original = std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "primary actuator error",
+                );
+                let failure = after_window_input(
+                    failure(
+                        original.into(),
+                        primary_attempted,
+                        NativeElementTransport::Accessibility,
+                    ),
+                    window_input_attempted,
+                );
+                assert_eq!(
+                    failure.dispatched,
+                    primary_attempted || window_input_attempted
+                );
+                assert_eq!(
+                    failure.transport,
+                    if !primary_attempted && window_input_attempted {
+                        NativeElementTransport::WindowSendEvent
+                    } else {
+                        NativeElementTransport::Accessibility
+                    }
+                );
+                assert_eq!(failure.error.to_string(), "primary actuator error");
+                assert_eq!(
+                    failure
+                        .error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::ConnectionReset
+                );
+            }
+        }
+    }
 
     #[test]
     fn context_menu_fallback_requires_one_exact_ascii_case_insensitive_action() {

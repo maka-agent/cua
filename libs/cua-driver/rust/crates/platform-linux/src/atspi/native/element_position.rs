@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Live screen geometry for a native element right-click.
+//! Live screen geometry for native element pointer preparation.
 
 use anyhow::{bail, Context, Result};
 use atspi::State;
@@ -16,6 +16,15 @@ fn intersect(left: Rect, right: Rect) -> Rect {
         top: left.top.max(right.top),
         right: left.right.min(right.right),
         bottom: left.bottom.min(right.bottom),
+    }
+}
+
+fn window_rect(window: &WindowInfo) -> Rect {
+    Rect {
+        left: i64::from(window.x),
+        top: i64::from(window.y),
+        right: i64::from(window.x) + i64::from(window.width),
+        bottom: i64::from(window.y) + i64::from(window.height),
     }
 }
 
@@ -37,7 +46,7 @@ pub(super) async fn position(
     conn: &AccessibilityConnection,
     target: &RawObjectRef,
     ancestors: &[RawObjectRef],
-    window: &WindowInfo,
+    window_id: u32,
     session_id: &str,
 ) -> Result<[i16; 2]> {
     super::element::check(Some(session_id))?;
@@ -53,18 +62,7 @@ pub(super) async fn position(
         bail!("element is not visible; scroll it into view before right-clicking");
     }
 
-    super::element::check(Some(session_id))?;
-    let target_bounds = bounds(conn, target, Some(session_id)).await;
-    super::element::check(Some(session_id))?;
-    let mut visible = intersect(
-        target_bounds?,
-        Rect {
-            left: i64::from(window.x),
-            top: i64::from(window.y),
-            right: i64::from(window.x) + i64::from(window.width),
-            bottom: i64::from(window.y) + i64::from(window.height),
-        },
-    );
+    let mut visible = live_window_clip(conn, target, window_id, session_id).await?;
 
     for ancestor in ancestors {
         super::element::check(Some(session_id))?;
@@ -85,6 +83,34 @@ pub(super) async fn position(
     }
 
     center(visible)
+}
+
+async fn live_window_clip(
+    conn: &AccessibilityConnection,
+    target: &RawObjectRef,
+    window_id: u32,
+    session_id: &str,
+) -> Result<Rect> {
+    super::element::check(Some(session_id))?;
+    let target_bounds = bounds(conn, target, Some(session_id)).await?;
+    super::element::check(Some(session_id))?;
+    let window = super::bounded_blocking(move || crate::x11::window_info(u64::from(window_id)))
+        .await
+        .flatten();
+    super::element::check(Some(session_id))?;
+    let window = window.context("native element position window is unavailable")?;
+    Ok(intersect(target_bounds, window_rect(&window)))
+}
+
+/// A scroll target uses only its own Screen bounds and the live window.
+/// The focus context already exists when this function is entered.
+pub(super) async fn scroll_position(
+    conn: &AccessibilityConnection,
+    target: &RawObjectRef,
+    window_id: u32,
+    session_id: &str,
+) -> Result<[i16; 2]> {
+    center(live_window_clip(conn, target, window_id, session_id).await?)
 }
 
 #[cfg(test)]

@@ -1880,6 +1880,35 @@ impl CuaDriverSession {
         }
     }
 
+    /// Scroll a freshly resolved native Linux selector through this binding.
+    ///
+    /// The selector and caller deadline stay in a typed sidecar. Ordinary
+    /// `scroll` authorization sees the exact process, window, direction and
+    /// pixel distance; the native worker retains the admitted operation.
+    ///
+    /// # Errors
+    /// Returns a driver error for an unsupported backend or failed transport.
+    /// Native preparation and dispatch refusals remain in [`ToolResult`].
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub async fn scroll_native_element_window(
+        &self,
+        request: platform_linux::input::native_element::NativeElementScrollRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = request.arguments();
+        match &self.backend {
+            SessionBackend::Embedded(session) => normalize_result(
+                "scroll",
+                session
+                    .invoke_native_element_scroll(arguments, request)
+                    .await?,
+            ),
+            _ => Err(DriverError::Protocol {
+                reason: "native Linux element scrolling requires an embedded trusted session"
+                    .into(),
+            }),
+        }
+    }
+
     /// Observe one host-prepared macOS source frame through this exact session.
     /// The request supplies data, never authority. This Rust-only method uses
     /// the ordinary get_window_state authorization and operation lifecycle.
@@ -2479,6 +2508,193 @@ mod snapshot_lifecycle_tests;
 #[cfg(test)]
 mod tests {
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    struct NativeElementScrollProbe;
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for NativeElementScrollProbe {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            static DEF: OnceLock<cua_driver_core::tool::ToolDef> = OnceLock::new();
+            DEF.get_or_init(|| cua_driver_core::tool::ToolDef {
+                name: "scroll".into(),
+                description: "test-only native element scroll argument probe".into(),
+                input_schema: serde_json::json!({
+                    "type":"object","additionalProperties":false,"properties":{
+                        "session":{"type":"string"},"pid":{"type":"integer"},
+                        "window_id":{"type":"integer"},"scope":{"type":"string"},
+                        "direction":{"type":"string"},"pixels":{"type":"integer"},
+                        "delivery_mode":{"type":"string"},
+                    }
+                }),
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            })
+        }
+
+        async fn invoke(&self, arguments: Value) -> cua_driver_core::protocol::ToolResult {
+            use cua_driver_core::action_record::{
+                ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+            };
+
+            cua_driver_core::protocol::ToolResult::error(arguments.to_string()).with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Refused,
+                    ActionTransport::LinuxXSendEvent,
+                    RequestedDelivery::Background,
+                )
+                .refusal("test_probe", None)
+                .build()
+                .unwrap(),
+            )
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    fn register_native_element_scroll_probes(registry: &mut cua_driver_core::tool::ToolRegistry) {
+        registry.register(Box::new(NativeObservationProbe));
+        registry.register(Box::new(NativeElementScrollProbe));
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[tokio::test]
+    async fn native_element_scroll_uses_bound_mutation_admission_and_canonical_arguments() {
+        use platform_linux::input::native_element::NativeElementScrollRequest;
+        use platform_linux::input::native_window::NativeScrollDirection;
+
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
+        let observer = Arc::new(RecordingActivityObserver::default());
+        let driver = CuaDriver::try_create_configured_for_host(
+            ConfiguredDriverOptions {
+                audio_enabled: false,
+                claude_code_compatibility: false,
+                authorization: RuntimeAuthorizationOptions {
+                    allowed_modes: vec![SessionPermissionMode::Standard],
+                    compatibility_mode: SessionPermissionMode::Standard,
+                    compatibility_capability_manifest_path: None,
+                    compatibility_bounded_manifest_path: None,
+                    unrestricted_acknowledged: false,
+                    max_session_ttl_seconds: 60,
+                    max_idle_ttl_seconds: 30,
+                },
+            },
+            DriverHostOptions {
+                cursor: cursor_overlay::CursorConfig {
+                    enabled: false,
+                    ..cursor_overlay::CursorConfig::default()
+                },
+                host_owns_permission_ux: false,
+                host_bundle_id: None,
+                claude_code_compatibility: false,
+                prepare_desktop_environment: false,
+                register_host_tools: Some(register_native_element_scroll_probes),
+                authorization_host: None,
+                activity_observer: Some(observer.clone()),
+            },
+        )
+        .unwrap();
+        let session = driver
+            .create_trusted_session(TrustedSessionOptions {
+                public_session: "native-element-scroll-test".into(),
+                mode: SessionPermissionMode::Standard,
+                ttl_seconds: 60,
+                idle_ttl_seconds: 30,
+                capability_manifest_path: None,
+                bounded_manifest_path: None,
+            })
+            .unwrap();
+        session
+            .call_tool("get_window_state".into(), "{}".into())
+            .await
+            .unwrap();
+        let target_pid = if std::process::id() == 123 { 124 } else { 123 };
+        let mut request = NativeElementScrollRequest {
+            pid: target_pid,
+            window_id: 456,
+            element_id: ":1.0:/org/a11y/atspi/accessible/5".into(),
+            direction: NativeScrollDirection::Up,
+            pixels: 0,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        };
+        let ordinary = session
+            .call_tool("scroll".into(), request.arguments().to_string())
+            .await
+            .unwrap();
+        assert!(ordinary.is_error, "the hermetic probe always refuses input");
+        for (direction, pixels) in [
+            (NativeScrollDirection::Up, 0),
+            (NativeScrollDirection::Down, 1),
+            (NativeScrollDirection::Left, 37),
+            (NativeScrollDirection::Right, u16::MAX),
+        ] {
+            request.direction = direction;
+            request.pixels = pixels;
+            let result = session
+                .scroll_native_element_window(request.clone())
+                .await
+                .unwrap();
+            assert!(result.is_error, "the hermetic probe always refuses input");
+            let actual: Value = serde_json::from_str(&result.text).unwrap();
+            assert_eq!(actual["pid"], target_pid);
+            assert_eq!(actual["window_id"], 456);
+            assert_eq!(actual["scope"], "window");
+            assert_eq!(actual["direction"], direction.as_str());
+            assert_eq!(actual["pixels"], pixels);
+            assert_eq!(actual["delivery_mode"], "background");
+            for absent in [
+                "element_id",
+                "element_token",
+                "x",
+                "y",
+                "deadline",
+                "native_profile",
+            ] {
+                assert!(
+                    actual.get(absent).is_none(),
+                    "{absent} stays outside authorized JSON"
+                );
+            }
+        }
+        let SessionBackend::Embedded(native) = &session.backend else {
+            panic!("test host has an embedded binding");
+        };
+        for (field, value) in [
+            ("pid", serde_json::json!(u64::from(target_pid) + 1)),
+            ("window_id", serde_json::json!(789)),
+            ("direction", serde_json::json!("up")),
+            ("pixels", serde_json::json!(1)),
+            ("delivery_mode", serde_json::json!("foreground")),
+        ] {
+            let mut substituted = request.arguments();
+            substituted[field] = value;
+            assert!(
+                matches!(native.invoke_native_element_scroll(substituted, request.clone()).await,
+                Err(DriverError::Protocol { reason }) if reason == "native Linux element scroll data does not match its canonical request")
+            );
+        }
+        {
+            let events = observer.events.lock().unwrap();
+            let read = events
+                .iter()
+                .find(|event| event.tool_name == "get_window_state")
+                .unwrap();
+            let scrolls: Vec<_> = events
+                .iter()
+                .filter(|event| event.tool_name == "scroll")
+                .collect();
+            assert_eq!(scrolls.len(), 5);
+            for event in scrolls {
+                assert_eq!(event.kind, DriverActivityKind::ActionFailed);
+                assert!(event.refusal_code.is_none());
+                assert_ne!(event.risk_class, read.risk_class);
+            }
+        }
+        session.close();
+        driver.shutdown().await.unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     struct NativeElementClickProbe;
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -2599,7 +2815,7 @@ mod tests {
         assert!(ordinary.is_error, "the hermetic probe always refuses input");
         for (button, delivery) in [
             (NativeClickButton::Left, "background"),
-            (NativeClickButton::Right, "foreground"),
+            (NativeClickButton::Right, "background"),
         ] {
             request.button = button;
             let result = session

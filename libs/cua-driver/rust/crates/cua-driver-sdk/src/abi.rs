@@ -926,6 +926,8 @@ enum NativeRequest {
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     ElementClick(platform_linux::input::native_element::NativeElementClickRequest),
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    ElementScroll(platform_linux::input::native_element::NativeElementScrollRequest),
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     Observation {
         request: platform_linux::atspi::native_observation::NativeObservationRequest,
         options: crate::NativeObservationOptions,
@@ -1054,6 +1056,15 @@ impl NativeRequest {
                 serde_json::json!({
                     "arguments":request.arguments(),
                     "element_id_present":request.element_id.is_some(),
+                    "deadline_present":request.deadline.is_some(),
+                }),
+            ),
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            Self::ElementScroll(request) => (
+                "linux_native_element_scroll",
+                serde_json::json!({
+                    "arguments":request.arguments(),
+                    "element_id_present":true,
                     "deadline_present":request.deadline.is_some(),
                 }),
             ),
@@ -1198,6 +1209,13 @@ unsafe fn session_invoke_in_frame(
                                 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
                                 NativeRequest::ElementClick(request) => {
                                     platform_linux::input::native_element::with_native_element_click(
+                                        request, invocation,
+                                    )
+                                    .await
+                                }
+                                #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+                                NativeRequest::ElementScroll(request) => {
+                                    platform_linux::input::native_element::with_native_element_scroll(
                                         request, invocation,
                                     )
                                     .await
@@ -1973,6 +1991,27 @@ impl NativeAbiSession {
         .await
     }
 
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub(crate) async fn invoke_native_element_scroll(
+        &self,
+        arguments: Value,
+        request: platform_linux::input::native_element::NativeElementScrollRequest,
+    ) -> Result<Value, DriverError> {
+        if arguments != request.arguments() {
+            return Err(DriverError::Protocol {
+                reason: "native Linux element scroll data does not match its canonical request"
+                    .into(),
+            });
+        }
+        self.invoke_in_frame(
+            "scroll",
+            arguments,
+            crate::runtime::CoordinateFrame::NativeWindow,
+            Some(NativeRequest::ElementScroll(request)),
+        )
+        .await
+    }
+
     async fn invoke_in_frame(
         &self,
         name: &str,
@@ -2181,6 +2220,40 @@ pub(crate) mod tests {
         let (profile, metadata) = NativeRequest::ElementClick(request).recording_input();
         assert_eq!(profile, "linux_native_element_click");
         assert_eq!(metadata, expected);
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn native_element_scroll_recording_keeps_scalar_configuration_without_selector_or_instant() {
+        use platform_linux::input::native_element::NativeElementScrollRequest;
+        use platform_linux::input::native_window::NativeScrollDirection;
+
+        for (element_id, deadline) in [
+            (String::new(), None),
+            (
+                ":1.0:/org/a11y/atspi/accessible/5".into(),
+                Some(std::time::Instant::now()),
+            ),
+        ] {
+            let request = NativeElementScrollRequest {
+                pid: 123,
+                window_id: 456,
+                element_id,
+                direction: NativeScrollDirection::Down,
+                pixels: u16::MAX,
+                deadline,
+            };
+            let expected = serde_json::json!({
+                "arguments":{
+                    "pid":123,"window_id":456,"scope":"window",
+                    "direction":"down","pixels":u16::MAX,"delivery_mode":"background",
+                },
+                "element_id_present":true,"deadline_present":deadline.is_some(),
+            });
+            let (profile, metadata) = NativeRequest::ElementScroll(request).recording_input();
+            assert_eq!(profile, "linux_native_element_scroll");
+            assert_eq!(metadata, expected);
+        }
     }
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]

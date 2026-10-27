@@ -4198,48 +4198,7 @@ fn send_click_xtest_desktop_with_timing(
     modifiers: &[&str],
     timing: ButtonTiming<'_>,
 ) -> Result<()> {
-    send_click_xtest_desktop_prepared(x, y, button, count, modifiers, timing, None)
-}
-
-/// A native element click retains the existing actuator while observing its
-/// preparation/dispatch boundary and checking its admitted lifecycle there.
-pub(crate) fn send_native_element_click_xtest(
-    point: [i16; 2],
-    before_dispatch: impl Fn() -> Result<()>,
-) -> std::result::Result<(), NativeElementPointerFailure> {
-    let dispatched = std::cell::Cell::new(false);
-    send_click_xtest_desktop_prepared(
-        i32::from(point[0]),
-        i32::from(point[1]),
-        3,
-        1,
-        &[],
-        ButtonTiming {
-            hold_ms: CLICK_DELAY_MS,
-            gap_ms: DOUBLE_CLICK_DELAY_MS,
-            native_wheel: false,
-            native_window: None,
-        },
-        Some(ButtonDispatchPhase {
-            check: &before_dispatch,
-            dispatched: &dispatched,
-        }),
-    )
-    .map_err(|error| NativeElementPointerFailure {
-        error,
-        dispatched: dispatched.get(),
-    })
-}
-
-#[derive(Debug)]
-pub(crate) struct NativeElementPointerFailure {
-    pub(crate) error: anyhow::Error,
-    pub(crate) dispatched: bool,
-}
-
-struct ButtonDispatchPhase<'a> {
-    check: &'a dyn Fn() -> Result<()>,
-    dispatched: &'a std::cell::Cell<bool>,
+    send_click_xtest_desktop_prepared(x, y, button, count, modifiers, timing)
 }
 
 fn send_click_xtest_desktop_prepared(
@@ -4249,7 +4208,6 @@ fn send_click_xtest_desktop_prepared(
     count: usize,
     modifiers: &[&str],
     timing: ButtonTiming<'_>,
-    phase: Option<ButtonDispatchPhase<'_>>,
 ) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
@@ -4276,19 +4234,10 @@ fn send_click_xtest_desktop_prepared(
         }
         // Absolute pointer warp (MotionNotify, detail=0 => absolute) so the
         // button events that follow are delivered at (x, y).
-        if let Some(phase) = &phase {
-            (phase.check)()?;
-        }
         attempted = true;
-        if let Some(phase) = &phase {
-            phase.dispatched.set(true);
-        }
         conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
         let count = count.max(1);
         for click_index in 0..count {
-            if let Some(phase) = &phase {
-                (phase.check)()?;
-            }
             let press =
                 conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
             // Confirm delivery before sleeping; buffering both edges produces a zero-ms click.

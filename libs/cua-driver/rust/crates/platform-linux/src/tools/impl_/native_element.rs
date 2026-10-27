@@ -125,17 +125,9 @@ async fn invoke_on_route(
 
 fn initial_transport(request: &NativeElementClickRequest) -> NativeElementTransport {
     if request.button == NativeClickButton::Right {
-        NativeElementTransport::PhysicalPointer
+        NativeElementTransport::WindowSendEvent
     } else {
         NativeElementTransport::Accessibility
-    }
-}
-
-fn requested_delivery(request: &NativeElementClickRequest) -> RequestedDelivery {
-    if request.button == NativeClickButton::Right {
-        RequestedDelivery::Foreground
-    } else {
-        RequestedDelivery::Background
     }
 }
 
@@ -145,14 +137,14 @@ fn transport_details(transport: NativeElementTransport) -> (ActionTransport, Act
             ActionTransport::LinuxAtSpiAction,
             ActualDelivery::Background,
         ),
-        NativeElementTransport::PhysicalPointer => {
-            (ActionTransport::LinuxXTest, ActualDelivery::Foreground)
+        NativeElementTransport::WindowSendEvent => {
+            (ActionTransport::LinuxXSendEvent, ActualDelivery::Background)
         }
     }
 }
 
 fn record(
-    request: &NativeElementClickRequest,
+    _request: &NativeElementClickRequest,
     transport: NativeElementTransport,
     effect: ActionEffect,
     actual: Option<ActualDelivery>,
@@ -161,7 +153,7 @@ fn record(
     let mut record = ActionExecutionRecord::builder(
         effect,
         transport_details(transport).0,
-        requested_delivery(request),
+        RequestedDelivery::Background,
     );
     if let Some(actual) = actual {
         record = record.actual_delivery(actual);
@@ -196,7 +188,7 @@ fn delivered(request: &NativeElementClickRequest, delivery: NativeElementDeliver
         NativeElementDelivery::Accessibility { unacknowledged } => {
             (NativeElementTransport::Accessibility, unacknowledged)
         }
-        NativeElementDelivery::PhysicalPointer => (NativeElementTransport::PhysicalPointer, false),
+        NativeElementDelivery::WindowSendEvent => (NativeElementTransport::WindowSendEvent, false),
     };
     ToolResult::text("Native element click dispatched; application effect remains unverified.")
         .with_structured(
@@ -298,9 +290,9 @@ mod tests {
             ),
             (
                 NativeClickButton::Right,
-                NativeElementDelivery::PhysicalPointer,
-                ActionTransport::LinuxXTest,
-                ActualDelivery::Foreground,
+                NativeElementDelivery::WindowSendEvent,
+                ActionTransport::LinuxXSendEvent,
+                ActualDelivery::Background,
             ),
         ] {
             let result = delivered(&request(button), delivery);
@@ -314,6 +306,32 @@ mod tests {
     }
 
     #[test]
+    fn focus_input_before_primary_failure_is_recorded_as_background_uncertainty() {
+        let result = failed(
+            &request(NativeClickButton::Right),
+            NativeElementClickFailure {
+                error: anyhow::anyhow!("position was unavailable"),
+                dispatched: true,
+                transport: NativeElementTransport::WindowSendEvent,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&result.content).unwrap()[0]["text"],
+            "position was unavailable"
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["verified"],
+            false
+        );
+        let record = result.action_record.unwrap();
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
+        assert_eq!(record.transport, ActionTransport::LinuxXSendEvent);
+        assert_eq!(record.requested_delivery, RequestedDelivery::Background);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Background));
+        assert!(record.public_result().is_ok());
+    }
+
+    #[test]
     fn preparation_refusal_has_no_delivery_and_dispatch_failure_stays_unknown() {
         for dispatched in [false, true] {
             let result = failed(
@@ -321,7 +339,7 @@ mod tests {
                 NativeElementClickFailure {
                     error: anyhow::anyhow!("native failure"),
                     dispatched,
-                    transport: NativeElementTransport::PhysicalPointer,
+                    transport: NativeElementTransport::WindowSendEvent,
                 },
             );
             let record = result.action_record.unwrap();
@@ -335,7 +353,7 @@ mod tests {
             );
             assert_eq!(
                 record.actual_delivery,
-                dispatched.then_some(ActualDelivery::Foreground)
+                dispatched.then_some(ActualDelivery::Background)
             );
             assert!(record.public_result().is_ok());
         }

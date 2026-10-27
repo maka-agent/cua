@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-//! Bound native selectors carried outside ordinary click arguments.
+//! Bound native selectors carried outside ordinary tool arguments.
 
 use std::{cell::RefCell, future::Future, time::Instant};
 
 use serde_json::{json, Value};
 
-use super::native_window::NativeClickButton;
+use super::native_window::{NativeClickButton, NativeScrollDirection};
 use crate::atspi::native_observation::{with_native_observation, NativeObservationRequest};
 
 /// A native selector for one selected process and X11 client window.
@@ -35,7 +35,7 @@ impl NativeElementClickRequest {
         json!({
             "pid":self.pid,"window_id":self.window_id,"scope":"window",
             "button":self.button.as_str(),"count":self.count,
-            "delivery_mode":if self.button == NativeClickButton::Right { "foreground" } else { "background" },
+            "delivery_mode":"background",
         })
     }
 
@@ -65,8 +65,57 @@ impl NativeElementClickRequest {
     }
 }
 
+/// One App-originated element scroll for an exact selected X11 client.
+///
+/// The native selector is data to resolve afresh, not input authority. The App
+/// projection has no key option; low-level key chords are outside this request.
+#[derive(Clone, Debug)]
+pub struct NativeElementScrollRequest {
+    /// Expected process owning the selected window.
+    pub pid: u32,
+    /// Exact X11 client window selected by the caller.
+    pub window_id: u32,
+    /// Opaque native selector; absence remains the coordinate-center route.
+    pub element_id: String,
+    /// Direction after the App/native parser's recognized spellings.
+    pub direction: NativeScrollDirection,
+    /// Native u16 pixel distance; zero is checked after position preparation.
+    pub pixels: u16,
+    /// Caller deadline, retained in memory rather than JSON arguments.
+    pub deadline: Option<Instant>,
+}
+
+impl NativeElementScrollRequest {
+    /// Ordinary scroll arguments used by the existing authorization path.
+    #[doc(hidden)]
+    pub fn arguments(&self) -> Value {
+        json!({
+            "pid":self.pid,"window_id":self.window_id,"scope":"window",
+            "direction":self.direction.as_str(),"pixels":self.pixels,
+            "delivery_mode":"background",
+        })
+    }
+
+    pub(crate) fn matches_arguments(&self, args: &Value) -> bool {
+        let expected = self.arguments();
+        expected.as_object().is_some_and(|fields| {
+            fields
+                .iter()
+                .all(|(name, value)| args.get(name) == Some(value))
+                && args.as_object().is_some_and(|actual| {
+                    actual.keys().all(|name| {
+                        name.starts_with('_')
+                            || fields.contains_key(name)
+                            || (name == "session" && actual[name].is_string())
+                    })
+                })
+        })
+    }
+}
+
 tokio::task_local! {
     static NATIVE_ELEMENT_CLICK: RefCell<Option<NativeElementClickRequest>>;
+    static NATIVE_ELEMENT_SCROLL: RefCell<Option<NativeElementScrollRequest>>;
 }
 
 /// Scope selector data and the existing native cancellation context together.
@@ -94,21 +143,47 @@ pub(crate) fn take_native_element_click() -> Option<NativeElementClickRequest> {
         .flatten()
 }
 
+/// Scope scroll selector data and the existing native cancellation context.
+#[doc(hidden)]
+pub async fn with_native_element_scroll<F: Future>(
+    request: NativeElementScrollRequest,
+    operation: F,
+) -> F::Output {
+    let observation = NativeObservationRequest {
+        pid: request.pid,
+        window_id: u64::from(request.window_id),
+        deadline: request.deadline,
+    };
+    with_native_observation(
+        observation,
+        NATIVE_ELEMENT_SCROLL.scope(RefCell::new(Some(request)), operation),
+    )
+    .await
+}
+
+pub(crate) fn take_native_element_scroll() -> Option<NativeElementScrollRequest> {
+    NATIVE_ELEMENT_SCROLL
+        .try_with(|request| request.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
 /// The actuator selected after fresh native lookup and preparation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeElementTransport {
     Accessibility,
-    PhysicalPointer,
+    WindowSendEvent,
 }
 
 /// Delivery is distinct from independently observed application effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeElementDelivery {
     Accessibility { unacknowledged: bool },
-    PhysicalPointer,
+    WindowSendEvent,
 }
 
-/// Preserve whether an error happened before or after an actuator was tried.
+/// Preserve whether an error happened before or after input was tried,
+/// including virtual focus before the primary actuator.
 #[derive(Debug)]
 pub(crate) struct NativeElementClickFailure {
     pub(crate) error: anyhow::Error,
@@ -131,12 +206,76 @@ mod tests {
         }
     }
 
+    fn scroll_request() -> NativeElementScrollRequest {
+        NativeElementScrollRequest {
+            pid: 123,
+            window_id: 456,
+            element_id: ":1.0:/org/a11y/atspi/accessible/5".into(),
+            direction: NativeScrollDirection::Down,
+            pixels: 100,
+            deadline: None,
+        }
+    }
+
+    #[test]
+    fn canonical_scroll_arguments_bind_target_and_keep_selector_out_of_json() {
+        let request = scroll_request();
+        assert_eq!(
+            request.arguments(),
+            json!({"pid":123,"window_id":456,"scope":"window",
+                "direction":"down","pixels":100,"delivery_mode":"background"}),
+        );
+        let mut admitted = request.arguments();
+        admitted["_session_id"] = "protected-session".into();
+        assert!(request.matches_arguments(&admitted));
+        for (field, value) in [
+            ("window_id", json!(789)),
+            ("pixels", json!(200)),
+            ("element_token", json!("forged")),
+            ("element_id", json!("native")),
+            ("x", json!(0)),
+        ] {
+            let mut changed = admitted.clone();
+            changed[field] = value;
+            assert!(!request.matches_arguments(&changed), "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scroll_scope_is_one_shot_and_cancels_its_retained_native_work() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut invocation = Box::pin(with_native_element_scroll(scroll_request(), async move {
+            let selected = take_native_element_scroll().expect("typed scroll is scoped");
+            assert_eq!(selected.element_id, ":1.0:/org/a11y/atspi/accessible/5");
+            assert!(take_native_element_scroll().is_none());
+            let observation = crate::atspi::native_observation::current()
+                .expect("same native cancellation context is scoped");
+            ready_tx
+                .send(observation)
+                .expect("test retains lookup context");
+            std::future::pending::<()>().await;
+        }));
+        let observation = tokio::select! {
+            _ = invocation.as_mut() => panic!("invocation stays pending"),
+            observation = ready_rx => observation.expect("lookup context is ready"),
+        };
+        assert_eq!(observation.stop_reason(), None);
+        drop(invocation);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), observation.stopped())
+                .await
+                .expect("dropping invocation wakes native scroll work"),
+            "cancelled"
+        );
+        assert!(take_native_element_scroll().is_none());
+    }
+
     #[test]
     fn canonical_click_arguments_keep_native_selectors_out_of_json() {
         let mut request = request();
         for (button, delivery) in [
             (NativeClickButton::Left, "background"),
-            (NativeClickButton::Right, "foreground"),
+            (NativeClickButton::Right, "background"),
         ] {
             request.button = button;
             assert_eq!(

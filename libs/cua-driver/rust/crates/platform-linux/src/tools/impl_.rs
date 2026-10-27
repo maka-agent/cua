@@ -24,6 +24,7 @@ use cursor_overlay::CursorRegistry;
 mod pixel_scroll;
 use pixel_scroll::PixelScroll;
 mod native_element;
+mod native_scroll;
 mod native_window;
 
 fn window_target_candidates_for_pid(
@@ -10078,6 +10079,9 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(request) = crate::input::native_element::take_native_element_scroll() {
+            return native_scroll::invoke(args, request).await;
+        }
         if let Some(request) = crate::input::native_window::take_native_window_input() {
             return native_window::invoke("scroll", args, request).await;
         }

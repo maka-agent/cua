@@ -30,10 +30,12 @@ mod element;
 mod element_position;
 pub mod hit;
 pub(crate) mod hit_test;
+mod scroll;
 mod traversal;
 mod visible_table;
 
 pub(crate) use element::click_native_element;
+pub(crate) use scroll::scroll_native_element;
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
