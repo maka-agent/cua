@@ -45,20 +45,26 @@ fn publish_action_capture(
     snapshot_id: Option<u32>,
     screenshot: Option<&WindowScreenshot>,
 ) -> Result<Option<String>, ToolResult> {
+    // This tool's public JPEG read is observational; capture_id-bound actions
+    // continue to require PNG. Other CaptureService surfaces keep their codecs.
     match (snapshot_id, screenshot) {
-        (Some(_), Some((bytes, _, width, height, Some(native), _, _, codec, _))) => bindings
-            .publish_window(
-                args,
-                pid,
-                window_id,
-                CaptureImage {
-                    encoded_bytes: bytes.clone(),
-                    codec: *codec,
-                    encoded_dimensions: (*width, *height),
-                    native_dimensions: *native,
-                },
-            )
-            .map(Some),
+        (Some(_), Some((bytes, _, width, height, Some(native), _, _, codec, _)))
+            if *codec == ScreenshotCodec::Png =>
+        {
+            bindings
+                .publish_window(
+                    args,
+                    pid,
+                    window_id,
+                    CaptureImage {
+                        encoded_bytes: bytes.clone(),
+                        codec: *codec,
+                        encoded_dimensions: (*width, *height),
+                        native_dimensions: *native,
+                    },
+                )
+                .map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -90,6 +96,40 @@ fn apply_screenshot_metadata(
     if let Some(prepared) = prepared {
         structured["prepared_capture"] = prepared;
     }
+}
+
+fn screenshot_encoding(
+    args: &Value,
+    frozen_capture_requested: bool,
+) -> Result<cua_driver_core::image_utils::ScreenshotEncoding, ToolResult> {
+    let resolve = || -> Result<_, String> {
+        let encoding = cua_driver_core::image_utils::ScreenshotEncoding::from_args(
+            "screenshot_format",
+            args.get("screenshot_format"),
+            "screenshot_quality",
+            args.get("screenshot_quality"),
+        )?;
+        if frozen_capture_requested
+            && ["screenshot_format", "screenshot_quality"]
+                .iter()
+                .any(|key| args.get(*key).is_some_and(|value| !value.is_null()))
+        {
+            return Err(
+                "screenshot_format and screenshot_quality cannot override a prepared capture's source-selected encoding"
+                    .into(),
+            );
+        }
+        Ok(encoding)
+    };
+    resolve().map_err(|detail| {
+        ToolResult::error(format!("get_window_state: {detail}")).with_structured(
+            serde_json::json!({
+                "code": "invalid_arguments",
+                "tool": "get_window_state",
+                "detail": detail,
+            }),
+        )
+    })
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -129,7 +169,18 @@ fn def() -> &'static ToolDef {
                 },
                 "screenshot_out_file": {
                     "type": "string",
-                    "description": "When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
+                    "description": "When set, write the screenshot (PNG, or JPEG with screenshot_format:\"jpeg\") to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
+                },
+                "screenshot_format": {
+                    "type": "string",
+                    "enum": ["png", "jpeg"],
+                    "description": "Encoding of the returned screenshot. Default \"png\". \"jpeg\" is smaller, drops alpha, and mints no capture_id (capture_id-bound tools need a PNG read); pixel coordinates are unchanged."
+                },
+                "screenshot_quality": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 95,
+                    "description": "JPEG quality, 1-95, with screenshot_format:\"jpeg\" only. Default 85."
                 },
                 "max_elements": {
                     "type": "integer",
@@ -175,15 +226,15 @@ fn prefetch_capture<T: Send + 'static>(
 
 fn verified_capture(
     window_id: u32,
-    prefetched: Option<anyhow::Result<Vec<u8>>>,
+    prefetched: Option<anyhow::Result<crate::capture::CapturedImage>>,
     bounds: &crate::windows::WindowBounds,
-    capture: impl FnOnce() -> anyhow::Result<Vec<u8>>,
-) -> Result<(Vec<u8>, u32, u32, f64), super::px_frame::PxFrameError> {
+    capture: impl FnOnce() -> anyhow::Result<crate::capture::CapturedImage>,
+) -> Result<(crate::capture::CapturedImage, u32, u32, f64), super::px_frame::PxFrameError> {
     use super::px_frame::{validate_capture_frame, PxFrameError};
-    let validate = |raw: anyhow::Result<Vec<u8>>| {
+    let validate = |raw: anyhow::Result<crate::capture::CapturedImage>| {
         let (raw, w, h) = (|| -> anyhow::Result<_> {
             let raw = raw?;
-            let (w, h) = crate::capture::png_dimensions(&raw)?;
+            let (w, h) = raw.dimensions()?;
             Ok((raw, w, h))
         })()
         .map_err(|e| PxFrameError::CaptureUnavailable {
@@ -362,6 +413,10 @@ impl Tool for GetWindowStateTool {
             .get("max_image_dimension")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let encoding = match screenshot_encoding(&args, frozen_capture.is_some()) {
+            Ok(encoding) => encoding,
+            Err(refusal) => return refusal,
+        };
         // Internal direct-tool mode used by verify_state. Registry ingress
         // strips underscore-prefixed arguments before public dispatch; only
         // a trusted direct in-process invocation can enable this mode.
@@ -402,7 +457,7 @@ impl Tool for GetWindowStateTool {
         let prefetched_capture = prefetch_capture(
             should_capture && !frozen_capture_requested,
             want_tree,
-            move || crate::capture::screenshot_window_bytes(window_id),
+            move || crate::capture::screenshot_window_image(window_id),
         );
         let (tree_result, prepared_snapshot) = if want_tree {
             let q = query.clone();
@@ -547,20 +602,24 @@ impl Tool for GetWindowStateTool {
                         .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
                     let (raw, orig_w, orig_h, scale) =
                         verified_capture(window_id, prefetched_raw, &bounds, || {
-                            crate::capture::screenshot_window_bytes(window_id)
+                            crate::capture::screenshot_window_image(window_id)
                         })?;
-                    let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|e| {
+                    // Resize and encode once from raw pixels, while the frozen
+                    // prepared path above preserves its source-selected codec.
+                    let (png, w, h) = raw.encode(max_dim, encoding).map_err(|e| {
                         super::px_frame::PxFrameError::CaptureUnavailable {
                             window_id,
                             reason: e.to_string(),
                         }
                     })?;
-                    let (w, h) = crate::capture::png_dimensions(&png).map_err(|e| {
-                        super::px_frame::PxFrameError::CaptureUnavailable {
-                            window_id,
-                            reason: e.to_string(),
+                    let codec = match encoding {
+                        cua_driver_core::image_utils::ScreenshotEncoding::Png => {
+                            ScreenshotCodec::Png
                         }
-                    })?;
+                        cua_driver_core::image_utils::ScreenshotEncoding::Jpeg { .. } => {
+                            ScreenshotCodec::Jpeg
+                        }
+                    };
                     if let Some(ref path) = out_file {
                         std::fs::write(path, &png).map_err(|e| {
                             super::px_frame::PxFrameError::CaptureUnavailable {
@@ -576,7 +635,7 @@ impl Tool for GetWindowStateTool {
                             Some((orig_w, orig_h)),
                             bounds,
                             scale,
-                            ScreenshotCodec::Png,
+                            codec,
                             None,
                         ))
                     } else {
@@ -588,7 +647,7 @@ impl Tool for GetWindowStateTool {
                             Some((orig_w, orig_h)),
                             bounds,
                             scale,
-                            ScreenshotCodec::Png,
+                            codec,
                             None,
                         ))
                     }
@@ -1552,6 +1611,12 @@ mod window_scope_contract_tests {
             assert!(props.get(name).is_some(), "schema must advertise {name}");
         }
         assert_eq!(d.input_schema["additionalProperties"], false);
+        assert_eq!(
+            props["screenshot_format"]["enum"],
+            serde_json::json!(["png", "jpeg"])
+        );
+        assert_eq!(props["screenshot_quality"]["minimum"], 1);
+        assert_eq!(props["screenshot_quality"]["maximum"], 95);
         for needle in [
             "at most 250 nodes",
             "since:",
@@ -1569,6 +1634,41 @@ mod window_scope_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_encoding_cannot_override_a_frozen_capture() {
+        use cua_driver_core::image_utils::ScreenshotEncoding;
+
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "screenshot_format": null,
+                "screenshot_quality": null
+            }),
+        ] {
+            assert_eq!(
+                screenshot_encoding(&args, true).unwrap(),
+                ScreenshotEncoding::Png
+            );
+        }
+        for args in [
+            serde_json::json!({"screenshot_format":"png"}),
+            serde_json::json!({"screenshot_format":"jpeg"}),
+            serde_json::json!({"screenshot_format":"jpeg","screenshot_quality":80}),
+        ] {
+            let refusal = screenshot_encoding(&args, true).unwrap_err();
+            assert_eq!(
+                refusal.structured_content.as_ref().unwrap()["code"],
+                "invalid_arguments"
+            );
+            assert!(screenshot_encoding(&args, false).is_ok());
+        }
+        assert_eq!(
+            screenshot_encoding(&serde_json::json!({"screenshot_format":"jpeg"}), false).unwrap(),
+            ScreenshotEncoding::Jpeg { quality: 85 }
+        );
+        assert!(screenshot_encoding(&serde_json::json!({"screenshot_quality":80}), false).is_err());
+    }
 
     #[test]
     fn resized_prepared_observation_keeps_source_metadata_without_portable_action_frame() {
@@ -1640,6 +1740,14 @@ mod tests {
         screenshot.4 = Some((102, 82));
         screenshot.8 = None;
         assert_eq!(screenshot_resize_scale(&screenshot), Some(2.0));
+        assert!(
+            publish_action_capture(&bindings, &args, 42, 7, Some(1), Some(&screenshot))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(service.retire_runtime(), 0);
+        screenshot.0 = png.clone();
+        screenshot.7 = ScreenshotCodec::Png;
         let id = publish_action_capture(&bindings, &args, 42, 7, Some(1), Some(&screenshot))
             .unwrap()
             .unwrap();
@@ -1647,7 +1755,7 @@ mod tests {
         let capture = service
             .read_for_perception(id.parse().unwrap(), &binding)
             .unwrap();
-        assert_eq!(&*capture.encoded_bytes(), bytes.as_slice());
+        assert_eq!(&*capture.encoded_bytes(), png.as_slice());
         let admission = service
             .admit_action(CaptureActionRequest {
                 capture_id: id.parse().unwrap(),
@@ -1692,12 +1800,13 @@ mod tests {
             width: 4.0,
             height: 4.0,
         };
-        let valid = png(4, 4);
+        use crate::capture::CapturedImage;
+        let valid = CapturedImage::Png(png(4, 4));
         for (prefetched, expected_calls) in [
             (Some(Ok(valid.clone())), 0),
             (Some(Err(anyhow::anyhow!("prefetch failed"))), 1),
-            (Some(Ok(png(3, 4))), 1),
-            (Some(Ok(vec![0])), 1),
+            (Some(Ok(CapturedImage::Png(png(3, 4)))), 1),
+            (Some(Ok(CapturedImage::Png(vec![0]))), 1),
             (None, 1),
         ] {
             let calls = Cell::new(0);
@@ -1709,6 +1818,48 @@ mod tests {
             assert_eq!(frame, (valid.clone(), 4, 4, 1.0));
             assert_eq!(calls.get(), expected_calls);
         }
+        let raw = |w: u32, h: u32| {
+            CapturedImage::Rgba(cua_driver_core::image_utils::RgbaFrame {
+                width: w,
+                height: h,
+                rgba: vec![0; (w * h * 4) as usize],
+            })
+        };
+        let calls = Cell::new(0);
+        let frame = verified_capture(7, Some(Ok(raw(4, 4))), &bounds, || {
+            calls.set(calls.get() + 1);
+            Ok(valid.clone())
+        })
+        .unwrap();
+        assert_eq!(frame, (raw(4, 4), 4, 4, 1.0));
+        assert_eq!(calls.get(), 0);
+        let calls = Cell::new(0);
+        let frame = verified_capture(7, Some(Ok(raw(3, 4))), &bounds, || {
+            calls.set(calls.get() + 1);
+            Ok(valid.clone())
+        })
+        .unwrap();
+        assert_eq!(frame, (valid.clone(), 4, 4, 1.0));
+        assert_eq!(calls.get(), 1);
+        let calls = Cell::new(0);
+        let error = verified_capture(7, Some(Ok(raw(3, 4))), &bounds, || {
+            calls.set(calls.get() + 1);
+            Ok(raw(3, 4))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PxFrameError::FrameMismatch {
+                window_id: 7,
+                bounds_width: 4.0,
+                bounds_height: 4.0,
+                capture_width: 3,
+                capture_height: 4,
+                scale_x: 0.75,
+                scale_y: 1.0,
+            }
+        );
+        assert_eq!(calls.get(), 1);
         for prefetched in [Some(Err(anyhow::anyhow!("old error"))), None] {
             let calls = Cell::new(0);
             let error = verified_capture(7, prefetched, &bounds, || {
