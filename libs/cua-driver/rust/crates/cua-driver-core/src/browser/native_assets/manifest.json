@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Maka Browser Connector",
+  "version": "0.0.3",
+  "minimum_chrome_version": "125",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "nativeMessaging",
+    "tabGroups",
+    "declarativeNetRequestWithHostAccess",
+    "downloads"
+  ],
+  "background": {
+    "service_worker": "background.mjs",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Connect Maka browser transport"
+  },
+  "host_permissions": ["<all_urls>"]
+}

@@ -37,14 +37,29 @@
 
 mod adapter_support;
 pub mod binding;
+mod broker_delivery;
 pub mod cdp_ws;
 pub mod download;
 pub mod engine;
 mod grant;
 mod keyed_gates;
+mod local_ipc;
 #[cfg(test)]
 pub(crate) mod mock_cdp;
 mod mutation;
+mod native_adapter_factory;
+mod native_adapter_process;
+mod native_broker;
+mod native_framing;
+mod native_host;
+mod native_install;
+pub mod native_process;
+mod native_provider;
+mod native_wire;
+mod original_adapter;
+mod original_inventory;
+mod original_rpc_v2;
+mod original_tab_id;
 pub mod platform;
 pub mod pointer;
 mod prepare;
@@ -97,6 +112,34 @@ pub(crate) fn required_session_schema() -> serde_json::Value {
         "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. This tool requires the label that owns its browser target, tab, and refs."
     })
 }
+
+pub use local_ipc::{IpcError, NativeEndpointIdentity, ValidatedNativeEndpoint};
+pub use native_provider::{
+    discover_installed_native_endpoints, discover_registered, discover_registered_endpoints,
+    discover_registered_for, CleanupEvidence, CleanupProof, NativeBrowserOperation,
+    NativeBrowserProvider, NativeCdpCompletionOutcome, NativeCreatedTab, NativeCreationReceipt,
+    NativeCursorPresentationAck, NativeDownloadMetadata, NativeDownloadStatus, NativeEffectOwner,
+    NativeEndpointDiscovery, NativeEndpointRejection, NativeGroupColor, NativeGroupPresentation,
+    NativeGroupProof, NativeGroupReleaseEvidence, NativeGroupReleaseProof, NativeHeader,
+    NativeHeaderPolicyScope, NativeHeaderProof, NativeHeaderScope, NativeHostOperation,
+    NativeKnownCustody, NativeManagedGroupReceipt, NativeMetadataError, NativeMutationDiagnostic,
+    NativeOperation, NativeOperationCompletion, NativeOperationOutcome, NativePendingOperation,
+    NativePhysicalClaim, NativePreparedTab, NativeProviderCapabilities, NativeProviderError,
+    NativeProviderEvent, NativeRecoveredOperation, NativeSessionHeaderProof, NativeTabInfo,
+    NativeUserTabsOrder,
+};
+
+pub use native_provider::NativeTabAbsenceObservation;
+
+pub use native_provider::{NativeKeepStatus, NativeKeepTab, NativeTurnFinishAck};
+
+pub use native_wire::{NativeWireContext, NativeWireContextError};
+
+pub use native_process::{NativeAdapterMode, NativeAdapterSelection, NativeAdapterSelectionError};
+
+pub use native_provider::{
+    NativeClaimCdpDrainProof, NativeClaimCdpSnapshot, NativePendingCdpRequest,
+};
 
 #[cfg(test)]
 mod tests {

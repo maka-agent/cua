@@ -1425,6 +1425,87 @@ async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() 
 }
 
 #[tokio::test]
+async fn approved_existing_profile_title_fallback_reads_only_the_bound_target() {
+    const TRANSPORT: &str = "transport-v2-title-fallback";
+    let (f, provider) = protected_existing_profile_fixture().await;
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
+    assert!(provider.consent_seen.load(Ordering::SeqCst));
+
+    let state = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT
+        }))
+        .await;
+    let bound = structured(&state);
+    assert_eq!(bound["status"], "ok", "{bound}");
+    assert_eq!(bound["tabs"][0]["title"], "Fixture", "{bound}");
+    let target = bound["target_id"].as_str().unwrap();
+    let tab = bound["tabs"][0]["tab_id"].as_str().unwrap();
+
+    // This fixture has no document TITLE or AX document name. Its observed
+    // target title changes after binding, so only the real fallback can see it.
+    let snap = semantic_snapshot(&f, target, tab).await;
+    assert_eq!(snap["status"], "ok", "{snap}");
+    assert_eq!(snap["page"]["title"], "Fixture after navigation", "{snap}");
+    assert_eq!(
+        recorded_calls(&f, "Target.getTargetInfo"),
+        vec![(None, json!({"targetId": "T1"}))],
+        "the fallback must read the exact backend target recorded by the approved binding"
+    );
+
+    let before = f.state.lock().unwrap().calls.len();
+    let foreign = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": "foreign-title-fallback-session",
+            "snapshot_format": "semantic_v2"
+        }))
+        .await;
+    let refused = structured(&foreign);
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(
+        refused["refusal"]["code"], "browser_binding_stale",
+        "{refused}"
+    );
+    assert_eq!(f.state.lock().unwrap().calls.len(), before);
+
+    let alias = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": "T_FOREIGN_BACKEND_ALIAS",
+            "session": SESSION,
+            "snapshot_format": "semantic_v2"
+        }))
+        .await;
+    let refused = structured(&alias);
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(
+        refused["refusal"]["code"], "browser_tab_not_found",
+        "{refused}"
+    );
+    assert_eq!(f.state.lock().unwrap().calls.len(), before);
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
 async fn existing_profile_sessions_share_one_browser_connection_across_session_ends() {
     // Chrome asks the person to approve every new browser-level WebSocket.
     // Sessions for the same browser instance must therefore multiplex over

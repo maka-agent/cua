@@ -1,0 +1,668 @@
+// Own public-Chrome-API transport. No selectors, injected JS, input or screenshot implementation.
+export class ConnectorError extends Error {
+  constructor(kind, message, details) {
+    super(message);
+    this.kind = kind;
+    this.details = details;
+  }
+}
+const fail = (kind, message) => {
+  throw new ConnectorError(kind, message);
+};
+const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const tabId = (value) => {
+  if (!Number.isSafeInteger(value) || value < 0)
+    fail('invalid_request', 'tabId must be a nonnegative safe integer');
+  return value;
+};
+async function chromeCall(call) {
+  try {
+    return await call();
+  } catch (error) {
+    throw new ConnectorError(
+      'chrome_rejected',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+export class BrowserConnector {
+  constructor(chrome, { emit, randomUUID = () => crypto.randomUUID(), maxPending = 64 } = {}) {
+    this.chrome = chrome;
+    this.emit = emit ?? (() => {});
+    this.randomUUID = randomUUID;
+    this.instanceId = randomUUID();
+    this.maxPending = maxPending;
+    this.generation = null;
+    this.accepting = false;
+    this.highWater = 0n;
+    this.pending = 0;
+    this.pendingCleanup = new Set();
+    this.closedOwners = new Set();
+    this.records = new Map();
+    this.claims = new Map();
+    this.creations = new Map();
+    chrome.debugger.onEvent.addListener((source, method, params) =>
+      this.onEvent(source, method, params),
+    );
+    chrome.debugger.onDetach.addListener((source, reason) => this.onDetach(source, reason));
+    chrome.tabs.onRemoved.addListener((id) => this.onRemoved(id));
+  }
+  hello() {
+    return {
+      kind: 'hello',
+      protocol: 1,
+      extensionId: this.chrome.runtime.id,
+      instanceId: this.instanceId,
+      capabilities: {
+        metadata: true,
+        rawTabCdp: true,
+        flatChildSessions: true,
+        tabLifecycle: true,
+        browserManagement: false,
+        nativeWindowProof: false,
+      },
+    };
+  }
+  bind(generation) {
+    if (this.accepting) fail('invalid_state', 'native port is already bound');
+    if (typeof generation !== 'string' || !generation)
+      fail('invalid_request', 'generation is required');
+    this.generation = generation;
+    this.accepting = true;
+    this.highWater = 0n;
+    this.closedOwners.clear();
+  }
+  async request(message) {
+    let id = message?.id;
+    try {
+      if (
+        !message ||
+        message.kind !== 'request' ||
+        message.protocol !== 1 ||
+        typeof id !== 'string' ||
+        !/^[1-9][0-9]{0,19}$/.test(id) ||
+        BigInt(id) > 18446744073709551615n ||
+        typeof message.owner !== 'string' ||
+        !message.owner
+      )
+        fail('invalid_request', 'invalid request envelope');
+      if (!this.accepting || message.generation !== this.generation)
+        fail('generation_lost', 'native generation is not active');
+      if (this.closedOwners.has(message.owner)) fail('owner_closed', 'client owner has ended');
+      if (BigInt(id) <= this.highWater)
+        fail('duplicate_request', 'request IDs cannot be replayed or dispatched out of order');
+      this.highWater = BigInt(id);
+      const cleanup = ['detach', 'stopCreatedTab', 'clearScopedHeaders'].includes(message.method);
+      const cleanupKey = cleanup
+        ? JSON.stringify([
+            message.owner,
+            message.method,
+            message.params?.claim ?? message.params?.creation,
+          ])
+        : null;
+      if (cleanup && this.pendingCleanup.has(cleanupKey))
+        fail('cleanup_pending', 'this exact cleanup operation is already awaiting proof');
+      if (cleanup && this.pendingCleanup.size >= this.maxPending)
+        fail('request_budget', 'reserved cleanup capacity is occupied');
+      if (!cleanup && this.pending >= this.maxPending && message.method !== 'closeOwner')
+        fail('request_budget', 'too many in-flight connector requests');
+      const generation = this.generation;
+      let result;
+      this.pending++;
+      if (cleanupKey) this.pendingCleanup.add(cleanupKey);
+      try {
+        result = await this.dispatch(message.owner, message.method, message.params ?? {});
+      } finally {
+        this.pending--;
+        if (cleanupKey) this.pendingCleanup.delete(cleanupKey);
+      }
+      if (
+        !this.accepting ||
+        this.generation !== generation ||
+        (message.method !== 'closeOwner' && this.closedOwners.has(message.owner))
+      )
+        throw new ConnectorError(
+          'outcome_unknown',
+          'connection or owner ended before the reply could be acknowledged',
+          { acknowledgedResult: result },
+        );
+      return { kind: 'response', protocol: 1, generation, id, result };
+    } catch (error) {
+      return {
+        kind: 'response',
+        protocol: 1,
+        generation: message?.generation,
+        id,
+        error: {
+          kind: error instanceof ConnectorError ? error.kind : 'connector_failure',
+          message: error instanceof Error ? error.message : String(error),
+          ...(error instanceof ConnectorError && error.details ? { details: error.details } : {}),
+        },
+      };
+    }
+  }
+  async dispatch(owner, method, params) {
+    switch (method) {
+      case 'inventory':
+        return { tabs: await this.inventory() };
+      case 'resolve': {
+        // Native-provider compatibility only. Public grammar remains with the Host.
+        if (typeof params.rawId !== 'string' || !params.rawId)
+          fail('invalid_request', 'rawId string is required');
+        const id = Number(params.rawId);
+        if (!Number.isInteger(id) || id <= 0)
+          fail('invalid_request', 'native tab ID does not resolve to a positive integer');
+        const tab = await chromeCall(() => this.chrome.tabs.get(id));
+        return { tab: await this.metadata(tab) };
+      }
+      case 'createTab':
+        return this.createTab(owner, params);
+      case 'closeTab':
+        return this.closeTab(this.owned(owner, params.claim));
+      case 'stopCreatedTab':
+        return this.stopCreatedTab(owner, params.creation);
+      case 'attach':
+        return this.attach(owner, tabId(params.tabId));
+      case 'detach':
+        return this.detach(this.owned(owner, params.claim));
+      case 'cdp':
+        return this.cdp(this.owned(owner, params.claim), params);
+      case 'closeOwner':
+        return this.closeOwner(owner);
+      default:
+        fail('unsupported', 'operation has no reviewed transport implementation');
+    }
+  }
+  async metadata(tab) {
+    if (!tab || !Number.isSafeInteger(tab.id) || tab.id < 0) return null;
+    const result = { id: tab.id };
+    for (const key of ['windowId', 'index', 'groupId'])
+      if (Number.isSafeInteger(tab[key])) result[key] = tab[key];
+    for (const key of ['title', 'url']) if (typeof tab[key] === 'string') result[key] = tab[key];
+    if (typeof tab.lastAccessed === 'number' && Number.isFinite(tab.lastAccessed))
+      result.lastAccessed = tab.lastAccessed;
+    if (typeof tab.groupId === 'number' && tab.groupId !== -1 && this.chrome.tabGroups) {
+      try {
+        const group = await this.chrome.tabGroups.get(tab.groupId);
+        const title = typeof group?.title === 'string' ? group.title.trim() : '';
+        if (title) result.groupTitle = title;
+      } catch {
+        /* Optional metadata is unavailable; never invent a group. */
+      }
+    }
+    return result;
+  }
+  async inventory() {
+    const tabs = await chromeCall(() => this.chrome.tabs.query({}));
+    const result = [];
+    const ids = new Set();
+    for (const tab of tabs) {
+      const dto = await this.metadata(tab);
+      if (dto && !ids.has(dto.id)) {
+        ids.add(dto.id);
+        result.push(dto);
+      }
+    }
+    return result;
+  }
+  async pageTarget(id) {
+    const targets = await chromeCall(() => this.chrome.debugger.getTargets());
+    const matches = targets.filter((target) => target.type === 'page' && target.tabId === id);
+    if (matches.length !== 1 || typeof matches[0].id !== 'string' || !matches[0].id)
+      fail('target_unavailable', 'tab has no unique current Chrome page target');
+    return matches[0];
+  }
+  claimResult(record) {
+    return { claim: record.token, tabId: record.tabId, targetId: record.targetId };
+  }
+  live(record) {
+    return (
+      this.accepting &&
+      record.generation === this.generation &&
+      !this.closedOwners.has(record.owner) &&
+      !record.ending &&
+      !record.revoked &&
+      !record.detachedAck &&
+      this.records.get(record.tabId) === record
+    );
+  }
+  owned(owner, token) {
+    if (typeof token !== 'string') fail('claim_required', 'physical claim token is required');
+    const record = this.claims.get(token);
+    if (!record || record.owner !== owner || record.generation !== this.generation)
+      fail('claim_unavailable', 'claim does not belong to this owner and generation');
+    return record;
+  }
+  async attach(owner, id) {
+    const created = [...this.creations.values()].find(
+      (receipt) => receipt.tabId === id && !receipt.closed,
+    );
+    if (created && created.owner !== owner)
+      fail('tab_busy', 'another client created and owns this tab');
+    const existing = this.records.get(id);
+    if (existing) {
+      if (existing.owner === owner && existing.state === 'owned' && this.live(existing))
+        return this.claimResult(existing);
+      fail('tab_busy', 'a physical attachment or unconfirmed cleanup already owns this tab');
+    }
+    const generation = this.generation;
+    // Reserve before the first asynchronous Chrome query. Competing requests cannot both attach.
+    const record = {
+      tabId: id,
+      owner,
+      generation,
+      token: this.randomUUID(),
+      targetId: null,
+      state: 'attaching',
+      attachSettled: false,
+      attachedAck: false,
+      ending: false,
+      revoked: false,
+      detachedEvent: false,
+      detachEventAfterAck: false,
+      detachedAck: false,
+      detachStarted: false,
+      detachSettled: false,
+      children: new Map(),
+      inFlight: new Set(),
+    };
+    record.settlement = new Promise((resolve) => {
+      record.resolveSettlement = resolve;
+    });
+    this.records.set(id, record);
+    this.claims.set(record.token, record);
+    try {
+      const before = await this.pageTarget(id);
+      record.targetId = before.id;
+      if (before.attached)
+        fail('foreign_debugger', 'Chrome reports an attachment not owned by this connector');
+      if (!this.live(record)) fail('generation_lost', 'attachment was cancelled before dispatch');
+      await chromeCall(() => this.chrome.debugger.attach({ tabId: id }, '1.3'));
+      record.attachedAck = true;
+      if (!this.live(record)) {
+        if (!record.detachEventAfterAck && !record.physicalGone) await this.detach(record);
+        fail('outcome_unknown', 'attachment ended before a live claim could be returned');
+      }
+      const after = await this.pageTarget(id);
+      if (after.id !== record.targetId || !after.attached) {
+        record.ending = true;
+        await this.detach(record);
+        fail('target_changed', 'Chrome page target changed during attachment');
+      }
+      if (!this.live(record)) {
+        if (!record.detachEventAfterAck && !record.physicalGone) await this.detach(record);
+        fail('outcome_unknown', 'attachment was revoked before claim acknowledgement');
+      }
+      record.state = 'owned';
+      return this.claimResult(record);
+    } catch (error) {
+      if (!record.attachedAck) {
+        // A matched rejection, or cancellation before dispatch, creates no owned attachment.
+        this.claims.delete(record.token);
+        if (this.records.get(id) === record) this.records.delete(id);
+      } else {
+        record.ending = true;
+        if (!record.detachedAck && !record.detachEventAfterAck && !record.physicalGone) {
+          try {
+            await this.detach(record);
+          } catch {
+            /* Preserve unknown physical custody below. */
+          }
+        }
+        if (!record.detachedAck && !record.detachEventAfterAck && !record.physicalGone)
+          throw new ConnectorError(
+            'outcome_unknown',
+            'attachment was acknowledged but cleanup is unconfirmed',
+            {
+              cause: error instanceof Error ? error.message : String(error),
+              custody: this.claimResult(record),
+            },
+          );
+        if (error instanceof ConnectorError && error.kind === 'chrome_rejected')
+          throw new ConnectorError(
+            'attach_aborted',
+            'post-attachment observation failed; owned attachment was cleaned',
+            { cause: error.message, cleanupConfirmed: true },
+          );
+      }
+      throw error;
+    } finally {
+      record.attachSettled = true;
+      record.resolveSettlement();
+      this.retire(record);
+    }
+  }
+  async detach(record) {
+    if (record.detachStarted) return record.detachPromise;
+    if (!record.attachedAck)
+      fail('attachment_pending', 'cannot detach an unacknowledged attachment');
+    if (record.detachEventAfterAck || record.physicalGone)
+      return { detached: true, proof: record.physicalGone ? 'tab_removed' : 'detach_event' };
+    if (this.records.get(record.tabId) !== record)
+      fail('claim_unavailable', 'physical epoch was replaced');
+    record.ending = true;
+    record.state = 'detaching';
+    record.detachStarted = true;
+    record.detachPromise = (async () => {
+      try {
+        await chromeCall(() => this.chrome.debugger.detach({ tabId: record.tabId }));
+        record.detachedAck = true;
+        record.state = record.detachedEvent ? 'released' : 'awaiting_detach_event';
+        return { detached: true, proof: 'detach_ack' };
+      } catch (error) {
+        record.state = record.revoked ? 'revoked' : 'cleanup_unknown';
+        throw error;
+      } finally {
+        record.detachSettled = true;
+        this.retire(record);
+      }
+    })();
+    return record.detachPromise;
+  }
+  retire(record) {
+    if (
+      !(record.detachEventAfterAck || record.physicalGone) ||
+      !record.attachSettled ||
+      (record.detachStarted && !record.detachSettled)
+    )
+      return;
+    if (this.records.get(record.tabId) === record) this.records.delete(record.tabId);
+    this.claims.delete(record.token);
+  }
+  async cdp(record, params) {
+    if (record.state !== 'owned' || !this.live(record))
+      fail('claim_revoked', 'physical claim is not active');
+    if (typeof params.method !== 'string' || !/^[A-Za-z]+\.[A-Za-z]+$/.test(params.method))
+      fail('invalid_request', 'CDP method is required');
+    const method = params.method;
+    if (
+      method.startsWith('Browser.') ||
+      (method.startsWith('Target.') && method !== 'Target.setAutoAttach')
+    )
+      fail('unsupported', 'browser/root target management is not an owned-tab transport command');
+    if (
+      method === 'Target.setAutoAttach' &&
+      (params.params?.flatten !== true || params.params?.waitForDebuggerOnStart !== false)
+    )
+      fail('invalid_request', 'auto-attach requires flat non-pausing child sessions');
+    const source = { tabId: record.tabId };
+    if (own(params, 'sessionId')) {
+      if (typeof params.sessionId !== 'string' || !record.children.has(params.sessionId))
+        fail(
+          'child_session_unavailable',
+          'child session was not observed under this physical claim',
+        );
+      source.sessionId = params.sessionId;
+    }
+    const call = chromeCall(() =>
+      this.chrome.debugger.sendCommand(source, method, params.params ?? {}),
+    );
+    record.inFlight.add(call);
+    try {
+      const result = await call;
+      if (!this.live(record))
+        fail('outcome_unknown', 'claim ended during CDP command; do not replay');
+      return { result: result ?? null };
+    } finally {
+      record.inFlight.delete(call);
+    }
+  }
+  recordForSource(source) {
+    if (Number.isSafeInteger(source?.tabId)) return this.records.get(source.tabId);
+    if (typeof source?.targetId === 'string') {
+      const found = [...this.records.values()].filter(
+        (record) => record.targetId === source.targetId,
+      );
+      return found.length === 1 ? found[0] : undefined;
+    }
+  }
+  onEvent(source, method, params = {}) {
+    const record = this.recordForSource(source);
+    if (!record || !record.attachedAck || record.revoked || record.detachedAck) return;
+    if (source.sessionId && !record.children.has(source.sessionId)) return;
+    if (method === 'Target.attachedToTarget') {
+      if (
+        typeof params.sessionId !== 'string' ||
+        !params.sessionId ||
+        typeof params.targetInfo?.targetId !== 'string'
+      )
+        return;
+      record.children.set(params.sessionId, {
+        targetId: params.targetInfo.targetId,
+        parent: source.sessionId ?? null,
+      });
+    } else if (method === 'Target.detachedFromTarget' && typeof params.sessionId === 'string') {
+      this.removeChild(record, params.sessionId);
+    }
+    this.emit({
+      kind: 'event',
+      protocol: 1,
+      generation: record.generation,
+      owner: record.owner,
+      claim: record.token,
+      method,
+      params,
+      ...(source.sessionId ? { sessionId: source.sessionId } : {}),
+    });
+  }
+  removeChild(record, sessionId) {
+    for (const [id, child] of record.children)
+      if (child.parent === sessionId) this.removeChild(record, id);
+    record.children.delete(sessionId);
+  }
+  onDetach(source, reason) {
+    const record = this.recordForSource(source);
+    if (!record) return;
+    record.revoked = true;
+    record.detachedEvent = true;
+    if (record.attachedAck) record.detachEventAfterAck = true;
+    record.state = 'revoked';
+    record.children.clear();
+    this.emit({
+      kind: 'revoked',
+      protocol: 1,
+      generation: record.generation,
+      owner: record.owner,
+      claim: record.token,
+      reason,
+    });
+    this.retire(record);
+  }
+  onRemoved(id) {
+    for (const [token, receipt] of this.creations)
+      if (receipt.tabId === id) {
+        receipt.closed = true;
+        this.creations.delete(token);
+      }
+    const record = this.records.get(id);
+    if (!record) return;
+    record.physicalGone = true;
+    this.onDetach({ tabId: id }, 'target_closed');
+  }
+  cleanupProven(record) {
+    return record.detachedAck || record.detachEventAfterAck || record.physicalGone;
+  }
+  async createTab(owner, params) {
+    if (Object.keys(params).some((key) => key !== 'windowId'))
+      fail('invalid_request', 'createTab accepts only a preferred windowId');
+    if (own(params, 'windowId') && (!Number.isSafeInteger(params.windowId) || params.windowId < 0))
+      fail('invalid_request', 'preferred windowId must be a nonnegative safe integer');
+    const receipt = {
+      token: this.randomUUID(),
+      owner,
+      generation: this.generation,
+      tabId: null,
+      settled: false,
+      closed: false,
+      closeStarted: false,
+    };
+    receipt.settlement = new Promise((resolve) => {
+      receipt.resolveSettlement = resolve;
+    });
+    this.creations.set(receipt.token, receipt);
+    try {
+      const windows = await chromeCall(() =>
+        this.chrome.windows.getAll({ windowTypes: ['normal'] }),
+      );
+      const normal = windows.filter((window) => window.type === 'normal');
+      const selected =
+        normal.find((window) => window.id === params.windowId) ??
+        normal.find((window) => window.focused) ??
+        normal[0];
+      if (!this.accepting || receipt.generation !== this.generation || this.closedOwners.has(owner))
+        fail('owner_closed', 'owner ended before tab creation dispatch');
+      let tab;
+      if (selected) {
+        tab = await chromeCall(() =>
+          this.chrome.tabs.create({ active: false, url: 'about:blank', windowId: selected.id }),
+        );
+        receipt.creationAck = true;
+      } else {
+        const window = await chromeCall(() =>
+          this.chrome.windows.create({ focused: false, type: 'normal', url: 'about:blank' }),
+        );
+        receipt.creationAck = true;
+        receipt.windowId = window.id;
+        tab = window.tabs?.find(
+          (candidate) => Number.isSafeInteger(candidate.id) && candidate.id >= 0,
+        );
+        if (!tab)
+          throw new ConnectorError(
+            'outcome_unknown',
+            'new window was acknowledged without a tab identity',
+            { windowId: window.id },
+          );
+      }
+      if (!tab || !Number.isSafeInteger(tab.id) || tab.id < 0)
+        fail('outcome_unknown', 'Chrome acknowledged creation without an exact tab ID');
+      receipt.tabId = tab.id;
+      const result = { creation: receipt.token, tab: await this.metadata(tab) };
+      return result;
+    } catch (error) {
+      if (!receipt.creationAck) {
+        receipt.closed = true;
+        this.creations.delete(receipt.token);
+      } else if (receipt.tabId === null)
+        throw new ConnectorError(
+          'outcome_unknown',
+          'creation acknowledged without exact tab identity',
+          {
+            creation: receipt.token,
+            windowId: receipt.windowId,
+            cause: error instanceof Error ? error.message : String(error),
+          },
+        );
+      if (receipt.creationAck && receipt.tabId !== null)
+        throw new ConnectorError(
+          'outcome_unknown',
+          'created tab was acknowledged but its metadata was not confirmed',
+          {
+            acknowledgedResult: { creation: receipt.token, tab: { id: receipt.tabId } },
+            cause: error instanceof Error ? error.message : String(error),
+          },
+        );
+      throw error;
+    } finally {
+      receipt.settled = true;
+      receipt.resolveSettlement();
+    }
+  }
+  async closeTab(record) {
+    if (record.closeStarted) return record.closePromise;
+    if (!this.live(record) || record.state !== 'owned')
+      fail('claim_revoked', 'explicit close requires a current owned physical claim');
+    record.ending = true;
+    record.closeStarted = true;
+    record.closePromise = chromeCall(() => this.chrome.tabs.remove(record.tabId)).then(() => {
+      this.onRemoved(record.tabId);
+      return { closed: true, proof: 'close_ack' };
+    });
+    const receipt = [...this.creations.values()].find(
+      (candidate) => candidate.tabId === record.tabId && candidate.owner === record.owner,
+    );
+    if (receipt) {
+      receipt.closeStarted = true;
+      receipt.closePromise = record.closePromise;
+    }
+    return record.closePromise;
+  }
+  async stopCreatedTab(owner, token) {
+    if (typeof token !== 'string')
+      fail('creation_required', 'creation receipt is required for automatic close');
+    const receipt = this.creations.get(token);
+    if (!receipt || receipt.owner !== owner || receipt.generation !== this.generation)
+      fail('creation_unavailable', 'creation receipt does not belong to this owner and generation');
+    return this.closeCreation(receipt);
+  }
+  async closeCreation(receipt) {
+    await receipt.settlement;
+    if (receipt.closed) return { closed: true, proof: 'tab_removed' };
+    if (receipt.closeStarted) return receipt.closePromise;
+    if (receipt.tabId === null)
+      fail('outcome_unknown', 'created window has no proven tab identity for cleanup');
+    receipt.closeStarted = true;
+    receipt.closePromise = (async () => {
+      const record = this.records.get(receipt.tabId);
+      if (record && record.owner === receipt.owner) {
+        record.ending = true;
+        if (!record.attachSettled) await record.settlement;
+        if (record.attachedAck && !this.cleanupProven(record)) {
+          try {
+            await this.detach(record);
+          } catch {
+            /* Exact created-tab close can still prove physical removal. */
+          }
+        }
+      }
+      if (receipt.closed || record?.physicalGone) return { closed: true, proof: 'tab_removed' };
+      await chromeCall(() => this.chrome.tabs.remove(receipt.tabId));
+      this.onRemoved(receipt.tabId);
+      return { closed: true, proof: 'close_ack' };
+    })();
+    return receipt.closePromise;
+  }
+  async closeOwner(owner) {
+    this.closedOwners.add(owner);
+    const results = [];
+    for (const record of this.records.values()) {
+      if (record.owner !== owner) continue;
+      record.ending = true;
+      if (record.closeStarted) {
+        results.push(
+          record.closePromise.catch(async (error) => {
+            if (record.attachedAck && !this.cleanupProven(record)) await this.detach(record);
+            throw error;
+          }),
+        );
+        continue;
+      }
+      if (!record.attachSettled) results.push(record.settlement);
+      if (record.attachedAck && !this.cleanupProven(record)) results.push(this.detach(record));
+    }
+    for (const receipt of this.creations.values())
+      if (receipt.owner === owner) results.push(this.closeCreation(receipt));
+    const settled = await Promise.allSettled(results);
+    const remaining = [...this.records.values()].filter((record) => record.owner === owner);
+    const pendingAttachments = remaining.filter((record) => !record.attachSettled).length;
+    const unconfirmedClaims = remaining.filter((record) => !this.cleanupProven(record)).length;
+    return {
+      cleanupConfirmed:
+        pendingAttachments === 0 &&
+        unconfirmedClaims === 0 &&
+        ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed),
+      pendingAttachments,
+      unconfirmedClaims,
+      diagnostics: settled
+        .filter((result) => result.status === 'rejected')
+        .map((result) => String(result.reason)),
+    };
+  }
+  async disconnect() {
+    this.accepting = false;
+    const owners = new Set(
+      [...this.records.values(), ...this.creations.values()].map((record) => record.owner),
+    );
+    return Promise.allSettled([...owners].map((owner) => this.closeOwner(owner)));
+  }
+}

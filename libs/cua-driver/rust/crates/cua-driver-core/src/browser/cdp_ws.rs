@@ -1,4 +1,4 @@
-//! Pooled CDP browser-endpoint WebSocket client.
+//! Pooled CDP browser-endpoint client with a shared reply/event demultiplexer.
 //!
 //! v2 demultiplexer: a dedicated reader task owns the receive half of
 //! each connection and routes frames by `id` to per-call oneshot
@@ -9,9 +9,11 @@
 //! guaranteed to be queued on a subscriber created before the call by
 //! the time that call returns.
 //!
-//! Only loopback `ws://` URLs are accepted: the endpoint is a local
-//! browser the platform adapter proved we own, never a remote service.
+//! WebSocket constructors accept only loopback `ws://` URLs. The crate-private
+//! native channel seam receives only an already authenticated, claim-scoped
+//! bridge; its local failures never become remote CDP rejections.
 
+use super::native_wire::NativeWireContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -21,7 +23,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -29,6 +31,8 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Native bridge calls remain bounded even after their outbound queue drains.
+const NATIVE_MAX_PENDING_CALLS: usize = 64;
 
 /// Connection-scoped command policy. Grant-owned personal-profile sockets
 /// always use the reviewed set below; callers cannot opt out or relax it.
@@ -67,6 +71,7 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Target.activateTarget",
     "Target.attachToTarget",
     "Target.detachFromTarget",
+    "Target.getTargetInfo",
     "Target.getTargets",
     "Target.setAutoAttach",
 ];
@@ -124,7 +129,88 @@ pub struct CdpDialogState {
 enum CallOutcome {
     Result(Value),
     Error { code: Option<i64>, message: String },
+    TransportFailure(String),
+    LocalRejected { code: String, message: String },
 }
+
+/// A remote error reply matched to one dispatched CDP request.
+///
+/// Local policy rejection, socket failure and a missing reply do not construct
+/// this type. Callers can downcast the existing `anyhow::Error` without parsing
+/// its diagnostic text. A remote reply can omit its numeric code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdpReplyError {
+    method: String,
+    code: Option<i64>,
+    message: String,
+}
+
+impl CdpReplyError {
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn code(&self) -> Option<i64> {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for CdpReplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(
+                formatter,
+                "CDP {} failed ({code}): {}",
+                self.method, self.message
+            ),
+            None => write!(formatter, "CDP {} failed: {}", self.method, self.message),
+        }
+    }
+}
+
+impl std::error::Error for CdpReplyError {}
+
+/// A definite request-matched refusal from the local native connector.
+///
+/// This is not a Chrome CDP error. The adapter may use it only when it knows
+/// this request was refused without dispatching its Chrome command; loss,
+/// revocation races and uncertain effects remain transport/unknown outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCdpRefusal {
+    method: String,
+    code: String,
+    message: String,
+}
+
+impl NativeCdpRefusal {
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for NativeCdpRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Native CDP {} refused ({}): {}",
+            self.method, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for NativeCdpRefusal {}
 
 /// State shared between the caller side and the reader task.
 struct Demux {
@@ -134,22 +220,131 @@ struct Demux {
     dialogs: StdMutex<HashMap<String, CdpDialogState>>,
     next_dialog_generation: AtomicU64,
     closed: AtomicBool,
+    native_close: StdMutex<Option<oneshot::Sender<()>>>,
+    pending_slots: Option<Semaphore>,
 }
 
 impl Demux {
+    fn new(native_close: Option<oneshot::Sender<()>>) -> Self {
+        let pending_slots = native_close
+            .as_ref()
+            .map(|_| Semaphore::new(NATIVE_MAX_PENDING_CALLS));
+        Self {
+            pending: StdMutex::new(HashMap::new()),
+            subscribers: StdMutex::new(Vec::new()),
+            session_targets: StdMutex::new(HashMap::new()),
+            dialogs: StdMutex::new(HashMap::new()),
+            next_dialog_generation: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            native_close: StdMutex::new(native_close),
+            pending_slots,
+        }
+    }
+
+    fn fail_transport(&self, message: String) {
+        self.close_inner(Some(message));
+    }
+
     fn close(&self) {
+        self.close_inner(None);
+    }
+
+    fn close_inner(&self, failure: Option<String>) {
         self.closed.store(true, Ordering::SeqCst);
-        // Dropping the senders wakes every pending caller with a recv
-        // error, which `call` reports as a closed socket.
-        self.pending.lock().unwrap().clear();
+        if let Some(slots) = &self.pending_slots {
+            slots.close();
+        }
+        if let Some(signal) = self.native_close.lock().unwrap().take() {
+            let _ = signal.send(());
+        }
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(message) = failure {
+            for (_, reply) in pending.drain() {
+                let _ = reply.send(CallOutcome::TransportFailure(message.clone()));
+            }
+        } else {
+            // Dropping senders preserves the existing socket-close outcome.
+            pending.clear();
+        }
+        drop(pending);
         self.subscribers.lock().unwrap().clear();
         self.session_targets.lock().unwrap().clear();
         self.dialogs.lock().unwrap().clear();
     }
 }
 
-/// The reader task: routes replies by id, fans events out to
-/// subscribers, and fails everything on socket close.
+/// Route one trusted CDP message through the existing pending/event state.
+fn route_json(v: Value, demux: &Demux) {
+    if let Some(id) = v.get("id").and_then(Value::as_u64) {
+        let Some(tx) = demux.pending.lock().unwrap().remove(&id) else {
+            return; // reply to a timed-out or unknown call
+        };
+        let outcome = match v.get("error") {
+            Some(err) => CallOutcome::Error {
+                code: err.get("code").and_then(Value::as_i64),
+                message: err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown CDP error")
+                    .to_owned(),
+            },
+            None => CallOutcome::Result(v.get("result").cloned().unwrap_or(Value::Null)),
+        };
+        let _ = tx.send(outcome);
+    } else if let Some(method) = v.get("method").and_then(Value::as_str) {
+        let event = CdpEvent {
+            method: method.to_owned(),
+            session_id: v
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            params: v.get("params").cloned().unwrap_or(Value::Null),
+        };
+        if let Some(session_id) = event.session_id.as_deref() {
+            let target_id = demux
+                .session_targets
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .cloned();
+            match event.method.as_str() {
+                "Page.javascriptDialogOpening" => {
+                    let kind = match event.params.get("type").and_then(Value::as_str) {
+                        Some("alert") => "alert",
+                        Some("confirm") => "confirm",
+                        Some("prompt") => "prompt",
+                        Some("beforeunload") => "beforeunload",
+                        _ => "other",
+                    };
+                    let generation = demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
+                    if let Some(target_id) = target_id {
+                        demux.dialogs.lock().unwrap().insert(
+                            target_id,
+                            CdpDialogState {
+                                generation,
+                                kind: kind.to_owned(),
+                                session_id: session_id.to_owned(),
+                            },
+                        );
+                    }
+                }
+                "Page.javascriptDialogClosed" => {
+                    if let Some(target_id) = target_id {
+                        demux.dialogs.lock().unwrap().remove(&target_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        demux
+            .subscribers
+            .lock()
+            .unwrap()
+            .retain(|s| s.send(event.clone()).is_ok());
+    }
+}
+
+/// The WebSocket reader retains its existing parsing and close behavior.
 async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
     loop {
         let frame = match read.next().await {
@@ -165,81 +360,108 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(id) = v.get("id").and_then(Value::as_u64) {
-            let Some(tx) = demux.pending.lock().unwrap().remove(&id) else {
-                continue; // reply to a timed-out or unknown call
-            };
-            let outcome = match v.get("error") {
-                Some(err) => CallOutcome::Error {
-                    code: err.get("code").and_then(Value::as_i64),
-                    message: err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown CDP error")
-                        .to_owned(),
-                },
-                None => CallOutcome::Result(v.get("result").cloned().unwrap_or(Value::Null)),
-            };
-            let _ = tx.send(outcome);
-        } else if let Some(method) = v.get("method").and_then(Value::as_str) {
-            let event = CdpEvent {
-                method: method.to_owned(),
-                session_id: v
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                params: v.get("params").cloned().unwrap_or(Value::Null),
-            };
-            if let Some(session_id) = event.session_id.as_deref() {
-                let target_id = demux
-                    .session_targets
-                    .lock()
-                    .unwrap()
-                    .get(session_id)
-                    .cloned();
-                match event.method.as_str() {
-                    "Page.javascriptDialogOpening" => {
-                        let kind = match event.params.get("type").and_then(Value::as_str) {
-                            Some("alert") => "alert",
-                            Some("confirm") => "confirm",
-                            Some("prompt") => "prompt",
-                            Some("beforeunload") => "beforeunload",
-                            _ => "other",
-                        };
-                        let generation =
-                            demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().insert(
-                                target_id,
-                                CdpDialogState {
-                                    generation,
-                                    kind: kind.to_owned(),
-                                    session_id: session_id.to_owned(),
-                                },
-                            );
-                        }
-                    }
-                    "Page.javascriptDialogClosed" => {
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().remove(&target_id);
-                        }
-                    }
-                    _ => {}
+        route_json(v, &demux);
+    }
+    demux.close();
+}
+
+/// A native bridge may forward only messages actually received from Chrome.
+/// Definite pre-dispatch refusals use LocalRejected; uncertain broker/claim/
+/// lifetime failures use TransportFailure, never a fabricated ChromeMessage.
+/// The bridge validates generation, owner, claim and byte budget before this
+/// internal boundary; this enum is not an external or model-facing wire API.
+pub(crate) enum NativeCdpInbound {
+    ChromeMessage(Value),
+    /// Known pre-dispatch connector refusal; kind is validated upstream.
+    LocalRejected {
+        id: u64,
+        code: String,
+        message: String,
+    },
+    TransportFailure(String),
+}
+
+/// A queued command cannot expose its payload after the connection closes.
+/// The bridge must call `into_dispatch_if_live` immediately before dispatch.
+/// Once released to the bridge, Chrome execution can still race cancellation;
+/// that outcome is unknown and must never be retried automatically.
+pub(crate) struct NativeCdpCommand {
+    message: Value,
+    wire_context: Option<NativeWireContext>,
+    connection: Weak<Demux>,
+}
+
+/// An admitted native message retains exact immutable trusted call metadata.
+/// Context is carried beside CDP JSON and is never a Chrome CDP parameter.
+pub(crate) struct NativeCdpDispatch {
+    pub(crate) message: Value,
+    pub(crate) wire_context: Option<NativeWireContext>,
+}
+
+impl NativeCdpCommand {
+    pub(crate) fn into_dispatch_if_live(self) -> Option<NativeCdpDispatch> {
+        let connection = self.connection.upgrade()?;
+        if connection.closed.load(Ordering::SeqCst) {
+            None
+        } else {
+            Some(NativeCdpDispatch {
+                message: self.message,
+                wire_context: self.wire_context,
+            })
+        }
+    }
+}
+
+async fn read_native_loop(mut inbound: mpsc::Receiver<NativeCdpInbound>, demux: Arc<Demux>) {
+    while let Some(message) = inbound.recv().await {
+        match message {
+            NativeCdpInbound::ChromeMessage(message) => route_json(message, &demux),
+            NativeCdpInbound::LocalRejected { id, code, message } => {
+                if let Some(reply) = demux.pending.lock().unwrap().remove(&id) {
+                    let _ = reply.send(CallOutcome::LocalRejected { code, message });
                 }
             }
-            demux
-                .subscribers
-                .lock()
-                .unwrap()
-                .retain(|s| s.send(event.clone()).is_ok());
+            NativeCdpInbound::TransportFailure(message) => {
+                demux.fail_transport(message);
+                return;
+            }
         }
     }
     demux.close();
 }
 
+enum CdpWriter {
+    WebSocket(SplitSink<WsStream, Message>),
+    Native(mpsc::Sender<NativeCdpCommand>),
+}
+
+impl CdpWriter {
+    async fn send(
+        &mut self,
+        message: Value,
+        demux: &Arc<Demux>,
+        wire_context: Option<&NativeWireContext>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::WebSocket(writer) => writer
+                .send(Message::Text(message.to_string()))
+                .await
+                .map_err(anyhow::Error::from),
+            Self::Native(writer) => writer
+                .send(NativeCdpCommand {
+                    message,
+                    wire_context: wire_context.cloned(),
+                    connection: Arc::downgrade(demux),
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("native CDP bridge is closed")),
+        }
+    }
+}
+
 /// A single browser-endpoint connection.
 pub struct CdpConnection {
-    writer: Mutex<SplitSink<WsStream, Message>>,
+    writer: Mutex<CdpWriter>,
     demux: Arc<Demux>,
     next_id: AtomicU64,
     existing_profile_policy: AtomicBool,
@@ -316,22 +538,43 @@ impl CdpConnection {
         .await
         .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
         let (write, read) = ws.split();
-        let demux = Arc::new(Demux {
-            pending: StdMutex::new(HashMap::new()),
-            subscribers: StdMutex::new(Vec::new()),
-            session_targets: StdMutex::new(HashMap::new()),
-            dialogs: StdMutex::new(HashMap::new()),
-            next_dialog_generation: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
-        });
+        let demux = Arc::new(Demux::new(None));
         let reader = tokio::spawn(read_loop(read, demux.clone()));
         Ok(Self {
-            writer: Mutex::new(write),
+            writer: Mutex::new(CdpWriter::WebSocket(write)),
             demux,
             next_id: AtomicU64::new(1),
             existing_profile_policy: AtomicBool::new(false),
             reader,
         })
+    }
+
+    /// Bind the shared CDP state to an already validated native bridge.
+    ///
+    /// The bridge owns physical attachment, generation and claim validation.
+    /// It must stop forwarding when `close` resolves, discard queued commands
+    /// whose liveness check fails, and never replay accepted commands. Sending
+    /// into `outbound` acknowledges queue acceptance, not Chrome execution.
+    /// Inbound Chrome messages must be byte-bounded and owner/claim-scoped by
+    /// the bridge. Definite pre-dispatch refusals use `LocalRejected`; unknown
+    /// effects and route loss use `TransportFailure`. Inner CDP ids start at1
+    /// per connection; the bridge must scope its outer-id mapping by this
+    /// exact connection and claim, never treat these ids as globally unique.
+    /// Native pending calls are bounded independently of the outbound queue.
+    pub(crate) fn from_native_channels(
+        outbound: mpsc::Sender<NativeCdpCommand>,
+        inbound: mpsc::Receiver<NativeCdpInbound>,
+        close: oneshot::Sender<()>,
+    ) -> Self {
+        let demux = Arc::new(Demux::new(Some(close)));
+        let reader = tokio::spawn(read_native_loop(inbound, demux.clone()));
+        Self {
+            writer: Mutex::new(CdpWriter::Native(outbound)),
+            demux,
+            next_id: AtomicU64::new(1),
+            existing_profile_policy: AtomicBool::new(false),
+            reader,
+        }
     }
 
     pub fn method_policy(&self) -> CdpMethodPolicy {
@@ -411,8 +654,14 @@ impl CdpConnection {
         method: &str,
         params: Value,
     ) -> anyhow::Result<Value> {
-        self.call_with_reply_disposition(session_id, method, params, ReplyDisposition::Required)
-            .await
+        self.call_with_reply_disposition(
+            session_id,
+            method,
+            params,
+            ReplyDisposition::Required,
+            None,
+        )
+        .await
     }
 
     /// Issue a known observation whose late reply can be discarded after its
@@ -424,8 +673,52 @@ impl CdpConnection {
         method: &str,
         params: Value,
     ) -> anyhow::Result<Value> {
-        self.call_with_reply_disposition(session_id, method, params, ReplyDisposition::Observation)
-            .await
+        self.call_with_reply_disposition(
+            session_id,
+            method,
+            params,
+            ReplyDisposition::Observation,
+            None,
+        )
+        .await
+    }
+
+    /// Pass exact trusted session/turn metadata to a native wire adapter.
+    /// WebSocket calls keep their original CDP payload and ignore this metadata.
+    /// Captured old context is never replaced with an ambient latest turn.
+    pub async fn call_with_native_context(
+        &self,
+        wire_context: &NativeWireContext,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        self.call_with_reply_disposition(
+            session_id,
+            method,
+            params,
+            ReplyDisposition::Required,
+            Some(wire_context),
+        )
+        .await
+    }
+
+    /// Observation counterpart with unchanged late-reply abandonment semantics.
+    pub async fn call_observation_with_native_context(
+        &self,
+        wire_context: &NativeWireContext,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        self.call_with_reply_disposition(
+            session_id,
+            method,
+            params,
+            ReplyDisposition::Observation,
+            Some(wire_context),
+        )
+        .await
     }
 
     async fn call_with_reply_disposition(
@@ -434,6 +727,7 @@ impl CdpConnection {
         method: &str,
         params: Value,
         reply_disposition: ReplyDisposition,
+        wire_context: Option<&NativeWireContext>,
     ) -> anyhow::Result<Value> {
         let policy = self.method_policy();
         if !policy.allows(method) {
@@ -444,6 +738,15 @@ impl CdpConnection {
         if self.is_closed() {
             anyhow::bail!("CDP socket closed before {method}");
         }
+        let _pending_slot = match &self.demux.pending_slots {
+            Some(slots) => Some(
+                slots
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("CDP socket closed before {method}"))?,
+            ),
+            None => None,
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.demux.pending.lock().unwrap().insert(id, tx);
@@ -471,7 +774,7 @@ impl CdpConnection {
                     anyhow::bail!("CDP socket closed before sending {method}");
                 }
                 writer
-                    .send(Message::Text(msg.to_string()))
+                    .send(msg, &self.demux, wire_context)
                     .await
                     .map_err(|e| anyhow::anyhow!("CDP send failed during {method}: {e}"))?;
                 pending.phase = PendingCallPhase::AwaitingReply(reply_disposition);
@@ -484,14 +787,21 @@ impl CdpConnection {
         pending.phase = PendingCallPhase::Replied;
         match outcome {
             CallOutcome::Result(v) => Ok(v),
-            CallOutcome::Error {
-                code: Some(code),
+            CallOutcome::TransportFailure(message) => {
+                anyhow::bail!("CDP transport failed during {method}: {message}")
+            }
+            CallOutcome::LocalRejected { code, message } => Err(NativeCdpRefusal {
+                method: method.to_owned(),
+                code,
                 message,
-            } => anyhow::bail!("CDP {method} failed ({code}): {message}"),
-            CallOutcome::Error {
-                code: None,
+            }
+            .into()),
+            CallOutcome::Error { code, message } => Err(CdpReplyError {
+                method: method.to_owned(),
+                code,
                 message,
-            } => anyhow::bail!("CDP {method} failed: {message}"),
+            }
+            .into()),
         }
     }
 }
@@ -1047,6 +1357,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["echoed"]["x"], 7);
+    }
+
+    #[tokio::test]
+    async fn matched_remote_rejection_is_typed_without_changing_its_diagnostic() {
+        let server = MockCdpServer::start(StdArc::new(|_| {
+            MockReply::err(-32601, "unsupported fixture method")
+        }))
+        .await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        let error = conn
+            .call(None, "Fixture.optional", json!({}))
+            .await
+            .unwrap_err();
+        let reply = error
+            .downcast_ref::<CdpReplyError>()
+            .expect("matched reply");
+        assert_eq!(reply.method(), "Fixture.optional");
+        assert_eq!(reply.code(), Some(-32601));
+        assert_eq!(reply.message(), "unsupported fixture method");
+        assert_eq!(
+            error.to_string(),
+            "CDP Fixture.optional failed (-32601): unsupported fixture method"
+        );
+        assert!(!conn.is_closed());
+    }
+
+    #[test]
+    fn remote_rejection_without_numeric_code_remains_typed() {
+        let error = anyhow::Error::new(CdpReplyError {
+            method: "Fixture.optional".into(),
+            code: None,
+            message: "fixture rejection".into(),
+        });
+        assert_eq!(error.downcast_ref::<CdpReplyError>().unwrap().code(), None);
+        assert_eq!(
+            error.to_string(),
+            "CDP Fixture.optional failed: fixture rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_policy_rejection_is_not_a_remote_reply_error() {
+        let methods = StdArc::new(StdMutex::new(Vec::new()));
+        let received = methods.clone();
+        let server = MockCdpServer::start(StdArc::new(move |call| {
+            received.lock().unwrap().push(call.method.clone());
+            MockReply::ok(json!({}))
+        }))
+        .await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        conn.restrict_to_existing_profile();
+        let error = conn
+            .call(None, "Fixture.refused", json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<CdpReplyError>().is_none());
+        assert!(error
+            .to_string()
+            .contains("existing-profile CDP policy refused"));
+        conn.call(None, "Page.getFrameTree", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(*methods.lock().unwrap(), ["Page.getFrameTree".to_owned()]);
     }
 
     #[tokio::test]
@@ -1702,5 +2075,534 @@ mod tests {
         pool.release_existing(&url, 3, SharedSocketRelease::Close)
             .await;
         log("session C: ended; socket closed");
+    }
+}
+
+#[cfg(test)]
+mod native_transport_tests {
+    use super::*;
+    use serde_json::json;
+    use std::future::Future;
+
+    struct NativePeer {
+        commands: mpsc::Receiver<NativeCdpCommand>,
+        inbound: mpsc::Sender<NativeCdpInbound>,
+        closed: oneshot::Receiver<()>,
+    }
+
+    fn native_connection(capacity: usize) -> (CdpConnection, NativePeer) {
+        let (outbound, commands) = mpsc::channel(capacity);
+        let (inbound, incoming) = mpsc::channel(128);
+        let (close, closed) = oneshot::channel();
+        (
+            CdpConnection::from_native_channels(outbound, incoming, close),
+            NativePeer {
+                commands,
+                inbound,
+                closed,
+            },
+        )
+    }
+
+    async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(1), future)
+            .await
+            .expect("hermetic channel operation must complete")
+    }
+
+    async fn next_command(peer: &mut NativePeer) -> Value {
+        bounded(peer.commands.recv())
+            .await
+            .expect("native command")
+            .into_dispatch_if_live()
+            .expect("live transport may dispatch queued command")
+            .message
+    }
+
+    async fn reply(peer: &NativePeer, message: Value) {
+        peer.inbound
+            .send(NativeCdpInbound::ChromeMessage(message))
+            .await
+            .expect("live inbound bridge");
+    }
+
+    #[tokio::test]
+    async fn native_event_preceding_reply_is_queued_before_call_completes() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let mut events = connection.subscribe();
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .call(Some("owned-child"), "Runtime.enable", json!({}))
+                    .await
+            })
+        };
+        let sent = next_command(&mut peer).await;
+        assert_eq!(sent["method"], "Runtime.enable");
+        assert_eq!(sent["sessionId"], "owned-child");
+        reply(
+            &peer,
+            json!({"method":"Runtime.executionContextCreated", "sessionId":"owned-child", "params":{"context":{"id":27}}}),
+        )
+        .await;
+        reply(&peer, json!({"id":sent["id"], "result":{"enabled":true}})).await;
+        assert_eq!(
+            bounded(call).await.unwrap().unwrap(),
+            json!({"enabled":true})
+        );
+        let event = events
+            .try_recv()
+            .expect("event is queued before reply completion");
+        assert_eq!(event.method, "Runtime.executionContextCreated");
+        assert_eq!(event.session_id.as_deref(), Some("owned-child"));
+        assert_eq!(event.params["context"]["id"], 27);
+        assert!(!connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn native_out_of_order_replies_reuse_existing_id_routing() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let first = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Runtime.first", json!({})).await })
+        };
+        let first_sent = next_command(&mut peer).await;
+        let second = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Runtime.second", json!({})).await })
+        };
+        let second_sent = next_command(&mut peer).await;
+        assert_ne!(first_sent["id"], second_sent["id"]);
+        reply(&peer, json!({"id":second_sent["id"], "result":{"which":2}})).await;
+        reply(&peer, json!({"id":first_sent["id"], "result":{"which":1}})).await;
+        assert_eq!(bounded(first).await.unwrap().unwrap(), json!({"which":1}));
+        assert_eq!(bounded(second).await.unwrap().unwrap(), json!({"which":2}));
+    }
+
+    #[tokio::test]
+    async fn only_matched_chrome_rejection_constructs_the_existing_reply_error() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Runtime.evaluate", json!({})).await })
+        };
+        let sent = next_command(&mut peer).await;
+        reply(
+            &peer,
+            json!({"id":sent["id"], "error":{"message":"Chrome rejected this fixture command"}}),
+        )
+        .await;
+        let error = bounded(call).await.unwrap().unwrap_err();
+        let remote = error
+            .downcast_ref::<CdpReplyError>()
+            .expect("exact Chrome error reply remains typed");
+        assert_eq!(remote.method(), "Runtime.evaluate");
+        assert_eq!(remote.code(), None);
+        assert_eq!(remote.message(), "Chrome rejected this fixture command");
+        assert!(!connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn broker_failure_is_not_a_chrome_rejection_and_closes_the_bridge() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .call(None, "Input.insertText", json!({"text":"once"}))
+                    .await
+            })
+        };
+        let _sent = next_command(&mut peer).await;
+        peer.inbound
+            .send(NativeCdpInbound::TransportFailure(
+                "native generation ended".into(),
+            ))
+            .await
+            .unwrap();
+        let error = bounded(call).await.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<CdpReplyError>().is_none());
+        assert_eq!(
+            error.to_string(),
+            "CDP transport failed during Input.insertText: native generation ended"
+        );
+        assert!(connection.is_closed());
+        bounded(peer.closed)
+            .await
+            .expect("connection fences bridge on broker failure");
+        assert!(matches!(
+            peer.commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_eof_fails_pending_call_without_retry_or_remote_error() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .call(
+                        None,
+                        "Input.dispatchMouseEvent",
+                        json!({"type":"mousePressed"}),
+                    )
+                    .await
+            })
+        };
+        let sent = next_command(&mut peer).await;
+        assert_eq!(sent["method"], "Input.dispatchMouseEvent");
+        drop(peer.inbound);
+        let error = bounded(call).await.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<CdpReplyError>().is_none());
+        assert_eq!(
+            error.to_string(),
+            "CDP socket closed during Input.dispatchMouseEvent"
+        );
+        assert!(connection.is_closed());
+        bounded(peer.closed)
+            .await
+            .expect("EOF fences outbound bridge");
+        assert!(matches!(
+            peer.commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_mutation_fences_queued_unsent_command_and_signals_close() {
+        let (connection, mut peer) = native_connection(1);
+        {
+            let call = connection.call(None, "Input.insertText", json!({"text":"once"}));
+            tokio::pin!(call);
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+        }
+        assert!(connection.is_closed());
+        let queued = bounded(peer.commands.recv())
+            .await
+            .expect("accepted queue item");
+        assert!(
+            queued.into_dispatch_if_live().is_none(),
+            "cancelled mutation must not leave dispatchable queued work"
+        );
+        bounded(peer.closed)
+            .await
+            .expect("mutation cancellation closes native claim route");
+        assert!(matches!(
+            peer.commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_sent_observation_drops_late_reply_and_keeps_connection_live() {
+        let (connection, mut peer) = native_connection(2);
+        {
+            let call = connection.call_observation(None, "Page.getLayoutMetrics", json!({}));
+            tokio::pin!(call);
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+        }
+        assert!(!connection.is_closed());
+        let abandoned = next_command(&mut peer).await;
+        reply(&peer, json!({"id":abandoned["id"], "result":{"old":true}})).await;
+        let connection = Arc::new(connection);
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Page.enable", json!({})).await })
+        };
+        let sent = next_command(&mut peer).await;
+        reply(&peer, json!({"id":sent["id"], "result":{"current":true}})).await;
+        assert_eq!(
+            bounded(call).await.unwrap().unwrap(),
+            json!({"current":true})
+        );
+        assert!(!connection.is_closed());
+        assert!(matches!(
+            peer.closed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_observation_while_its_send_is_blocked_fences_old_queue() {
+        let (connection, mut peer) = native_connection(1);
+        {
+            let first = connection.call_observation(None, "Page.getLayoutMetrics", json!({}));
+            tokio::pin!(first);
+            assert!(futures_util::poll!(first.as_mut()).is_pending());
+        }
+        assert!(
+            !connection.is_closed(),
+            "first observation was wholly queued"
+        );
+        {
+            let blocked = connection.call_observation(None, "DOM.getDocument", json!({}));
+            tokio::pin!(blocked);
+            assert!(futures_util::poll!(blocked.as_mut()).is_pending());
+        }
+        assert!(
+            connection.is_closed(),
+            "abandoning incomplete send must fence the route"
+        );
+        let queued = bounded(peer.commands.recv()).await.unwrap();
+        assert!(queued.into_dispatch_if_live().is_none());
+        bounded(peer.closed).await.unwrap();
+        assert!(matches!(
+            peer.commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_invalidates_held_unsent_command() {
+        let (connection, mut peer) = native_connection(1);
+        {
+            let observation = connection.call_observation(None, "DOM.getDocument", json!({}));
+            tokio::pin!(observation);
+            assert!(futures_util::poll!(observation.as_mut()).is_pending());
+        }
+        let queued = bounded(peer.commands.recv()).await.unwrap();
+        drop(connection);
+        assert!(queued.into_dispatch_if_live().is_none());
+        bounded(peer.closed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_pending_bound_survives_draining_the_outbound_queue() {
+        let (connection, mut peer) = native_connection(64);
+        let connection = Arc::new(connection);
+        let mut calls = tokio::task::JoinSet::new();
+        let mut sent = Vec::new();
+        for _ in 0..64 {
+            let connection = connection.clone();
+            // Tokio may cooperatively yield before queueing even with capacity.
+            // Keep callers scheduled and observe admission through actual output.
+            calls.spawn(async move { connection.call(None, "Runtime.evaluate", json!({})).await });
+            sent.push(next_command(&mut peer).await);
+        }
+        let (attempted, attempt_observed) = oneshot::channel();
+        let excess = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                let call = connection.call(None, "Runtime.evaluate", json!({}));
+                tokio::pin!(call);
+                assert!(futures_util::poll!(call.as_mut()).is_pending());
+                attempted.send(()).expect("test observes the 65th attempt");
+                call.await
+            })
+        };
+        bounded(attempt_observed)
+            .await
+            .expect("65th caller was polled");
+        assert!(
+            matches!(
+                peer.commands.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "65th call must await a reply slot even though queue drained"
+        );
+        reply(
+            &peer,
+            json!({"id":sent[0]["id"], "result":{"released":true}}),
+        )
+        .await;
+        assert_eq!(
+            bounded(calls.join_next()).await.unwrap().unwrap().unwrap(),
+            json!({"released":true})
+        );
+        let excess_sent = next_command(&mut peer).await;
+        assert_eq!(excess_sent["id"], 65);
+        reply(
+            &peer,
+            json!({"id":excess_sent["id"], "result":{"excess":true}}),
+        )
+        .await;
+        assert_eq!(
+            bounded(excess).await.unwrap().unwrap(),
+            json!({"excess":true})
+        );
+        for command in &sent[1..] {
+            reply(&peer, json!({"id":command["id"], "result":{}})).await;
+        }
+        for _ in 1..64 {
+            assert_eq!(
+                bounded(calls.join_next()).await.unwrap().unwrap().unwrap(),
+                json!({})
+            );
+        }
+        assert!(!connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn request_matched_local_refusal_keeps_unrelated_call_and_connection_live() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let refused = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .call(None, "Browser.getWindowBounds", json!({}))
+                    .await
+            })
+        };
+        let refused_sent = next_command(&mut peer).await;
+        let healthy = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Page.enable", json!({})).await })
+        };
+        let healthy_sent = next_command(&mut peer).await;
+        peer.inbound
+            .send(NativeCdpInbound::LocalRejected {
+                id: 999,
+                code: "unsupported".into(),
+                message: "stale unmatched reply".into(),
+            })
+            .await
+            .unwrap();
+        peer.inbound
+            .send(NativeCdpInbound::LocalRejected {
+                id: refused_sent["id"].as_u64().unwrap(),
+                code: "unsupported".into(),
+                message: "Browser domain is unavailable through chrome.debugger".into(),
+            })
+            .await
+            .unwrap();
+        reply(
+            &peer,
+            json!({"id":healthy_sent["id"], "result":{"enabled":true}}),
+        )
+        .await;
+        let error = bounded(refused).await.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<CdpReplyError>().is_none());
+        let refusal = error
+            .downcast_ref::<NativeCdpRefusal>()
+            .expect("known local refusal retains separate provenance");
+        assert_eq!(refusal.method(), "Browser.getWindowBounds");
+        assert_eq!(refusal.code(), "unsupported");
+        assert_eq!(
+            refusal.message(),
+            "Browser domain is unavailable through chrome.debugger"
+        );
+        assert_eq!(
+            bounded(healthy).await.unwrap().unwrap(),
+            json!({"enabled":true})
+        );
+        assert!(!connection.is_closed());
+        assert!(matches!(
+            peer.closed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+    #[tokio::test]
+    async fn native_context_is_immutable_and_distinct_for_each_command() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let first_context = NativeWireContext::new("canonical-owner", "turn-A").unwrap();
+        let second_context = NativeWireContext::new("canonical-owner", "turn-B").unwrap();
+        let first = {
+            let connection = connection.clone();
+            let context = first_context.clone();
+            tokio::spawn(async move {
+                connection
+                    .call_with_native_context(&context, None, "Runtime.first", json!({"value":1}))
+                    .await
+            })
+        };
+        let first_sent = bounded(peer.commands.recv())
+            .await
+            .unwrap()
+            .into_dispatch_if_live()
+            .unwrap();
+        assert_eq!(first_sent.wire_context, Some(first_context));
+        assert!(first_sent.message.get("wireContext").is_none());
+        let second = {
+            let connection = connection.clone();
+            let context = second_context.clone();
+            tokio::spawn(async move {
+                connection
+                    .call_with_native_context(&context, None, "Runtime.second", json!({"value":2}))
+                    .await
+            })
+        };
+        let second_sent = bounded(peer.commands.recv())
+            .await
+            .unwrap()
+            .into_dispatch_if_live()
+            .unwrap();
+        assert_eq!(second_sent.wire_context, Some(second_context));
+        assert!(second_sent.message.get("wireContext").is_none());
+        reply(
+            &peer,
+            json!({"id":second_sent.message["id"],"result":{"which":2}}),
+        )
+        .await;
+        reply(
+            &peer,
+            json!({"id":first_sent.message["id"],"result":{"which":1}}),
+        )
+        .await;
+        assert_eq!(bounded(first).await.unwrap().unwrap()["which"], 1);
+        assert_eq!(bounded(second).await.unwrap().unwrap()["which"], 2);
+    }
+
+    #[tokio::test]
+    async fn default_native_call_keeps_context_absent() {
+        let (connection, mut peer) = native_connection(2);
+        let connection = Arc::new(connection);
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Page.enable", json!({})).await })
+        };
+        let sent = bounded(peer.commands.recv())
+            .await
+            .unwrap()
+            .into_dispatch_if_live()
+            .unwrap();
+        assert!(sent.wire_context.is_none());
+        reply(&peer, json!({"id":sent.message["id"],"result":{}})).await;
+        bounded(call).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_native_context_never_leaks_into_cdp_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let message = websocket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("CDP JSON text expected");
+            };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 3);
+            assert_eq!(value["method"], "Page.enable");
+            assert!(value.get("wireContext").is_none());
+            websocket
+                .send(Message::Text(
+                    json!({"id":value["id"],"result":{"enabled":true}}).to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+        let connection = CdpConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let context = NativeWireContext::new("owner", "captured-turn").unwrap();
+        assert_eq!(
+            connection
+                .call_with_native_context(&context, None, "Page.enable", json!({}))
+                .await
+                .unwrap()["enabled"],
+            true
+        );
+        bounded(server).await.unwrap();
     }
 }
