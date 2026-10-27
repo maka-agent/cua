@@ -145,13 +145,12 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
 /// Errors that mean the request never reached the app (illegal argument,
 /// invalid element, cannot complete, API disabled) are not among them.
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
-    use crate::ax::bindings;
-    matches!(
-        err,
-        bindings::kAXErrorFailure
-            | bindings::kAXErrorAttributeUnsupported
-            | bindings::kAXErrorActionUnsupported
-    )
+    use crate::ax::bindings::{
+        kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
+    };
+    err == kAXErrorFailure
+        || err == kAXErrorAttributeUnsupported
+        || err == kAXErrorActionUnsupported
 }
 
 /// Whether a toggle's value moving from `before` to `now` is what pressing it

@@ -48,6 +48,9 @@ export class FixtureHost {
     if (next) throw next;
     const relay = o.mode === "relay";
     const spare = o.profile === "spare";
+    // As cua-host decides when the request leaves it out: a machine set up
+    // before keeps its setting; a new relay setup provides Spaces.
+    const keep = this.current.configured ? this.current.provideSpaces : relay;
     this.current = {
       ...unconfiguredHost(),
       configured: true,
@@ -63,7 +66,7 @@ export class FixtureHost {
       online: true,
       allow: o.allow,
       shareDesktop: o.shareDesktop ?? !spare,
-      provideSpaces: o.provideSpaces ?? spare,
+      provideSpaces: o.provideSpaces ?? (spare || keep),
       owner: relay ? this.owner : undefined,
       ownerEmail: relay ? this.ownerEmail : undefined,
     };
@@ -302,6 +305,14 @@ export class FixtureSystem implements SystemServices {
   globalShortcut() {
     return this.shortcut;
   }
+  /** Settings, General, Change: the keys asked for; "Command+K" is held by another app. */
+  readonly shortcutChanges: string[] = [];
+  setGlobalShortcut(accelerator: string) {
+    if (accelerator === "Command+K") throw new Error("Another app is using \u2318K. Pick other keys.");
+    this.shortcutChanges.push(accelerator);
+    this.shortcut = { label: accelerator, registered: true };
+    return this.shortcut;
+  }
   async openExternal(url: string) {
     this.opened.push(url);
   }
@@ -325,7 +336,7 @@ export const HOST_METHODS = [
   "devices.get", "devices.enroll", "devices.checkEnrolled", "devices.approve", "devices.rename", "devices.revoke", "devices.confirmMachine",
   "devices.createPairingCode", "devices.pairingCodes", "devices.revokePairingCode", "teams.list",
   "storage.get", "storage.run", "notifications.list", "notifications.markAllRead", "notifications.markRead",
-  "host.setUp", "host.joinWithCode", "host.action", "host.openSettings", "settings.get", "settings.choose",
+  "host.setUp", "host.joinWithCode", "host.action", "host.openSettings", "settings.get", "settings.choose", "settings.update",
   "onboarding.get", "onboarding.complete",
 ];
 

@@ -51,11 +51,174 @@ public enum PermissionGuide {
 
     private static var controller: PermissionFlowController?
 
+    /// How a pane is opened, what the guide draws over it, and what runs on
+    /// a grant. Replaced in tests, which must not open System Settings or
+    /// draw panels.
+    nonisolated(unsafe) static var openPane: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    nonisolated(unsafe) static var showsGuide = true
+    nonisolated(unsafe) static var grantedHook: ((PermissionFlowPane) -> Void)?
+
+    // MARK: - Listed or not (CUA-2283)
+
+    /// What the guide tells the person to do in a pane's list.
+    enum Instruction: Equatable {
+        /// The app is not in the list yet: drag it in (PermissionFlow's panel).
+        case drag
+        /// The app is already in the list: only its switch needs turning on.
+        case switchOn
+    }
+
+    /// macOS has no public call that says whether an app has a row in a
+    /// privacy list, so the guide remembers it: the permission was seen
+    /// granted (a revoked grant keeps its row). An app dragged in but never
+    /// switched on is not noticed, and keeps the drag guide. An
+    /// uninstall that resets the permissions removes the app's preferences
+    /// with this note.
+    nonisolated(unsafe) static var listedStore: UserDefaults = .standard
+
+    nonisolated static func listedKey(_ pane: PermissionFlowPane) -> String { "permissionListed.\(pane.rawValue)" }
+
+    nonisolated static func isListed(_ pane: PermissionFlowPane) -> Bool {
+        listedStore.bool(forKey: listedKey(pane))
+    }
+
+    nonisolated static func markListed(_ pane: PermissionFlowPane, _ listed: Bool = true) {
+        listedStore.set(listed, forKey: listedKey(pane))
+    }
+
+    nonisolated static func instruction(for pane: PermissionFlowPane, listed: Bool) -> Instruction {
+        listed ? .switchOn : .drag
+    }
+
+    /// The line of the switch-on hint.
+    nonisolated static func switchOnText(appName: String) -> String {
+        "Turn on \(appName) in System Settings, then come back."
+    }
+
+    /// Where one permission stands. macOS never prompts again once it is
+    /// denied or switched off, so only the first ask may use its own prompt;
+    /// after that "Allow" means opening the pane.
+    enum State: Equatable {
+        case notDetermined, off, granted
+    }
+
+    /// Granted comes from the preflight call; the app having a row in the
+    /// list (seen granted once, see `isListed`) tells off from not asked.
+    nonisolated static func state(granted: Bool, listed: Bool) -> State {
+        granted ? .granted : (listed ? .off : .notDetermined)
+    }
+
+    /// Polls until `pane` reads as granted (true) or `deadline` passes (false),
+    /// so the step completes without a second click.
+    nonisolated static func waitForGrant(_ pane: PermissionFlowPane,
+                                         read: () async -> Set<PermissionFlowPane>,
+                                         interval: Duration, giveUpAfter: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + giveUpAfter
+        while !Task.isCancelled, clock.now < deadline {
+            if await read().contains(pane) { return true }
+            try? await Task.sleep(for: interval)
+        }
+        return false
+    }
+
+    private static var hint: NSPanel?
+
+    private static func closeHint() {
+        hint?.close()
+        hint = nil
+    }
+
+    /// A small panel over System Settings for a pane whose list already has
+    /// this app: no dragging, just the switch. "Not in the list?" falls back
+    /// to the drag guide.
+    private static func showSwitchOnHint(for pane: PermissionFlowPane, url: String) {
+        closeHint()
+        let name = FileManager.default.displayName(atPath: Bundle.main.bundlePath)
+        let label = NSTextField(labelWithString: switchOnText(appName: name))
+        label.font = .systemFont(ofSize: 14)
+        let fallback = NSButton(title: "Not in the list?", target: nil, action: nil)
+        fallback.bezelStyle = .inline
+        let close = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close") ?? NSImage(),
+                             target: nil, action: nil)
+        close.isBordered = false
+        let row = NSStackView(views: [label, fallback, close])
+        row.spacing = 10
+        row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 12)
+        let box = NSVisualEffectView()
+        box.material = .hudWindow
+        box.state = .active
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 12
+        row.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            row.topAnchor.constraint(equalTo: box.topAnchor),
+            row.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+        ])
+        let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        panel.contentView = box
+        let size = box.fittingSize
+        if let screen = NSScreen.main?.visibleFrame {
+            panel.setFrame(NSRect(x: screen.midX - size.width / 2, y: screen.maxY - size.height - 16,
+                                  width: size.width, height: size.height), display: true)
+        }
+        let actions = HintActions(
+            close: { closeHint() },
+            fallback: {
+                markListed(pane, false)
+                closeHint()
+                guide(url)
+            })
+        fallback.target = actions
+        fallback.action = #selector(HintActions.fallbackTapped)
+        close.target = actions
+        close.action = #selector(HintActions.closeTapped)
+        objc_setAssociatedObject(panel, &HintActions.key, actions, .OBJC_ASSOCIATION_RETAIN)
+        panel.orderFrontRegardless()
+        hint = panel
+    }
+
+    private final class HintActions: NSObject {
+        nonisolated(unsafe) static var key: UInt8 = 0
+        let close: () -> Void
+        let fallback: () -> Void
+        init(close: @escaping () -> Void, fallback: @escaping () -> Void) {
+            self.close = close
+            self.fallback = fallback
+        }
+        @objc func closeTapped() { close() }
+        @objc func fallbackTapped() { fallback() }
+    }
+
     /// Guides `url`'s pane: false when the guide doesn't know it (open it
     /// plainly then).
     @discardableResult
     public static func guide(_ url: String) -> Bool {
         guard let pane = pane(for: url) else { return false }
+        closeHint()
+        // Already in the list: say "switch on", not "drag".
+        if instruction(for: pane, listed: isListed(pane)) == .switchOn, let u = URL(string: url) {
+            controller?.closePanel()
+            openPane(u)
+            if showsGuide { showSwitchOnHint(for: pane, url: url) }
+            watch(pane)
+            return true
+        }
+        guard showsGuide else {
+            if let u = URL(string: url) { openPane(u) }
+            watch(pane)
+            return true
+        }
         let app = Bundle.main.bundleURL
         let flow = controller ?? PermissionFlowController(configuration: .init(requiredAppURLs: [app]))
         controller = flow
@@ -115,7 +278,7 @@ public enum PermissionGuide {
 
     /// The answer `preflight-permissions` gives (run by main.swift).
     public nonisolated static func preflightReport() -> String {
-        "screen-recording=\(CGPreflightScreenCaptureAccess() ? 1 : 0) accessibility=\(AXIsProcessTrusted() ? 1 : 0)"
+        "screen-recording=\(PermissionRequester.screenRecordingGranted() ? 1 : 0) accessibility=\(PermissionRequester.accessibilityGranted() ? 1 : 0)"
     }
 
     /// What follows a grant.
@@ -156,16 +319,22 @@ public enum PermissionGuide {
             while !Task.isCancelled, clock.now < deadline {
                 let now = await readGranted()
                 guard !Task.isCancelled else { return }
+                // A grant, even one revoked later, means the app has its row.
+                for p in now { markListed(p) }
                 if now.contains(pane) { granted(pane, others: now); return }
                 try? await Task.sleep(for: pollInterval)
             }
+            // Gave up (a replaced or finished watch must not close a newer hint).
+            if !Task.isCancelled { closeHint() }
         }
     }
 
     private static func granted(_ pane: PermissionFlowPane, others: Set<PermissionFlowPane>) {
         watching = nil
         reopening?.cancel()
+        if let hook = grantedHook { return hook(pane) }
         controller?.closePanel()
+        closeHint()
         let followUp = {
             switch next(after: pane, isGranted: others.contains) {
             case .guide(let other):
