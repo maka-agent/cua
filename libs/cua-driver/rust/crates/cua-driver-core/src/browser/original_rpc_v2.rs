@@ -41,7 +41,6 @@ pub(crate) enum Method {
     #[cfg(test)]
     MarkTab,
     FinalizeTabs,
-    #[cfg(test)]
     GetCommittedTabUrl,
     #[cfg(test)]
     NameSession,
@@ -73,7 +72,6 @@ impl Method {
             #[cfg(test)]
             Self::MarkTab => "markTab",
             Self::FinalizeTabs => "finalizeTabs",
-            #[cfg(test)]
             Self::GetCommittedTabUrl => "getCommittedTabUrl",
             #[cfg(test)]
             Self::NameSession => "nameSession",
@@ -119,7 +117,6 @@ impl Method {
             // no-session focusTab branch returning undefined is not this contract.
             #[cfg(test)]
             Self::FocusTab => result.is_boolean(),
-            #[cfg(test)]
             Self::GetCommittedTabUrl => result.is_string(),
             // CDP method results remain opaque to this correlation layer.
             Self::ExecuteCdp => true,
@@ -479,6 +476,16 @@ impl RpcCodec {
             effects.push(RpcEvent::IgnoredReply { id });
             return effects;
         };
+        // Only this exact namespace/sequence/full-ID match produces this event.
+        // These fields are minted request metadata, never incoming method/params.
+        tracing::trace!(
+            target: "maka::native_rpc_phase",
+            native_host_pid = std::process::id(),
+            native_rpc_id = %pending.id,
+            native_method = pending.method.as_str(),
+            phase = "reply_id_matched",
+            "native RPC phase"
+        );
         effects.push(RpcEvent::Reply(complete_response(pending, object)));
         effects
     }
@@ -635,6 +642,85 @@ mod tests {
         match events.into_iter().next().expect("one effect was checked") {
             RpcEvent::Reply(reply) => reply,
             other => panic!("expected a reply effect, received {other:?}"),
+        }
+    }
+
+    #[test]
+    fn passive_match_trace_uses_exact_local_ids_not_payload_or_expiry() {
+        use super::super::native_wire::rpc_phase_test::Capture;
+        let capture = Capture::default();
+        let now = Instant::now();
+        let mut rpc = codec();
+        let first = rpc
+            .begin(
+                Method::ClaimUserTab,
+                json!({"url":"URL_SENTINEL","headers":"HEADER_SENTINEL"}),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        let second = rpc
+            .begin(Method::GetUserTabs, json!({}), now + Duration::from_secs(1))
+            .unwrap();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let _ = rpc.receive(
+                json!({"jsonrpc":"2.0","id":"foreign-generation:1","result":"RESULT_SENTINEL"}),
+                now,
+            );
+            let _ = rpc.receive(json!({"jsonrpc":"2.0","method":"NOTIFICATION_SENTINEL","params":{"headers":"HEADER_SENTINEL"}}), now);
+            assert!(capture.rows().is_empty());
+            let response = one_reply(rpc.receive(
+                json!({"jsonrpc":"2.0","id":second.id.as_str(),"result":[]}),
+                now,
+            ));
+            assert!(response.outcome.is_ok());
+            let malformed = one_reply(rpc.receive(
+                json!({"jsonrpc":"2.0","id":first.id.as_str(),"result":"RESULT_SENTINEL"}),
+                now,
+            ));
+            assert!(matches!(
+                malformed.outcome,
+                Err(RpcError::OutcomeUnknown {
+                    cause: LossCause::Protocol,
+                    ..
+                })
+            ));
+            let _ = rpc.receive(
+                json!({"jsonrpc":"2.0","id":first.id.as_str(),"result":{}}),
+                now,
+            );
+            let remote = rpc
+                .begin(Method::GetInfo, json!({}), now + Duration::from_secs(1))
+                .unwrap();
+            let failed = one_reply(rpc.receive(json!({"jsonrpc":"2.0","id":remote.id.as_str(),"error":{"code":1,"message":"ERROR_MESSAGE_SENTINEL","data":{"headers":"ERROR_DATA_SENTINEL"}}}), now));
+            assert!(matches!(failed.outcome, Err(RpcError::Remote(_))));
+            let expired = rpc.begin(Method::ClaimUserTab, json!({}), now).unwrap();
+            let _ = rpc.receive(
+                json!({"jsonrpc":"2.0","id":expired.id.as_str(),"result":{}}),
+                now,
+            );
+            let _ = rpc.eof("EOF_SENTINEL");
+        });
+        let rows = capture.rows();
+        assert_eq!(
+            rows.len(),
+            3,
+            "unmatched/duplicate/expired IDs cannot manufacture reply matches"
+        );
+        assert_eq!(rows[0]["native_rpc_id"], second.id.as_str());
+        assert_eq!(rows[1]["native_rpc_id"], first.id.as_str());
+        assert!(rows.iter().all(|row| row["phase"] == "reply_id_matched"
+            && row["native_host_pid"] == std::process::id().to_string()));
+        let rendered = format!("{rows:?}");
+        for forbidden in [
+            "URL_SENTINEL",
+            "HEADER_SENTINEL",
+            "RESULT_SENTINEL",
+            "NOTIFICATION_SENTINEL",
+            "EOF_SENTINEL",
+            "ERROR_MESSAGE_SENTINEL",
+            "ERROR_DATA_SENTINEL",
+        ] {
+            assert!(!rendered.contains(forbidden), "trace disclosed {forbidden}");
         }
     }
 

@@ -147,19 +147,44 @@ export class BrowserConnector {
       };
     }
   }
-  async dispatch(owner, method, params) {
+  sessionOnlyRequested(params, wireContext) {
+    if (own(params, 'sessionOnly') && typeof params.sessionOnly !== 'boolean')
+      fail('invalid_request', 'sessionOnly must be a boolean when provided');
+    if (params.sessionOnly !== true) return false;
+    const nonempty = (value) =>
+      typeof value === 'string' && value.trim().length > 0 && value.length <= 4096;
+    if (!nonempty(wireContext?.hostSessionId) || !nonempty(wireContext?.hostTurnId))
+      fail('invalid_request', 'session-only resolution requires captured Host session and turn');
+    // Purpose confirmation only. The Host owns logical tab membership and admission.
+    return true;
+  }
+  async dispatch(owner, method, params, wireContext) {
     switch (method) {
       case 'inventory':
         return { tabs: await this.inventory() };
       case 'resolve': {
         // Native-provider compatibility only. Public grammar remains with the Host.
+        const sessionOnly = this.sessionOnlyRequested(params, wireContext);
+        if (own(params, 'committedUrlOnly') && typeof params.committedUrlOnly !== 'boolean')
+          fail('invalid_request', 'committedUrlOnly must be a boolean when provided');
+        const committedUrlOnly = params.committedUrlOnly === true;
+        if (committedUrlOnly && !sessionOnly)
+          fail('invalid_request', 'committed URL resolution requires sessionOnly:true');
         if (typeof params.rawId !== 'string' || !params.rawId)
           fail('invalid_request', 'rawId string is required');
         const id = Number(params.rawId);
         if (!Number.isInteger(id) || id <= 0)
           fail('invalid_request', 'native tab ID does not resolve to a positive integer');
         const tab = await chromeCall(() => this.chrome.tabs.get(id));
-        return { tab: await this.metadata(tab) };
+        if (committedUrlOnly) {
+          if (!Number.isSafeInteger(tab?.id) || tab.id !== id || typeof tab.url !== 'string')
+            fail('target_unavailable', 'Chrome returned no exact committed tab URL string');
+          return { url: tab.url, sessionOnly: true, committedUrlOnly: true };
+        }
+        const metadata = await this.metadata(tab);
+        if (sessionOnly && metadata?.id !== id)
+          fail('target_unavailable', 'Chrome metadata did not match the requested session tab');
+        return { tab: metadata, ...(sessionOnly ? { sessionOnly: true } : {}) };
       }
       case 'createTab':
         return this.createTab(owner, params);

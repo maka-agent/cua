@@ -185,12 +185,70 @@ pub(crate) enum NativeReplyProvenance {
     Matched(MatchedNativeReply),
 }
 
+/// Passive correlation captured from the adapter's existing typed request state.
+/// This is never serialized onto native IPC and carries no payload or authority.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeRpcTrace {
+    generation: String,
+    native_rpc_id: String,
+    native_method: &'static str,
+    semantic_id: Option<String>,
+    owner: Option<String>,
+    context: Option<NativeWireContext>,
+}
+
+impl NativeRpcTrace {
+    pub(crate) fn captured(
+        generation: &str,
+        native_rpc_id: &str,
+        native_method: &'static str,
+        semantic_id: Option<&str>,
+        owner: Option<&str>,
+        context: Option<&NativeWireContext>,
+    ) -> Self {
+        Self {
+            generation: generation.to_owned(),
+            native_rpc_id: native_rpc_id.to_owned(),
+            native_method,
+            semantic_id: semantic_id.map(str::to_owned),
+            owner: owner.map(str::to_owned),
+            context: context.cloned(),
+        }
+    }
+
+    pub(crate) fn frame_written(&self) {
+        self.record("frame_written", None);
+    }
+
+    pub(crate) fn completion(&self, category: &'static str) {
+        self.record("rpc_completion", Some(category));
+    }
+
+    fn record(&self, phase: &'static str, completion_category: Option<&'static str>) {
+        tracing::trace!(
+            target: "maka::native_rpc_phase",
+            native_host_pid = std::process::id(),
+            generation = %self.generation,
+            native_rpc_id = %self.native_rpc_id,
+            native_method = self.native_method,
+            semantic_id = ?self.semantic_id,
+            owner = ?self.owner,
+            host_session_id = ?self.context.as_ref().map(NativeWireContext::host_session_id),
+            host_turn_id = ?self.context.as_ref().map(NativeWireContext::host_turn_id),
+            phase,
+            completion_category = ?completion_category,
+            "native RPC phase"
+        );
+    }
+}
+
 /// Protocol actions keep actual native frames separate from broker semantics.
 #[derive(Debug)]
 pub(crate) enum NativeWireAction {
     NativeFrame {
         message: Value,
         semantic_id: Option<String>,
+        trace: Option<NativeRpcTrace>,
     },
     BrokerMessage(Value),
     MatchedBrokerMessage {
@@ -287,6 +345,7 @@ impl NativeWireAdapter for OwnWireAdapter {
             return Ok(vec![NativeWireAction::NativeFrame {
                 message: envelope,
                 semantic_id: None,
+                trace: None,
             }]);
         }
         let semantic_id = envelope["id"]
@@ -312,6 +371,7 @@ impl NativeWireAdapter for OwnWireAdapter {
             NativeWireAction::NativeFrame {
                 message: envelope,
                 semantic_id: Some(semantic_id.clone()),
+                trace: None,
             },
             NativeWireAction::SemanticPayloadReleased { semantic_id },
         ])
@@ -409,7 +469,7 @@ mod tests {
         let bound = json!({"kind":"bound","protocol":1,"generation":"actual-host-generation"});
         let actions = adapter.on_semantic(bound.clone(), None, now).unwrap();
         assert!(
-            matches!(&actions[..],[NativeWireAction::NativeFrame{message,semantic_id:None}] if message==&bound)
+            matches!(&actions[..],[NativeWireAction::NativeFrame{message,semantic_id:None,..}] if message==&bound)
         );
     }
 
@@ -421,5 +481,58 @@ mod tests {
         assert!(
             matches!(&actions[..], [NativeWireAction::SemanticFinished { semantic_id }] if semantic_id == "19")
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod rpc_phase_test {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+    use tracing::{
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+        Event, Metadata, Subscriber,
+    };
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Capture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    impl Capture {
+        pub(crate) fn rows(&self) -> Vec<BTreeMap<String, String>> {
+            self.0.lock().expect("trace capture lock poisoned").clone()
+        }
+    }
+    struct Fields(BTreeMap<String, String>);
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+    }
+    impl Subscriber for Capture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "maka::native_rpc_phase"
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .expect("trace capture lock poisoned")
+                .push(fields.0);
+        }
     }
 }

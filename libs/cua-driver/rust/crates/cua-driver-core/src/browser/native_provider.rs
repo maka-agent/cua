@@ -198,6 +198,12 @@ pub struct NativeProviderCapabilities {
     /// A separate same-claim upgrade; metadata-only attachment never implies it.
     #[serde(default)]
     pub explicit_claim_preparation: bool,
+    /// Explicit captured-session metadata/preparation selector, not an ownership grant.
+    #[serde(default)]
+    pub session_tab_resolution: bool,
+    /// Supports the captured-session URL-only purpose, not an ownership grant.
+    #[serde(default)]
+    pub session_committed_url: bool,
 }
 
 /// Global observed metadata: no owner, claim or tab is attributed here.
@@ -449,6 +455,30 @@ pub struct NativePreparedTab {
     completion_id: u64,
 }
 impl NativePreparedTab {
+    pub fn completion_id(&self) -> u64 {
+        self.completion_id
+    }
+}
+
+/// The browser's unmodified last-committed URL field, which may be empty.
+/// This is neither a parsed Origin nor permission, membership or liveness proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeCommittedTabUrl(String);
+impl NativeCommittedTabUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Metadata returned by the session preparer, without inferred normalization state.
+/// The native preparer may collect this snapshot before later preparation effects.
+/// It is not proof of the current document, Origin, or tab liveness.
+#[derive(Clone, Debug)]
+pub struct NativeSessionPreparedTab {
+    pub tab: NativeTabInfo,
+    completion_id: u64,
+}
+impl NativeSessionPreparedTab {
     pub fn completion_id(&self) -> u64 {
         self.completion_id
     }
@@ -795,6 +825,12 @@ pub enum NativeOperation {
     Resolve {
         raw_id: String,
     },
+    ResolveSessionTab {
+        raw_id: String,
+    },
+    CommittedSessionTabUrl {
+        raw_id: String,
+    },
     Attach {
         tab_id: u64,
     },
@@ -856,6 +892,9 @@ pub enum NativeOperation {
     PrepareUserTab {
         tab_id: u64,
     },
+    PrepareSessionTab {
+        tab_id: u64,
+    },
     MuteCreatedTab {
         creation: String,
     },
@@ -890,7 +929,9 @@ impl NativeOperation {
     fn method(&self) -> &'static str {
         match self {
             Self::Inventory => "inventory",
-            Self::Resolve { .. } => "resolve",
+            Self::Resolve { .. }
+            | Self::ResolveSessionTab { .. }
+            | Self::CommittedSessionTabUrl { .. } => "resolve",
             Self::Attach { .. } => "attach",
             Self::Detach { .. } => "detach",
             Self::FenceCdp { .. } => "fenceCdp",
@@ -907,7 +948,7 @@ impl NativeOperation {
             Self::ClearSessionHeaders => "clearSessionHeaders",
             Self::MoveMousePresentation { .. } => "moveMouse",
             Self::FinishTurn { .. } => "finishTurn",
-            Self::PrepareUserTab { .. } => "prepareUserTab",
+            Self::PrepareUserTab { .. } | Self::PrepareSessionTab { .. } => "prepareUserTab",
             Self::MuteCreatedTab { .. } => "muteCreatedTab",
             Self::UnmuteCreatedTabIfActive { .. } => "unmuteCreatedTabIfActive",
             Self::EnsureCreatedTabGroup { .. } => "ensureCreatedTabGroup",
@@ -922,6 +963,8 @@ impl NativeOperation {
             self,
             Self::Inventory
                 | Self::Resolve { .. }
+                | Self::ResolveSessionTab { .. }
+                | Self::CommittedSessionTabUrl { .. }
                 | Self::FenceCdp { .. }
                 | Self::RetireClaim { .. }
         )
@@ -1046,6 +1089,7 @@ pub enum NativeRecoveredOperation {
     Cleanup(CleanupProof),
     Headers(NativeHeaderProof),
     Prepared(NativePreparedTab),
+    SessionPrepared(NativeSessionPreparedTab),
     ClaimPrepared(NativeClaimPreparationProof),
     PopupRequested(NativePopupRequest),
     Presentation(NativeMutationDiagnostic),
@@ -1296,6 +1340,13 @@ impl NativeBrowserProvider {
         operation: &NativeOperation,
     ) -> Result<(), NativeProviderError> {
         let supported = match operation {
+            NativeOperation::CommittedSessionTabUrl { .. } => {
+                self.capabilities()?.session_committed_url
+            }
+            NativeOperation::ResolveSessionTab { .. }
+            | NativeOperation::PrepareSessionTab { .. } => {
+                self.capabilities()?.session_tab_resolution
+            }
             NativeOperation::PrepareClaim { .. } | NativeOperation::CreatePopupTab { .. } => {
                 self.capabilities()?.explicit_claim_preparation
             }
@@ -1368,6 +1419,72 @@ impl NativeBrowserProvider {
                 .cloned()
                 .ok_or_else(|| protocol("resolve result lacks actual tab"))?,
         )
+    }
+    /// Resolve through the captured logical session without a user-inventory fallback.
+    /// Own metadata transport still requires the caller's actual Host admission;
+    /// the selector and its acknowledgement do not grant ownership.
+    /// Original session activation may have effects even though this observation
+    /// has no retained mutation receipt; it proves neither NoEffect nor Host T2 settlement.
+    pub async fn resolve_session_tab(
+        &self,
+        raw_id: &str,
+    ) -> Result<NativeTabInfo, NativeProviderError> {
+        self.require_session_tab_context()?;
+        let reply = self
+            .control(
+                NativeOperation::ResolveSessionTab {
+                    raw_id: raw_id.to_owned(),
+                },
+                json!({"rawId":raw_id,"sessionOnly":true}),
+            )
+            .await?;
+        let result = reply.outcome.into_result("resolve")?;
+        require_session_tab_ack(&result)?;
+        decode(
+            result
+                .get("tab")
+                .cloned()
+                .ok_or_else(|| protocol("resolve result lacks actual tab"))?,
+        )
+    }
+    /// Read only the last committed URL through the captured logical session.
+    /// The value is not an Origin, complete tab metadata, or a liveness proof.
+    /// Original session activation may have effects even though this transport
+    /// observation has no retained mutation receipt.
+    pub async fn committed_session_tab_url(
+        &self,
+        raw_id: &str,
+    ) -> Result<NativeCommittedTabUrl, NativeProviderError> {
+        self.require_session_tab_context()?;
+        let reply = self
+            .control(
+                NativeOperation::CommittedSessionTabUrl {
+                    raw_id: raw_id.to_owned(),
+                },
+                json!({"rawId":raw_id,"sessionOnly":true,"committedUrlOnly":true}),
+            )
+            .await?;
+        let result = reply.outcome.into_result("resolve")?;
+        require_session_tab_ack(&result)?;
+        if result.get("committedUrlOnly").and_then(Value::as_bool) != Some(true) {
+            return Err(protocol(
+                "committed URL result lacks its exact selector acknowledgement",
+            ));
+        }
+        let url = result
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| protocol("committed URL result lacks its actual string"))?;
+        Ok(NativeCommittedTabUrl(url.to_owned()))
+    }
+    fn require_session_tab_context(&self) -> Result<(), NativeProviderError> {
+        if self.wire_context.is_none() {
+            return Err(refused(
+                "context_required",
+                "session-only metadata and preparation require captured trusted wire context",
+            ));
+        }
+        Ok(())
     }
     pub async fn attach_tab(
         &self,
@@ -2004,6 +2121,23 @@ impl NativeBrowserProvider {
             completion_id: reply.id,
         })
     }
+    /// Run the provider's actual session preparation transaction under captured context.
+    /// The result attests its actual tab and receipt, without inventing a
+    /// normalization flag that the Original native transaction does not expose.
+    pub async fn prepare_session_tab(
+        &self,
+        tab_id: u64,
+    ) -> Result<NativeSessionPreparedTab, NativeProviderError> {
+        self.require_session_tab_context()?;
+        let reply = self
+            .control(
+                NativeOperation::PrepareSessionTab { tab_id },
+                json!({"tabId":tab_id,"sessionOnly":true}),
+            )
+            .await?;
+        let result = reply.outcome.into_result("prepareUserTab")?;
+        session_prepared_tab(&result, tab_id, reply.id)
+    }
     async fn presentation_diagnostic(
         &self,
         creation: &NativeCreationReceipt,
@@ -2483,6 +2617,18 @@ impl NativeBrowserProvider {
                     false,
                 )?)
             }
+            NativeOperation::PrepareSessionTab { tab_id } => {
+                if completion.wire_context.is_none() {
+                    return Err(protocol(
+                        "session-only preparation receipt lost its captured wire context",
+                    ));
+                }
+                NativeRecoveredOperation::SessionPrepared(session_prepared_tab(
+                    &result,
+                    *tab_id,
+                    completion.id,
+                )?)
+            }
             NativeOperation::PrepareUserTab { tab_id } => {
                 let tab: NativeTabInfo = decode(result["tab"].clone())?;
                 if tab.id != *tab_id {
@@ -2546,6 +2692,8 @@ impl NativeBrowserProvider {
             },
             NativeOperation::Inventory
             | NativeOperation::Resolve { .. }
+            | NativeOperation::ResolveSessionTab { .. }
+            | NativeOperation::CommittedSessionTabUrl { .. }
             | NativeOperation::FenceCdp { .. }
             | NativeOperation::RetireClaim { .. } => {
                 return Err(refused(
@@ -2815,6 +2963,33 @@ fn session_header_proof(
     }
     proof.completion_id = reply.id;
     Ok(proof)
+}
+
+fn session_prepared_tab(
+    result: &Value,
+    tab_id: u64,
+    completion_id: u64,
+) -> Result<NativeSessionPreparedTab, NativeProviderError> {
+    require_session_tab_ack(result)?;
+    let tab: NativeTabInfo = decode(
+        result
+            .get("tab")
+            .cloned()
+            .ok_or_else(|| protocol("prepared tab metadata missing"))?,
+    )?;
+    if tab.id != tab_id {
+        return Err(protocol("prepared completion changed tab identity"));
+    }
+    Ok(NativeSessionPreparedTab { tab, completion_id })
+}
+
+fn require_session_tab_ack(result: &Value) -> Result<(), NativeProviderError> {
+    if result.get("sessionOnly").and_then(Value::as_bool) != Some(true) {
+        return Err(protocol(
+            "session-only result lacks its exact selector acknowledgement",
+        ));
+    }
+    Ok(())
 }
 
 fn required_nullable_bool<'de, D: serde::Deserializer<'de>>(
@@ -7716,5 +7891,302 @@ mod tests {
             ));
             provider.close().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_tab_selector_requires_captured_context_and_supported_contract_without_dispatch(
+    ) {
+        for supported in [false, true] {
+            let mut capabilities = own_capabilities();
+            if supported {
+                capabilities["sessionTabResolution"] = json!(true);
+            }
+            let (provider, mut server) = fixture_with_capabilities(capabilities);
+            assert!(
+                matches!(provider.resolve_session_tab("2001").await,Err(NativeProviderError::Refused{kind,..}) if kind=="context_required")
+            );
+            assert!(
+                matches!(provider.prepare_session_tab(2001).await,Err(NativeProviderError::Refused{kind,..}) if kind=="context_required")
+            );
+            if !supported {
+                let scoped = provider.with_wire_context(
+                    NativeWireContext::new("managed-owner", "turn-current").unwrap(),
+                );
+                assert!(
+                    matches!(scoped.resolve_session_tab("2001").await,Err(NativeProviderError::Refused{kind,..}) if kind=="unsupported")
+                );
+                assert!(
+                    matches!(scoped.prepare_session_tab(2001).await,Err(NativeProviderError::Refused{kind,..}) if kind=="unsupported")
+                );
+            }
+            let mut bytes = [0u8; 1];
+            assert_eq!(
+                server.try_read(&mut bytes).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(provider.pending_completions().await.unwrap().is_empty());
+            // The ordinary metadata method stays compatible with the old contract.
+            let plain = provider.clone();
+            let call = tokio::spawn(async move { plain.resolve_user_tab("2001").await });
+            let sent = request(&mut server).await;
+            assert!(sent["request"].get("sessionOnly").is_none());
+            control_result(
+                &mut server,
+                sent["request"]["id"].as_u64().unwrap(),
+                json!({"tab":{"id":2001}}),
+            )
+            .await;
+            assert_eq!(bounded(call).await.unwrap().unwrap().id, 2001);
+            provider.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_tab_selector_uses_existing_methods_and_preserves_original_request_context() {
+        let mut capabilities = own_capabilities();
+        capabilities["sessionTabResolution"] = json!(true);
+        let (provider, mut server) = fixture_with_capabilities(capabilities);
+        let wire = NativeWireContext::new("managed-owner", "turn-A").unwrap();
+        let scoped = provider.with_wire_context(wire.clone());
+        let resolving = scoped.clone();
+        let call = tokio::spawn(async move { resolving.resolve_session_tab("2001").await });
+        let sent = request(&mut server).await;
+        let id = sent["request"]["id"].as_u64().unwrap();
+        assert_eq!(
+            sent["request"],
+            json!({"method":"resolve","id":id,"rawId":"2001","sessionOnly":true})
+        );
+        assert_eq!(sent["wireContext"], serde_json::to_value(&wire).unwrap());
+        let _other_view =
+            provider.with_wire_context(NativeWireContext::new("managed-owner", "turn-B").unwrap());
+        control_result(
+            &mut server,
+            id,
+            json!({"tab":{"id":2001},"sessionOnly":true}),
+        )
+        .await;
+        assert_eq!(bounded(call).await.unwrap().unwrap().id, 2001);
+        assert!(
+            provider.pending_completions().await.unwrap().is_empty(),
+            "metadata never mints a retained mutation or claim"
+        );
+        let preparing = scoped.clone();
+        let call = tokio::spawn(async move { preparing.prepare_session_tab(2001).await });
+        let sent = request(&mut server).await;
+        let id = sent["request"]["id"].as_u64().unwrap();
+        assert_eq!(
+            sent["request"],
+            json!({"method":"prepareUserTab","id":id,"tabId":2001,"sessionOnly":true})
+        );
+        assert_eq!(sent["wireContext"], serde_json::to_value(&wire).unwrap());
+        control_result(
+            &mut server,
+            id,
+            json!({"tab":{"id":2001},"sessionOnly":true}),
+        )
+        .await;
+        let prepared = bounded(call).await.unwrap().unwrap();
+        assert_eq!(prepared.tab.id, 2001);
+        assert_eq!(prepared.completion_id(), id);
+        let snapshot = provider.pending_completions().await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].wire_context, Some(wire));
+        assert!(matches!(
+            snapshot[0].operation,
+            NativeOperation::PrepareSessionTab { tab_id: 2001 }
+        ));
+        assert!(
+            matches!(provider.recover_completion(id).await.unwrap(),NativeRecoveredOperation::SessionPrepared(value) if value.tab.id==2001)
+        );
+        provider.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_tab_selector_never_accepts_an_ordinary_success_as_purpose_confirmation() {
+        for prepare in [false, true] {
+            for echo in [None, Some(json!(false)), Some(json!("true"))] {
+                let mut capabilities = own_capabilities();
+                capabilities["sessionTabResolution"] = json!(true);
+                let (provider, mut server) = fixture_with_capabilities(capabilities);
+                let scoped = provider
+                    .with_wire_context(NativeWireContext::new("managed-owner", "turn").unwrap());
+                let call = tokio::spawn(async move {
+                    if prepare {
+                        scoped.prepare_session_tab(2001).await.map(|tab| tab.tab.id)
+                    } else {
+                        scoped.resolve_session_tab("2001").await.map(|tab| tab.id)
+                    }
+                });
+                let sent = request(&mut server).await;
+                let id = sent["request"]["id"].as_u64().unwrap();
+                let mut result = json!({"tab":{"id":2001},"normalized":false});
+                if let Some(echo) = echo {
+                    result["sessionOnly"] = echo;
+                }
+                control_result(&mut server, id, result).await;
+                assert!(
+                    matches!(bounded(call).await.unwrap(),Err(NativeProviderError::Protocol(message)) if message=="session-only result lacks its exact selector acknowledgement")
+                );
+                if prepare {
+                    for _ in 0..2 {
+                        assert!(
+                            matches!(provider.recover_completion(id).await,Err(NativeProviderError::Protocol(message)) if message=="session-only result lacks its exact selector acknowledgement")
+                        );
+                    }
+                    let snapshot = provider.pending_completions().await.unwrap();
+                    assert_eq!(snapshot.len(), 1);
+                    assert!(matches!(
+                        snapshot[0].operation,
+                        NativeOperation::PrepareSessionTab { tab_id: 2001 }
+                    ));
+                } else {
+                    assert!(provider.pending_completions().await.unwrap().is_empty());
+                }
+                let mut bytes = [0u8; 1];
+                assert_eq!(
+                    server.try_read(&mut bytes).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "receipt inspection never replays preparation"
+                );
+                provider.close().await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_preparation_unknown_is_retained_as_unknown_under_its_original_scope() {
+        let mut capabilities = original_capabilities();
+        capabilities["sessionTabResolution"] = json!(true);
+        let (provider, mut server) = fixture_with_capabilities(capabilities);
+        let wire = NativeWireContext::new("managed-owner", "unknown-turn").unwrap();
+        let scoped = provider.with_wire_context(wire.clone());
+        let call = tokio::spawn(async move { scoped.prepare_session_tab(2001).await });
+        let sent = request(&mut server).await;
+        let id = sent["request"]["id"].as_u64().unwrap();
+        let details = json!({"nativeCode":1,"nativeMessage":"mixed activation or Chrome failure"});
+        local_ipc::write_json(&mut server,&json!({"kind":"controlEvent","event":{"kind":"reply","data":{"id":id,"outcome":{"kind":"unknown","data":{"reason":"actual managed failure","details":details}}}}})).await.unwrap();
+        assert!(
+            matches!(bounded(call).await.unwrap(),Err(NativeProviderError::OutcomeUnknown{reason,..}) if reason=="actual managed failure")
+        );
+        let snapshot = provider.pending_completions().await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].wire_context, Some(wire));
+        assert!(
+            matches!(provider.recover_completion(id).await.unwrap(),NativeRecoveredOperation::Unknown{operation:NativeOperation::PrepareSessionTab{tab_id:2001},reason,details:Some(actual),..} if reason=="actual managed failure" && actual==details)
+        );
+        provider.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_url_requires_captured_context_and_its_supported_contract_without_dispatch() {
+        for supported in [false, true] {
+            let mut capabilities = own_capabilities();
+            capabilities["sessionCommittedUrl"] = json!(supported);
+            let (provider, server) = fixture_with_capabilities(capabilities);
+            assert!(
+                matches!(provider.committed_session_tab_url("2001").await,Err(NativeProviderError::Refused{kind,..}) if kind=="context_required")
+            );
+            if !supported {
+                let scoped = provider
+                    .with_wire_context(NativeWireContext::new("url-owner", "url-turn").unwrap());
+                assert!(
+                    matches!(scoped.committed_session_tab_url("2001").await,Err(NativeProviderError::Refused{kind,..}) if kind=="unsupported")
+                );
+            }
+            let mut bytes = [0u8; 1];
+            assert_eq!(
+                server.try_read(&mut bytes).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(provider.pending_completions().await.unwrap().is_empty());
+            provider.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_url_preserves_only_actual_string_including_empty_and_old_call_context() {
+        for actual in ["https://committed.test/path", "chrome://newtab/", ""] {
+            let mut capabilities = own_capabilities();
+            capabilities["sessionCommittedUrl"] = json!(true);
+            let (provider, mut server) = fixture_with_capabilities(capabilities);
+            let wire = NativeWireContext::new("url-owner", "turn-A").unwrap();
+            let scoped = provider.with_wire_context(wire.clone());
+            let call = tokio::spawn(async move { scoped.committed_session_tab_url("2001").await });
+            let sent = request(&mut server).await;
+            let id = sent["request"]["id"].as_u64().unwrap();
+            assert_eq!(
+                sent["request"],
+                json!({"method":"resolve","id":id,"rawId":"2001","sessionOnly":true,"committedUrlOnly":true})
+            );
+            assert_eq!(sent["wireContext"], serde_json::to_value(&wire).unwrap());
+            let _later_view =
+                provider.with_wire_context(NativeWireContext::new("url-owner", "turn-B").unwrap());
+            control_result(&mut server,id,json!({"url":actual,"pendingUrl":"https://not-committed.test/","tab":{"id":2001,"title":"not-returned","url":"https://not-actual.test/"},"sessionOnly":true,"committedUrlOnly":true})).await;
+            let value = bounded(call).await.unwrap().unwrap();
+            assert_eq!(value.as_str(), actual);
+            // No retained transport receipt does not prove Original activation was effect-free.
+            assert!(provider.pending_completions().await.unwrap().is_empty());
+            provider.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_url_never_substitutes_pending_or_full_metadata_or_ignores_purpose() {
+        for value in [
+            json!({"url":"https://actual.test/","sessionOnly":true}),
+            json!({"url":"https://actual.test/","sessionOnly":false,"committedUrlOnly":true}),
+            json!({"url":"https://actual.test/","sessionOnly":true,"committedUrlOnly":"true"}),
+            json!({"pendingUrl":"https://pending.test/","tab":{"url":"https://not-field.test/"},"sessionOnly":true,"committedUrlOnly":true}),
+            json!({"url":null,"pendingUrl":"https://pending.test/","sessionOnly":true,"committedUrlOnly":true}),
+            json!({"url":17,"sessionOnly":true,"committedUrlOnly":true}),
+        ] {
+            let mut capabilities = own_capabilities();
+            capabilities["sessionCommittedUrl"] = json!(true);
+            let (provider, mut server) = fixture_with_capabilities(capabilities);
+            let scoped =
+                provider.with_wire_context(NativeWireContext::new("url-owner", "turn").unwrap());
+            let call = tokio::spawn(async move { scoped.committed_session_tab_url("2001").await });
+            let sent = request(&mut server).await;
+            control_result(&mut server, sent["request"]["id"].as_u64().unwrap(), value).await;
+            assert!(matches!(
+                bounded(call).await.unwrap(),
+                Err(NativeProviderError::Protocol(_))
+            ));
+            let mut bytes = [0u8; 1];
+            assert_eq!(
+                server.try_read(&mut bytes).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "no getter or preparer fallback"
+            );
+            provider.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_url_activation_unknown_keeps_typed_unknown_instead_of_chrome_rejection() {
+        let mut capabilities = original_capabilities();
+        capabilities["sessionCommittedUrl"] = json!(true);
+        let (provider, mut server) = fixture_with_capabilities(capabilities);
+        let scoped = provider
+            .with_wire_context(NativeWireContext::new("url-owner", "uncertain-turn").unwrap());
+        let call = tokio::spawn(async move { scoped.committed_session_tab_url("2001").await });
+        let sent = request(&mut server).await;
+        let id = sent["request"]["id"].as_u64().unwrap();
+        let details = json!({"nativeMethod":"getCommittedTabUrl","nativeCode":1});
+        local_ipc::write_json(&mut server,&json!({"kind":"controlEvent","event":{"kind":"reply","data":{"id":id,"outcome":{"kind":"unknown","data":{"reason":"actual activation remains uncertain","details":details}}}}})).await.unwrap();
+        assert!(
+            matches!(bounded(call).await.unwrap(),Err(NativeProviderError::OutcomeUnknown{reason,details:Some(actual),..}) if reason=="actual activation remains uncertain" && actual==details)
+        );
+        // The Original adapter and Host retain session/effect custody independently.
+        assert!(provider.pending_completions().await.unwrap().is_empty());
+        provider.close().await;
     }
 }

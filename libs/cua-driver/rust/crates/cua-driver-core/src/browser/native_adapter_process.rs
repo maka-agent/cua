@@ -12,8 +12,8 @@ use super::{
     native_broker::{BrokerHandle, NativeAdapterRequest, NativeDispatchGuard, NativeOutbound},
     native_framing::{self, Direction, FrameError},
     native_wire::{
-        NativeReplyProvenance, NativeWireAction, NativeWireAdapter, NativeWireError,
-        MAX_ACTION_BATCH,
+        NativeReplyProvenance, NativeRpcTrace, NativeWireAction, NativeWireAdapter,
+        NativeWireError, MAX_ACTION_BATCH,
     },
 };
 use serde_json::Value;
@@ -53,6 +53,7 @@ struct Semantic {
 
 struct RawWrite {
     payload: Vec<u8>,
+    trace: Option<NativeRpcTrace>,
     guard: Option<NativeDispatchGuard>,
     port_live: Arc<AtomicBool>,
     // The input Value has moved into a native phase. Retain its charge through
@@ -102,6 +103,18 @@ fn write_raw(writer: &mut impl Write, request: &RawWrite) -> Result<RawWriteOutc
         .map_err(|error| error.to_string())?;
     if let Some(guard) = &request.guard {
         guard.frame_written();
+    }
+    if let Some(trace) = &request.trace {
+        trace.frame_written();
+    } else {
+        // Reverse native requests have no locally minted RPC correlation.
+        // Never log their untrusted IDs, methods or params as Host metadata.
+        tracing::trace!(
+            target: "maka::native_rpc_phase",
+            native_host_pid = std::process::id(),
+            phase = "frame_written_unattributed",
+            "native RPC phase"
+        );
     }
     Ok(RawWriteOutcome::Written)
 }
@@ -356,6 +369,7 @@ impl Actor {
         message: Value,
         id: Option<&str>,
         charge: Option<Arc<ByteCharge>>,
+        trace: Option<NativeRpcTrace>,
     ) -> Result<(), AdapterProcessError> {
         let guard = match id {
             Some(id) => Some(
@@ -402,6 +416,7 @@ impl Actor {
         let (completion, done) = oneshot::channel();
         let request = RawWrite {
             payload,
+            trace,
             guard: guard.clone(),
             port_live: self.io.port_live.clone(),
             _charge: charge,
@@ -497,6 +512,7 @@ impl Actor {
                     NativeWireAction::NativeFrame {
                         message,
                         semantic_id,
+                        trace,
                     } => {
                         if terminal_reason.is_some() {
                             // A malformed adapter tail cannot release more
@@ -506,7 +522,7 @@ impl Actor {
                         let charge = semantic_id
                             .as_ref()
                             .and_then(|id| payloads.get(id).cloned());
-                        self.write_phase(message, semantic_id.as_deref(), charge)
+                        self.write_phase(message, semantic_id.as_deref(), charge, trace)
                             .await?;
                         if let Some(id) = semantic_id {
                             if let Some(left) = frames.get_mut(&id) {
@@ -768,6 +784,7 @@ mod tests {
         let payload = br#"{"jsonrpc":"2.0","id":1,"method":"getInfo"}"#.to_vec();
         let (completion, _) = oneshot::channel();
         let request = RawWrite {
+            trace: None,
             payload: payload.clone(),
             guard: None,
             port_live: Arc::new(AtomicBool::new(true)),
@@ -782,6 +799,73 @@ mod tests {
         let bytes = writer.into_inner();
         assert_eq!(&bytes[..4], &(payload.len() as u32).to_ne_bytes());
         assert_eq!(&bytes[4..], payload);
+    }
+
+    #[test]
+    fn passive_frame_trace_requires_complete_flush_and_contains_only_captured_metadata() {
+        use super::super::native_wire::{rpc_phase_test::Capture, NativeWireContext};
+        struct FlushFailure;
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush failed"))
+            }
+        }
+        let capture = Capture::default();
+        let context = NativeWireContext::new("session-old", "turn-old").unwrap();
+        let (completion, _) = oneshot::channel();
+        let request = RawWrite {
+            payload: br#"{"params":{"url":"PAYLOAD_URL_SENTINEL","headers":"HEADER_SENTINEL"}}"#
+                .to_vec(),
+            trace: Some(NativeRpcTrace::captured(
+                "generation-old",
+                "maka-original-compat:generation-old:9",
+                "claimUserTab",
+                Some("42"),
+                Some("owner-old"),
+                Some(&context),
+            )),
+            guard: None,
+            port_live: Arc::new(AtomicBool::new(false)),
+            _charge: None,
+            completion,
+        };
+        tracing::subscriber::with_default(capture.clone(), || {
+            assert_eq!(
+                write_raw(&mut Cursor::new(Vec::new()), &request).unwrap(),
+                RawWriteOutcome::FencedBeforeWrite
+            );
+            assert!(
+                capture.rows().is_empty(),
+                "a fence cannot produce write completion"
+            );
+            request.port_live.store(true, Ordering::SeqCst);
+            assert!(write_raw(&mut FlushFailure, &request).is_err());
+            assert!(
+                capture.rows().is_empty(),
+                "a partial write/failed flush cannot produce write completion"
+            );
+            let mut bytes = Cursor::new(Vec::new());
+            assert_eq!(
+                write_raw(&mut bytes, &request).unwrap(),
+                RawWriteOutcome::Written
+            );
+            assert_eq!(&bytes.get_ref()[4..], request.payload);
+        });
+        let rows = capture.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["phase"], "frame_written");
+        assert_eq!(rows[0]["native_method"], "claimUserTab");
+        assert_eq!(
+            rows[0]["native_rpc_id"],
+            "maka-original-compat:generation-old:9"
+        );
+        assert_eq!(rows[0]["native_host_pid"], std::process::id().to_string());
+        assert_eq!(rows[0]["host_turn_id"], "Some(\"turn-old\")");
+        let fields = format!("{rows:?}");
+        assert!(!fields.contains("PAYLOAD_URL_SENTINEL") && !fields.contains("HEADER_SENTINEL"));
     }
 
     #[test]
@@ -801,6 +885,7 @@ mod tests {
         let live = Arc::new(AtomicBool::new(true));
         let (completion, _) = oneshot::channel();
         let request = RawWrite {
+            trace: None,
             payload: br#"{"id":1,"method":"getInfo"}"#.to_vec(),
             guard: None,
             port_live: live.clone(),
@@ -911,6 +996,7 @@ mod tests {
         actions.push(NativeWireAction::NativeFrame {
             message: json!({"method":"must-not-dispatch"}),
             semantic_id: None,
+            trace: None,
         });
         assert!(
             actions.len() > MAX_SEMANTICS,

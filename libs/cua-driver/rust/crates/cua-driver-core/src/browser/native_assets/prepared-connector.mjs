@@ -80,8 +80,9 @@ export class PreparedBrowserConnector extends BrowserConnector {
       tabId: record.tabId,
     };
   }
-  async dispatch(owner, method, params) {
+  async dispatch(owner, method, params, wireContext) {
     if (method === 'prepareUserTab') {
+      const sessionOnly = this.sessionOnlyRequested(params, wireContext);
       if (typeof this.prepareUserTab !== 'function')
         throw new ConnectorError('unsupported', 'tab preparation has no reviewed provider leaf');
       const prepared = await this.prepareUserTab(owner, params, { generation: this.generation });
@@ -93,7 +94,11 @@ export class PreparedBrowserConnector extends BrowserConnector {
         );
       if (typeof prepared.tab.pendingUrl === 'string') tab.pendingUrl = prepared.tab.pendingUrl;
       if (typeof prepared.tab.active === 'boolean') tab.active = prepared.tab.active;
-      return { tab, normalized: prepared.normalized === true };
+      return {
+        tab,
+        normalized: prepared.normalized === true,
+        ...(sessionOnly ? { sessionOnly: true } : {}),
+      };
     }
     if (method === 'setScopedHeaders') {
       const record = this.owned(owner, params.claim);
@@ -116,7 +121,7 @@ export class PreparedBrowserConnector extends BrowserConnector {
       const record = this.owned(owner, params.claim);
       return this.clearRecordHeaders(record);
     }
-    return super.dispatch(owner, method, params);
+    return super.dispatch(owner, method, params, wireContext);
   }
   clearRecordHeaders(record) {
     if (!record.headerScope)

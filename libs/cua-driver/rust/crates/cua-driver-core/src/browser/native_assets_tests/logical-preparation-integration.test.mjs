@@ -19,12 +19,10 @@ const deferred = () => {
   return { promise, resolve };
 };
 
-async function fixture() {
+async function fixture(url = 'https://admitted.test/document') {
   const calls = [],
     emitted = [],
-    tabs = new Map([
-      [11, { id: 11, windowId: 9, url: 'https://admitted.test/document', active: false }],
-    ]);
+    tabs = new Map([[11, { id: 11, windowId: 9, url, active: false }]]);
   let rules = [],
     sequence = 0,
     nextTab = 20,
@@ -32,7 +30,13 @@ async function fixture() {
     getInterceptor;
   const attached = new Set(),
     installed = new Set();
-  let frame = { id: 'frame-main', loaderId: 'loader-main', url: tabs.get(11).url };
+  const hash = url.indexOf('#');
+  let frame = {
+    id: 'frame-main',
+    loaderId: 'loader-main',
+    url: hash === -1 ? url : url.slice(0, hash),
+    ...(hash === -1 ? {} : { urlFragment: url.slice(hash) }),
+  };
   const chrome = {
     runtime: { id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', onMessage: event() },
     downloads: { onCreated: event(), onChanged: event() },
@@ -160,7 +164,11 @@ async function fixture() {
   calls.length = 0;
   const policy = (turn = 'turn-main') => ({
     wireContext: { hostSessionId: 'existing-host-session', hostTurnId: turn },
-    document: { ...frame, frameId: frame.id },
+    document: {
+      frameId: frame.id,
+      loaderId: frame.loaderId,
+      url: frame.url + (frame.urlFragment ?? ''),
+    },
     popupEnabled: true,
     headerEnabled: true,
     headers: [{ name: 'x-browser-agent', value: 'Maka/existing-host-session' }],
@@ -772,4 +780,188 @@ test('joint-cleanup recovery refuses foreign, nested, malformed and differently 
   assert.deepEqual(recovered, { ...proof, claim: f.claim, tabId: 11, targetId: issued.targetId });
   assert.equal('preparationCleanupConfirmed' in recovered, false);
   assert.equal('scopedHeadersCleanupConfirmed' in recovered, false);
+});
+
+test('preparation matches actual CDP base URL plus route or trailing hash fragment', async () => {
+  for (const url of [
+    'https://admitted.test/document#route',
+    'https://admitted.test/document#',
+    'https://admitted.test/document',
+  ]) {
+    const f = await fixture(url);
+    const captured = f.policy();
+    assert.equal(captured.document.url, url);
+    const result = await f.prepare(captured);
+    assert.equal(result.claim, f.claim);
+    assert.equal(result.foreignInstalled, true);
+    assert.equal(result.popupInstalled, true);
+    assert.equal(f.calls.filter((call) => call[0] === 'cdp').length, 2);
+    assert.equal(f.connector.claims.get(f.claim), f.record);
+    assert.equal(
+      f.calls.some((call) => call[0] === 'attach'),
+      false,
+    );
+  }
+});
+
+test('missing actual CDP fragment cannot confirm a captured route or trailing hash', async () => {
+  for (const suffix of ['#route', '#']) {
+    const f = await fixture('https://admitted.test/document' + suffix);
+    const captured = f.policy();
+    f.setFrame({
+      id: 'frame-main',
+      loaderId: 'loader-main',
+      url: 'https://admitted.test/document',
+    });
+    await assert.rejects(f.prepare(captured), { kind: 'document_changed' });
+    assert.equal(
+      f.calls.some((call) => call[0] === 'script' || call[0] === 'dnr'),
+      false,
+    );
+    assert.equal(f.record.logicalPreparation, undefined);
+  }
+});
+
+test('changed frame loader base URL or fragment refuses preparation before effects', async () => {
+  for (const changed of [
+    { id: 'different-frame' },
+    { loaderId: 'different-loader' },
+    { url: 'https://admitted.test/other-document' },
+    { urlFragment: '#other-route' },
+    { urlFragment: '' },
+  ]) {
+    const f = await fixture('https://admitted.test/document#route');
+    const captured = f.policy();
+    f.setFrame({
+      id: 'frame-main',
+      loaderId: 'loader-main',
+      url: 'https://admitted.test/document',
+      urlFragment: '#route',
+      ...changed,
+    });
+    await assert.rejects(f.prepare(captured), { kind: 'document_changed' });
+    assert.equal(
+      f.calls.some((call) => call[0] === 'script' || call[0] === 'dnr'),
+      false,
+    );
+    assert.equal(f.record.logicalPreparation, undefined);
+  }
+});
+
+test('malformed CDP URL or explicitly supplied fragment types cannot be coerced or treated as absent', async () => {
+  for (const changed of [
+    { url: undefined },
+    { url: null },
+    { url: 7 },
+    { url: {} },
+    { urlFragment: undefined },
+    { urlFragment: null },
+    { urlFragment: 7 },
+    { urlFragment: [] },
+  ]) {
+    const f = await fixture();
+    const captured = f.policy();
+    f.setFrame({
+      id: 'frame-main',
+      loaderId: 'loader-main',
+      url: 'https://admitted.test/document',
+      ...changed,
+    });
+    await assert.rejects(f.prepare(captured), { kind: 'document_changed' });
+    assert.equal(
+      f.calls.some((call) => call[0] === 'script' || call[0] === 'dnr'),
+      false,
+    );
+  }
+});
+
+test('full document URL comparison does not decode canonicalize or trim captured fragments', async () => {
+  for (const changed of [
+    'https://admitted.test/document#/',
+    'https://admitted.test/document#%2F',
+    'https://admitted.test/document#%2f ',
+  ]) {
+    const f = await fixture('https://admitted.test/document#%2f');
+    const captured = f.policy();
+    captured.document.url = changed;
+    await assert.rejects(f.prepare(captured), { kind: 'document_changed' });
+    assert.equal(
+      f.calls.some((call) => call[0] === 'script' || call[0] === 'dnr'),
+      false,
+    );
+  }
+});
+
+test('fragment change while header ACK is pending is fenced before fixed scripts and retains same claim', async () => {
+  const f = await fixture('https://admitted.test/document#route');
+  const captured = f.policy();
+  const gate = deferred();
+  const update = f.chrome.declarativeNetRequest.updateSessionRules;
+  f.chrome.declarativeNetRequest.updateSessionRules = async (change) => {
+    await update(change);
+    await gate.promise;
+  };
+  const pending = f.prepare(captured);
+  await tick();
+  assert.equal(
+    f.calls.some((call) => call[0] === 'dnr'),
+    true,
+  );
+  f.setFrame({
+    id: 'frame-main',
+    loaderId: 'loader-main',
+    url: 'https://admitted.test/document',
+    urlFragment: '#new-route',
+  });
+  gate.resolve();
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.kind, 'outcome_unknown');
+    assert.equal(error.details.causeKind, 'document_changed');
+    assert.equal(error.details.custody.claim, f.claim);
+    return true;
+  });
+  assert.equal(
+    f.calls.some((call) => call[0] === 'script'),
+    false,
+  );
+  assert.equal(f.connector.claims.get(f.claim), f.record);
+  assert.equal(f.connector.records.get(11), f.record);
+  assert.equal(f.record.headerScope.claim, f.claim);
+});
+
+test('nonempty CDP fragments without a leading hash cannot confirm an accidental concatenation', async () => {
+  for (const fragment of ['route', '%23route', ' #route', '?route', '/route']) {
+    const f = await fixture();
+    const captured = f.policy();
+    captured.document.url += fragment;
+    f.setFrame({
+      id: 'frame-main',
+      loaderId: 'loader-main',
+      url: 'https://admitted.test/document',
+      urlFragment: fragment,
+    });
+    await assert.rejects(f.prepare(captured), { kind: 'document_changed' });
+    assert.equal(
+      f.calls.some((call) => call[0] === 'script' || call[0] === 'dnr'),
+      false,
+    );
+    assert.equal(f.record.logicalPreparation, undefined);
+  }
+});
+
+test('an explicitly empty CDP fragment preserves the exact captured base URL', async () => {
+  const f = await fixture();
+  const captured = f.policy();
+  f.setFrame({
+    id: 'frame-main',
+    loaderId: 'loader-main',
+    url: 'https://admitted.test/document',
+    urlFragment: '',
+  });
+  const result = await f.prepare(captured);
+  assert.equal(result.claim, f.claim);
+  assert.equal(result.foreignInstalled, true);
+  assert.equal(result.popupInstalled, true);
+  assert.equal(f.connector.claims.get(f.claim), f.record);
+  assert.equal(f.calls.filter((call) => call[0] === 'cdp').length, 2);
 });

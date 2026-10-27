@@ -117,6 +117,10 @@ pub(crate) enum ControlRequest {
         id: u64,
         #[serde(rename = "rawId")]
         raw_id: String,
+        #[serde(default, rename = "sessionOnly")]
+        session_only: bool,
+        #[serde(default, rename = "committedUrlOnly")]
+        committed_url_only: bool,
     },
     Attach {
         id: u64,
@@ -178,6 +182,8 @@ pub(crate) enum ControlRequest {
         id: u64,
         #[serde(rename = "tabId")]
         tab_id: u64,
+        #[serde(default, rename = "sessionOnly")]
+        session_only: bool,
     },
     MuteCreatedTab {
         id: u64,
@@ -1381,6 +1387,62 @@ impl NativeHostBroker {
             );
             return;
         }
+        let session_only = matches!(
+            &request,
+            ControlRequest::Resolve {
+                session_only: true,
+                ..
+            } | ControlRequest::PrepareUserTab {
+                session_only: true,
+                ..
+            }
+        );
+        let committed_url_only = matches!(
+            &request,
+            ControlRequest::Resolve {
+                committed_url_only: true,
+                ..
+            }
+        );
+        if committed_url_only && !session_only {
+            self.reject_control(
+                client,
+                id,
+                "invalid_request",
+                "committed URL selection requires the captured session-only purpose",
+                output,
+            );
+            return;
+        }
+        if session_only && self.input_context.is_none() {
+            self.reject_control(
+                client,
+                id,
+                "context_required",
+                "session-only metadata and preparation require captured trusted wire context",
+                output,
+            );
+            return;
+        }
+        if session_only
+            && !self.identity.as_ref().is_some_and(|identity| {
+                let capability = if committed_url_only {
+                    "sessionCommittedUrl"
+                } else {
+                    "sessionTabResolution"
+                };
+                identity.capabilities[capability].as_bool() == Some(true)
+            })
+        {
+            self.reject_control(
+                client,
+                id,
+                "unsupported",
+                "selected provider does not support the session-only selector",
+                output,
+            );
+            return;
+        }
         let (method, params, operation) = match request {
             ControlRequest::PrepareClaim {
                 claim,
@@ -1418,19 +1480,37 @@ impl NativeHostBroker {
                 ("createPopupTab", json!({"claim":claim}), ControlKind::Other)
             }
             ControlRequest::Inventory { .. } => ("inventory", json!({}), ControlKind::Inventory),
-            ControlRequest::Resolve { raw_id, .. } if !raw_id.is_empty() => {
-                ("resolve", json!({"rawId":raw_id}), ControlKind::Resolve)
+            ControlRequest::Resolve {
+                raw_id,
+                session_only,
+                committed_url_only,
+                ..
+            } if !raw_id.is_empty() => {
+                let mut params = json!({"rawId":raw_id});
+                if session_only {
+                    params["sessionOnly"] = json!(true);
+                }
+                if committed_url_only {
+                    params["committedUrlOnly"] = json!(true);
+                }
+                ("resolve", params, ControlKind::Resolve)
             }
             ControlRequest::CreateTab { window_id, .. } => (
                 "createTab",
                 window_id.map_or_else(|| json!({}), |window_id| json!({"windowId":window_id})),
                 ControlKind::Other,
             ),
-            ControlRequest::PrepareUserTab { tab_id, .. } if tab_id <= 9_007_199_254_740_991 => (
-                "prepareUserTab",
-                json!({"tabId":tab_id}),
-                ControlKind::Other,
-            ),
+            ControlRequest::PrepareUserTab {
+                tab_id,
+                session_only,
+                ..
+            } if tab_id <= 9_007_199_254_740_991 => {
+                let mut params = json!({"tabId":tab_id});
+                if session_only {
+                    params["sessionOnly"] = json!(true);
+                }
+                ("prepareUserTab", params, ControlKind::Other)
+            }
             ControlRequest::MuteCreatedTab { creation, .. } => (
                 "muteCreatedTab",
                 json!({"creation":creation}),

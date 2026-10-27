@@ -43,6 +43,7 @@ fn boot() -> (OriginalWireAdapter, NativeWireContext, Instant) {
         .expect("matched getInfo");
     assert!(actions.iter().any(|action| matches!(action, NativeWireAction::BrokerMessage(value) if value["capabilities"]["userTabsOrder"] == "provider")));
     assert!(actions.iter().any(|action| matches!(action, NativeWireAction::BrokerMessage(value) if value["capabilities"]["attachmentPreparation"] == "full_preparation")));
+    assert!(actions.iter().any(|action| matches!(action, NativeWireAction::BrokerMessage(value) if value["capabilities"]["sessionCommittedUrl"] == true)));
     (
         adapter,
         NativeWireContext::new(SID, "turn1").expect("trusted context"),
@@ -1490,4 +1491,1451 @@ fn earlier_native_phase_ack_cannot_tag_a_later_phase_timeout_as_answered() {
         result["error"]["details"]["custody"]["tabId"], 7,
         "prior actual attach custody must still survive"
     );
+}
+
+#[test]
+fn session_only_resolve_uses_actual_uncapped_session_inventory_without_acquiring() {
+    let (mut adapter, context, now) = boot();
+    let request = frame(
+        &adapter
+            .on_semantic(
+                semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&context),
+                now,
+            )
+            .expect("captured session-only lookup"),
+    );
+    assert_eq!(request["method"], "getTabs");
+    assert_eq!(request["params"]["session_id"], SID);
+    assert_eq!(request["params"]["turn_id"], "turn1");
+    assert!(request["params"].get("sessionOnly").is_none());
+    let tabs: Vec<_> = (1..=2001)
+        .map(|id| json!({"id":id,"url":"https://fixture.invalid/"}))
+        .collect();
+    let actions = reply(&mut adapter, &request, json!(tabs), now);
+    let terminal = response(&actions);
+    assert_eq!(terminal["result"]["tab"]["id"], 2001);
+    assert_eq!(terminal["result"]["sessionOnly"], true);
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+    assert!(
+        adapter.leases.is_empty(),
+        "metadata cannot mint an acquisition row"
+    );
+    assert!(
+        adapter.claims.is_empty(),
+        "metadata cannot mint a physical claim"
+    );
+    assert!(adapter.creations.is_empty());
+    assert_eq!(adapter.rpc.pending_len(), 0);
+}
+
+#[test]
+fn session_only_resolve_rejects_missing_context_and_malformed_selector_without_dispatch() {
+    let (mut adapter, context, now) = boot();
+    assert!(matches!(
+        adapter.on_semantic(
+            semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+            None,
+            now
+        ),
+        Err(NativeWireError::LocalRefusal { code, .. }) if code == "wire_context_required"
+    ));
+    for invalid in [Value::Null, json!("true"), json!(1), json!({})] {
+        assert!(matches!(
+            adapter.on_semantic(
+                semantic("2", "resolve", json!({"rawId":"2001","sessionOnly":invalid})),
+                Some(&context),
+                now
+            ),
+            Err(NativeWireError::LocalRefusal { code, .. }) if code == "invalid_request"
+        ));
+    }
+    assert_eq!(adapter.rpc.pending_len(), 0);
+    assert!(adapter.session_turns.is_empty());
+    assert!(adapter.leases.is_empty());
+}
+
+#[test]
+fn finished_turn_cannot_session_resolve_after_lease_removal_but_next_turn_can_query() {
+    let (mut adapter, context, now) = boot();
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("actual owned creation"),
+    );
+    reply(
+        &mut adapter,
+        &create,
+        json!({"id":2001,"url":"about:blank"}),
+        now,
+    );
+    let finish = frame(
+        &adapter
+            .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .expect("finish exact turn"),
+    );
+    adapter
+        .on_native(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .expect("actual finish ACK");
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
+    assert!(adapter.leases.is_empty());
+    assert!(matches!(
+        adapter.on_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now),
+        Err(NativeWireError::LocalRefusal { code, .. }) if code == "turn_finished"
+    ));
+    assert_eq!(adapter.rpc.pending_len(), 0);
+    let global = frame(
+        &adapter
+            .on_semantic(
+                semantic("4", "resolve", json!({"rawId":"2001","sessionOnly":false})),
+                Some(&context),
+                now,
+            )
+            .expect("normal resolve keeps global observation semantics"),
+    );
+    assert_eq!(global["method"], "getUserTabs");
+    let observed = response(&reply(&mut adapter, &global, json!([{"id":2001}]), now));
+    assert!(observed["result"].get("sessionOnly").is_none());
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
+    let next = NativeWireContext::new(SID, "turn2").expect("next trusted turn");
+    let request = frame(
+        &adapter
+            .on_semantic(
+                semantic("5", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&next),
+                now,
+            )
+            .expect("new turn must query actual managed inventory"),
+    );
+    assert_eq!(request["method"], "getTabs");
+    assert_eq!(request["params"]["turn_id"], "turn2");
+    let output = response(&reply(&mut adapter, &request, json!([{"id":2001}]), now));
+    assert_eq!(output["result"]["sessionOnly"], true);
+    assert!(
+        adapter.leases.is_empty(),
+        "session metadata does not restore an acquisition row"
+    );
+}
+
+#[test]
+fn session_only_resolve_never_reassigns_a_foreign_logical_lease() {
+    for same_session in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let create = frame(
+            &adapter
+                .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                .expect("actual original owner"),
+        );
+        reply(
+            &mut adapter,
+            &create,
+            json!({"id":2001,"url":"about:blank"}),
+            now,
+        );
+        let foreign = NativeWireContext::new("33333333-3333-4333-8333-333333333333", "turn1")
+            .expect("another canonical session");
+        let mut envelope = semantic("2", "resolve", json!({"rawId":"2001","sessionOnly":true}));
+        if same_session {
+            envelope["owner"] = json!("foreign-owner");
+            assert!(
+                matches!(adapter.on_semantic(envelope, Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "session_has_foreign_custody")
+            );
+        } else {
+            assert!(matches!(
+                adapter.on_semantic(envelope, Some(&foreign), now),
+                Err(NativeWireError::LocalRefusal { code, .. }) if code == "claim_unavailable"
+            ));
+        }
+        assert_eq!(adapter.leases[&2001], ("owner".to_owned(), SID.to_owned()));
+        assert_eq!(
+            adapter.rpc.pending_len(),
+            0,
+            "no fallback query may be dispatched"
+        );
+    }
+}
+
+#[test]
+fn managed_resolve_native_failure_and_finish_uncertainty_keep_session_unavailable() {
+    for finishing in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let pending = if finishing {
+            let create = frame(
+                &adapter
+                    .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                    .expect("active turn"),
+            );
+            reply(
+                &mut adapter,
+                &create,
+                json!({"id":2001,"url":"about:blank"}),
+                now,
+            );
+            frame(
+                &adapter
+                    .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+                    .expect("actual pending finish"),
+            )
+        } else {
+            frame(
+                &adapter
+                    .on_semantic(
+                        semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                        Some(&context),
+                        now,
+                    )
+                    .expect("actual managed metadata invocation"),
+            )
+        };
+        if finishing {
+            assert!(
+                matches!(adapter.on_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "session_unavailable")
+            );
+        }
+        let actions = adapter.on_native(json!({"jsonrpc":"2.0","id":pending["id"],"error":{"code":1,"message":"native failure after possible activation"}}), now).expect("matched native terminal");
+        assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
+        assert_eq!(
+            response(&actions)["error"]["details"]["provenance"],
+            "mixed_extension_or_chrome"
+        );
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+        assert_eq!(
+            adapter.session_turns[SID].phase,
+            if finishing {
+                TurnPhase::FinishUnknown
+            } else {
+                TurnPhase::ActivationUnknown
+            }
+        );
+        assert!(
+            matches!(adapter.on_semantic(semantic("4", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "session_unavailable")
+        );
+        assert_eq!(adapter.rpc.pending_len(), 0);
+    }
+}
+
+#[test]
+fn old_managed_metadata_reply_cannot_confirm_a_new_turn_or_acquire_a_row() {
+    let (mut adapter, context, now) = boot();
+    let old = frame(
+        &adapter
+            .on_semantic(
+                semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&context),
+                now,
+            )
+            .expect("old session lookup"),
+    );
+    let next = NativeWireContext::new(SID, "turn2").expect("new trusted turn");
+    let new = frame(
+        &adapter
+            .on_semantic(
+                semantic("2", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&next),
+                now,
+            )
+            .expect("new lookup replaces turn admission"),
+    );
+    let old_terminal = response(&reply(&mut adapter, &old, json!([{"id":2001}]), now));
+    assert_eq!(old_terminal["error"]["kind"], "outcome_unknown");
+    assert!(old_terminal.get("result").is_none());
+    assert_eq!(adapter.session_turns[SID].turn, "turn2");
+    let new_terminal = response(&reply(&mut adapter, &new, json!([{"id":2001}]), now));
+    assert_eq!(new_terminal["result"]["sessionOnly"], true);
+    assert!(adapter.leases.is_empty());
+    assert!(adapter.claims.is_empty());
+    assert_eq!(adapter.rpc.pending_len(), 0);
+}
+
+#[test]
+fn detached_managed_session_preparation_claims_directly_after_actual_session_metadata() {
+    let (mut adapter, context, now) = boot();
+    let token = attached(&mut adapter, &context, "1", 2001, now);
+    let detach = frame(
+        &adapter
+            .on_semantic(
+                semantic("2", "detach", json!({"claim":token})),
+                Some(&context),
+                now,
+            )
+            .expect("exact physical detach"),
+    );
+    adapter
+        .on_native(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .expect("physical detach ACK");
+    assert!(adapter.claims.is_empty());
+    assert_eq!(adapter.leases[&2001], ("owner".to_owned(), SID.to_owned()));
+    let metadata = frame(
+        &adapter
+            .on_semantic(
+                semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&context),
+                now,
+            )
+            .expect("managed metadata after detach"),
+    );
+    assert_eq!(metadata["method"], "getTabs");
+    reply(
+        &mut adapter,
+        &metadata,
+        json!([{"id":2001,"url":"https://fixture.invalid/"}]),
+        now,
+    );
+    let claim = frame(
+        &adapter
+            .on_semantic(
+                semantic(
+                    "4",
+                    "prepareUserTab",
+                    json!({"tabId":2001,"sessionOnly":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .expect("strict managed preparation"),
+    );
+    assert_eq!(claim["method"], "claimUserTab");
+    assert_eq!(claim["params"]["tabId"], 2001);
+    assert_eq!(claim["params"]["session_id"], SID);
+    assert!(adapter.claims.is_empty());
+    let terminal = response(&reply(
+        &mut adapter,
+        &claim,
+        json!({"id":2001,"url":"about:blank"}),
+        now,
+    ));
+    assert_eq!(terminal["result"]["tab"]["url"], "about:blank");
+    assert_eq!(terminal["result"]["sessionOnly"], true);
+    assert!(
+        terminal["result"].get("normalized").is_none(),
+        "no pre-claim URL observation can authorize a normalization assertion"
+    );
+    assert_eq!(adapter.leases.len(), 1);
+    assert!(adapter.claims.is_empty());
+}
+
+#[test]
+fn session_metadata_does_not_consume_the_existing_acquisition_budget() {
+    let (mut adapter, context, now) = boot();
+    for tab in 1..=MAX_CLAIMS as u64 {
+        adapter
+            .leases
+            .insert(tab, ("owner".to_owned(), SID.to_owned()));
+    }
+    let request = frame(
+        &adapter
+            .on_semantic(
+                semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&context),
+                now,
+            )
+            .expect("metadata is not a new acquisition"),
+    );
+    assert_eq!(request["method"], "getTabs");
+    let terminal = response(&reply(&mut adapter, &request, json!([{"id":2001}]), now));
+    assert_eq!(terminal["result"]["sessionOnly"], true);
+    assert_eq!(adapter.leases.len(), MAX_CLAIMS);
+    assert!(!adapter.leases.contains_key(&2001));
+    assert!(adapter.claims.is_empty());
+}
+
+#[test]
+fn forced_session_preparation_uses_direct_native_claim_and_confirms_exact_purpose() {
+    let (mut adapter, context, now) = boot();
+    let claim = frame(
+        &adapter
+            .on_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":2001,"sessionOnly":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .expect("forced session preparation"),
+    );
+    assert_eq!(claim["method"], "claimUserTab");
+    assert_eq!(claim["params"]["session_id"], SID);
+    assert_eq!(claim["params"]["turn_id"], "turn1");
+    assert_eq!(claim["params"]["tabId"], 2001);
+    assert!(
+        adapter.leases.is_empty(),
+        "only the real native claim ACK records a logical lease"
+    );
+    assert!(adapter.claims.is_empty());
+    let terminal = response(&reply(
+        &mut adapter,
+        &claim,
+        json!({"id":2001,"url":"https://fixture.invalid/"}),
+        now,
+    ));
+    assert_eq!(terminal["result"]["sessionOnly"], true);
+    assert!(terminal["result"].get("normalized").is_none());
+    assert_eq!(adapter.leases[&2001], ("owner".to_owned(), SID.to_owned()));
+    assert!(adapter.claims.is_empty());
+    assert_eq!(adapter.rpc.pending_len(), 0);
+}
+
+#[test]
+fn forced_session_preparation_refuses_untrusted_or_finished_scope_before_native_effects() {
+    let (mut adapter, context, now) = boot();
+    assert!(
+        matches!(adapter.on_semantic(semantic("1", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), None, now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
+    );
+    assert!(
+        matches!(adapter.on_semantic(semantic("2", "prepareUserTab", json!({"tabId":2001,"sessionOnly":"true"})), Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "invalid_request")
+    );
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("3", "createTab", json!({})), Some(&context), now)
+            .expect("actual active turn"),
+    );
+    reply(
+        &mut adapter,
+        &create,
+        json!({"id":2001,"url":"about:blank"}),
+        now,
+    );
+    let finish = frame(
+        &adapter
+            .on_semantic(semantic("4", "finishTurn", json!({})), Some(&context), now)
+            .expect("finish trusted turn"),
+    );
+    adapter
+        .on_native(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .expect("actual finish ACK");
+    assert!(
+        matches!(adapter.on_semantic(semantic("5", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "turn_finished")
+    );
+    assert!(adapter.leases.is_empty());
+    assert!(adapter.claims.is_empty());
+    assert_eq!(adapter.rpc.pending_len(), 0);
+}
+
+#[test]
+fn strict_session_prepare_does_not_invent_filtered_inventory_or_normalization_preconditions() {
+    for known_lease in [false, true] {
+        let (mut adapter, context, now) = boot();
+        if known_lease {
+            let create = frame(
+                &adapter
+                    .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                    .expect("existing actual logical owner"),
+            );
+            reply(
+                &mut adapter,
+                &create,
+                json!({"id":2001,"url":"about:blank"}),
+                now,
+            );
+        }
+        let actions = adapter
+            .on_semantic(
+                semantic(
+                    "2",
+                    "prepareUserTab",
+                    json!({"tabId":2001,"sessionOnly":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .expect("source-backed direct native claim");
+        let claim = frame(&actions);
+        assert_eq!(
+            claim["method"], "claimUserTab",
+            "filtered GetTabs must not block native known-newtab normalization"
+        );
+        assert_eq!(claim["params"]["tabId"], 2001);
+        assert_eq!(adapter.leases.contains_key(&2001), known_lease);
+        let output = reply(
+            &mut adapter,
+            &claim,
+            json!({"id":2001,"url":"about:blank"}),
+            now,
+        );
+        let terminal = response(&output);
+        assert_eq!(terminal["result"]["sessionOnly"], true);
+        assert_eq!(terminal["result"]["tab"]["url"], "about:blank");
+        assert!(terminal["result"].get("normalized").is_none());
+        assert!(!output
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })));
+        assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+        assert_eq!(adapter.leases[&2001], ("owner".to_owned(), SID.to_owned()));
+        assert!(adapter.claims.is_empty());
+    }
+    let (mut adapter, context, now) = boot();
+    let before = frame(
+        &adapter
+            .on_semantic(
+                semantic("1", "prepareUserTab", json!({"tabId":7})),
+                Some(&context),
+                now,
+            )
+            .expect("ordinary user preparation keeps prior observation contract"),
+    );
+    assert_eq!(before["method"], "getUserTabs");
+    let claim = frame(&reply(
+        &mut adapter,
+        &before,
+        json!([{"id":7,"url":"chrome://newtab/"}]),
+        now,
+    ));
+    assert_eq!(claim["method"], "claimUserTab");
+    let terminal = response(&reply(
+        &mut adapter,
+        &claim,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    assert_eq!(terminal["result"]["normalized"], true);
+    assert!(terminal["result"].get("sessionOnly").is_none());
+}
+
+#[test]
+fn session_preparation_native_error_or_cancel_never_replays_or_echoes_success() {
+    for cancel in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let claim = frame(
+            &adapter
+                .on_semantic(
+                    semantic(
+                        "1",
+                        "prepareUserTab",
+                        json!({"tabId":2001,"sessionOnly":true}),
+                    ),
+                    Some(&context),
+                    now,
+                )
+                .expect("actual direct native claim"),
+        );
+        assert_eq!(claim["method"], "claimUserTab");
+        let actions = if cancel {
+            adapter.on_cancel("1");
+            reply(
+                &mut adapter,
+                &claim,
+                json!({"id":2001,"url":"about:blank"}),
+                now,
+            )
+        } else {
+            adapter.on_native(json!({"jsonrpc":"2.0","id":claim["id"],"error":{"code":1,"message":"ClaimUserTab failed after possible preparation"}}), now).expect("actual native rejection")
+        };
+        assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
+        assert!(response(&actions).get("result").is_none());
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })),
+            "uncertain or canceled claim cannot trigger a replay"
+        );
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+        assert!(adapter.leases.is_empty());
+        assert!(adapter.claims.is_empty());
+        assert_eq!(adapter.rpc.pending_len(), 0);
+        if cancel {
+            let terminal = response(&actions);
+            assert_eq!(
+                terminal["error"]["details"]["acknowledgedResult"]["tab"]["id"],
+                2001
+            );
+            assert_eq!(
+                terminal["error"]["details"]["acknowledgedResult"]["sessionOnly"],
+                true
+            );
+            assert!(terminal["error"]["details"]["acknowledgedResult"]
+                .get("normalized")
+                .is_none());
+            assert_eq!(terminal["error"]["details"]["nativeMethod"], "claimUserTab");
+        } else {
+            assert_eq!(
+                adapter.session_turns[SID].phase,
+                TurnPhase::ActivationUnknown
+            );
+        }
+    }
+}
+
+#[test]
+fn visible_session_inventory_miss_does_not_delete_owned_logical_or_creation_rows() {
+    let (mut adapter, context, now) = boot();
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("actual owned creation"),
+    );
+    let created = response(&reply(
+        &mut adapter,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let creation = created["result"]["creation"]
+        .as_str()
+        .expect("actual receipt")
+        .to_owned();
+    let lookup = frame(
+        &adapter
+            .on_semantic(
+                semantic("2", "resolve", json!({"rawId":"7","sessionOnly":true})),
+                Some(&context),
+                now,
+            )
+            .expect("strict metadata observation"),
+    );
+    assert_eq!(lookup["method"], "getTabs");
+    let terminal = response(&reply(&mut adapter, &lookup, json!([]), now));
+    assert_eq!(terminal["error"]["kind"], "tab_unavailable");
+    assert!(terminal["error"]["message"]
+        .as_str()
+        .expect("visible inventory diagnostic")
+        .contains("visible tab inventory"));
+    assert!(
+        adapter.leases.contains_key(&7),
+        "filtered metadata absence is not logical deletion"
+    );
+    assert!(adapter.creations.contains_key(&creation));
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+}
+
+#[test]
+fn late_session_preparation_ack_after_finish_retains_metadata_without_reactivating_or_granting() {
+    let (mut adapter, context, now) = boot();
+    let claim = frame(
+        &adapter
+            .on_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":2001,"sessionOnly":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .expect("actual strict preparation pending"),
+    );
+    let finish = frame(
+        &adapter
+            .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .expect("finish admitted turn"),
+    );
+    adapter
+        .on_native(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .expect("actual finish ACK");
+    let next = NativeWireContext::new(SID, "turn2").expect("next trusted turn");
+    let metadata = frame(
+        &adapter
+            .on_semantic(
+                semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&next),
+                now,
+            )
+            .expect("new managed metadata invocation"),
+    );
+    reply(&mut adapter, &metadata, json!([]), now);
+    let actions = reply(
+        &mut adapter,
+        &claim,
+        json!({"id":2001,"url":"about:blank"}),
+        now,
+    );
+    let terminal = response(&actions);
+    assert_eq!(terminal["error"]["kind"], "outcome_unknown");
+    assert_eq!(
+        terminal["error"]["details"]["acknowledgedResult"]["tab"]["id"],
+        2001
+    );
+    assert_eq!(
+        terminal["error"]["details"]["acknowledgedResult"]["sessionOnly"],
+        true
+    );
+    assert!(terminal.get("result").is_none());
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })));
+    assert!(adapter.leases.is_empty());
+    assert!(adapter.claims.is_empty());
+    assert_eq!(adapter.session_turns[SID].turn, "turn2");
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+}
+
+#[test]
+fn session_preparation_foreign_returned_id_never_becomes_ack_metadata_or_a_lease() {
+    for cancel in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let claim = frame(
+            &adapter
+                .on_semantic(
+                    semantic(
+                        "1",
+                        "prepareUserTab",
+                        json!({"tabId":2001,"sessionOnly":true}),
+                    ),
+                    Some(&context),
+                    now,
+                )
+                .expect("actual strict claim pending"),
+        );
+        if cancel {
+            adapter.on_cancel("1");
+        }
+        let output = reply(
+            &mut adapter,
+            &claim,
+            json!({"id":2002,"url":"about:blank"}),
+            now,
+        );
+        let terminal = response(&output);
+        assert_eq!(terminal["error"]["kind"], "outcome_unknown");
+        assert!(terminal["error"]["details"]
+            .get("acknowledgedResult")
+            .is_none());
+        assert!(terminal.get("result").is_none());
+        assert!(adapter.leases.is_empty());
+        assert!(adapter.claims.is_empty());
+        assert!(!output
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })));
+    }
+}
+
+#[test]
+fn acknowledged_close_retires_exact_creation_and_lease_across_more_than_the_budget() {
+    let (mut adapter, context, now) = boot();
+    for index in 0..=MAX_CLAIMS {
+        let tab = 1000 + index as u64;
+        let create = frame(
+            &adapter
+                .on_semantic(
+                    semantic(&(3 * index + 1).to_string(), "createTab", json!({})),
+                    Some(&context),
+                    now,
+                )
+                .expect("sequential actual create remains admitted"),
+        );
+        let created = response(&reply(
+            &mut adapter,
+            &create,
+            json!({"id":tab,"url":"about:blank"}),
+            now,
+        ));
+        let creation = created["result"]["creation"]
+            .as_str()
+            .expect("actual created receipt")
+            .to_owned();
+        let claim = attached(
+            &mut adapter,
+            &context,
+            &(3 * index + 2).to_string(),
+            tab,
+            now,
+        );
+        let close = frame(
+            &adapter
+                .on_semantic(
+                    semantic(
+                        &(3 * index + 3).to_string(),
+                        "closeTab",
+                        json!({"claim":claim}),
+                    ),
+                    Some(&context),
+                    now,
+                )
+                .expect("close exact created target"),
+        );
+        assert_eq!(close["params"]["method"], "Target.closeTarget");
+        assert_eq!(
+            close["params"]["commandParams"]["targetId"],
+            format!("target-{tab}")
+        );
+        let closed = response(&reply(&mut adapter, &close, json!({"success":true}), now));
+        assert_eq!(closed["result"]["proof"], "close_ack");
+        assert!(!adapter.creations.contains_key(&creation));
+        assert!(!adapter.leases.contains_key(&tab));
+        assert!(adapter.claims.is_empty());
+        assert!(
+            adapter.creations.is_empty(),
+            "known gone creations must not accumulate"
+        );
+        assert!(
+            adapter.leases.is_empty(),
+            "known gone logical rows must not accumulate"
+        );
+        assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+        assert_eq!(adapter.rpc.pending_len(), 0);
+    }
+}
+
+#[test]
+fn detach_ack_and_unproven_or_contradictory_close_results_retain_logical_custody() {
+    for result in [
+        json!({"success":false}),
+        json!({"success":"true"}),
+        json!({"success":true,"tabId":999}),
+        json!({"success":true,"targetId":"foreign"}),
+        json!({"success":true,"claim":"foreign"}),
+    ] {
+        let (mut adapter, context, now) = boot();
+        let create = frame(
+            &adapter
+                .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                .expect("real creation"),
+        );
+        let created = response(&reply(
+            &mut adapter,
+            &create,
+            json!({"id":7,"url":"about:blank"}),
+            now,
+        ));
+        let creation = created["result"]["creation"]
+            .as_str()
+            .expect("actual creation receipt")
+            .to_owned();
+        let claim = attached(&mut adapter, &context, "2", 7, now);
+        let close = frame(
+            &adapter
+                .on_semantic(
+                    semantic("3", "closeTab", json!({"claim":claim})),
+                    Some(&context),
+                    now,
+                )
+                .expect("admitted exact close"),
+        );
+        let terminal = response(&reply(&mut adapter, &close, result, now));
+        assert_eq!(terminal["error"]["kind"], "outcome_unknown");
+        assert!(terminal.get("result").is_none());
+        assert!(adapter.claims.contains_key(&claim));
+        assert_eq!(adapter.leases[&7], ("owner".to_owned(), SID.to_owned()));
+        assert!(adapter.creations.contains_key(&creation));
+    }
+    let (mut adapter, context, now) = boot();
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("real creation before detach"),
+    );
+    let created = response(&reply(
+        &mut adapter,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let creation = created["result"]["creation"]
+        .as_str()
+        .expect("actual creation receipt")
+        .to_owned();
+    let claim = attached(&mut adapter, &context, "2", 7, now);
+    let detach = frame(
+        &adapter
+            .on_semantic(
+                semantic("3", "detach", json!({"claim":claim})),
+                Some(&context),
+                now,
+            )
+            .expect("detach exact physical claim"),
+    );
+    let terminal = response(
+        &adapter
+            .on_native(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+            .expect("real detach ACK"),
+    );
+    assert_eq!(terminal["result"]["proof"], "detach_ack");
+    assert!(adapter.claims.is_empty());
+    assert_eq!(adapter.leases[&7], ("owner".to_owned(), SID.to_owned()));
+    assert!(adapter.creations.contains_key(&creation));
+}
+
+#[test]
+fn close_native_error_and_foreign_request_cannot_remove_owned_logical_records() {
+    let (mut adapter, context, now) = boot();
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("actual owner creates"),
+    );
+    let created = response(&reply(
+        &mut adapter,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let creation = created["result"]["creation"]
+        .as_str()
+        .expect("actual creation receipt")
+        .to_owned();
+    let claim = attached(&mut adapter, &context, "2", 7, now);
+    let mut foreign = semantic("3", "closeTab", json!({"claim":claim}));
+    foreign["owner"] = json!("foreign-owner");
+    assert!(
+        matches!(adapter.on_semantic(foreign, Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "claim_unavailable")
+    );
+    assert_eq!(adapter.rpc.pending_len(), 0);
+    let close = frame(
+        &adapter
+            .on_semantic(
+                semantic("4", "closeTab", json!({"claim":claim})),
+                Some(&context),
+                now,
+            )
+            .expect("exact owner close"),
+    );
+    let output = adapter.on_native(json!({"jsonrpc":"2.0","id":close["id"],"error":{"code":1,"message":"close effect unknown"}}), now).expect("native error correlated");
+    assert_eq!(response(&output)["error"]["kind"], "outcome_unknown");
+    assert!(adapter.claims.contains_key(&claim));
+    assert!(adapter.creations.contains_key(&creation));
+    assert!(adapter.leases.contains_key(&7));
+    assert_eq!(
+        adapter.session_turns[SID].phase,
+        TurnPhase::ActivationUnknown
+    );
+}
+
+#[test]
+fn late_positive_close_keeps_outer_unknown_but_collects_exact_old_custody() {
+    let (mut adapter, context, now) = boot();
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("real creation"),
+    );
+    let created = response(&reply(
+        &mut adapter,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let creation = created["result"]["creation"]
+        .as_str()
+        .expect("created receipt")
+        .to_owned();
+    let claim = attached(&mut adapter, &context, "2", 7, now);
+    let close = frame(
+        &adapter
+            .on_semantic(
+                semantic("3", "closeTab", json!({"claim":claim})),
+                Some(&context),
+                now,
+            )
+            .expect("exact close pending"),
+    );
+    adapter.on_cancel("3");
+    let output = reply(&mut adapter, &close, json!({"success":true}), now);
+    let terminal = response(&output);
+    assert_eq!(terminal["error"]["kind"], "outcome_unknown");
+    assert_eq!(
+        terminal["error"]["details"]["acknowledgedResult"]["proof"],
+        "close_ack"
+    );
+    assert!(terminal.get("result").is_none());
+    assert!(!adapter.claims.contains_key(&claim));
+    assert!(!adapter.creations.contains_key(&creation));
+    assert!(!adapter.leases.contains_key(&7));
+    assert!(output
+        .iter()
+        .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+}
+
+#[test]
+fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
+    let (mut adapter, context, now) = boot();
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("old creation"),
+    );
+    let old_created = response(&reply(
+        &mut adapter,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let old_creation = old_created["result"]["creation"]
+        .as_str()
+        .expect("old creation receipt")
+        .to_owned();
+    let old_claim = attached(&mut adapter, &context, "2", 7, now);
+    let close = frame(
+        &adapter
+            .on_semantic(
+                semantic("3", "closeTab", json!({"claim":old_claim})),
+                Some(&context),
+                now,
+            )
+            .expect("old exact target close pending"),
+    );
+    let detach = frame(
+        &adapter
+            .on_semantic(
+                semantic("4", "detach", json!({"claim":old_claim})),
+                Some(&context),
+                now,
+            )
+            .expect("physical detach while close pending"),
+    );
+    adapter
+        .on_native(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .expect("detach ACK");
+    let finish = frame(
+        &adapter
+            .on_semantic(semantic("5", "finishTurn", json!({})), Some(&context), now)
+            .expect("old turn finish"),
+    );
+    adapter
+        .on_native(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .expect("old turn finish ACK");
+    let next = NativeWireContext::new(SID, "turn2").expect("new immutable turn");
+    let create = frame(
+        &adapter
+            .on_semantic(semantic("6", "createTab", json!({})), Some(&next), now)
+            .expect("actual new creation with reused raw ID"),
+    );
+    let new_created = response(&reply(
+        &mut adapter,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let new_creation = new_created["result"]["creation"]
+        .as_str()
+        .expect("new creation receipt")
+        .to_owned();
+    assert_ne!(old_creation, new_creation);
+    let pre = frame(
+        &adapter
+            .on_semantic(
+                semantic("7", "attach", json!({"tabId":7})),
+                Some(&next),
+                now,
+            )
+            .expect("new logical tab attaches"),
+    );
+    let attach = frame(&reply(
+        &mut adapter,
+        &pre,
+        json!({"targetInfos":[{"tabId":7,"type":"page","targetId":"new-target-7","attached":false}]}),
+        now,
+    ));
+    let probe = frame(
+        &adapter
+            .on_native(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .expect("new physical attach ACK"),
+    );
+    let targets = frame(&reply(
+        &mut adapter,
+        &probe,
+        json!({"result":{"value":0}}),
+        now,
+    ));
+    let new_claim = response(&reply(&mut adapter, &targets, json!({"targetInfos":[{"tabId":7,"type":"page","targetId":"new-target-7","attached":true}]}), now))["result"]["claim"].as_str().expect("new physical claim").to_owned();
+    let late = response(&reply(&mut adapter, &close, json!({"success":true}), now));
+    assert_eq!(late["error"]["kind"], "outcome_unknown");
+    assert!(!adapter.creations.contains_key(&old_creation));
+    assert!(adapter.creations.contains_key(&new_creation));
+    assert_eq!(adapter.leases[&7], ("owner".to_owned(), SID.to_owned()));
+    assert_eq!(adapter.current_claim[&7], new_claim);
+    assert!(adapter.claims[&new_claim].live);
+    assert_eq!(adapter.claims[&new_claim].target, "new-target-7");
+    assert_eq!(adapter.session_turns[SID].turn, "turn2");
+}
+
+#[test]
+fn old_generation_close_reply_does_not_enter_new_generation_custody() {
+    let (mut old, context, now) = boot();
+    let create = frame(
+        &old.on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .expect("old creation"),
+    );
+    reply(&mut old, &create, json!({"id":7,"url":"about:blank"}), now);
+    let old_claim = attached(&mut old, &context, "2", 7, now);
+    let close = frame(
+        &old.on_semantic(
+            semantic("3", "closeTab", json!({"claim":old_claim})),
+            Some(&context),
+            now,
+        )
+        .expect("old close pending"),
+    );
+    let generation = "33333333-3333-4333-8333-333333333333";
+    let mut new = OriginalWireAdapter::new(generation.to_owned(), EXT.to_owned())
+        .expect("new independent generation");
+    let info = frame(&new.start(now).expect("new bootstrap"));
+    new.on_native(json!({"jsonrpc":"2.0","id":info["id"],"result":{"type":"extension","version":"observed","metadata":{"extensionId":EXT,"extensionInstanceId":"instance-new"}}}), now).expect("new actual identity ACK");
+    let mut create = semantic("1", "createTab", json!({}));
+    create["generation"] = json!(generation);
+    let create = frame(
+        &new.on_semantic(create, Some(&context), now)
+            .expect("new real creation"),
+    );
+    let created = response(&reply(
+        &mut new,
+        &create,
+        json!({"id":7,"url":"about:blank"}),
+        now,
+    ));
+    let receipt = created["result"]["creation"]
+        .as_str()
+        .expect("new receipt")
+        .to_owned();
+    let ignored = new
+        .on_native(
+            json!({"jsonrpc":"2.0","id":close["id"],"result":{"success":true}}),
+            now,
+        )
+        .expect("foreign generation reply is ignored by actual matcher");
+    assert!(ignored.is_empty());
+    assert!(new.creations.contains_key(&receipt));
+    assert_eq!(new.leases[&7], ("owner".to_owned(), SID.to_owned()));
+    assert_eq!(new.creations[&receipt].endpoint.generation, generation);
+    assert_eq!(new.rpc.pending_len(), 0);
+}
+
+fn committed_url_semantic(id: &str, raw_id: &str) -> Value {
+    semantic(
+        id,
+        "resolve",
+        json!({"rawId":raw_id,"sessionOnly":true,"committedUrlOnly":true}),
+    )
+}
+
+#[test]
+fn committed_session_url_uses_only_actual_owned_native_url_and_preserves_empty_strings() {
+    for url in [
+        "",
+        "about:blank",
+        "chrome://newtab/",
+        "https://fixture.invalid/Case?A=%20#B",
+        "file:///fixture/data",
+    ] {
+        let (mut adapter, context, now) = boot();
+        let mut envelope = committed_url_semantic("1", "7.0");
+        envelope["params"]["url"] = json!("https://caller.invalid/fake");
+        envelope["params"]["pendingUrl"] = json!("https://caller.invalid/pending");
+        let request = frame(
+            &adapter
+                .on_semantic(envelope, Some(&context), now)
+                .expect("captured owned URL purpose"),
+        );
+        assert_eq!(request["method"], "getCommittedTabUrl");
+        assert_eq!(
+            request["params"],
+            json!({"tabId":7,"session_id":SID,"turn_id":"turn1","session_context":"live"})
+        );
+        assert_eq!(
+            Method::GetCommittedTabUrl.call_effect(),
+            super::super::original_rpc_v2::CallEffect::MayMutate
+        );
+        let actions = reply(&mut adapter, &request, json!(url), now);
+        let terminal = response(&actions);
+        assert_eq!(
+            terminal["result"],
+            json!({"url":url,"sessionOnly":true,"committedUrlOnly":true})
+        );
+        assert!(terminal["result"].get("tab").is_none());
+        assert!(terminal["result"].get("normalized").is_none());
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })),
+            "no preparer, attach, global inventory or retry follows URL data"
+        );
+        assert!(adapter.leases.is_empty());
+        assert!(adapter.claims.is_empty());
+        assert!(adapter.creations.is_empty());
+    }
+}
+
+#[test]
+fn committed_url_selector_requires_strict_session_purpose_and_trusted_context_before_dispatch() {
+    let (mut adapter, context, now) = boot();
+    assert!(
+        matches!(adapter.on_semantic(committed_url_semantic("1", "7"), None, now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
+    );
+    for session in [None, Some(json!(false))] {
+        let mut envelope = committed_url_semantic("2", "7");
+        match session {
+            Some(value) => envelope["params"]["sessionOnly"] = value,
+            None => {
+                envelope["params"]
+                    .as_object_mut()
+                    .expect("request fields")
+                    .remove("sessionOnly");
+            }
+        }
+        assert!(
+            matches!(adapter.on_semantic(envelope, Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "invalid_request")
+        );
+    }
+    for value in [Value::Null, json!(1), json!("true"), json!({}), json!([])] {
+        let mut envelope = committed_url_semantic("3", "7");
+        envelope["params"]["committedUrlOnly"] = value;
+        assert!(
+            matches!(adapter.on_semantic(envelope, Some(&context), now), Err(NativeWireError::LocalRefusal { code, .. }) if code == "invalid_request")
+        );
+    }
+    assert_eq!(adapter.rpc.pending_len(), 0);
+    assert!(adapter.session_turns.is_empty());
+    assert!(adapter.leases.is_empty());
+}
+
+#[test]
+fn committed_url_false_keeps_both_existing_generic_and_strict_metadata_purposes() {
+    for session_only in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let request = frame(
+            &adapter
+                .on_semantic(
+                    semantic(
+                        "1",
+                        "resolve",
+                        json!({"rawId":"7","sessionOnly":session_only,"committedUrlOnly":false}),
+                    ),
+                    Some(&context),
+                    now,
+                )
+                .expect("unchanged metadata purpose"),
+        );
+        assert_eq!(
+            request["method"],
+            if session_only {
+                "getTabs"
+            } else {
+                "getUserTabs"
+            }
+        );
+        let terminal = response(&reply(
+            &mut adapter,
+            &request,
+            json!([{"id":7,"url":"https://fixture.invalid/"}]),
+            now,
+        ));
+        assert_eq!(terminal["result"]["tab"]["id"], 7);
+        assert!(terminal["result"].get("committedUrlOnly").is_none());
+        assert!(terminal["result"].get("url").is_none());
+    }
+}
+
+#[test]
+fn committed_url_foreign_local_scope_is_refused_before_native_ownership_is_borrowed() {
+    for same_session in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let create = frame(
+            &adapter
+                .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                .expect("real owner creation"),
+        );
+        reply(
+            &mut adapter,
+            &create,
+            json!({"id":7,"url":"about:blank"}),
+            now,
+        );
+        let mut envelope = committed_url_semantic("2", "7");
+        let foreign = NativeWireContext::new("33333333-3333-4333-8333-333333333333", "turn1")
+            .expect("other canonical session");
+        if same_session {
+            envelope["owner"] = json!("foreign-owner");
+            assert!(
+                matches!(adapter.on_semantic(envelope,Some(&context),now),Err(NativeWireError::LocalRefusal{code,..}) if code=="session_has_foreign_custody")
+            );
+        } else {
+            assert!(
+                matches!(adapter.on_semantic(envelope,Some(&foreign),now),Err(NativeWireError::LocalRefusal{code,..}) if code=="claim_unavailable")
+            );
+        }
+        assert_eq!(adapter.rpc.pending_len(), 0);
+        assert_eq!(adapter.leases[&7], ("owner".to_owned(), SID.to_owned()));
+    }
+}
+
+#[test]
+fn committed_url_remote_or_malformed_reply_stays_unknown_with_activation_custody() {
+    for invalid in [
+        Value::Null,
+        json!(7),
+        json!(false),
+        json!({"url":"https://fake.invalid/"}),
+        json!(["https://fake.invalid/"]),
+    ] {
+        let (mut adapter, context, now) = boot();
+        let request = frame(
+            &adapter
+                .on_semantic(committed_url_semantic("1", "7"), Some(&context), now)
+                .expect("actual URL method"),
+        );
+        let actions = reply(&mut adapter, &request, invalid, now);
+        let terminal = response(&actions);
+        assert_eq!(terminal["error"]["kind"], "outcome_unknown");
+        assert!(terminal.get("result").is_none());
+        assert_eq!(
+            adapter.session_turns[SID].phase,
+            TurnPhase::ActivationUnknown
+        );
+        assert!(adapter.leases.is_empty());
+        assert!(adapter.claims.is_empty());
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })));
+        assert!(
+            matches!(adapter.on_semantic(committed_url_semantic("2","7"),Some(&context),now),Err(NativeWireError::LocalRefusal{code,..}) if code=="session_unavailable")
+        );
+    }
+    let (mut adapter, context, now) = boot();
+    let request = frame(
+        &adapter
+            .on_semantic(committed_url_semantic("1", "7"), Some(&context), now)
+            .expect("actual owned URL method"),
+    );
+    let actions=adapter.on_native(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"actual owned URL read refused"}}),now).expect("actual native error");
+    let terminal = response(&actions);
+    assert_eq!(terminal["error"]["kind"], "outcome_unknown");
+    assert_eq!(
+        terminal["error"]["details"]["provenance"],
+        "mixed_extension_or_chrome"
+    );
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+    assert_eq!(
+        adapter.session_turns[SID].phase,
+        TurnPhase::ActivationUnknown
+    );
+}
+
+#[test]
+fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback() {
+    for mode in [
+        "missing-result",
+        "timeout",
+        "eof",
+        "finished",
+        "finishing",
+        "finish-unknown",
+        "closed",
+    ] {
+        let (mut adapter, context, now) = boot();
+        if matches!(mode, "finished" | "finishing" | "finish-unknown" | "closed") {
+            let create = frame(
+                &adapter
+                    .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                    .expect("real owner"),
+            );
+            reply(
+                &mut adapter,
+                &create,
+                json!({"id":7,"url":"about:blank"}),
+                now,
+            );
+        }
+        if matches!(mode, "finished" | "finishing" | "finish-unknown") {
+            let finish = frame(
+                &adapter
+                    .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+                    .expect("actual finish transition"),
+            );
+            match mode {
+                "finished" => {
+                    adapter
+                        .on_native(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+                        .expect("actual finish ACK");
+                }
+                "finish-unknown" => {
+                    adapter.on_native(json!({"jsonrpc":"2.0","id":finish["id"],"error":{"code":1,"message":"finish uncertain"}}),now).expect("actual finish error");
+                }
+                _ => {}
+            }
+            assert!(
+                matches!(adapter.on_semantic(committed_url_semantic("3","7"),Some(&context),now),Err(NativeWireError::LocalRefusal{code,..}) if code==if mode=="finished" {"turn_finished"} else {"session_unavailable"})
+            );
+            continue;
+        }
+        if mode == "closed" {
+            let claim = attached(&mut adapter, &context, "2", 7, now);
+            let close = frame(
+                &adapter
+                    .on_semantic(
+                        semantic("3", "closeTab", json!({"claim":claim})),
+                        Some(&context),
+                        now,
+                    )
+                    .expect("known actual close"),
+            );
+            reply(&mut adapter, &close, json!({"success":true}), now);
+            assert!(adapter.leases.is_empty());
+        }
+        let request = frame(
+            &adapter
+                .on_semantic(committed_url_semantic("4", "7"), Some(&context), now)
+                .expect("strict request has no local/global bypass"),
+        );
+        assert_eq!(request["method"], "getCommittedTabUrl");
+        let actions=match mode {
+            "missing-result"=>adapter.on_native(json!({"jsonrpc":"2.0","id":request["id"]}),now).expect("source nonvoid method cannot accept id-only ACK"),
+            "timeout"=>adapter.expire(now+DEADLINE+Duration::from_millis(1)),
+            "eof"=>adapter.on_eof("owned URL connection ended"),
+            "closed"=>adapter.on_native(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"Tab is not part of this browser session"}}),now).expect("native actual owned check refuses closed row"),
+            _=>unreachable!("each mode handled"),
+        };
+        assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })));
+        assert!(adapter.leases.is_empty());
+        assert!(adapter.claims.is_empty());
+    }
+}
+
+#[test]
+fn canceled_old_committed_url_retains_actual_payload_in_its_original_unknown_scope() {
+    let (mut adapter, context, now) = boot();
+    let old = frame(
+        &adapter
+            .on_semantic(committed_url_semantic("1", "7"), Some(&context), now)
+            .expect("old captured URL request"),
+    );
+    let next = NativeWireContext::new(SID, "turn2").expect("new trusted turn");
+    let new = frame(
+        &adapter
+            .on_semantic(committed_url_semantic("2", "7"), Some(&next), now)
+            .expect("new captured URL request"),
+    );
+    let actions = reply(
+        &mut adapter,
+        &old,
+        json!("https://old.fixture.invalid/#committed"),
+        now,
+    );
+    let old_terminal = response(&actions);
+    assert_eq!(old_terminal["id"], "1");
+    assert_eq!(old_terminal["error"]["kind"], "outcome_unknown");
+    assert_eq!(
+        old_terminal["error"]["details"]["acknowledgedResult"],
+        json!({"url":"https://old.fixture.invalid/#committed","sessionOnly":true,"committedUrlOnly":true})
+    );
+    assert_eq!(
+        old_terminal["error"]["details"]["nativeMethod"],
+        "getCommittedTabUrl"
+    );
+    assert!(old_terminal.get("result").is_none());
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, NativeWireAction::MatchedBrokerMessage { .. })));
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, NativeWireAction::NativeFrame { .. })));
+    assert_eq!(adapter.session_turns[SID].turn, "turn2");
+    let current = response(&reply(&mut adapter, &new, json!("chrome://newtab/"), now));
+    assert_eq!(current["id"], "2");
+    assert_eq!(current["result"]["url"], "chrome://newtab/");
+    assert!(adapter.leases.is_empty());
+    assert!(adapter.claims.is_empty());
 }

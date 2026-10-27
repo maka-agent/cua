@@ -119,7 +119,7 @@ pub use native_provider::{
     discover_installed_native_endpoints, discover_registered, discover_registered_endpoints,
     discover_registered_for, CleanupEvidence, CleanupProof, NativeAttachmentPreparation,
     NativeBrowserOperation, NativeBrowserProvider, NativeCdpCompletionOutcome,
-    NativeClaimPreparationProof, NativeCreatedTab, NativeCreationReceipt,
+    NativeClaimPreparationProof, NativeCommittedTabUrl, NativeCreatedTab, NativeCreationReceipt,
     NativeCursorPresentationAck, NativeDownloadMetadata, NativeDownloadStatus, NativeEffectOwner,
     NativeEndpointDiscovery, NativeEndpointRejection, NativeGroupColor, NativeGroupPresentation,
     NativeGroupProof, NativeGroupReleaseEvidence, NativeGroupReleaseProof, NativeHeader,
@@ -129,7 +129,7 @@ pub use native_provider::{
     NativePhysicalClaim, NativePopupRequest, NativePreparationDocument,
     NativePreparationDocumentBinding, NativePreparationPolicy, NativePreparedTab,
     NativeProviderCapabilities, NativeProviderError, NativeProviderEvent, NativeRecoveredOperation,
-    NativeSessionHeaderProof, NativeTabInfo, NativeUserTabsOrder,
+    NativeSessionHeaderProof, NativeSessionPreparedTab, NativeTabInfo, NativeUserTabsOrder,
 };
 
 pub use native_provider::NativeTabAbsenceObservation;

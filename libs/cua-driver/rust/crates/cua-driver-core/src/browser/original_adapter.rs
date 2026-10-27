@@ -8,13 +8,14 @@
 //! Source-only aftercopy: compilation and integrated desktop execution are pending.
 
 use super::native_wire::{
-    MatchedNativeReply, NativeWireAction, NativeWireAdapter, NativeWireContext, NativeWireError,
+    MatchedNativeReply, NativeRpcTrace, NativeWireAction, NativeWireAdapter, NativeWireContext,
+    NativeWireError,
 };
 use super::original_inventory::{
     self, AbsenceEvidence, Caller, EndpointIdentity, InventoryFreshness, KnownCreated,
 };
 use super::original_rpc_v2::{
-    Completion, Method, Outbound, Reply, RequestId, RpcCodec, RpcError, RpcEvent,
+    Completion, LossCause, Method, Outbound, Reply, RequestId, RpcCodec, RpcError, RpcEvent,
 };
 use super::original_tab_id::native_tab_id;
 use serde_json::{json, Map, Value};
@@ -101,6 +102,14 @@ struct Creation {
     finish_observed: bool,
 }
 
+#[derive(Clone, Debug)]
+struct CloseScope {
+    claim: String,
+    tab: u64,
+    target: String,
+    creations: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TurnPhase {
     Active,
@@ -125,12 +134,28 @@ enum InventorySource {
 }
 
 #[derive(Clone, Debug)]
+enum PreparationPurpose {
+    UserObserved { normalize_candidate: bool },
+    Session,
+}
+
+#[derive(Clone, Debug)]
 enum Stage {
     Bootstrap,
     Inventory,
-    Resolve { tab: u64, source: InventorySource },
+    Resolve {
+        tab: u64,
+        source: InventorySource,
+        session_only: bool,
+    },
+    CommittedUrl {
+        tab: u64,
+    },
     PrepareBefore(u64),
-    PrepareClaim { tab: u64, normalize_candidate: bool },
+    PrepareClaim {
+        tab: u64,
+        purpose: PreparationPurpose,
+    },
     Create,
     ClaimForAttach(u64),
     PreTargets(u64),
@@ -139,11 +164,15 @@ enum Stage {
     Targets(u64),
     Cdp(CdpScope),
     Detach(String),
-    Close(String),
+    Close(CloseScope),
     Finish,
     ObserveCreated(String),
-    SessionHeaders { active: bool },
-    MoveMouse { arrival_requested: bool },
+    SessionHeaders {
+        active: bool,
+    },
+    MoveMouse {
+        arrival_requested: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -244,10 +273,22 @@ impl OriginalWireAdapter {
                 call.payload_released = true;
                 call.outer.clone()
             });
+        let trace = tracing::enabled!(target: "maka::native_rpc_phase", tracing::Level::TRACE)
+            .then(|| {
+                NativeRpcTrace::captured(
+                    &self.generation,
+                    id.as_str(),
+                    method.as_str(),
+                    semantic_id.as_deref(),
+                    task.call.as_ref().map(|call| call.owner.as_str()),
+                    task.call.as_ref().and_then(|call| call.context.as_ref()),
+                )
+            });
         self.tasks.insert(id, task);
         let mut actions = vec![NativeWireAction::NativeFrame {
             message,
             semantic_id,
+            trace,
         }];
         if let Some(semantic_id) = released {
             actions.push(NativeWireAction::SemanticPayloadReleased { semantic_id });
@@ -680,6 +721,51 @@ impl OriginalWireAdapter {
         Some(claim)
     }
 
+    fn retire_closed_scope(&mut self, call: &Call, scope: &CloseScope, epoch: Option<u64>) {
+        let Some(context) = call.context.as_ref() else {
+            return;
+        };
+        if self.claims.get(&scope.claim).is_some_and(|claim| {
+            claim.owner != call.owner
+                || claim.session != context.host_session_id()
+                || claim.tab != scope.tab
+                || claim.target != scope.target
+        }) {
+            return;
+        }
+        let newer_claim = self
+            .current_claim
+            .get(&scope.tab)
+            .is_some_and(|token| token != &scope.claim);
+        self.retire_claim(&scope.claim);
+        let generation = self.generation.as_str();
+        let instance = self.extension_instance.as_deref();
+        self.creations.retain(|token, creation| {
+            !scope.creations.contains(token)
+                || creation.owner != call.owner
+                || creation.session != context.host_session_id()
+                || creation.tab_id != scope.tab
+                || creation.endpoint.generation.as_str() != generation
+                || Some(creation.endpoint.extension_instance_id.as_str()) != instance
+        });
+        let same_epoch = self
+            .session_turns
+            .get(context.host_session_id())
+            .is_some_and(|turn| {
+                Some(turn.epoch) == epoch
+                    && turn.owner == call.owner
+                    && turn.turn == context.host_turn_id()
+            });
+        if !newer_claim
+            && same_epoch
+            && self.leases.get(&scope.tab).is_some_and(|(owner, session)| {
+                owner == &call.owner && session == context.host_session_id()
+            })
+        {
+            self.leases.remove(&scope.tab);
+        }
+    }
+
     fn uncertain_activation(&mut self, call: &Call, epoch: Option<u64>, expected: TurnPhase) {
         let Some(context) = call.context.as_ref() else {
             return;
@@ -735,6 +821,37 @@ impl OriginalWireAdapter {
         let Some(mut retained) = self.tasks.remove(&completion.id) else {
             return Ok(Vec::new());
         };
+        // A completion also arises from expiry/EOF/protocol drain. Only the
+        // codec's separate exact-ID event establishes an incoming matched reply.
+        let category = match &completion.outcome {
+            Ok(Reply::Value(_)) => "result",
+            Ok(Reply::Void(_)) => "void_result",
+            Err(RpcError::Remote(_)) => "native_error",
+            Err(RpcError::Protocol { .. }) => "protocol_error",
+            Err(
+                RpcError::ReadUnavailable { cause, .. } | RpcError::OutcomeUnknown { cause, .. },
+            ) => match cause {
+                LossCause::Timeout => "timeout",
+                LossCause::Eof => "eof",
+                LossCause::Protocol => "protocol_error",
+                #[cfg(test)]
+                LossCause::WriteFailed => "write_failed",
+            },
+        };
+        if tracing::enabled!(target: "maka::native_rpc_phase", tracing::Level::TRACE) {
+            NativeRpcTrace::captured(
+                &self.generation,
+                completion.id.as_str(),
+                completion.method.as_str(),
+                retained.call.as_ref().map(|call| call.outer.as_str()),
+                retained.call.as_ref().map(|call| call.owner.as_str()),
+                retained
+                    .call
+                    .as_ref()
+                    .and_then(|call| call.context.as_ref()),
+            )
+            .completion(category);
+        }
         if matches!(retained.stage, Stage::Attach(_)) && completion.outcome.is_ok() {
             retained.attach_acknowledged = true;
         }
@@ -906,7 +1023,7 @@ impl OriginalWireAdapter {
                 "kind":"hello","protocol":1,"extensionId":self.expected_extension,
                 "instanceId":value["metadata"]["extensionInstanceId"],
                 "capabilities":{"metadata":true,"physicalClaims":true,"orderedCdpEvents":true,"flatChildSessions":true,
-                    "browserManagement":false,"nativeWindowProof":false,"adapter":"original_jsonrpc", "observedVersion":value["version"],"userTabsOrder":"provider","headerScope":"session","presentationOwner":"provider","cursorMovePresentation":true,"cursorHidePresentation":false,"createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider","attachmentPreparation":"full_preparation","downloadNotifications":true}
+                    "browserManagement":false,"nativeWindowProof":false,"adapter":"original_jsonrpc", "observedVersion":value["version"],"userTabsOrder":"provider","headerScope":"session","presentationOwner":"provider","cursorMovePresentation":true,"cursorHidePresentation":false,"createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider","attachmentPreparation":"full_preparation","downloadNotifications":true,"sessionTabResolution":true,"sessionCommittedUrl":true}
             }))]);
         }
         let call = task
@@ -924,8 +1041,8 @@ impl OriginalWireAdapter {
                     self.retire_claim(token);
                     Some(json!({"detached":true,"proof":"detach_ack"}))
                 }
-                Stage::Close(token) if value["success"] == true => {
-                    self.retire_claim(token);
+                Stage::Close(scope) if known_close_ack(&value, scope) => {
+                    self.retire_closed_scope(&call, scope, task.activation_epoch);
                     Some(json!({"closed":true,"proof":"close_ack"}))
                 }
                 Stage::Finish => {
@@ -993,6 +1110,41 @@ impl OriginalWireAdapter {
                 self.success(&call, result)
             });
         }
+        if call.cancelled {
+            if let Stage::PrepareClaim {
+                tab,
+                purpose: PreparationPurpose::Session,
+            } = &task.stage
+            {
+                let actual = checked_tab(value)?;
+                if actual["id"].as_u64() != Some(*tab) {
+                    return Err(NativeWireError::Protocol(
+                        "Original session preparation changed raw tab identity".to_owned(),
+                    ));
+                }
+                return Ok(self.failure(
+                    &call,
+                    "outcome_unknown",
+                    "Session preparation completed after cancellation; actual tab metadata retained",
+                    json!({"acknowledgedResult":{"tab":actual,"sessionOnly":true},"nativeMethod":completion.method.as_str()}),
+                ));
+            }
+        }
+        if call.cancelled {
+            if let Stage::CommittedUrl { tab } = &task.stage {
+                let url = value.as_str().ok_or_else(|| {
+                    NativeWireError::Protocol(format!(
+                        "Original committed URL for raw tab {tab} is not a string"
+                    ))
+                })?;
+                return Ok(self.failure(
+                    &call,
+                    "outcome_unknown",
+                    "Committed URL completed after cancellation; actual URL metadata retained",
+                    json!({"acknowledgedResult":{"url":url,"sessionOnly":true,"committedUrlOnly":true},"nativeMethod":completion.method.as_str()}),
+                ));
+            }
+        }
         if call.cancelled && !matches!(task.stage, Stage::Create | Stage::ObserveCreated(_)) {
             if let Some(custody) = self.partial_attachment(&task, &call) {
                 return Ok(self.failure(
@@ -1006,14 +1158,20 @@ impl OriginalWireAdapter {
         }
         match task.stage {
             Stage::Inventory => Ok(self.success(&call, json!({"tabs":project_inventory(value, InventorySource::User)?}))),
-            Stage::Resolve { tab: tab_id, source } => {
+            Stage::Resolve { tab: tab_id, source, session_only } => {
                 let tabs = project_inventory(value, source)?;
                 let truncated = source == InventorySource::User && tabs.len() == 1000;
                 let tab = tabs
                     .into_iter()
                     .find(|tab| tab["id"].as_u64() == Some(tab_id));
                 Ok(match tab {
-                    Some(tab) => self.success(&call, json!({"tab":tab})),
+                    Some(tab) => {
+                        let mut result = json!({"tab":tab});
+                        if session_only {
+                            result["sessionOnly"] = json!(true);
+                        }
+                        self.success(&call, result)
+                    },
                     None if truncated => self.failure(
                         &call,
                         "inventory_truncated",
@@ -1024,13 +1182,19 @@ impl OriginalWireAdapter {
                         &call,
                         "tab_unavailable",
                         if source == InventorySource::ManagedSession {
-                            "Raw Chrome tab is absent from this exact logical session's inventory"
+                            "Raw Chrome tab was not returned by this session's visible tab inventory"
                         } else {
                             "Raw Chrome tab is absent from the complete observed user-tab inventory"
                         },
                         json!({"tabId":tab_id}),
                     ),
                 })
+            }
+            Stage::CommittedUrl { tab } => {
+                let url = value.as_str().ok_or_else(|| NativeWireError::Protocol(
+                    format!("Original committed URL for raw tab {tab} is not a string"),
+                ))?;
+                Ok(self.success(&call, json!({"url":url,"sessionOnly":true,"committedUrlOnly":true})))
             }
             Stage::PrepareBefore(tab) => {
                 let tabs = project_inventory(value, InventorySource::User)?;
@@ -1043,12 +1207,14 @@ impl OriginalWireAdapter {
                     })?;
                 task.stage = Stage::PrepareClaim {
                     tab,
-                    normalize_candidate: old["url"].as_str().is_some_and(normalizable_chrome_url),
+                    purpose: PreparationPurpose::UserObserved {
+                        normalize_candidate: old["url"].as_str().is_some_and(normalizable_chrome_url),
+                    },
                 };
                 let params = self.params(&call, json!({"tabId":tab}))?;
                 self.queue(task, Method::ClaimUserTab, params, now)
             }
-            Stage::PrepareClaim { tab, normalize_candidate } => {
+            Stage::PrepareClaim { tab, purpose } => {
                 let tab_value = checked_tab(value)?;
                 if tab_value["id"].as_u64() != Some(tab) {
                     return Err(NativeWireError::Protocol(
@@ -1060,9 +1226,17 @@ impl OriginalWireAdapter {
                     tab,
                     (call.owner.clone(), context.host_session_id().to_owned()),
                 );
-                let normalized = normalize_candidate
-                    && tab_value["url"] == "about:blank";
-                Ok(self.success(&call, json!({"tab":tab_value,"normalized":normalized})))
+                let mut result = json!({"tab":tab_value});
+                match purpose {
+                    PreparationPurpose::UserObserved { normalize_candidate } => {
+                        let normalized = normalize_candidate && result["tab"]["url"] == "about:blank";
+                        result["normalized"] = json!(normalized);
+                    },
+                    PreparationPurpose::Session => {
+                        result["sessionOnly"] = json!(true);
+                    },
+                }
+                Ok(self.success(&call, result))
             }
             Stage::ClaimForAttach(tab) => {
                 if value["id"].as_u64() != Some(tab) {
@@ -1157,8 +1331,8 @@ impl OriginalWireAdapter {
             }
             Stage::Cdp(scope) => self.cdp_completed(&call, scope, value),
             Stage::Detach(token)=>{self.retire_claim(&token);Ok(self.success(&call,json!({"detached":true,"proof":"detach_ack"})))},
-            Stage::Close(token) => {
-                if value["success"] != true {
+            Stage::Close(scope) => {
+                if !known_close_ack(&value, &scope) {
                     return Ok(self.failure(
                         &call,
                         "outcome_unknown",
@@ -1166,7 +1340,7 @@ impl OriginalWireAdapter {
                         json!({"nativeResult":value}),
                     ));
                 }
-                self.retire_claim(&token);
+                self.retire_closed_scope(&call, &scope, task.activation_epoch);
                 Ok(self.success(&call, json!({"closed":true,"proof":"close_ack"})))
             }
             Stage::Finish=>{self.finish_observed(&call, task.activation_epoch);let context=self.context(&call)?;Ok(self.success(&call,json!({"turnFinished":true,"hostSessionId":context.host_session_id(),"hostTurnId":context.host_turn_id()})))},
@@ -1305,6 +1479,7 @@ impl NativeWireAdapter for OriginalWireAdapter {
                 RpcEvent::Send(message) => Ok(vec![NativeWireAction::NativeFrame {
                     message,
                     semantic_id: None,
+                    trace: None,
                 }]),
                 RpcEvent::Notification(notification) => self.notification(
                     &notification.method,
@@ -1807,6 +1982,40 @@ fn required_tab(value: &Value) -> Result<u64, NativeWireError> {
         .filter(|id| *id > 0 && *id <= 9_007_199_254_740_991)
         .ok_or_else(|| NativeWireError::Protocol("Invalid actual Chrome tab ID".to_owned()))
 }
+fn known_close_ack(value: &Value, scope: &CloseScope) -> bool {
+    value["success"] == true
+        && value
+            .get("claim")
+            .is_none_or(|claim| claim.as_str() == Some(scope.claim.as_str()))
+        && value
+            .get("tabId")
+            .is_none_or(|tab| tab.as_u64() == Some(scope.tab))
+        && value
+            .get("targetId")
+            .is_none_or(|target| target.as_str() == Some(scope.target.as_str()))
+}
+
+fn requested_committed_url_only(fields: &Value) -> Result<bool, NativeWireError> {
+    match fields.get("committedUrlOnly") {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(NativeWireError::LocalRefusal {
+            code: "invalid_request".to_owned(),
+            message: "committedUrlOnly must be a boolean".to_owned(),
+        }),
+    }
+}
+
+fn requested_session_only(fields: &Value) -> Result<bool, NativeWireError> {
+    match fields.get("sessionOnly") {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(NativeWireError::LocalRefusal {
+            code: "invalid_request".to_owned(),
+            message: "sessionOnly must be a boolean".to_owned(),
+        }),
+    }
+}
 fn checked_tab(value: Value) -> Result<Value, NativeWireError> {
     let id = value["id"]
         .as_u64()
@@ -2035,18 +2244,37 @@ impl OriginalWireAdapter {
             // boundary; transport only its actual canonical Chrome integer.
             "resolve"=>{
                 let id=native_tab_id(&required_string(&fields,"rawId")?).ok_or_else(||NativeWireError::LocalRefusal {code:"invalid_request".to_owned(),message:"Native tab ID must convert to a positive safe integer".to_owned()})?;
+                let session_only=requested_session_only(&fields)?;
+                let committed_url_only=requested_committed_url_only(&fields)?;
+                if committed_url_only && !session_only {
+                    return Err(NativeWireError::LocalRefusal {code:"invalid_request".to_owned(),message:"committedUrlOnly requires sessionOnly".to_owned()});
+                }
+                if session_only {
+                    let context=self.context(&call)?;
+                    if self.leases.get(&id).is_some_and(|(owner,session)|owner!=&call.owner||session!=context.host_session_id()) {
+                        return Ok(self.failure(&call,"claim_unavailable","Session metadata cannot reassign another logical owner's raw tab",Value::Null));
+                    }
+                }
                 let owned=call.context.as_ref().is_some_and(|context| self.leases.get(&id).is_some_and(|(owner,session)|owner==&call.owner&&session==context.host_session_id()));
-                if owned {
+                if committed_url_only {
+                    let params=self.params(&call,json!({"tabId":id}))?;
+                    (Stage::CommittedUrl {tab:id},Method::GetCommittedTabUrl,params)
+                } else if session_only || owned {
                     let params=self.params(&call,json!({}))?;
-                    (Stage::Resolve {tab:id,source:InventorySource::ManagedSession},Method::GetTabs,params)
+                    (Stage::Resolve {tab:id,source:InventorySource::ManagedSession,session_only},Method::GetTabs,params)
                 } else {
-                    (Stage::Resolve {tab:id,source:InventorySource::User},Method::GetUserTabs,json!({}))
+                    (Stage::Resolve {tab:id,source:InventorySource::User,session_only:false},Method::GetUserTabs,json!({}))
                 }
             },
             "prepareUserTab"=>{
-                let tab=required_tab(&fields)?;let context=self.context(&call)?.clone();
+                let tab=required_tab(&fields)?;let session_only=requested_session_only(&fields)?;let context=self.context(&call)?.clone();
                 if self.leases.get(&tab).is_some_and(|(owner,session)|owner!=&call.owner||session!=context.host_session_id())||self.attaching.get(&tab).is_some_and(|entry|entry.owner!=call.owner||entry.session!=context.host_session_id())||self.claims.values().any(|claim|claim.tab==tab&&claim.live&&(claim.owner!=call.owner||claim.session!=context.host_session_id())){return Ok(self.failure(&call,"claim_unavailable","Preparation cannot reassign another owner's raw tab",Value::Null));}
-                (Stage::PrepareBefore(tab),Method::GetUserTabs,json!({}))
+                if session_only {
+                    let params=self.params(&call,json!({"tabId":tab}))?;
+                    (Stage::PrepareClaim {tab,purpose:PreparationPurpose::Session},Method::ClaimUserTab,params)
+                } else {
+                    (Stage::PrepareBefore(tab),Method::GetUserTabs,json!({}))
+                }
             },
             "createTab"=>{
                 let params=self.params(&call,fields.get("windowId").map_or_else(||json!({}),|value|json!({"preferredWindowId":value})))?;
@@ -2098,8 +2326,12 @@ impl OriginalWireAdapter {
                 let token=required_string(&fields,"claim")?;let claim=self.owned_claim(&call,&token)?;
                 // Matches Original closeTab's preferred branch after actual
                 // Target.getTargets correlation. Never replaces it with tabs.remove.
+                let context=self.context(&call)?;
+                // Capture existing receipt IDs before the effect; a late ACK cannot collect later raw-ID reuse.
+                let creations=self.creations.iter().filter(|(_,creation)|creation.owner==call.owner&&creation.session==context.host_session_id()&&creation.tab_id==claim.tab&&creation.endpoint.generation==self.generation&&Some(creation.endpoint.extension_instance_id.as_str())==self.extension_instance.as_deref()).map(|(token,_)|token.clone()).collect();
+                let scope=CloseScope {claim:token,tab:claim.tab,target:claim.target.clone(),creations};
                 let params=self.params(&call,json!({"target":{"tabId":claim.tab},"method":"Target.closeTarget","commandParams":{"targetId":claim.target}}))?;
-                (Stage::Close(token),Method::ExecuteCdp,params)
+                (Stage::Close(scope),Method::ExecuteCdp,params)
             }
             "finishTurn"=>{
                 self.validate_finish(&call)?;
@@ -2156,10 +2388,93 @@ fn activates_session(method: Method) -> bool {
     matches!(
         method,
         Method::GetTabs
+            | Method::GetCommittedTabUrl
             | Method::CreateTab
             | Method::ClaimUserTab
             | Method::Attach
             | Method::ExecuteCdp
             | Method::MoveMouse
     )
+}
+
+#[cfg(test)]
+mod passive_phase_tests {
+    use super::super::native_wire::rpc_phase_test::Capture;
+    use super::*;
+
+    #[test]
+    fn queued_and_out_of_order_canceled_phases_keep_their_original_metadata() {
+        let capture = Capture::default();
+        let now = Instant::now();
+        let mut adapter = OriginalWireAdapter::new(
+            "trace-generation".to_owned(),
+            "hehggadaopoacecdllhhajmbjkdcmajg".to_owned(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        tracing::subscriber::with_default(capture.clone(), || {
+            for (outer, turn) in [("41", "turn-old"), ("42", "turn-new")] {
+                let actions = adapter
+                    .queue(
+                        Task {
+                            call: Some(Call {
+                                outer: outer.to_owned(),
+                                owner: "fixture-owner".to_owned(),
+                                context: Some(
+                                    NativeWireContext::new("fixture-session", turn).unwrap(),
+                                ),
+                                cancelled: false,
+                                payload_released: false,
+                            }),
+                            stage: Stage::Inventory,
+                            candidate_target: None,
+                            attach_acknowledged: false,
+                            finish_observed: false,
+                            activation_epoch: None,
+                        },
+                        Method::GetUserTabs,
+                        json!({"headers":"HEADER_SENTINEL"}),
+                        now,
+                    )
+                    .unwrap();
+                let id = actions
+                    .into_iter()
+                    .find_map(|action| match action {
+                        NativeWireAction::NativeFrame {
+                            message,
+                            trace: Some(_),
+                            ..
+                        } => message["id"].as_str().map(str::to_owned),
+                        _ => None,
+                    })
+                    .expect("each actual phase carries typed captured metadata");
+                ids.push(id);
+            }
+            assert!(
+                capture.rows().is_empty(),
+                "queue is not actual frame completion"
+            );
+            let _ = adapter.on_cancel("41");
+            for id in [ids[1].clone(), ids[0].clone()] {
+                adapter
+                    .on_native(json!({"jsonrpc":"2.0","id":id,"result":[]}), now)
+                    .unwrap();
+            }
+        });
+        let rows = capture.rows();
+        assert_eq!(rows.len(), 4);
+        for (pair, id, semantic, turn) in [
+            (&rows[..2], &ids[1], "42", "turn-new"),
+            (&rows[2..], &ids[0], "41", "turn-old"),
+        ] {
+            assert_eq!(pair[0]["phase"], "reply_id_matched");
+            assert_eq!(pair[1]["phase"], "rpc_completion");
+            assert_eq!(pair[0]["native_rpc_id"], *id);
+            assert_eq!(pair[1]["native_rpc_id"], *id);
+            assert_eq!(pair[1]["semantic_id"], format!("Some({semantic:?})"));
+            assert_eq!(pair[1]["host_turn_id"], format!("Some({turn:?})"));
+            assert_eq!(pair[0]["native_host_pid"], pair[1]["native_host_pid"]);
+        }
+        assert!(!format!("{rows:?}").contains("HEADER_SENTINEL"));
+    }
 }

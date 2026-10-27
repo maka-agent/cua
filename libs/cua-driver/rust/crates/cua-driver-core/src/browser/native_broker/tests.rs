@@ -3122,3 +3122,148 @@ fn fixed_cleanup_unknown_retains_only_actual_top_level_physical_proof() {
         );
     }
 }
+
+#[test]
+fn session_tab_control_selector_is_optional_but_strictly_boolean() {
+    for method in ["resolve", "prepareUserTab"] {
+        let mut fields = if method == "resolve" {
+            json!({"method":method,"id":1,"rawId":"2001"})
+        } else {
+            json!({"method":method,"id":1,"tabId":2001})
+        };
+        assert!(serde_json::from_value::<ControlRequest>(fields.clone()).is_ok());
+        for valid in [false, true] {
+            fields["sessionOnly"] = json!(valid);
+            assert!(serde_json::from_value::<ControlRequest>(fields.clone()).is_ok());
+        }
+        for invalid in [Value::Null, json!("true"), json!(1), json!({})] {
+            fields["sessionOnly"] = invalid;
+            assert!(serde_json::from_value::<ControlRequest>(fields.clone()).is_err());
+        }
+    }
+}
+
+#[test]
+fn session_tab_control_requires_context_and_capability_and_forwards_exact_existing_method() {
+    for method in ["resolve", "prepareUserTab"] {
+        for supported in [false, true] {
+            for contextual in [false, true] {
+                let mut broker = fixture();
+                let mut client = admit(&mut broker);
+                broker.identity.as_mut().unwrap().capabilities["sessionTabResolution"] =
+                    json!(supported);
+                let wire = NativeWireContext::new("actual-host-session", "actual-turn").unwrap();
+                if contextual {
+                    broker.input_context = Some(wire.clone());
+                }
+                let fields = if method == "resolve" {
+                    json!({"method":method,"id":1,"rawId":"2001","sessionOnly":true})
+                } else {
+                    json!({"method":method,"id":1,"tabId":2001,"sessionOnly":true})
+                };
+                let mut output = Vec::new();
+                broker.control(
+                    client.sender.lease.id,
+                    serde_json::from_value(fields).unwrap(),
+                    &mut output,
+                );
+                if contextual && supported {
+                    assert_eq!(output.len(), 1);
+                    let outbound = output.pop().unwrap();
+                    assert_eq!(outbound.wire_context, Some(wire));
+                    let sent = write(outbound);
+                    assert_eq!(sent["method"], method);
+                    assert_eq!(sent["params"]["sessionOnly"], true);
+                    assert!(
+                        broker.claims.is_empty(),
+                        "selector does not acquire a physical claim"
+                    );
+                } else {
+                    assert!(
+                        output.is_empty(),
+                        "unsupported or unscoped selectors never fall back to native metadata"
+                    );
+                    let expected = if contextual {
+                        "unsupported"
+                    } else {
+                        "context_required"
+                    };
+                    assert!(
+                        matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind==expected)
+                    );
+                    assert!(broker.pending.is_empty());
+                    assert!(broker.claims.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn committed_url_control_selector_requires_boolean_and_session_purpose() {
+    for invalid in [Value::Null, json!("true"), json!(1), json!({})] {
+        assert!(serde_json::from_value::<ControlRequest>(json!({"method":"resolve","id":1,"rawId":"2001","sessionOnly":true,"committedUrlOnly":invalid})).is_err());
+    }
+    for session in [false, true] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        broker.input_context = Some(NativeWireContext::new("url-owner", "turn").unwrap());
+        broker.identity.as_mut().unwrap().capabilities["sessionCommittedUrl"] = json!(true);
+        let control=serde_json::from_value(json!({"method":"resolve","id":1,"rawId":"2001","sessionOnly":session,"committedUrlOnly":true})).unwrap();
+        let mut output = Vec::new();
+        broker.control(client.sender.lease.id, control, &mut output);
+        if session {
+            assert_eq!(output.len(), 1);
+        } else {
+            assert!(output.is_empty());
+            assert!(
+                matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind=="invalid_request")
+            );
+        }
+    }
+}
+
+#[test]
+fn committed_url_control_checks_its_capability_and_context_before_same_resolve_dispatch() {
+    for contextual in [false, true] {
+        for supported in [false, true] {
+            let mut broker = fixture();
+            let mut client = admit(&mut broker);
+            let wire = NativeWireContext::new("url-owner", "url-turn").unwrap();
+            if contextual {
+                broker.input_context = Some(wire.clone());
+            }
+            broker.identity.as_mut().unwrap().capabilities["sessionCommittedUrl"] =
+                json!(supported);
+            // URL-only support does not silently inherit or require the full-tab capability.
+            broker.identity.as_mut().unwrap().capabilities["sessionTabResolution"] = json!(false);
+            let control=serde_json::from_value(json!({"method":"resolve","id":1,"rawId":"2001","sessionOnly":true,"committedUrlOnly":true})).unwrap();
+            let mut output = Vec::new();
+            broker.control(client.sender.lease.id, control, &mut output);
+            if contextual && supported {
+                assert_eq!(output.len(), 1);
+                let outbound = output.pop().unwrap();
+                assert_eq!(outbound.wire_context, Some(wire));
+                let sent = write(outbound);
+                assert_eq!(sent["method"], "resolve");
+                assert_eq!(
+                    sent["params"],
+                    json!({"rawId":"2001","sessionOnly":true,"committedUrlOnly":true})
+                );
+                assert!(broker.claims.is_empty());
+            } else {
+                assert!(output.is_empty());
+                let expected = if contextual {
+                    "unsupported"
+                } else {
+                    "context_required"
+                };
+                assert!(
+                    matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind==expected)
+                );
+                assert!(broker.pending.is_empty());
+                assert!(broker.claims.is_empty());
+            }
+        }
+    }
+}

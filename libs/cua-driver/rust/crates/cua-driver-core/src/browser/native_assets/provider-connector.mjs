@@ -75,6 +75,8 @@ export class NativeBrowserConnector extends PreparedBrowserConnector {
     // attach() only observes target identity around debugger attachment.
     result.capabilities.attachmentPreparation = 'metadata_only';
     result.capabilities.explicitClaimPreparation = true;
+    result.capabilities.sessionTabResolution = true;
+    result.capabilities.sessionCommittedUrl = true;
     result.capabilities.downloadNotifications = true;
     result.capabilities.tabPreparation = true;
     result.capabilities.createdPresentation = true;
@@ -143,11 +145,17 @@ export class NativeBrowserConnector extends PreparedBrowserConnector {
   async checkPreparationDocument(record, scope) {
     const result = await this.cdp(record, { method: 'Page.getFrameTree', params: {} });
     const frame = result?.result?.frameTree?.frame;
+    const fragment = Object.prototype.hasOwnProperty.call(frame ?? {}, 'urlFragment')
+      ? frame.urlFragment
+      : '';
     if (
       !this.live(record) ||
       frame?.id !== scope.document.frameId ||
       frame?.loaderId !== scope.document.loaderId ||
-      frame?.url !== scope.document.url
+      typeof frame?.url !== 'string' ||
+      typeof fragment !== 'string' ||
+      (fragment !== '' && !fragment.startsWith('#')) ||
+      frame.url + fragment !== scope.document.url
     )
       throw new ConnectorError(
         'document_changed',
@@ -540,7 +548,7 @@ export class NativeBrowserConnector extends PreparedBrowserConnector {
             params.group,
           );
         default:
-          return await super.dispatch(owner, method, params);
+          return await super.dispatch(owner, method, params, wireContext);
       }
     } catch (error) {
       if (error instanceof CreatedTabPresentationError)

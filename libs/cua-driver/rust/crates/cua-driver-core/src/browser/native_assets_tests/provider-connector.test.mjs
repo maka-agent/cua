@@ -152,7 +152,7 @@ async function fixture() {
   await connector.initialize();
   connector.bind('gen-1');
   let seq = 0;
-  const request = (method, params = {}, owner = 'owner-a') =>
+  const request = (method, params = {}, owner = 'owner-a', wireContext) =>
     connector.request({
       kind: 'request',
       protocol: 1,
@@ -161,6 +161,7 @@ async function fixture() {
       owner,
       method,
       params,
+      ...(wireContext === undefined ? {} : { wireContext }),
     });
   return { chrome, connector, tabs, groups, calls, events, request, rules: () => rules };
 }
@@ -526,4 +527,467 @@ test('metadata conversion failure after creation preserves the acknowledged exac
     true,
   );
   assert.equal(f.calls.filter((call) => call[0] === 'create').length, 1);
+});
+
+const sessionContext = Object.freeze({
+  hostSessionId: 'actual-session',
+  hostTurnId: 'actual-turn',
+});
+const resolutionMethods = [
+  ['resolve', { rawId: '1' }],
+  ['prepareUserTab', { tabId: 1 }],
+];
+test('session purpose traverses the composed dispatch layers and returns only actual Chrome metadata', async () => {
+  const f = await fixture();
+  f.tabs.set(1, {
+    id: 1,
+    windowId: 7,
+    url: 'https://actual.test/current',
+    title: 'Actual Chrome title',
+    groupId: -1,
+  });
+  const reads = [];
+  const get = f.chrome.tabs.get;
+  f.chrome.tabs.get = async (id) => {
+    reads.push(id);
+    return get(id);
+  };
+  const before = f.calls.length;
+  assert.deepEqual(
+    (await f.request('resolve', { rawId: '1', sessionOnly: true }, 'owner-a', sessionContext))
+      .result,
+    {
+      tab: {
+        id: 1,
+        windowId: 7,
+        groupId: -1,
+        title: 'Actual Chrome title',
+        url: 'https://actual.test/current',
+        providerTabId: '1',
+      },
+      sessionOnly: true,
+    },
+  );
+  assert.deepEqual(reads, [1]);
+  assert.equal(f.calls.length, before);
+  assert.equal(f.connector.claims.size, 0);
+  assert.equal(f.connector.records.size, 0);
+  assert.equal(f.connector.creations.size, 0);
+  assert.equal(f.connector.hello().capabilities.sessionTabResolution, true);
+});
+test('session selector must be a literal boolean before either semantic method reads Chrome', async () => {
+  const f = await fixture();
+  let reads = 0;
+  f.chrome.tabs.get = async () => {
+    reads++;
+    throw Error('invalid selector reached Chrome');
+  };
+  const before = f.calls.length;
+  for (const [method, params] of resolutionMethods)
+    for (const sessionOnly of [undefined, null, 'true', 1, 0, {}, []]) {
+      const response = await f.request(
+        method,
+        { ...params, sessionOnly },
+        'owner-a',
+        sessionContext,
+      );
+      assert.equal(response.error.kind, 'invalid_request', `${method}: ${String(sessionOnly)}`);
+      assert.equal('result' in response, false);
+    }
+  assert.equal(reads, 0);
+  assert.equal(f.calls.length, before);
+});
+test('session purpose requires actual captured envelope context and ignores params context', async () => {
+  const f = await fixture();
+  let reads = 0;
+  f.chrome.tabs.get = async () => {
+    reads++;
+    throw Error('missing captured context reached Chrome');
+  };
+  for (const [method, params] of resolutionMethods)
+    for (const wireContext of [
+      undefined,
+      null,
+      {},
+      { hostSessionId: 'actual-session' },
+      { hostTurnId: 'actual-turn' },
+      { hostSessionId: ' ', hostTurnId: 'actual-turn' },
+      { hostSessionId: 'actual-session', hostTurnId: '\t' },
+      { hostSessionId: 5, hostTurnId: 'actual-turn' },
+      { hostSessionId: 'actual-session', hostTurnId: 'x'.repeat(4097) },
+    ]) {
+      const response = await f.request(
+        method,
+        { ...params, sessionOnly: true, wireContext: sessionContext },
+        'owner-a',
+        wireContext,
+      );
+      assert.equal(response.error.kind, 'invalid_request', method);
+      assert.equal('result' in response, false);
+    }
+  assert.equal(reads, 0);
+});
+test('ordinary absent and false selectors preserve both existing result shapes without context', async () => {
+  for (const selector of [{}, { sessionOnly: false }]) {
+    const f = await fixture();
+    const resolved = await f.request('resolve', { rawId: '1', ...selector });
+    assert.deepEqual(resolved.result, {
+      tab: {
+        id: 1,
+        windowId: 3,
+        index: 0,
+        groupId: -1,
+        url: 'chrome://newtab/',
+        providerTabId: '1',
+        active: true,
+      },
+    });
+    const prepared = await f.request('prepareUserTab', { tabId: 1, ...selector });
+    assert.deepEqual(prepared.result, {
+      tab: {
+        id: 1,
+        windowId: 3,
+        index: 0,
+        groupId: -1,
+        url: 'about:blank',
+        providerTabId: '1',
+        active: true,
+      },
+      normalized: true,
+    });
+    assert.deepEqual(
+      f.calls.filter((call) => call[0] === 'update'),
+      [['update', 1, { url: 'about:blank' }]],
+    );
+  }
+});
+test('session tab preparation uses the same exact new-tab normalizer without a new claim', async () => {
+  const f = await fixture();
+  const response = await f.request(
+    'prepareUserTab',
+    { tabId: 1, sessionOnly: true },
+    'owner-a',
+    sessionContext,
+  );
+  assert.deepEqual(response.result, {
+    tab: {
+      id: 1,
+      windowId: 3,
+      index: 0,
+      groupId: -1,
+      url: 'about:blank',
+      providerTabId: '1',
+      active: true,
+    },
+    normalized: true,
+    sessionOnly: true,
+  });
+  assert.deepEqual(
+    f.calls.filter((call) => call[0] !== 'dnr'),
+    [['update', 1, { url: 'about:blank' }]],
+  );
+  assert.equal(f.connector.claims.size, 0);
+  assert.equal(f.connector.records.size, 0);
+  assert.equal(f.connector.creations.size, 0);
+});
+test('failed actual session reads never return purpose success or invoke the normalizer', async () => {
+  const f = await fixture();
+  const reads = [];
+  f.chrome.tabs.get = async (id) => {
+    reads.push(id);
+    throw Error('actual Chrome tab was removed');
+  };
+  const before = f.calls.length;
+  for (const [method, params] of resolutionMethods) {
+    const response = await f.request(
+      method,
+      { ...params, sessionOnly: true },
+      'owner-a',
+      sessionContext,
+    );
+    assert.equal(response.error.kind, 'chrome_rejected');
+    assert.equal('result' in response, false);
+  }
+  assert.deepEqual(reads, [1, 1]);
+  assert.equal(f.calls.length, before);
+});
+test('session resolution refuses missing or contradictory actual Chrome identity without changing ordinary resolution', async () => {
+  const f = await fixture();
+  for (const tab of [null, { id: 2, url: 'https://foreign.test/' }]) {
+    f.chrome.tabs.get = async () => tab;
+    const response = await f.request(
+      'resolve',
+      { rawId: '1', sessionOnly: true },
+      'owner-a',
+      sessionContext,
+    );
+    assert.equal(response.error.kind, 'target_unavailable');
+    assert.equal('result' in response, false);
+  }
+  f.chrome.tabs.get = async () => null;
+  assert.deepEqual((await f.request('resolve', { rawId: '1' })).result, { tab: null });
+});
+test('failed read after acknowledged session normalization retains Unknown without a purpose success echo', async () => {
+  const f = await fixture();
+  const get = f.chrome.tabs.get;
+  let reads = 0;
+  f.chrome.tabs.get = async (id) => {
+    if (++reads > 1) throw Error('actual metadata ACK lost after update');
+    return get(id);
+  };
+  f.chrome.tabs.update = async (id, options) => {
+    f.calls.push(['update', id, options]);
+    f.tabs.get(id).url = options.url;
+    return { id, url: 'chrome://newtab/' };
+  };
+  const response = await f.request(
+    'prepareUserTab',
+    { tabId: 1, sessionOnly: true },
+    'owner-a',
+    sessionContext,
+  );
+  assert.equal(response.error.kind, 'outcome_unknown');
+  assert.equal(response.error.details.tabId, 1);
+  assert.equal('result' in response, false);
+  assert.equal(f.tabs.get(1).url, 'about:blank');
+  assert.deepEqual(
+    f.calls.filter((call) => call[0] === 'update'),
+    [['update', 1, { url: 'about:blank' }]],
+  );
+});
+
+const committedParams = Object.freeze({
+  rawId: '1',
+  sessionOnly: true,
+  committedUrlOnly: true,
+});
+test('committed session URL returns the exact actual string without reading pending URL or full metadata', async () => {
+  const f = await fixture();
+  const reads = [];
+  const url = 'https://ACTUAL.test/path?raw=%2f#fragment';
+  f.chrome.tabs.get = async (id) => {
+    reads.push(id);
+    return {
+      id,
+      url,
+      get pendingUrl() {
+        throw Error('pending navigation is not committed URL data');
+      },
+      get title() {
+        throw Error('committed URL must not expand full tab metadata');
+      },
+      lastAccessed: 1e20,
+    };
+  };
+  const before = f.calls.length;
+  assert.deepEqual(
+    (await f.request('resolve', committedParams, 'owner-a', sessionContext)).result,
+    { url, sessionOnly: true, committedUrlOnly: true },
+  );
+  assert.deepEqual(reads, [1]);
+  assert.equal(f.calls.length, before);
+  assert.equal(f.connector.claims.size, 0);
+  assert.equal(f.connector.records.size, 0);
+  assert.equal(f.connector.creations.size, 0);
+  assert.equal(f.connector.hello().capabilities.sessionCommittedUrl, true);
+});
+test('committed URL data preserves empty and non-site strings without claiming Origin or liveness', async () => {
+  const f = await fixture();
+  for (const url of ['', 'about:blank', 'chrome://newtab/', 'data:text/plain,observed']) {
+    f.chrome.tabs.get = async () => ({ id: 1, url, pendingUrl: 'https://pending.test/' });
+    assert.deepEqual(
+      (await f.request('resolve', committedParams, 'owner-a', sessionContext)).result,
+      { url, sessionOnly: true, committedUrlOnly: true },
+    );
+  }
+  assert.equal(f.connector.claims.size, 0);
+  assert.equal(f.connector.records.size, 0);
+});
+test('missing or malformed committed URL cannot be substituted by an actual pending URL', async () => {
+  const f = await fixture();
+  for (const tab of [
+    { id: 1, pendingUrl: 'https://pending.test/' },
+    { id: 1, url: null, pendingUrl: 'https://pending.test/' },
+    { id: 1, url: 7, pendingUrl: 'https://pending.test/' },
+    { id: 1, url: {}, pendingUrl: 'https://pending.test/' },
+  ]) {
+    f.chrome.tabs.get = async () => tab;
+    const response = await f.request('resolve', committedParams, 'owner-a', sessionContext);
+    assert.equal(response.error.kind, 'target_unavailable');
+    assert.equal('result' in response, false);
+  }
+});
+test('committed URL requires the exact actual Chrome tab identity without metadata conversion', async () => {
+  const f = await fixture();
+  for (const tab of [
+    null,
+    { url: 'https://actual.test/' },
+    { id: 2, url: 'https://actual.test/' },
+    { id: Number.MAX_SAFE_INTEGER + 1, url: 'https://actual.test/' },
+  ]) {
+    f.chrome.tabs.get = async () => tab;
+    const response = await f.request('resolve', committedParams, 'owner-a', sessionContext);
+    assert.equal(response.error.kind, 'target_unavailable');
+    assert.equal('result' in response, false);
+  }
+});
+test('committed session selectors reject malformed or contradictory purposes before Chrome', async () => {
+  const f = await fixture();
+  let reads = 0;
+  f.chrome.tabs.get = async () => {
+    reads++;
+    throw Error('invalid purpose reached Chrome');
+  };
+  for (const invalid of [undefined, null, 'true', 1, 0, {}, []])
+    for (const field of ['sessionOnly', 'committedUrlOnly']) {
+      const response = await f.request(
+        'resolve',
+        { ...committedParams, [field]: invalid },
+        'owner-a',
+        sessionContext,
+      );
+      assert.equal(response.error.kind, 'invalid_request', field);
+      assert.equal('result' in response, false);
+    }
+  for (const params of [
+    { rawId: '1', committedUrlOnly: true },
+    { rawId: '1', sessionOnly: false, committedUrlOnly: true },
+  ]) {
+    const response = await f.request('resolve', params);
+    assert.equal(response.error.kind, 'invalid_request');
+    assert.equal('result' in response, false);
+  }
+  assert.equal(reads, 0);
+});
+test('committed session URL requires captured envelope context and cannot use params context', async () => {
+  const f = await fixture();
+  let reads = 0;
+  f.chrome.tabs.get = async () => {
+    reads++;
+    throw Error('uncaptured scope reached Chrome');
+  };
+  for (const wireContext of [
+    undefined,
+    null,
+    {},
+    { hostSessionId: 'actual-session' },
+    { hostSessionId: ' ', hostTurnId: 'actual-turn' },
+    { hostSessionId: 'actual-session', hostTurnId: '' },
+    { hostSessionId: 'actual-session', hostTurnId: 'x'.repeat(4097) },
+  ]) {
+    const response = await f.request(
+      'resolve',
+      { ...committedParams, wireContext: sessionContext },
+      'owner-a',
+      wireContext,
+    );
+    assert.equal(response.error.kind, 'invalid_request');
+    assert.equal('result' in response, false);
+  }
+  assert.equal(reads, 0);
+});
+test('false or absent committed selector preserves ordinary and session tab result shapes', async () => {
+  const f = await fixture();
+  const ordinary = (await f.request('resolve', { rawId: '1' })).result;
+  assert.deepEqual(
+    (await f.request('resolve', { rawId: '1', committedUrlOnly: false })).result,
+    ordinary,
+  );
+  assert.deepEqual(
+    (await f.request('resolve', { rawId: '1', sessionOnly: false, committedUrlOnly: false }))
+      .result,
+    ordinary,
+  );
+  const session = (
+    await f.request('resolve', { rawId: '1', sessionOnly: true }, 'owner-a', sessionContext)
+  ).result;
+  assert.deepEqual(
+    (
+      await f.request(
+        'resolve',
+        { rawId: '1', sessionOnly: true, committedUrlOnly: false },
+        'owner-a',
+        sessionContext,
+      )
+    ).result,
+    session,
+  );
+  assert.ok(ordinary.tab);
+  assert.ok(session.tab);
+  assert.equal('url' in ordinary, false);
+  assert.equal('committedUrlOnly' in ordinary, false);
+  assert.equal('committedUrlOnly' in session, false);
+});
+test('committed URL observation never normalizes a new-tab page or creates physical custody', async () => {
+  const f = await fixture();
+  f.tabs.get(1).pendingUrl = 'chrome://new-tab-page/';
+  const before = f.calls.length;
+  const response = await f.request('resolve', committedParams, 'owner-a', sessionContext);
+  assert.deepEqual(response.result, {
+    url: 'chrome://newtab/',
+    sessionOnly: true,
+    committedUrlOnly: true,
+  });
+  assert.equal(f.tabs.get(1).url, 'chrome://newtab/');
+  assert.equal(f.calls.length, before);
+  assert.equal(f.connector.claims.size, 0);
+  assert.equal(f.connector.records.size, 0);
+  assert.equal(f.connector.creations.size, 0);
+});
+test('closed native owners and malformed envelope owners cannot read committed URL', async () => {
+  const f = await fixture();
+  await f.request('closeOwner');
+  let reads = 0;
+  f.chrome.tabs.get = async () => {
+    reads++;
+    throw Error('ended or invalid owner reached Chrome');
+  };
+  const ended = await f.request('resolve', committedParams, 'owner-a', sessionContext);
+  assert.equal(ended.error.kind, 'owner_closed');
+  assert.equal('result' in ended, false);
+  const invalid = await f.request('resolve', committedParams, '', sessionContext);
+  assert.equal(invalid.error.kind, 'invalid_request');
+  assert.equal('result' in invalid, false);
+  assert.equal(reads, 0);
+});
+test('actual Chrome read rejection cannot produce committed URL or purpose acknowledgement', async () => {
+  const f = await fixture();
+  const reads = [];
+  f.chrome.tabs.get = async (id) => {
+    reads.push(id);
+    throw Error('actual Chrome tab no longer exists');
+  };
+  const response = await f.request('resolve', committedParams, 'owner-a', sessionContext);
+  assert.equal(response.error.kind, 'chrome_rejected');
+  assert.equal('result' in response, false);
+  assert.deepEqual(reads, [1]);
+  assert.equal(f.connector.claims.size, 0);
+});
+test('owner closure during actual committed URL read retains data as Unknown without a live success', async () => {
+  const f = await fixture();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let reads = 0;
+  f.chrome.tabs.get = async (id) => {
+    reads++;
+    await gate;
+    return { id, url: 'https://observed-before-reply.test/' };
+  };
+  const pending = f.request('resolve', committedParams, 'owner-a', sessionContext);
+  await tick();
+  await f.request('closeOwner');
+  release();
+  const response = await pending;
+  assert.equal(response.error.kind, 'outcome_unknown');
+  assert.equal('result' in response, false);
+  assert.deepEqual(response.error.details.acknowledgedResult, {
+    url: 'https://observed-before-reply.test/',
+    sessionOnly: true,
+    committedUrlOnly: true,
+  });
+  assert.equal(reads, 1);
+  assert.equal(f.connector.claims.size, 0);
+  assert.equal(f.connector.records.size, 0);
 });
