@@ -421,6 +421,7 @@ test('Own metadata supplies lastOpened only from actual positive lastAccessed wi
   assert.equal(capabilities.cursorPresentationOwner, 'host');
   assert.equal(capabilities.cursorHideOwner, 'host');
   assert.equal(capabilities.turnLifecycleOwner, 'host');
+  assert.equal(capabilities.attachmentPreparation, 'metadata_only');
 });
 test('Own metadata does not synthesize lastOpened for missing, zero, negative or nonfinite activity time', async () => {
   const f = await fixture();

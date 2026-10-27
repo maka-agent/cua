@@ -329,9 +329,9 @@ mod tests {
 
     #[test]
     fn the_reply_deadline_outlasts_every_tool_budget() {
-        let mut budgets_ms = vec![crate::tool_schema::TIMEOUT_MS_MAX];
+        let budgets_ms = std::iter::once(crate::tool_schema::TIMEOUT_MS_MAX);
         #[cfg(feature = "script")]
-        budgets_ms.push(crate::script_tool::MAX_TIMEOUT_MS);
+        let budgets_ms = budgets_ms.chain(std::iter::once(crate::script_tool::MAX_TIMEOUT_MS));
         for budget_ms in budgets_ms {
             assert!(
                 REPLY_DEADLINE >= Duration::from_millis(budget_ms) + DAEMON_OVERHEAD_ALLOWANCE,

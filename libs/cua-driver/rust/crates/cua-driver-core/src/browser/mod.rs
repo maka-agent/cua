@@ -39,6 +39,7 @@ mod adapter_support;
 pub mod binding;
 mod broker_delivery;
 pub mod cdp_ws;
+pub use cdp_ws::CdpFailureDisposition;
 pub mod download;
 pub mod engine;
 mod grant;
@@ -116,17 +117,19 @@ pub(crate) fn required_session_schema() -> serde_json::Value {
 pub use local_ipc::{IpcError, NativeEndpointIdentity, ValidatedNativeEndpoint};
 pub use native_provider::{
     discover_installed_native_endpoints, discover_registered, discover_registered_endpoints,
-    discover_registered_for, CleanupEvidence, CleanupProof, NativeBrowserOperation,
-    NativeBrowserProvider, NativeCdpCompletionOutcome, NativeCreatedTab, NativeCreationReceipt,
+    discover_registered_for, CleanupEvidence, CleanupProof, NativeAttachmentPreparation,
+    NativeBrowserOperation, NativeBrowserProvider, NativeCdpCompletionOutcome,
+    NativeClaimPreparationProof, NativeCreatedTab, NativeCreationReceipt,
     NativeCursorPresentationAck, NativeDownloadMetadata, NativeDownloadStatus, NativeEffectOwner,
     NativeEndpointDiscovery, NativeEndpointRejection, NativeGroupColor, NativeGroupPresentation,
     NativeGroupProof, NativeGroupReleaseEvidence, NativeGroupReleaseProof, NativeHeader,
     NativeHeaderPolicyScope, NativeHeaderProof, NativeHeaderScope, NativeHostOperation,
     NativeKnownCustody, NativeManagedGroupReceipt, NativeMetadataError, NativeMutationDiagnostic,
     NativeOperation, NativeOperationCompletion, NativeOperationOutcome, NativePendingOperation,
-    NativePhysicalClaim, NativePreparedTab, NativeProviderCapabilities, NativeProviderError,
-    NativeProviderEvent, NativeRecoveredOperation, NativeSessionHeaderProof, NativeTabInfo,
-    NativeUserTabsOrder,
+    NativePhysicalClaim, NativePopupRequest, NativePreparationDocument,
+    NativePreparationDocumentBinding, NativePreparationPolicy, NativePreparedTab,
+    NativeProviderCapabilities, NativeProviderError, NativeProviderEvent, NativeRecoveredOperation,
+    NativeSessionHeaderProof, NativeTabInfo, NativeUserTabsOrder,
 };
 
 pub use native_provider::NativeTabAbsenceObservation;

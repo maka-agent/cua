@@ -8,10 +8,10 @@
 //! The process ends with this Chrome native port, without starting a daemon.
 
 use super::{
-    broker_delivery::Queued,
-    local_ipc::{self, IpcError, LocalStream, NativeEndpointIdentity, PublishedEndpoint},
+    broker_delivery::{DeliveryError, Queued, IPC_SHUTDOWN_DRAIN_TIMEOUT},
+    local_ipc::{self, IpcError, NativeEndpointIdentity, PublishedEndpoint},
     native_broker::{
-        BrokerCdpEvent, BrokerError, BrokerHandle, ClientConnection, ControlEvent, ControlRequest,
+        BrokerError, BrokerHandle, ClientConnection, ControlEvent, ControlRequest,
         NativeHostBroker, RouteSender,
     },
     native_framing::{self, Direction, FrameError},
@@ -23,23 +23,13 @@ use super::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    io,
-    path::PathBuf,
-    process::ExitCode,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, io, path::PathBuf, process::ExitCode};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
 
 const MAX_CONNECTIONS: usize = 32;
-const MAX_ROUTES_PER_CONNECTION: usize = 64;
 
 pub(crate) const ORIGINAL_HOST_NAME: &str = "com.openai.codexextension";
 
@@ -484,12 +474,28 @@ async fn serve_until(
             Some(_)=clients.join_next(),if !clients.is_empty()=>{}
         }
     };
-    clients.abort_all();
-    while clients.join_next().await.is_some() {}
+    // Stop discovery/admission first. Existing owners retain their ordered
+    // output until the final native generation receipt reaches the socket.
     let cleanup = endpoint.cleanup();
+    if outcome.is_err() {
+        broker.native_eof("local IPC listener ended").await;
+    }
+    drain_connections(&mut clients).await;
     outcome?;
     cleanup?;
     Ok(())
+}
+
+async fn drain_connections(clients: &mut JoinSet<Result<(), ProcessError>>) {
+    if tokio::time::timeout(IPC_SHUTDOWN_DRAIN_TIMEOUT, async {
+        while clients.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        clients.abort_all();
+        while clients.join_next().await.is_some() {}
+    }
 }
 
 #[derive(Deserialize)]
@@ -515,47 +521,23 @@ enum ClientWire {
     },
 }
 
-struct RouteBinding {
-    sender: RouteSender,
-    live: Arc<AtomicBool>,
-}
-
 enum ServerOutbound {
     Plain(Value),
     Control(Queued<ControlEvent>),
-    Cdp {
-        route: u64,
-        claim: String,
-        live: Arc<AtomicBool>,
-        event: Queued<BrokerCdpEvent>,
-    },
+    End,
 }
 
 impl ServerOutbound {
-    fn json(&self) -> Value {
+    fn json(&self) -> Option<Value> {
         match self {
-            Self::Plain(value) => value.clone(),
-            Self::Control(event) => json!({"kind":"controlEvent","event":event}),
-            Self::Cdp {
-                route,
-                claim,
-                live,
-                event,
-            } => {
-                let id = match event.event() {
-                    BrokerCdpEvent::ChromeMessage(value) => value["id"].as_u64(),
-                    BrokerCdpEvent::LocalRejected { id, .. } => Some(*id),
-                    BrokerCdpEvent::TransportFailure(_) => None,
-                };
-                if !live.load(Ordering::SeqCst) {
-                    if let Some(id) = id {
-                        // The same Queued permit remains held by self through the
-                        // final socket write, including this orphan projection.
-                        return json!({"kind":"controlEvent","event":{"kind":"orphanCdpCompletion","data":{"route":route,"claim":claim,"id":id,"event":event}}});
-                    }
+            Self::Plain(value) => Some(value.clone()),
+            Self::Control(event) => Some(match event.event() {
+                ControlEvent::CdpOpened { id, route } => {
+                    json!({"kind":"cdpOpened","id":id,"route":route})
                 }
-                json!({"kind":"cdpEvent","route":route,"event":event})
-            }
+                _ => json!({"kind":"controlEvent","event":event}),
+            }),
+            Self::End => None,
         }
     }
 }
@@ -563,7 +545,6 @@ impl ServerOutbound {
 struct ConnectionTasks {
     writer: JoinHandle<Result<(), IpcError>>,
     control_forward: JoinHandle<()>,
-    forwarders: JoinSet<()>,
     stop: watch::Receiver<bool>,
 }
 
@@ -572,29 +553,38 @@ impl ConnectionTasks {
         &mut self,
         input: &mut R,
     ) -> Result<Option<Value>, ProcessError> {
-        // Keep this exact parser future alive across nonterminal completions.
-        // There is no extra queue of uncharged decoded client payloads.
         let read = local_ipc::read_json(input);
         tokio::pin!(read);
-        loop {
-            tokio::select! {
-                biased;
-                _=wait_stop(&mut self.stop)=>return Ok(None),
-                _=&mut self.control_forward=>return Ok(None),
-                result=&mut self.writer=>return match result { Ok(Ok(()))=>Ok(None),Ok(Err(error))=>Err(error.into()),Err(error)=>Err(ProcessError::Lifecycle(format!("IPC writer ended: {error}"))) },
-                Some(_)=self.forwarders.join_next(),if !self.forwarders.is_empty()=>{},
-                value=&mut read=>return value.map_err(Into::into),
-            }
+        tokio::select! {
+            biased;
+            _=wait_stop(&mut self.stop)=>{
+                // Admission ends at stop; queued native receipts still precede
+                // the writer's End. The server bounds nonreading peers outside.
+                match (&mut self.writer).await {
+                    Ok(Ok(()))=>Ok(None),
+                    Ok(Err(error))=>Err(error.into()),
+                    Err(error)=>Err(ProcessError::Lifecycle(format!("IPC writer ended: {error}"))),
+                }
+            },
+            result=&mut self.writer=>match result {
+                Ok(Ok(()))=>Ok(None),
+                Ok(Err(error))=>Err(error.into()),
+                Err(error)=>Err(ProcessError::Lifecycle(format!("IPC writer ended: {error}"))),
+            },
+            value=&mut read=>value.map_err(Into::into),
         }
     }
 }
 
-async fn serve_connection(
-    stream: LocalStream,
+async fn serve_connection<S>(
+    stream: S,
     connection: ClientConnection,
     broker: BrokerHandle,
     stop: watch::Receiver<bool>,
-) -> Result<(), ProcessError> {
+) -> Result<(), ProcessError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let ClientConnection {
         sender: control,
         events: mut controls,
@@ -604,7 +594,9 @@ async fn serve_connection(
     let writer_progress = broker.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = messages.recv().await {
-            let value = message.json();
+            let Some(value) = message.json() else {
+                return Ok::<(), IpcError>(());
+            };
             local_ipc::write_json(&mut output, &value).await?;
             drop(value);
             drop(message);
@@ -625,15 +617,18 @@ async fn serve_connection(
                 return;
             }
         }
+        // The writer consumes this only after every prior FIFO item reached
+        // the socket. Control EOF must not abort its final generation receipt.
+        let _ = control_output.send(ServerOutbound::End).await;
     });
-    let mut routes: HashMap<u64, RouteBinding> = HashMap::new();
+    let mut routes: HashMap<u64, RouteSender> = HashMap::new();
     let mut tasks = ConnectionTasks {
         writer,
         control_forward,
-        forwarders: JoinSet::new(),
         stop,
     };
     let mut open_high_water = 0_u64;
+    let mut drain_before_owner_close = false;
     let result = loop {
         let value = match tasks.next_frame(&mut input).await {
             Ok(Some(value)) => value,
@@ -650,6 +645,10 @@ async fn serve_connection(
                 wire_context,
             } => {
                 if let Err(error) = control.control_with_context(request, wire_context).await {
+                    drain_before_owner_close = matches!(
+                        &error,
+                        BrokerError::Closed | BrokerError::Delivery(DeliveryError::Closed(_))
+                    );
                     break Err(error.into());
                 }
             }
@@ -659,25 +658,29 @@ async fn serve_connection(
                     continue;
                 }
                 open_high_water = id;
-                if routes.len() >= MAX_ROUTES_PER_CONNECTION {
-                    let _=send.send(ServerOutbound::Plain(json!({"kind":"cdpOpenRejected","id":id,"code":"route_budget","message":"IPC route budget exhausted"}))).await;
-                    continue;
-                }
-                match control.open_cdp_route(&claim).await {
-                            Ok(route)=>{
-                                let id_route=route.sender.wire_id();
-                                if send.send(ServerOutbound::Plain(json!({"kind":"cdpOpened","id":id,"route":id_route}))).await.is_err() { break Ok(()); }
-                                // Open acknowledgement precedes buffered events, so
-                                // the runtime has installed this route when events arrive.
-                                let route_output=send.clone(); let mut events=route.events;
-                                let route_progress=broker.clone();
-                                let live=Arc::new(AtomicBool::new(true)); let delivery_live=live.clone();
-                                tasks.forwarders.spawn(async move { while let Some(event)=events.recv().await { route_progress.delivery_progress(); if route_output.send(ServerOutbound::Cdp{route:id_route,claim:claim.clone(),live:delivery_live.clone(),event}).await.is_err() { return; } } });
-                                routes.insert(id_route,RouteBinding{sender:route.sender,live});
-                            }
-                            Err(error)=>{ if send.send(ServerOutbound::Plain(json!({"kind":"cdpOpenRejected","id":id,"code":"claim_unavailable","message":error.to_string()}))).await.is_err() { break Ok(()); } }
+                match control.open_cdp_route_ordered(&claim, id).await {
+                    Ok(route) => {
+                        let id_route = route.sender.wire_id();
+                        // The broker puts the open acknowledgement before all
+                        // buffered CDP data on the same owner output FIFO.
+                        drop(route.events);
+                        routes.insert(id_route, route.sender);
+                    }
+                    Err(error) => {
+                        if matches!(
+                            &error,
+                            BrokerError::Closed | BrokerError::Delivery(DeliveryError::Closed(_))
+                        ) {
+                            drain_before_owner_close = true;
+                            break Err(error.into());
                         }
+                        if send.send(ServerOutbound::Plain(json!({"kind":"cdpOpenRejected","id":id,"code":"claim_unavailable","message":error.to_string()}))).await.is_err() {
+                            break Ok(());
+                        }
+                    }
+                }
             }
+
             ClientWire::Cdp {
                 route,
                 message,
@@ -688,28 +691,29 @@ async fn serve_connection(
                         "CDP input names an unavailable local route".to_owned(),
                     ));
                 };
-                if let Err(error) = binding
-                    .sender
-                    .send_json_with_context(message, wire_context)
-                    .await
-                {
+                if let Err(error) = binding.send_json_with_context(message, wire_context).await {
+                    drain_before_owner_close = matches!(
+                        &error,
+                        BrokerError::Closed | BrokerError::Delivery(DeliveryError::Closed(_))
+                    );
                     break Err(error.into());
                 }
             }
             ClientWire::CloseCdp { route } => {
                 if let Some(binding) = routes.remove(&route) {
-                    binding.live.store(false, Ordering::SeqCst);
-                    binding.sender.close().await;
+                    binding.close().await;
                 }
             }
         }
     };
-    // Local EOF ends this owner, not the shared native host or another owner.
-    control.close().await;
-    for (_, binding) in routes {
-        binding.live.store(false, Ordering::SeqCst);
+    // Valid input may meet native EOF with final owner receipts still queued.
+    // ClientClosed and route-drop must follow that drain; local socket EOF and
+    // malformed input still close the owner promptly.
+    if drain_before_owner_close && !tasks.writer.is_finished() {
+        let _ = tokio::time::timeout(IPC_SHUTDOWN_DRAIN_TIMEOUT, &mut tasks.writer).await;
     }
-    tasks.forwarders.abort_all();
+    control.close().await;
+    drop(routes);
     tasks.control_forward.abort();
     tasks.writer.abort();
     result
@@ -717,6 +721,7 @@ async fn serve_connection(
 
 #[cfg(test)]
 mod tests {
+    use super::super::native_broker::BrokerCdpEvent;
     use super::*;
 
     #[test]
@@ -786,96 +791,360 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_receipt_keeps_budget_through_orphan_projection() {
+    async fn ipc_routes_preserve_more_than_sixty_four_active_claims() {
+        use super::super::native_broker::{CheckedLocalPeer, LocalPrincipal, NativeOutbound};
+        use std::{future::Future, io::Cursor, time::Duration};
+
+        async fn bounded<T>(future: impl Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(1), future)
+                .await
+                .expect("hermetic process channel operation must complete")
+        }
+
+        async fn native_frame(
+            frames: &mut mpsc::Receiver<NativeOutbound>,
+            broker: &BrokerHandle,
+        ) -> Value {
+            let frame = bounded(frames.recv()).await.expect("actual native request");
+            let mut bytes = Vec::new();
+            if let Some(report) = frame.write_to(&mut bytes).unwrap() {
+                broker.write_report(report).await;
+            }
+            let mut input = Cursor::new(bytes);
+            let body = native_framing::read_frame(&mut input, Direction::HostToChrome)
+                .unwrap()
+                .expect("one written native request");
+            assert!(
+                native_framing::read_frame(&mut input, Direction::HostToChrome)
+                    .unwrap()
+                    .is_none()
+            );
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        async fn local_frame(stream: &mut tokio::io::DuplexStream) -> Value {
+            bounded(local_ipc::read_json(stream))
+                .await
+                .unwrap()
+                .expect("actual local server response")
+        }
+
+        let origin = ExtensionOrigin::from_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let principal = LocalPrincipal::UnixUid(123);
+        let (broker, actor, mut native) = NativeHostBroker::channels(origin, principal.clone());
+        let generation = actor.generation().to_owned();
+        let actor = tokio::spawn(actor.run());
+        broker.native_message(json!({"kind":"hello","protocol":1,"extensionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instanceId":"process-route-fixture","capabilities":{"metadata":true,"rawTabCdp":true,"nativeWindowProof":false}})).await.unwrap();
+        assert_eq!(native_frame(&mut native, &broker).await["kind"], "bound");
+        let client = broker
+            .admit_peer(CheckedLocalPeer::from_checked_principal(principal))
+            .await
+            .unwrap();
+        let (mut wire, stream) = tokio::io::duplex(4096);
+        let (_stop_send, stop) = watch::channel(false);
+        let server = tokio::spawn(serve_connection(stream, client, broker.clone(), stop));
+        let mut routes = Vec::new();
+        // Each claim comes from the real attach/reply path. Keep every route
+        // open while exercising the next one, including the 65th.
+        for id in 1..=65_u64 {
+            local_ipc::write_json(
+                &mut wire,
+                &json!({"kind":"control","request":{"method":"attach","id":id,"tabId":id}}),
+            )
+            .await
+            .unwrap();
+            let attach = native_frame(&mut native, &broker).await;
+            assert_eq!(attach["method"], "attach");
+            assert_eq!(attach["params"]["tabId"], id);
+            let claim = format!("process-claim-{id}");
+            broker.native_message(json!({"kind":"response","protocol":1,"generation":generation,"id":attach["id"],"result":{"claim":claim,"tabId":id,"targetId":format!("opaque-target-{id}")}})).await.unwrap();
+            let attached = local_frame(&mut wire).await;
+            assert_eq!(attached["kind"], "controlEvent");
+            assert_eq!(attached["event"]["kind"], "reply");
+            assert_eq!(attached["event"]["data"]["id"], id);
+            assert_eq!(attached["event"]["data"]["outcome"]["kind"], "result");
+            assert_eq!(attached["event"]["data"]["outcome"]["data"]["claim"], claim);
+            local_ipc::write_json(&mut wire, &json!({"kind":"openCdp","id":id,"claim":claim}))
+                .await
+                .unwrap();
+            let opened = local_frame(&mut wire).await;
+            assert_eq!(opened["kind"], "cdpOpened", "open attempt {id}: {opened}");
+            assert_eq!(opened["id"], id);
+            let route = opened["route"].as_u64().expect("issued route identity");
+            assert!(routes.iter().all(|(existing, _)| *existing != route));
+            routes.push((route, claim));
+        }
+        // Reusing the same inner CDP id on every still-open route must retain
+        // its exact physical claim and recipient, including the first and last.
+        for (route, claim) in &routes {
+            local_ipc::write_json(
+                &mut wire,
+                &json!({"kind":"cdp","route":route,"message":{"id":1,"method":"Runtime.evaluate","params":{"expression":"1"}}}),
+            )
+            .await
+            .unwrap();
+            let command = native_frame(&mut native, &broker).await;
+            assert_eq!(command["method"], "cdp");
+            assert_eq!(command["params"]["claim"], *claim);
+            assert_eq!(command["params"]["method"], "Runtime.evaluate");
+            broker.native_message(json!({"kind":"response","protocol":1,"generation":generation,"id":command["id"],"result":{"result":{"recipient":claim}}})).await.unwrap();
+            let response = local_frame(&mut wire).await;
+            assert_eq!(response["kind"], "controlEvent");
+            assert_eq!(response["event"]["kind"], "cdpMessage");
+            let delivered = &response["event"]["data"];
+            assert_eq!(delivered["route"], *route);
+            assert_eq!(delivered["claim"], *claim);
+            assert_eq!(delivered["event"]["kind"], "chromeMessage");
+            assert_eq!(delivered["event"]["data"]["id"], 1);
+            assert_eq!(delivered["event"]["data"]["result"]["recipient"], *claim);
+        }
+        let (retired_route, retired_claim) = &routes[0];
+        local_ipc::write_json(
+            &mut wire,
+            &json!({"kind":"cdp","route":retired_route,"message":{"id":2,"method":"Runtime.evaluate","params":{"expression":"2"}}}),
+        ).await.unwrap();
+        let last_command = native_frame(&mut native, &broker).await;
+        broker.native_message(json!({"kind":"event","protocol":1,"generation":generation,"owner":last_command["owner"],"claim":retired_claim,"method":"Runtime.consoleAPICalled","params":{"fixture":"before-close"}})).await.unwrap();
+        broker.native_message(json!({"kind":"response","protocol":1,"generation":generation,"id":last_command["id"],"result":{"result":{"beforeClose":true}}})).await.unwrap();
+        local_ipc::write_json(
+            &mut wire,
+            &json!({"kind":"control","request":{"method":"detach","id":1000,"claim":retired_claim}}),
+        ).await.unwrap();
+        let detach = native_frame(&mut native, &broker).await;
+        assert_eq!(detach["method"], "detach");
+        broker.native_message(json!({"kind":"response","protocol":1,"generation":generation,"id":detach["id"],"result":{"detached":true,"proof":"detach_ack"}})).await.unwrap();
+        // No local output has been consumed since the real event and reply.
+        // Both must precede route closure even if the socket writer is delayed.
+        let event = local_frame(&mut wire).await;
+        assert_eq!(event["event"]["kind"], "cdpMessage");
+        assert_eq!(
+            event["event"]["data"]["event"]["data"]["method"],
+            "Runtime.consoleAPICalled"
+        );
+        let reply = local_frame(&mut wire).await;
+        assert_eq!(reply["event"]["kind"], "cdpMessage");
+        assert_eq!(reply["event"]["data"]["event"]["data"]["id"], 2);
+        assert_eq!(
+            reply["event"]["data"]["event"]["data"]["result"]["beforeClose"],
+            true
+        );
+        let ended = local_frame(&mut wire).await;
+        assert_eq!(ended["event"]["kind"], "cdpRouteClosed");
+        assert_eq!(ended["event"]["data"]["route"], *retired_route);
+        let cleanup = local_frame(&mut wire).await;
+        assert_eq!(cleanup["event"]["kind"], "reply");
+        assert_eq!(cleanup["event"]["data"]["id"], 1000);
+        assert_eq!(cleanup["event"]["data"]["outcome"]["kind"], "result");
+        // A request racing client-side route retirement is known unsent and
+        // follows the same broker FIFO; it cannot close other owner routes.
+        local_ipc::write_json(
+            &mut wire,
+            &json!({"kind":"cdp","route":retired_route,"message":{"id":3,"method":"Runtime.evaluate","params":{"expression":"3"}}}),
+        ).await.unwrap();
+        let refused = local_frame(&mut wire).await;
+        assert_eq!(refused["event"]["kind"], "cdpMessage");
+        assert_eq!(refused["event"]["data"]["route"], *retired_route);
+        assert_eq!(refused["event"]["data"]["event"]["kind"], "localRejected");
+        assert_eq!(refused["event"]["data"]["event"]["data"]["id"], 3);
+        assert_eq!(
+            refused["event"]["data"]["event"]["data"]["code"],
+            "not_dispatched"
+        );
+        assert!(matches!(
+            native.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let (live_route, live_claim) = routes.last().unwrap();
+        local_ipc::write_json(
+            &mut wire,
+            &json!({"kind":"cdp","route":live_route,"message":{"id":2,"method":"Runtime.evaluate","params":{"expression":"2"}}}),
+        ).await.unwrap();
+        let live_command = native_frame(&mut native, &broker).await;
+        assert_eq!(live_command["params"]["claim"], *live_claim);
+        broker.native_message(json!({"kind":"response","protocol":1,"generation":generation,"id":live_command["id"],"result":{"result":{"ownerStillLive":true}}})).await.unwrap();
+        let live = local_frame(&mut wire).await;
+        assert_eq!(live["event"]["data"]["route"], *live_route);
+        assert_eq!(
+            live["event"]["data"]["event"]["data"]["result"]["ownerStillLive"],
+            true
+        );
+        local_ipc::write_json(
+            &mut wire,
+            &json!({"kind":"openCdp","id":66,"claim":"foreign-unissued-claim"}),
+        )
+        .await
+        .unwrap();
+        let refused = local_frame(&mut wire).await;
+        assert_eq!(refused["kind"], "cdpOpenRejected");
+        assert_eq!(refused["code"], "claim_unavailable");
+        drop(wire);
+        bounded(server).await.unwrap().unwrap();
+        broker.native_eof("process route fixture ended").await;
+        bounded(actor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_cdp_receipt_keeps_budget_through_owner_fifo_projection() {
         let budget = super::super::broker_delivery::ByteBudget::new();
         let initial = budget.available_bytes();
-        let event = BrokerCdpEvent::ChromeMessage(json!({"id":3,"result":{"text":"receipt"}}));
-        let charge = budget.charge(&event).await.unwrap();
-        let message = ServerOutbound::Cdp {
+        let event = ControlEvent::CdpMessage {
             route: 9,
             claim: "actual-issued-token-fixture".to_owned(),
-            live: Arc::new(AtomicBool::new(false)),
-            event: Queued::new(event, Some(charge)),
+            event: BrokerCdpEvent::ChromeMessage(json!({"id":3,"result":{"text":"receipt"}})),
+            wire_context: None,
         };
-        let value = message.json();
-        assert_eq!(value["event"]["kind"], "orphanCdpCompletion");
+        let charge = budget.charge(&event).await.unwrap();
+        let message = ServerOutbound::Control(Queued::new(event, Some(charge)));
+        let value = message.json().unwrap();
+        assert_eq!(value["event"]["kind"], "cdpMessage");
         assert_eq!(value["event"]["data"]["route"], 9);
-        assert_eq!(value["event"]["data"]["id"], 3);
+        assert_eq!(value["event"]["data"]["event"]["data"]["id"], 3);
         assert!(
             budget.available_bytes() < initial,
-            "serializing must not release queued byte ownership"
+            "serialization must retain queued byte ownership"
         );
         drop(value);
         drop(message);
         assert_eq!(budget.available_bytes(), initial);
     }
 
-    #[tokio::test]
-    async fn partial_frame_survives_nonterminal_forwarder_completion() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_eof_flushes_final_receipt_with_stop_and_inflight_valid_input() {
+        use super::super::native_broker::{CheckedLocalPeer, LocalPrincipal};
         use std::{
             pin::Pin,
             task::{Context, Poll},
+            time::Duration,
         };
-        use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
-        let (mut wire, input) = tokio::io::duplex(128);
-        struct PrefixProbe {
-            input: tokio::io::DuplexStream,
-            seen: usize,
-            notify: Option<oneshot::Sender<()>>,
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct SignalAfterFrameRead<R> {
+            inner: R,
+            remaining: usize,
+            consumed: Option<oneshot::Sender<()>>,
         }
-        impl AsyncRead for PrefixProbe {
+        impl<R: AsyncRead + Unpin> AsyncRead for SignalAfterFrameRead<R> {
             fn poll_read(
                 self: Pin<&mut Self>,
-                context: &mut Context<'_>,
+                cx: &mut Context<'_>,
                 buffer: &mut ReadBuf<'_>,
             ) -> Poll<io::Result<()>> {
                 let this = self.get_mut();
                 let before = buffer.filled().len();
-                let result = Pin::new(&mut this.input).poll_read(context, buffer);
-                if matches!(result, Poll::Ready(Ok(()))) {
-                    this.seen += buffer.filled().len() - before;
-                    if this.seen >= 2 {
-                        if let Some(notify) = this.notify.take() {
-                            let _ = notify.send(());
+                let result = Pin::new(&mut this.inner).poll_read(cx, buffer);
+                if let Poll::Ready(Ok(())) = &result {
+                    let received = buffer.filled().len() - before;
+                    if this.remaining > 0 {
+                        assert!(received <= this.remaining, "read crossed the fixture frame");
+                        this.remaining -= received;
+                        if this.remaining == 0 {
+                            let _ = this.consumed.take().unwrap().send(());
                         }
                     }
                 }
                 result
             }
         }
-        let (prefix_send, prefix_seen) = oneshot::channel();
-        let (forward_send, forward_done) = oneshot::channel();
-        let mut input = PrefixProbe {
-            input,
-            seen: 0,
-            notify: Some(prefix_send),
-        };
-        let (_stop_send, stop) = watch::channel(false);
-        let mut tasks = ConnectionTasks {
-            writer: tokio::spawn(std::future::pending::<Result<(), IpcError>>()),
-            control_forward: tokio::spawn(std::future::pending::<()>()),
-            forwarders: JoinSet::new(),
-            stop,
-        };
-        tasks.forwarders.spawn(async move {
-            let _ = prefix_seen.await;
-            let _ = forward_send.send(());
-        });
-        let task = tokio::spawn(async move {
-            let frame = tasks.next_frame(&mut input).await;
-            tasks.writer.abort();
-            tasks.control_forward.abort();
-            frame
-        });
-        let payload = br#"{"kind":"control","request":{"method":"inventory","id":7}}"#;
-        let header = (payload.len() as u32).to_ne_bytes();
-        wire.write_all(&header[..2]).await.unwrap();
-        forward_done.await.unwrap();
-        wire.write_all(&header[2..]).await.unwrap();
-        wire.write_all(payload).await.unwrap();
-        let frame = task.await.unwrap().unwrap().unwrap();
-        assert_eq!(frame["request"]["id"], 7);
-        assert_eq!(frame["request"]["method"], "inventory");
+        for in_flight_input in [false, true] {
+            let origin = ExtensionOrigin::from_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+            let principal = LocalPrincipal::UnixUid(123);
+            let (broker, actor, _native) = NativeHostBroker::channels(origin, principal.clone());
+            let actor = tokio::spawn(actor.run());
+            broker.native_message(json!({"kind":"hello","protocol":1,"extensionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instanceId":"eof-fixture","capabilities":{"metadata":true,"rawTabCdp":true,"nativeWindowProof":false}})).await.unwrap();
+            let client = broker
+                .admit_peer(CheckedLocalPeer::from_checked_principal(principal))
+                .await
+                .unwrap();
+            // Smaller than the final frame: writer blocks until our read.
+            let (mut wire, stream) = tokio::io::duplex(64);
+            let request = json!({"kind":"control",
+                "request":{"method":"inventory","id":7},
+                "wireContext":{"hostSessionId":"550e8400-e29b-41d4-a716-446655440000",
+                    "hostTurnId":"inflight-native-eof-".repeat(32)}});
+            let frame_bytes = std::mem::size_of::<u32>()
+                + native_framing::encode_json(&request, Direction::ChromeToHost)
+                    .unwrap()
+                    .len();
+            let (consumed, request_consumed) = oneshot::channel();
+            let (read, write) = tokio::io::split(stream);
+            let stream = tokio::io::join(
+                SignalAfterFrameRead {
+                    inner: read,
+                    remaining: frame_bytes,
+                    consumed: Some(consumed),
+                },
+                write,
+            );
+            let (stop_send, stop) = watch::channel(false);
+            let (finished, observed) = oneshot::channel();
+            let mut clients = JoinSet::new();
+            let server_broker = broker.clone();
+            clients.spawn(async move {
+                let result = serve_connection(stream, client, server_broker, stop).await;
+                let known_closed = matches!(
+                    &result,
+                    Err(ProcessError::Broker(BrokerError::Closed))
+                        | Err(ProcessError::Broker(BrokerError::Delivery(
+                            DeliveryError::Closed(_)
+                        )))
+                );
+                let _ = finished.send(known_closed);
+                result
+            });
+            broker.native_eof("actual native EOF fixture").await;
+            assert!(
+                broker.identity().await.is_err(),
+                "generation closure barrier"
+            );
+            if in_flight_input {
+                local_ipc::write_json(&mut wire, &request).await.unwrap();
+                // A completed write may leave the final bytes in the duplex
+                // buffer. Wait for the server's actual final body read. On
+                // this current-thread runtime, parsing and the already-Closed
+                // sender check then finish in that same poll before we can stop.
+                tokio::time::timeout(Duration::from_secs(1), request_consumed)
+                    .await
+                    .unwrap()
+                    .expect("server consumed the complete valid request frame");
+            }
+            stop_send.send_replace(true);
+            let draining = tokio::spawn(async move { drain_connections(&mut clients).await });
+            let frame =
+                tokio::time::timeout(Duration::from_secs(1), local_ipc::read_json(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(frame["kind"], "controlEvent");
+            assert_eq!(frame["event"]["kind"], "generationClosed");
+            assert_eq!(
+                frame["event"]["data"]["reason"],
+                "actual native EOF fixture"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), local_ipc::read_json(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+            tokio::time::timeout(Duration::from_secs(1), draining)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), observed)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                in_flight_input,
+                "exercise handler-error separately from supervisor-stop branch"
+            );
+            tokio::time::timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]

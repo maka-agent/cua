@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Explicit Own v3 extension source embedded in the own CLI build.
+//! Own extension source embedded in the own CLI build.
 
 pub(super) const EXTENSION_ASSETS: &[(&str, &str)] = &[
     (
@@ -7,6 +7,10 @@ pub(super) const EXTENSION_ASSETS: &[(&str, &str)] = &[
         include_str!("native_assets/background.mjs"),
     ),
     ("chunking.mjs", include_str!("native_assets/chunking.mjs")),
+    (
+        "claim-preparation.mjs",
+        include_str!("native_assets/claim-preparation.mjs"),
+    ),
     ("connector.mjs", include_str!("native_assets/connector.mjs")),
     (
         "created-tab-presentation.mjs",
@@ -16,6 +20,10 @@ pub(super) const EXTENSION_ASSETS: &[(&str, &str)] = &[
     (
         "native-downloads.mjs",
         include_str!("native_assets/native-downloads.mjs"),
+    ),
+    (
+        "page-preparation.mjs",
+        include_str!("native_assets/page-preparation.mjs"),
     ),
     (
         "prepared-connector.mjs",

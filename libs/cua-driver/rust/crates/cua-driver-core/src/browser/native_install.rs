@@ -194,6 +194,7 @@ fn refuse_alternate_presence(slots: &[AlternateRegistration]) -> Result<(), Inst
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn system_manifest(platform: Platform, namespace: &str) -> Option<PathBuf> {
     match platform {
         Platform::Linux => Some(
@@ -550,7 +551,7 @@ mod registry {
             return Ok(None);
         }
         status(error)?;
-        if kind != 1 || bytes < 2 || bytes > 65536 || bytes % 2 != 0 {
+        if kind != 1 || !(2..=65536).contains(&bytes) || bytes % 2 != 0 {
             return Err(InstallError::Refused(
                 "native host registry value is not bounded REG_SZ".to_owned(),
             ));

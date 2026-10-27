@@ -7,8 +7,13 @@
 //! owner. The native writer is serial. It consumes each outbound exactly once.
 //! No CDP demultiplexer, desktop runtime, selector or input implementation lives here.
 
-use super::broker_delivery::{ByteBudget, ByteCharge, DeliveryError, Queued};
-use super::native_wire::{NativeReplyProvenance, NativeWireContext};
+use super::broker_delivery::{
+    ByteBudget, ByteCharge, DeliveryError, Queued, IPC_SHUTDOWN_DRAIN_TIMEOUT,
+};
+use super::native_wire::{
+    NativeCdpWritePhase, NativePreparationDocument, NativePreparationPolicy, NativeReplyProvenance,
+    NativeWireContext,
+};
 use super::{
     native_framing::{self, Direction, FrameError},
     native_host::ExtensionOrigin,
@@ -28,9 +33,8 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_CLIENTS: usize = 32;
 const MAX_NORMAL_PENDING: usize = 64;
-const MAX_CLEANUP_PENDING: usize = MAX_CLIENTS * (MAX_CLAIMS_PER_CLIENT + 1);
-const MAX_CLAIMS_PER_CLIENT: usize = 64;
-const MAX_ROUTES: usize = 256;
+// Cleanup headroom bounds concurrent pending work, never total claim lifetime.
+const MAX_CLEANUP_PENDING: usize = MAX_CLIENTS * (MAX_NORMAL_PENDING + 1);
 const EVENT_CAPACITY: usize = 64;
 const MAX_BUFFERED_EVENTS: usize = 64;
 const MAX_BUFFERED_EVENT_BYTES: usize = 1024 * 1024;
@@ -87,7 +91,7 @@ pub(crate) enum BrokerError {
     ClientBudget,
     #[error("native claim is unavailable or already has a CDP route")]
     ClaimUnavailable,
-    #[error("native broker route budget exhausted")]
+    #[error("native broker route identity exhausted or event backlog unavailable")]
     RouteBudget,
     #[error("native protocol failed: {0}")]
     Protocol(String),
@@ -127,6 +131,22 @@ pub(crate) enum ControlRequest {
         id: u64,
         claim: String,
     },
+    RetireClaim {
+        id: u64,
+        claim: String,
+        #[serde(rename = "cleanupId")]
+        cleanup_id: u64,
+    },
+    PrepareClaim {
+        id: u64,
+        claim: String,
+        document: NativePreparationDocument,
+        policy: NativePreparationPolicy,
+    },
+    CreatePopupTab {
+        id: u64,
+        claim: String,
+    },
     CreateTab {
         id: u64,
         #[serde(rename = "windowId")]
@@ -140,6 +160,8 @@ pub(crate) enum ControlRequest {
     StopCreatedTab {
         id: u64,
         creation: String,
+        #[serde(rename = "tabId", default, skip_serializing_if = "Option::is_none")]
+        tab_id: Option<u64>,
     },
     SetScopedHeaders {
         id: u64,
@@ -229,15 +251,16 @@ impl ControlRequest {
             self,
             Self::Detach { .. }
                 | Self::FenceCdp { .. }
+                | Self::RetireClaim { .. }
                 | Self::StopCreatedTab { .. }
                 | Self::FinishTurn { .. }
         )
     }
     fn bounded_cleanup(&self) -> bool {
         match self {
-            Self::Detach { claim, .. } | Self::FenceCdp { claim, .. } => {
-                !claim.is_empty() && claim.len() <= 128
-            }
+            Self::Detach { claim, .. }
+            | Self::FenceCdp { claim, .. }
+            | Self::RetireClaim { claim, .. } => !claim.is_empty() && claim.len() <= 128,
             Self::StopCreatedTab { creation, .. } => !creation.is_empty() && creation.len() <= 128,
             Self::FinishTurn { keep, .. } => keep.as_ref().is_none_or(|items| {
                 items.len() <= 1000
@@ -255,7 +278,10 @@ impl ControlRequest {
             | Self::Attach { id, .. }
             | Self::Detach { id, .. }
             | Self::FenceCdp { id, .. }
+            | Self::RetireClaim { id, .. }
             | Self::CreateTab { id, .. }
+            | Self::PrepareClaim { id, .. }
+            | Self::CreatePopupTab { id, .. }
             | Self::CloseTab { id, .. }
             | Self::StopCreatedTab { id, .. }
             | Self::SetScopedHeaders { id, .. }
@@ -311,6 +337,42 @@ pub(crate) enum ControlEvent {
     ClaimCdpProgress {
         claim: String,
     },
+    CdpUnconfirmed {
+        claim: String,
+        route: u64,
+        id: u64,
+        #[serde(rename = "writePhase")]
+        write_phase: NativeCdpWritePhase,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<BrokerCdpEvent>,
+        #[serde(
+            rename = "wireContext",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        wire_context: Option<NativeWireContext>,
+    },
+    CdpOpened {
+        id: u64,
+        route: u64,
+    },
+    CdpMessage {
+        route: u64,
+        claim: String,
+        event: BrokerCdpEvent,
+        #[serde(
+            rename = "wireContext",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        wire_context: Option<NativeWireContext>,
+    },
+    CdpRouteClosed {
+        route: u64,
+        claim: String,
+        reason: String,
+    },
     GenerationClosed {
         reason: String,
     },
@@ -326,12 +388,32 @@ pub(crate) enum ControlEvent {
         )]
         wire_context: Option<NativeWireContext>,
     },
+    PopupRequested {
+        claim: String,
+        #[serde(rename = "tabId")]
+        tab_id: u64,
+        url: String,
+        #[serde(rename = "wireContext")]
+        wire_context: NativeWireContext,
+        #[serde(rename = "frameId", skip_serializing_if = "Option::is_none")]
+        frame_id: Option<i64>,
+        #[serde(rename = "documentId", skip_serializing_if = "Option::is_none")]
+        document_id: Option<String>,
+        #[serde(rename = "sourceUrl", skip_serializing_if = "Option::is_none")]
+        source_url: Option<String>,
+    },
     EffectsCleanup {
         claim: String,
         effect: String,
         #[serde(rename = "cleanupConfirmed")]
         cleanup_confirmed: bool,
         error: Option<String>,
+        #[serde(
+            rename = "wireContext",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        wire_context: Option<NativeWireContext>,
     },
     TabStateChanged {
         claim: String,
@@ -525,7 +607,28 @@ impl ClientSender {
             .map_err(|_| BrokerError::Closed)
     }
 
-    pub(crate) async fn open_cdp_route(&self, claim: &str) -> Result<CdpRoute, BrokerError> {
+    pub(crate) async fn open_cdp_route_ordered(
+        &self,
+        claim: &str,
+        open_local_id: u64,
+    ) -> Result<CdpRoute, BrokerError> {
+        if open_local_id == 0 {
+            return Err(BrokerError::ClaimUnavailable);
+        }
+        self.open_cdp_route_with_delivery(
+            claim,
+            RouteDelivery::Ordered {
+                open_id: open_local_id,
+            },
+        )
+        .await
+    }
+
+    async fn open_cdp_route_with_delivery(
+        &self,
+        claim: &str,
+        delivery: RouteDelivery,
+    ) -> Result<CdpRoute, BrokerError> {
         if claim.is_empty() || claim.len() > 128 {
             return Err(BrokerError::ClaimUnavailable);
         }
@@ -538,6 +641,7 @@ impl ClientSender {
             .send(Input::BindRoute {
                 client: self.lease.id,
                 claim: claim.to_owned(),
+                delivery,
                 reply,
             })
             .await
@@ -559,6 +663,7 @@ impl ClientSender {
 struct RouteLease {
     id: RouteId,
     client: ClientId,
+    claim: String,
     alive: Arc<AtomicBool>,
     client_alive: Arc<AtomicBool>,
     input: mpsc::Sender<Input>,
@@ -591,9 +696,7 @@ impl RouteSender {
         message: Value,
         wire_context: Option<NativeWireContext>,
     ) -> Result<(), BrokerError> {
-        if !self.lease.alive.load(Ordering::SeqCst)
-            || !self.lease.client_alive.load(Ordering::SeqCst)
-        {
+        if !self.lease.client_alive.load(Ordering::SeqCst) {
             return Err(BrokerError::Closed);
         }
         self.lease
@@ -601,6 +704,7 @@ impl RouteSender {
             .send(Input::Cdp {
                 client: self.lease.client,
                 route: self.lease.id,
+                claim: self.lease.claim.clone(),
                 charge: self.lease.budget.charge(&message).await?,
                 wire_context,
                 message,
@@ -628,6 +732,7 @@ enum Input {
     BindRoute {
         client: ClientId,
         claim: String,
+        delivery: RouteDelivery,
         reply: oneshot::Sender<Result<CdpRoute, BrokerError>>,
     },
     Control {
@@ -639,6 +744,7 @@ enum Input {
     Cdp {
         client: ClientId,
         route: RouteId,
+        claim: String,
         message: Value,
         charge: Arc<ByteCharge>,
         wire_context: Option<NativeWireContext>,
@@ -680,6 +786,7 @@ enum Delivery {
         sender: mpsc::Sender<Queued<ControlEvent>>,
         event: Queued<ControlEvent>,
     },
+    #[cfg(test)]
     Cdp {
         route: RouteId,
         client: ClientId,
@@ -717,11 +824,24 @@ struct ClaimState {
     cleanup_only: bool,
     // Only an observer of this existing claim's drain; not cleanup authority.
     cdp_fenced: bool,
+    // Exact known physical cleanup receipt, retained until Host folding retires it.
+    cleanup_id: Option<u64>,
 }
+#[derive(Clone, Copy)]
+enum RouteDelivery {
+    Ordered {
+        open_id: u64,
+    },
+    #[cfg(test)]
+    Direct,
+}
+
 struct RouteState {
     client: ClientId,
     claim: String,
     alive: Arc<AtomicBool>,
+    delivery: RouteDelivery,
+    #[cfg(test)]
     events: mpsc::Sender<Queued<BrokerCdpEvent>>,
     high_water: u64,
 }
@@ -731,7 +851,8 @@ enum ControlKind {
     Resolve,
     Attach(u64),
     Detach(String),
-    StopCreated,
+    Close(String),
+    StopCreated(Option<u64>),
     Other,
 }
 enum PendingKind {
@@ -749,6 +870,16 @@ enum PendingKind {
     },
     CloseOwner,
 }
+// Transient view into the existing Pending association, never stored.
+struct UnconfirmedCdp<'a> {
+    client: ClientId,
+    route: RouteId,
+    claim: &'a str,
+    id: u64,
+    dispatch: &'a AtomicU8,
+    wire_context: Option<&'a NativeWireContext>,
+}
+
 struct Pending {
     client: ClientId,
     kind: PendingKind,
@@ -782,7 +913,7 @@ pub(crate) struct NativeHostBroker {
     deliveries: VecDeque<Delivery>,
     input: mpsc::Receiver<Input>,
     input_sender: mpsc::Sender<Input>,
-    native_output: mpsc::Sender<NativeOutbound>,
+    native_output: Option<mpsc::Sender<NativeOutbound>>,
 }
 
 impl NativeHostBroker {
@@ -819,7 +950,7 @@ impl NativeHostBroker {
             deliveries: VecDeque::new(),
             input,
             input_sender,
-            native_output,
+            native_output: Some(native_output),
         };
         (handle, broker, output)
     }
@@ -846,9 +977,10 @@ impl NativeHostBroker {
                 Input::BindRoute {
                     client,
                     claim,
+                    delivery,
                     reply,
                 } => {
-                    let _ = reply.send(self.bind_route(client, &claim));
+                    let _ = reply.send(self.bind_route_with_delivery(client, &claim, delivery));
                 }
                 Input::Control {
                     client,
@@ -859,10 +991,11 @@ impl NativeHostBroker {
                 Input::Cdp {
                     client,
                     route,
+                    claim,
                     message,
                     charge: _,
                     wire_context: _,
-                } => self.cdp(client, route, message, &mut output),
+                } => self.cdp_input(client, route, &claim, message, &mut output),
                 Input::ClientClosed(client) => self.close_client(client, &mut output),
                 Input::RouteClosed(route) => {
                     self.close_route(route, "CDP connection ended", &mut output)
@@ -889,7 +1022,12 @@ impl NativeHostBroker {
             }
             native_backlog.extend(output);
             while let Some(frame) = native_backlog.pop_front() {
-                match self.native_output.try_send(frame) {
+                match self
+                    .native_output
+                    .as_ref()
+                    .expect("active generation retains its native output lane")
+                    .try_send(frame)
+                {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(frame)) => {
                         native_backlog.push_front(frame);
@@ -907,6 +1045,7 @@ impl NativeHostBroker {
             }
         }
         self.end_generation("native broker input ended");
+        self.drain_stopped_deliveries().await;
     }
 
     fn written(&mut self, report: WriteReport, output: &mut Vec<NativeOutbound>) {
@@ -949,6 +1088,37 @@ impl NativeHostBroker {
                     awaiting_reply = self.pending.contains_key(&outer),
                     "native browser wire write acknowledged"
                 );
+            }
+        }
+    }
+
+    async fn drain_stopped_deliveries(&mut self) {
+        let deadline = tokio::time::sleep(IPC_SHUTDOWN_DRAIN_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            self.flush_deliveries();
+            if self.deliveries.is_empty() {
+                return;
+            }
+            tokio::select! {
+                _ = &mut deadline => return,
+                input = self.input.recv() => match input {
+                    Some(Input::Identity(reply)) => { let _ = reply.send(Err(BrokerError::Closed)); }
+                    Some(Input::Admit { reply, .. }) => { let _ = reply.send(Err(BrokerError::Closed)); }
+                    Some(Input::BindRoute { reply, .. }) => { let _ = reply.send(Err(BrokerError::Closed)); }
+                    Some(Input::ClientClosed(client)) => {
+                        if let Some(state) = self.clients.get_mut(&client) {
+                            state.closing = true;
+                            state.alive.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    Some(_) => {
+                        // Existing progress/drop inputs wake the same egress
+                        // queue. No command, new owner or native effect can be
+                        // admitted after the generation fence became false.
+                    }
+                    None => return,
+                }
             }
         }
     }
@@ -998,7 +1168,17 @@ impl NativeHostBroker {
         })
     }
 
+    #[cfg(test)]
     fn bind_route(&mut self, client: ClientId, token: &str) -> Result<CdpRoute, BrokerError> {
+        self.bind_route_with_delivery(client, token, RouteDelivery::Direct)
+    }
+
+    fn bind_route_with_delivery(
+        &mut self,
+        client: ClientId,
+        token: &str,
+        delivery: RouteDelivery,
+    ) -> Result<CdpRoute, BrokerError> {
         let owner = self
             .clients
             .get(&client)
@@ -1006,6 +1186,7 @@ impl NativeHostBroker {
                 state.alive.load(Ordering::SeqCst) && !state.closing && !state.delivery_blocked
             })
             .ok_or(BrokerError::Closed)?;
+        let client_alive = owner.alive.clone();
         let claim = self
             .claims
             .get_mut(token)
@@ -1017,9 +1198,6 @@ impl NativeHostBroker {
                     && claim.route.is_none()
             })
             .ok_or(BrokerError::ClaimUnavailable)?;
-        if self.routes.len() >= MAX_ROUTES {
-            return Err(BrokerError::RouteBudget);
-        }
         self.next_route = self
             .next_route
             .checked_add(1)
@@ -1027,16 +1205,7 @@ impl NativeHostBroker {
         let id = RouteId(self.next_route);
         let alive = Arc::new(AtomicBool::new(true));
         let (events, receiver) = mpsc::channel(EVENT_CAPACITY);
-        while let Some(event) = claim.early.events.pop_front() {
-            let charge = claim.early.charges.pop_front().unwrap_or(None);
-            if events
-                .try_send(Queued::new(BrokerCdpEvent::ChromeMessage(event), charge))
-                .is_err()
-            {
-                return Err(BrokerError::RouteBudget);
-            }
-        }
-        claim.early.bytes = 0;
+        let mut early = std::mem::take(&mut claim.early);
         claim.route = Some(id);
         self.routes.insert(
             id,
@@ -1044,15 +1213,37 @@ impl NativeHostBroker {
                 client,
                 claim: token.to_owned(),
                 alive: alive.clone(),
+                delivery,
+                #[cfg(test)]
                 events,
                 high_water: 0,
             },
         );
+        #[cfg(not(test))]
+        drop(events);
+        match delivery {
+            RouteDelivery::Ordered { open_id } => self.queue_cdp_control(
+                client,
+                ControlEvent::CdpOpened {
+                    id: open_id,
+                    route: id.0,
+                },
+            ),
+            #[cfg(test)]
+            RouteDelivery::Direct => {}
+        }
+        while let Some(event) = early.events.pop_front() {
+            let prior_charge = self.current_charge.take();
+            self.current_charge = early.charges.pop_front().unwrap_or(None);
+            self.emit_cdp_with_context(id, BrokerCdpEvent::ChromeMessage(event), None);
+            self.current_charge = prior_charge;
+        }
         let lease = Arc::new(RouteLease {
             id,
             client,
+            claim: token.to_owned(),
             alive,
-            client_alive: owner.alive.clone(),
+            client_alive,
             input: self.input_sender.clone(),
             budget: self.budget.clone(),
         });
@@ -1099,7 +1290,10 @@ impl NativeHostBroker {
             || state.closing
             || (state.delivery_blocked && !cleanup)
         {
-            if matches!(request, ControlRequest::FenceCdp { .. }) {
+            if matches!(
+                request,
+                ControlRequest::FenceCdp { .. } | ControlRequest::RetireClaim { .. }
+            ) {
                 self.emit_control(
                     client,
                     ControlEvent::Reply {
@@ -1116,7 +1310,10 @@ impl NativeHostBroker {
             return;
         }
         if id == 0 || id <= state.high_water {
-            if matches!(request, ControlRequest::FenceCdp { .. }) {
+            if matches!(
+                request,
+                ControlRequest::FenceCdp { .. } | ControlRequest::RetireClaim { .. }
+            ) {
                 self.fence_cdp_reply(
                     client,
                     id,
@@ -1143,6 +1340,13 @@ impl NativeHostBroker {
             self.fence_cdp(client, id, claim, output);
             return;
         }
+        if let ControlRequest::RetireClaim {
+            claim, cleanup_id, ..
+        } = &request
+        {
+            self.retire_claim(client, id, claim, *cleanup_id, output);
+            return;
+        }
         if !cleanup && self.normal_pending() >= MAX_NORMAL_PENDING {
             self.reject_control(
                 client,
@@ -1163,7 +1367,56 @@ impl NativeHostBroker {
             );
             return;
         }
+        if matches!(
+            &request,
+            ControlRequest::PrepareClaim { .. } | ControlRequest::CreatePopupTab { .. }
+        ) && self.input_context.is_none()
+        {
+            self.reject_control(
+                client,
+                id,
+                "context_required",
+                "same-claim preparation requires captured trusted wire context",
+                output,
+            );
+            return;
+        }
         let (method, params, operation) = match request {
+            ControlRequest::PrepareClaim {
+                claim,
+                document,
+                policy,
+                ..
+            } => {
+                if !self.owns_active_claim(client, &claim) {
+                    self.reject_control(
+                        client,
+                        id,
+                        "claim_unavailable",
+                        "preparation claim is not active for this connection",
+                        output,
+                    );
+                    return;
+                }
+                (
+                    "prepareClaim",
+                    json!({"claim":claim,"document":document,"policy":policy}),
+                    ControlKind::Other,
+                )
+            }
+            ControlRequest::CreatePopupTab { claim, .. } => {
+                if !self.owns_active_claim(client, &claim) {
+                    self.reject_control(
+                        client,
+                        id,
+                        "claim_unavailable",
+                        "popup opener claim is not active for this connection",
+                        output,
+                    );
+                    return;
+                }
+                ("createPopupTab", json!({"claim":claim}), ControlKind::Other)
+            }
             ControlRequest::Inventory { .. } => ("inventory", json!({}), ControlKind::Inventory),
             ControlRequest::Resolve { raw_id, .. } if !raw_id.is_empty() => {
                 ("resolve", json!({"rawId":raw_id}), ControlKind::Resolve)
@@ -1214,13 +1467,16 @@ impl NativeHostBroker {
                 json!({"creation":creation,"group":group}),
                 ControlKind::Other,
             ),
-            ControlRequest::StopCreatedTab { creation, .. }
-                if !creation.is_empty() && creation.len() <= 128 =>
+            ControlRequest::StopCreatedTab {
+                creation, tab_id, ..
+            } if !creation.is_empty()
+                && creation.len() <= 128
+                && tab_id.is_none_or(|id| id <= 9_007_199_254_740_991) =>
             {
                 (
                     "stopCreatedTab",
                     json!({"creation":creation}),
-                    ControlKind::StopCreated,
+                    ControlKind::StopCreated(tab_id),
                 )
             }
             ControlRequest::FinishTurn { keep, .. } => {
@@ -1271,7 +1527,11 @@ impl NativeHostBroker {
                     );
                     return;
                 }
-                ("closeTab", json!({"claim":claim}), ControlKind::Other)
+                (
+                    "closeTab",
+                    json!({"claim":claim}),
+                    ControlKind::Close(claim),
+                )
             }
             ControlRequest::ClearScopedHeaders { claim, .. } => {
                 if !self.owns_active_claim(client, &claim) {
@@ -1313,23 +1573,16 @@ impl NativeHostBroker {
                 ("setScopedHeaders", params, ControlKind::Other)
             }
             ControlRequest::Attach { tab_id, .. } if tab_id <= 9_007_199_254_740_991 => {
-                let count = self
-                    .claims
-                    .values()
-                    .filter(|claim| claim.client == client)
-                    .count();
                 let state = self
                     .clients
                     .get_mut(&client)
                     .expect("client was checked above");
-                if count + state.attaching.len() >= MAX_CLAIMS_PER_CLIENT
-                    || !state.attaching.insert(tab_id)
-                {
+                if !state.attaching.insert(tab_id) {
                     self.reject_control(
                         client,
                         id,
-                        "claim_budget",
-                        "tab attach is already pending or claim budget exhausted",
+                        "attach_pending",
+                        "this tab already has an attach pending",
                         output,
                     );
                     return;
@@ -1381,6 +1634,48 @@ impl NativeHostBroker {
                 operation,
             },
             None,
+            output,
+        );
+    }
+
+    fn retire_claim(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        claim: &str,
+        cleanup_id: u64,
+        output: &mut Vec<NativeOutbound>,
+    ) {
+        let exact_cleanup = self.claims.get(claim).is_some_and(|record| {
+            record.client == client
+                && record.cdp_fenced
+                && record.cleanup_id == Some(cleanup_id)
+                && cleanup_id != 0
+                && !record.alive.load(Ordering::SeqCst)
+        });
+        let raw_pending = self.pending.values().any(|pending| {
+            pending.client == client
+                && matches!(&pending.kind, PendingKind::Cdp { claim: token, .. } if token == claim)
+        });
+        if !exact_cleanup || raw_pending {
+            self.fence_cdp_reply(
+                client,
+                id,
+                ControlOutcome::Unknown {
+                    reason: "claim retirement requires its exact known cleanup and empty fenced CDP custody".to_owned(),
+                    details: None,
+                },
+                output,
+            );
+            return;
+        }
+        // The caller retains the opaque cleanup receipt until Host effects
+        // have folded. This local operation never invokes native cleanup.
+        self.claims.remove(claim);
+        self.fence_cdp_reply(
+            client,
+            id,
+            ControlOutcome::Result(json!({"retired":true,"claim":claim})),
             output,
         );
     }
@@ -1502,6 +1797,43 @@ impl NativeHostBroker {
         }
     }
 
+    fn cdp_input(
+        &mut self,
+        client: ClientId,
+        route: RouteId,
+        claim: &str,
+        message: Value,
+        output: &mut Vec<NativeOutbound>,
+    ) {
+        if self.routes.get(&route).is_some_and(|record| {
+            record.client == client && record.claim == claim && record.alive.load(Ordering::SeqCst)
+        }) {
+            self.cdp(client, route, message, output);
+            return;
+        }
+        // RouteSender captured these IDs before input admission. Retirement
+        // can race the actor dequeue, but cannot turn unsent work into a hang
+        // or a native dispatch. No new claim record is needed to refuse it.
+        if !self.clients.contains_key(&client) {
+            return;
+        }
+        if let Some(id) = message["id"].as_u64().filter(|id| *id != 0) {
+            self.queue_cdp_control(
+                client,
+                ControlEvent::CdpMessage {
+                    route: route.0,
+                    claim: claim.to_owned(),
+                    event: BrokerCdpEvent::LocalRejected {
+                        id,
+                        code: "not_dispatched".to_owned(),
+                        message: "CDP route ended before native dispatch".to_owned(),
+                    },
+                    wire_context: self.input_context.clone(),
+                },
+            );
+        }
+    }
+
     fn cdp(
         &mut self,
         client: ClientId,
@@ -1610,6 +1942,7 @@ impl NativeHostBroker {
                             operation: ControlKind::Inventory
                                 | ControlKind::Resolve
                                 | ControlKind::Attach(_)
+                                | ControlKind::Close(_)
                                 | ControlKind::Other,
                             ..
                         }
@@ -1722,23 +2055,120 @@ impl NativeHostBroker {
         }
     }
 
+    fn cdp_unconfirmed(&mut self, receipt: UnconfirmedCdp<'_>, event: Option<BrokerCdpEvent>) {
+        let write_phase = match receipt.dispatch.load(Ordering::SeqCst) {
+            QUEUED => NativeCdpWritePhase::Queued,
+            STARTED => NativeCdpWritePhase::Started,
+            WRITTEN => NativeCdpWritePhase::Written,
+            SKIPPED => NativeCdpWritePhase::Skipped,
+            _ => NativeCdpWritePhase::Unknown,
+        };
+        let event = ControlEvent::CdpUnconfirmed {
+            claim: receipt.claim.to_owned(),
+            route: receipt.route.0,
+            id: receipt.id,
+            write_phase,
+            reason: UNKNOWN_CDP_REASON.to_owned(),
+            event,
+            wire_context: receipt.wire_context.cloned(),
+        };
+        // Phase and its exact terminal share the control FIFO. Each new
+        // payload owns its actual bytes, including captured context copies.
+        self.queue_cdp_control(receipt.client, event);
+    }
+
+    fn queue_cdp_control(&mut self, client: ClientId, event: ControlEvent) {
+        match self.budget.try_charge(&event) {
+            Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
+            Err(_) => self.fail_client_cdp_delivery(client),
+        }
+    }
+
+    fn fail_client_cdp_delivery(&mut self, client: ClientId) {
+        let Some(state) = self.clients.get_mut(&client) else {
+            return;
+        };
+        let first_failure = !state.closing;
+        state.closing = true;
+        state.alive.store(false, Ordering::SeqCst);
+        for claim in self.claims.values().filter(|claim| claim.client == client) {
+            claim.alive.store(false, Ordering::SeqCst);
+        }
+        for route in self.routes.values().filter(|route| route.client == client) {
+            route.alive.store(false, Ordering::SeqCst);
+        }
+        // This fixed local-lifetime diagnostic carries no phase or cleanup
+        // proof. Do not recurse through route cleanup or native EOF while
+        // emitting EOF metadata under an exhausted byte budget.
+        if first_failure {
+            self.queue_control_delivery(client, Queued::new(ControlEvent::GenerationClosed {
+                reason: "owner CDP delivery budget exhausted; invocation and effect settlement remain unknown".to_owned(),
+            }, None));
+        }
+    }
+
+    fn route_unconfirmed(&mut self, route: RouteId, reason: Option<&str>) {
+        let mut requests = self
+            .pending
+            .iter()
+            .filter_map(|(outer, pending)| {
+                let PendingKind::Cdp {
+                    route: actual,
+                    claim,
+                    inner_id,
+                    ..
+                } = &pending.kind
+                else {
+                    return None;
+                };
+                if *actual != route {
+                    return None;
+                }
+                Some((*outer, pending.client, claim.clone(), *inner_id))
+            })
+            .collect::<Vec<_>>();
+        requests.sort_unstable_by_key(|(outer, ..)| *outer);
+        for (outer, client, claim, inner_id) in requests {
+            // Pending remains in the original store; no completion registry
+            // or consumed acknowledgement is introduced for notification.
+            let Some(pending) = self.pending.remove(&outer) else {
+                continue;
+            };
+            self.cdp_unconfirmed(
+                UnconfirmedCdp {
+                    client,
+                    route,
+                    claim: &claim,
+                    id: inner_id,
+                    dispatch: &pending.dispatch,
+                    wire_context: pending.wire_context.as_ref(),
+                },
+                // The initiating native cause remains in its original charged
+                // receipt. Do not clone an arbitrary cause for each neighbor.
+                reason.map(|_| BrokerCdpEvent::TransportFailure(UNKNOWN_CDP_REASON.to_owned())),
+            );
+            self.pending.insert(outer, pending);
+        }
+    }
+
     fn retire_route(&mut self, route: RouteId, reason: &str) {
         let Some(record) = self.routes.remove(&route) else {
             return;
         };
         record.alive.store(false, Ordering::SeqCst);
-        self.queue_cdp_delivery(
-            route,
-            record.client,
-            record.claim.clone(),
-            record.events.clone(),
-            Queued::new(
-                BrokerCdpEvent::TransportFailure(reason.to_owned()),
-                self.current_charge.clone(),
-            ),
-        );
-        // Written work keeps its exact outer->inner receipt mapping after the
-        // reader route closes. A later ACK becomes an owner custody event.
+        if !self.stopped {
+            self.route_unconfirmed(route, Some(reason));
+            self.queue_cdp_control(
+                record.client,
+                ControlEvent::CdpRouteClosed {
+                    route: route.0,
+                    claim: record.claim.clone(),
+                    reason: "native CDP route ended; physical claim custody is retained".to_owned(),
+                },
+            );
+        }
+        // Unknown terminals travel once through the same owner control FIFO
+        // as their dispatch phase. Dropping a route grants no physical cleanup.
         if let Some(claim) = self.claims.get_mut(&record.claim) {
             if claim.route == Some(route) {
                 claim.route = None;
@@ -1831,16 +2261,40 @@ impl NativeHostBroker {
         event: BrokerCdpEvent,
         output: &mut Vec<NativeOutbound>,
     ) {
-        if let Some(state) = self.routes.get(&route) {
-            self.queue_cdp_delivery(
+        self.emit_cdp_with_context(route, event, self.input_context.clone());
+        let _ = output;
+    }
+
+    fn emit_cdp_with_context(
+        &mut self,
+        route: RouteId,
+        event: BrokerCdpEvent,
+        wire_context: Option<NativeWireContext>,
+    ) {
+        let Some(state) = self.routes.get(&route) else {
+            return;
+        };
+        match state.delivery {
+            RouteDelivery::Ordered { .. } => {
+                self.queue_cdp_control(
+                    state.client,
+                    ControlEvent::CdpMessage {
+                        route: route.0,
+                        claim: state.claim.clone(),
+                        event,
+                        wire_context,
+                    },
+                );
+            }
+            #[cfg(test)]
+            RouteDelivery::Direct => self.queue_cdp_delivery(
                 route,
                 state.client,
                 state.claim.clone(),
                 state.events.clone(),
                 Queued::new(event, self.current_charge.clone()),
-            );
+            ),
         }
-        let _ = output;
     }
 
     fn queue_control_delivery(&mut self, client: ClientId, event: Queued<ControlEvent>) {
@@ -1879,6 +2333,7 @@ impl NativeHostBroker {
         }
     }
 
+    #[cfg(test)]
     fn queue_cdp_delivery(
         &mut self,
         route: RouteId,
@@ -1918,6 +2373,7 @@ impl NativeHostBroker {
         // clients still need admission. A drained receiver notifies progress.
         let count = self.deliveries.len();
         let mut blocked_clients = HashSet::new();
+        #[cfg(test)]
         let mut blocked_routes = HashSet::new();
         for _ in 0..count {
             let Some(delivery) = self.deliveries.pop_front() else {
@@ -1957,6 +2413,7 @@ impl NativeHostBroker {
                         }
                     }
                 }
+                #[cfg(test)]
                 Delivery::Cdp {
                     route,
                     client,
@@ -2091,7 +2548,8 @@ impl NativeHostBroker {
             Some("response") => self.response(value, provenance, output),
             Some("download_changed") => self.download_changed(value, output),
             Some(
-                "event" | "revoked" | "effects_cleanup" | "tab_state_changed" | "tab_state_unknown",
+                "event" | "revoked" | "effects_cleanup" | "tab_state_changed" | "tab_state_unknown"
+                | "popup_requested",
             ) => self.event(value, output),
             _ => Err(BrokerError::Protocol(
                 "unexpected native message kind".to_owned(),
@@ -2165,15 +2623,17 @@ impl NativeHostBroker {
                 }
             }
         }
-        if self.pending.get(&outer).is_some_and(|pending| {
-            matches!(
-                &pending.kind,
-                PendingKind::Cdp {
-                    unknown: Some(_),
-                    ..
-                }
-            )
-        }) {
+        if !matches!(provenance, NativeReplyProvenance::DirectNative)
+            && self.pending.get(&outer).is_some_and(|pending| {
+                matches!(
+                    &pending.kind,
+                    PendingKind::Cdp {
+                        unknown: Some(_),
+                        ..
+                    }
+                )
+            })
+        {
             return Ok(());
         }
         let Some(pending) = self.pending.remove(&outer) else {
@@ -2200,7 +2660,7 @@ impl NativeHostBroker {
                 route,
                 claim,
                 inner_id,
-                unknown: _,
+                unknown: previous_unknown,
             } => {
                 let event = if let Some(error) = value.get("error") {
                     let (kind, message) = error_fields(error)?;
@@ -2236,6 +2696,20 @@ impl NativeHostBroker {
                     })?;
                     BrokerCdpEvent::ChromeMessage(json!({"id":inner_id,"result":result}))
                 };
+                // A response parsed from the selected Own native port proves
+                // its exact issued frame reached that peer, even if the serial
+                // writer has not resumed after flush. Generation, issued ID,
+                // released dispatch and complete outcome were checked above.
+                // Original Matched can represent an earlier activation phase
+                // and therefore never supplies this direct-frame write proof.
+                if matches!(provenance, NativeReplyProvenance::DirectNative) {
+                    let _ = pending.dispatch.compare_exchange(
+                        STARTED,
+                        WRITTEN,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
                 let raw_terminal = matches!(
                     provenance,
                     NativeReplyProvenance::DirectNative | NativeReplyProvenance::Matched(_)
@@ -2246,12 +2720,39 @@ impl NativeHostBroker {
                     }
                     _ => None,
                 };
-                if self.routes.contains_key(&route) {
-                    let failure = matches!(event, BrokerCdpEvent::TransportFailure(_));
-                    self.emit_cdp(route, event, output);
-                    if failure {
-                        self.close_route(route, "native claim command is unknown", output);
+                if let BrokerCdpEvent::TransportFailure(reason) = event {
+                    let active_route =
+                        previous_unknown.is_none() && self.routes.contains_key(&route);
+                    self.cdp_unconfirmed(
+                        UnconfirmedCdp {
+                            client: pending.client,
+                            route,
+                            claim: &claim,
+                            id: inner_id,
+                            dispatch: &pending.dispatch,
+                            wire_context: pending.wire_context.as_ref(),
+                        },
+                        active_route.then(|| BrokerCdpEvent::TransportFailure(reason.clone())),
+                    );
+                    if active_route {
+                        self.retire_route(route, &reason);
+                    } else {
+                        // A late actual raw receipt remains distinguishable
+                        // from the earlier synthetic route-close terminal.
+                        self.emit_control(
+                            pending.client,
+                            ControlEvent::OrphanCdpCompletion {
+                                route: route.0,
+                                claim: claim.clone(),
+                                id: inner_id,
+                                event: BrokerCdpEvent::TransportFailure(reason),
+                                wire_context: pending.wire_context.clone(),
+                            },
+                            output,
+                        );
                     }
+                } else if previous_unknown.is_none() && self.routes.contains_key(&route) {
+                    self.emit_cdp_with_context(route, event, pending.wire_context.clone());
                 } else {
                     self.emit_control(
                         pending.client,
@@ -2295,6 +2796,13 @@ impl NativeHostBroker {
                 }
                 let outcome = if let Some(error) = value.get("error") {
                     let (kind, message) = error_fields(error)?;
+                    if let Some(result) = error.get("details").and_then(|details| {
+                        details
+                            .get("acknowledgedResult")
+                            .or_else(|| details.get("physicalProof"))
+                    }) {
+                        self.record_known_cleanup(pending.client, local_id, &operation, result);
+                    }
                     if let ControlKind::Attach(tab_id) = &operation {
                         if let Some(custody) = error
                             .get("details")
@@ -2338,16 +2846,12 @@ impl NativeHostBroker {
                     } else {
                         None
                     };
-                    if let ControlKind::Detach(ref token) = operation {
-                        if result["detached"] != true {
-                            return Err(BrokerError::Protocol(
-                                "detach success lacks acknowledgement".to_owned(),
-                            ));
-                        }
-                        if let Some(record) = self.claims.get(token) {
-                            record.alive.store(false, Ordering::SeqCst);
-                        }
+                    if matches!(operation, ControlKind::Detach(_)) && result["detached"] != true {
+                        return Err(BrokerError::Protocol(
+                            "detach success lacks acknowledgement".to_owned(),
+                        ));
                     }
+                    self.record_known_cleanup(pending.client, local_id, &operation, &result);
                     if let Some(reason) = revoked {
                         ControlOutcome::Unknown {
                             reason: format!(
@@ -2386,6 +2890,79 @@ impl NativeHostBroker {
             }
         }
         Ok(())
+    }
+
+    fn record_known_cleanup(
+        &mut self,
+        client: ClientId,
+        local_id: u64,
+        operation: &ControlKind,
+        result: &Value,
+    ) {
+        let exact_claim = match operation {
+            ControlKind::Detach(claim)
+                if result["detached"] == true
+                    && matches!(
+                        result["proof"].as_str(),
+                        Some("detach_ack" | "detach_event" | "tab_removed")
+                    ) =>
+            {
+                Some(claim)
+            }
+            ControlKind::Close(claim)
+                if result["closed"] == true
+                    && matches!(result["proof"].as_str(), Some("close_ack" | "tab_removed")) =>
+            {
+                Some(claim)
+            }
+            _ => None,
+        };
+        if let Some(claim) = exact_claim {
+            if let Some(record) = self.claims.get_mut(claim).filter(|record| {
+                record.client == client
+                    && result
+                        .get("claim")
+                        .is_none_or(|value| value.as_str() == Some(claim.as_str()))
+                    && result
+                        .get("tabId")
+                        .is_none_or(|value| value.as_u64() == Some(record.tab_id))
+                    && result
+                        .get("targetId")
+                        .is_none_or(|value| value.as_str() == Some(record.target_id.as_str()))
+            }) {
+                record.alive.store(false, Ordering::SeqCst);
+                record.cleanup_id = Some(local_id);
+            }
+        }
+        if let ControlKind::StopCreated(Some(tab_id)) = operation {
+            let known_closed = result["closed"] == true
+                && (result["proof"] == "close_ack"
+                    || result["proof"] == "tab_removed"
+                    || (result["proof"] == "tab_absent"
+                        && result["tabId"].as_u64() == Some(*tab_id)
+                        && result["observationRequestId"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())));
+            if known_closed
+                && result
+                    .get("tabId")
+                    .is_none_or(|value| value.as_u64() == Some(*tab_id))
+            {
+                for (_, record) in self.claims.iter_mut().filter(|(claim, record)| {
+                    record.client == client
+                        && record.tab_id == *tab_id
+                        && result
+                            .get("claim")
+                            .is_none_or(|value| value.as_str() == Some(claim.as_str()))
+                        && result
+                            .get("targetId")
+                            .is_none_or(|value| value.as_str() == Some(record.target_id.as_str()))
+                }) {
+                    record.alive.store(false, Ordering::SeqCst);
+                    record.cleanup_id = Some(local_id);
+                }
+            }
+        }
     }
 
     fn record_claim(
@@ -2463,6 +3040,7 @@ impl NativeHostBroker {
                 early,
                 cleanup_only,
                 cdp_fenced: false,
+                cleanup_id: None,
             },
         );
         Ok(None)
@@ -2483,6 +3061,67 @@ impl NativeHostBroker {
             .filter(|token| !token.is_empty() && token.len() <= 128)
             .ok_or_else(|| BrokerError::Protocol("event lacks bounded claim".to_owned()))?
             .to_owned();
+        if value["kind"] == "popup_requested" {
+            let Some(record) = self.claims.get(&token).filter(|record| {
+                record.client == client
+                    && record.alive.load(Ordering::SeqCst)
+                    && !record.cleanup_only
+            }) else {
+                return Ok(());
+            };
+            if value["tabId"].as_u64() != Some(record.tab_id) {
+                return Err(BrokerError::Protocol(
+                    "popup metadata changed its exact claimed tab".to_owned(),
+                ));
+            }
+            let wire_context: NativeWireContext =
+                serde_json::from_value(value["wireContext"].clone()).map_err(|error| {
+                    BrokerError::Protocol(format!(
+                        "popup metadata lacks captured wire context: {error}"
+                    ))
+                })?;
+            let url = value["url"]
+                .as_str()
+                .ok_or_else(|| BrokerError::Protocol("popup metadata lacks actual URL".to_owned()))?
+                .to_owned();
+            let frame_id = value
+                .get("frameId")
+                .map(|id| {
+                    id.as_i64()
+                        .filter(|id| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(id))
+                        .ok_or_else(|| {
+                            BrokerError::Protocol(
+                                "popup sender frame ID is not a Chrome safe integer".to_owned(),
+                            )
+                        })
+                })
+                .transpose()?;
+            let optional_text = |key: &str| -> Result<Option<String>, BrokerError> {
+                value
+                    .get(key)
+                    .map(|field| {
+                        field.as_str().map(str::to_owned).ok_or_else(|| {
+                            BrokerError::Protocol(format!("popup sender {key} is not text"))
+                        })
+                    })
+                    .transpose()
+            };
+            let tab_id = record.tab_id;
+            self.emit_control(
+                client,
+                ControlEvent::PopupRequested {
+                    claim: token,
+                    tab_id,
+                    url,
+                    wire_context,
+                    frame_id,
+                    document_id: optional_text("documentId")?,
+                    source_url: optional_text("sourceUrl")?,
+                },
+                output,
+            );
+            return Ok(());
+        }
         if value["kind"] == "effects_cleanup" {
             if self
                 .claims
@@ -2520,6 +3159,16 @@ impl NativeHostBroker {
                     effect: effect.to_owned(),
                     cleanup_confirmed: confirmed,
                     error,
+                    wire_context: value
+                        .get("wireContext")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|error| {
+                            BrokerError::Protocol(format!(
+                                "effect cleanup wire context is invalid: {error}"
+                            ))
+                        })?,
                 },
                 output,
             );
@@ -2643,7 +3292,7 @@ impl NativeHostBroker {
             if state.attaching.is_empty() {
                 return Ok(());
             }
-            if state.early.len() >= MAX_CLAIMS_PER_CLIENT && !state.early.contains_key(&token) {
+            if state.early.len() >= MAX_NORMAL_PENDING && !state.early.contains_key(&token) {
                 self.close_client(client, output);
                 return Ok(());
             }
@@ -2674,6 +3323,20 @@ impl NativeHostBroker {
         }
         self.stopped = true;
         self.generation_alive.store(false, Ordering::SeqCst);
+        // Close the native writer scope before emitting or draining local
+        // receipts. Already queued frames observe this generation fence.
+        drop(self.native_output.take());
+        let routes_with_pending = self
+            .pending
+            .values()
+            .filter_map(|pending| match &pending.kind {
+                PendingKind::Cdp { route, .. } => Some(*route),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for route in routes_with_pending {
+            self.route_unconfirmed(route, None);
+        }
         self.budget.close();
         let routes = self.routes.keys().copied().collect::<Vec<_>>();
         for route in routes {
@@ -2732,29 +3395,53 @@ impl NativeHostBroker {
                 inner_id,
                 unknown: _,
             } => {
-                let event = if partial {
-                    BrokerCdpEvent::TransportFailure(reason.to_owned())
+                if partial {
+                    let active_route = self.routes.contains_key(&route);
+                    self.cdp_unconfirmed(
+                        UnconfirmedCdp {
+                            client: pending.client,
+                            route,
+                            claim: &claim,
+                            id: inner_id,
+                            dispatch: &pending.dispatch,
+                            wire_context: pending.wire_context.as_ref(),
+                        },
+                        active_route.then(|| BrokerCdpEvent::TransportFailure(reason.to_owned())),
+                    );
+                    if !active_route {
+                        self.emit_control(
+                            pending.client,
+                            ControlEvent::OrphanCdpCompletion {
+                                route: route.0,
+                                claim: claim.clone(),
+                                id: inner_id,
+                                event: BrokerCdpEvent::TransportFailure(reason.to_owned()),
+                                wire_context: pending.wire_context.clone(),
+                            },
+                            output,
+                        );
+                    }
                 } else {
-                    BrokerCdpEvent::LocalRejected {
+                    let event = BrokerCdpEvent::LocalRejected {
                         id: inner_id,
                         code: "not_dispatched".to_owned(),
                         message: reason.to_owned(),
+                    };
+                    if self.routes.contains_key(&route) {
+                        self.emit_cdp_with_context(route, event, pending.wire_context.clone());
+                    } else {
+                        self.emit_control(
+                            pending.client,
+                            ControlEvent::OrphanCdpCompletion {
+                                route: route.0,
+                                claim: claim.clone(),
+                                id: inner_id,
+                                event,
+                                wire_context: pending.wire_context.clone(),
+                            },
+                            output,
+                        );
                     }
-                };
-                if self.routes.contains_key(&route) {
-                    self.emit_cdp(route, event, output);
-                } else {
-                    self.emit_control(
-                        pending.client,
-                        ControlEvent::OrphanCdpCompletion {
-                            route: route.0,
-                            claim: claim.clone(),
-                            id: inner_id,
-                            event,
-                            wire_context: pending.wire_context.clone(),
-                        },
-                        output,
-                    );
                 }
                 if partial {
                     self.pending.insert(
@@ -2818,7 +3505,7 @@ impl NativeHostBroker {
                     message,
                 };
                 if self.routes.contains_key(&route) {
-                    self.emit_cdp(route, event, output);
+                    self.emit_cdp_with_context(route, event, pending.wire_context.clone());
                 } else {
                     self.emit_control(
                         pending.client,
@@ -3013,9 +3700,15 @@ impl NativeOutbound {
     /// Each logical request completes its fragment sequence before a higher ID.
     /// Errors after any bytes require native-port retirement, never a retry.
     pub(crate) fn write_to(
-        self,
+        mut self,
         writer: &mut impl Write,
     ) -> Result<Option<WriteReport>, BrokerError> {
+        // Only the selected Own direct writer serializes this trusted context.
+        // Original adapters retain the separate into_adapter_request sidechannel.
+        if let Some(context) = &self.wire_context {
+            self.value["wireContext"] = serde_json::to_value(context)
+                .map_err(|error| BrokerError::Protocol(error.to_string()))?;
+        }
         let payload = match native_framing::encode_json(&self.value, Direction::ChromeToHost) {
             Ok(value) => value,
             Err(error @ FrameError::TooLarge { .. }) => {

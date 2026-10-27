@@ -112,7 +112,12 @@ export class BrowserConnector {
       this.pending++;
       if (cleanupKey) this.pendingCleanup.add(cleanupKey);
       try {
-        result = await this.dispatch(message.owner, message.method, message.params ?? {});
+        result = await this.dispatch(
+          message.owner,
+          message.method,
+          message.params ?? {},
+          message.wireContext,
+        );
       } finally {
         this.pending--;
         if (cleanupKey) this.pendingCleanup.delete(cleanupKey);
@@ -234,7 +239,16 @@ export class BrowserConnector {
       fail('claim_unavailable', 'claim does not belong to this owner and generation');
     return record;
   }
-  async attach(owner, id) {
+  // Subclasses may prepare only the already reserved exact record. The default attach
+  // remains metadata-only; an admitted full-preparation caller supplies its captured scope.
+  async prepareAttachment(_record, _preparation) {}
+  async cleanupAttachment(_record) {
+    return { cleanupConfirmed: true };
+  }
+  attachmentCleanupConfirmed(_record) {
+    return true;
+  }
+  async attach(owner, id, preparation) {
     const created = [...this.creations.values()].find(
       (receipt) => receipt.tabId === id && !receipt.closed,
     );
@@ -277,6 +291,7 @@ export class BrowserConnector {
       record.targetId = before.id;
       if (before.attached)
         fail('foreign_debugger', 'Chrome reports an attachment not owned by this connector');
+      await this.prepareAttachment(record, preparation);
       if (!this.live(record)) fail('generation_lost', 'attachment was cancelled before dispatch');
       await chromeCall(() => this.chrome.debugger.attach({ tabId: id }, '1.3'));
       record.attachedAck = true;
@@ -298,7 +313,25 @@ export class BrowserConnector {
       return this.claimResult(record);
     } catch (error) {
       if (!record.attachedAck) {
-        // A matched rejection, or cancellation before dispatch, creates no owned attachment.
+        // Fixed preparation can precede the debugger effect. Keep that same reserved
+        // record until its cleanup is proven, including late installation replies.
+        record.ending = true;
+        try {
+          await this.cleanupAttachment(record);
+        } catch {
+          // Cleanup custody remains in this record; it is never converted to absence.
+        }
+        if (!this.attachmentCleanupConfirmed(record)) {
+          record.state = 'cleanup_unknown';
+          throw new ConnectorError(
+            'outcome_unknown',
+            'pre-attachment effects require confirmed cleanup',
+            {
+              cause: error instanceof Error ? error.message : String(error),
+              custody: this.claimResult(record),
+            },
+          );
+        }
         this.claims.delete(record.token);
         if (this.records.get(id) === record) this.records.delete(id);
       } else {
@@ -376,11 +409,38 @@ export class BrowserConnector {
     if (typeof params.method !== 'string' || !/^[A-Za-z]+\.[A-Za-z]+$/.test(params.method))
       fail('invalid_request', 'CDP method is required');
     const method = params.method;
+    const commandParams = params.params ?? {};
     if (
-      method.startsWith('Browser.') ||
-      (method.startsWith('Target.') && method !== 'Target.setAutoAttach')
+      method === 'Target.createTarget' ||
+      method === 'Target.createBrowserContext' ||
+      method === 'Target.disposeBrowserContext' ||
+      method === 'Target.attachToBrowserTarget'
     )
-      fail('unsupported', 'browser/root target management is not an owned-tab transport command');
+      fail(
+        'host_scope_required',
+        'this command creates or changes a global browser resource outside the tracked tab creator',
+      );
+    if (method.startsWith('Target.') && own(commandParams, 'targetId')) {
+      const targetId = commandParams.targetId;
+      const observed =
+        targetId === record.targetId ||
+        [...record.children.values()].some(
+          (child) => child.active !== false && child.targetId === targetId,
+        );
+      if (typeof targetId !== 'string' || !targetId || !observed)
+        fail('target_unavailable', 'target was not observed under this physical claim');
+    }
+    if (
+      method === 'Target.attachToTarget' &&
+      (typeof commandParams.targetId !== 'string' || !commandParams.targetId)
+    )
+      fail('invalid_request', 'attach requires an exact observed targetId');
+    if (
+      method === 'Target.detachFromTarget' &&
+      (typeof commandParams.sessionId !== 'string' ||
+        !this.activeChild(record, commandParams.sessionId))
+    )
+      fail('child_session_unavailable', 'detach requires an observed child session');
     if (
       method === 'Target.setAutoAttach' &&
       (params.params?.flatten !== true || params.params?.waitForDebuggerOnStart !== false)
@@ -388,25 +448,73 @@ export class BrowserConnector {
       fail('invalid_request', 'auto-attach requires flat non-pausing child sessions');
     const source = { tabId: record.tabId };
     if (own(params, 'sessionId')) {
-      if (typeof params.sessionId !== 'string' || !record.children.has(params.sessionId))
+      if (typeof params.sessionId !== 'string' || !this.activeChild(record, params.sessionId))
         fail(
           'child_session_unavailable',
           'child session was not observed under this physical claim',
         );
       source.sessionId = params.sessionId;
     }
-    const call = chromeCall(() =>
-      this.chrome.debugger.sendCommand(source, method, params.params ?? {}),
-    );
+    const attaching = method === 'Target.attachToTarget';
+    if (attaching) record.pendingTargetAttaches = (record.pendingTargetAttaches ?? 0) + 1;
+    const call = chromeCall(async () => {
+      if (method === 'Target.getTargets') {
+        const targets = await this.chrome.debugger.getTargets();
+        return { targetInfos: targets.map((target) => ({ ...target, targetId: target.id })) };
+      }
+      // Chrome owns method support, including its restricted Browser domain.
+      return this.chrome.debugger.sendCommand(source, method, commandParams);
+    });
     record.inFlight.add(call);
     try {
       const result = await call;
       if (!this.live(record))
         fail('outcome_unknown', 'claim ended during CDP command; do not replay');
+      if (method === 'Target.attachToTarget') {
+        const sessionId = result?.sessionId;
+        if (typeof sessionId !== 'string' || !sessionId)
+          throw new ConnectorError(
+            'outcome_unknown',
+            'target attach returned no exact Chrome session identity',
+            { acknowledgedResult: result },
+          );
+        if (source.sessionId && !this.activeChild(record, source.sessionId))
+          throw new ConnectorError(
+            'outcome_unknown',
+            'parent session ended during target attach; do not replay',
+            { acknowledgedResult: result, parentSessionId: source.sessionId },
+          );
+        const child = record.children.get(sessionId);
+        const parent = source.sessionId ?? null;
+        if (
+          child &&
+          (child.active === false ||
+            child.targetId !== commandParams.targetId ||
+            child.parent !== parent)
+        )
+          throw new ConnectorError(
+            'outcome_unknown',
+            'target attach acknowledgement disagrees with its observed child event',
+            { acknowledgedResult: result },
+          );
+        record.children.set(sessionId, { targetId: commandParams.targetId, parent });
+      } else if (method === 'Target.detachFromTarget') {
+        this.removeChild(record, commandParams.sessionId);
+      }
       return { result: result ?? null };
     } finally {
       record.inFlight.delete(call);
+      if (attaching) {
+        record.pendingTargetAttaches--;
+        if (record.pendingTargetAttaches === 0)
+          for (const [id, child] of record.children)
+            if (child.active === false) record.children.delete(id);
+      }
     }
+  }
+  activeChild(record, sessionId) {
+    const child = record.children.get(sessionId);
+    return child && child.active !== false ? child : undefined;
   }
   recordForSource(source) {
     if (Number.isSafeInteger(source?.tabId)) return this.records.get(source.tabId);
@@ -420,7 +528,7 @@ export class BrowserConnector {
   onEvent(source, method, params = {}) {
     const record = this.recordForSource(source);
     if (!record || !record.attachedAck || record.revoked || record.detachedAck) return;
-    if (source.sessionId && !record.children.has(source.sessionId)) return;
+    if (source.sessionId && !this.activeChild(record, source.sessionId)) return;
     if (method === 'Target.attachedToTarget') {
       if (
         typeof params.sessionId !== 'string' ||
@@ -433,7 +541,7 @@ export class BrowserConnector {
         parent: source.sessionId ?? null,
       });
     } else if (method === 'Target.detachedFromTarget' && typeof params.sessionId === 'string') {
-      this.removeChild(record, params.sessionId);
+      this.removeChild(record, params.sessionId, source.sessionId ?? null);
     }
     this.emit({
       kind: 'event',
@@ -446,10 +554,19 @@ export class BrowserConnector {
       ...(source.sessionId ? { sessionId: source.sessionId } : {}),
     });
   }
-  removeChild(record, sessionId) {
+  removeChild(record, sessionId, parent = null) {
     for (const [id, child] of record.children)
-      if (child.parent === sessionId) this.removeChild(record, id);
-    record.children.delete(sessionId);
+      if (child.parent === sessionId && child.active !== false)
+        this.removeChild(record, id, sessionId);
+    if (record.pendingTargetAttaches > 0) {
+      // Keep this actual detach observation only while an attach ACK could
+      // still name it. The ACK must not resurrect a session Chrome retired.
+      const child = record.children.get(sessionId);
+      if (child) child.active = false;
+      else record.children.set(sessionId, { targetId: null, parent, active: false });
+    } else {
+      record.children.delete(sessionId);
+    }
   }
   onDetach(source, reason) {
     const record = this.recordForSource(source);
@@ -483,7 +600,7 @@ export class BrowserConnector {
   cleanupProven(record) {
     return record.detachedAck || record.detachEventAfterAck || record.physicalGone;
   }
-  async createTab(owner, params) {
+  async createTab(owner, params, openerScope) {
     if (Object.keys(params).some((key) => key !== 'windowId'))
       fail('invalid_request', 'createTab accepts only a preferred windowId');
     if (own(params, 'windowId') && (!Number.isSafeInteger(params.windowId) || params.windowId < 0))
@@ -502,37 +619,70 @@ export class BrowserConnector {
     });
     this.creations.set(receipt.token, receipt);
     try {
-      const windows = await chromeCall(() =>
-        this.chrome.windows.getAll({ windowTypes: ['normal'] }),
-      );
-      const normal = windows.filter((window) => window.type === 'normal');
-      const selected =
-        normal.find((window) => window.id === params.windowId) ??
-        normal.find((window) => window.focused) ??
-        normal[0];
-      if (!this.accepting || receipt.generation !== this.generation || this.closedOwners.has(owner))
-        fail('owner_closed', 'owner ended before tab creation dispatch');
       let tab;
-      if (selected) {
+      if (openerScope) {
+        const record = openerScope.record;
+        const current = () =>
+          record.owner === owner &&
+          this.live(record) &&
+          record.state === 'owned' &&
+          record.attachedAck &&
+          !record.preparation?.ending &&
+          record.logicalPreparation === openerScope.logicalScope;
+        if (!current()) fail('claim_revoked', 'popup opener logical claim is no longer current');
+        const opener = await chromeCall(() => this.chrome.tabs.get(record.tabId));
+        if (!current()) fail('claim_revoked', 'popup opener ended before creation dispatch');
+        if (
+          opener.id !== record.tabId ||
+          !Number.isSafeInteger(opener.windowId) ||
+          opener.windowId < 0
+        )
+          fail('target_unavailable', 'popup opener has no actual current window identity');
         tab = await chromeCall(() =>
-          this.chrome.tabs.create({ active: false, url: 'about:blank', windowId: selected.id }),
+          this.chrome.tabs.create({
+            active: false,
+            openerTabId: record.tabId,
+            url: 'about:blank',
+            windowId: opener.windowId,
+          }),
         );
         receipt.creationAck = true;
       } else {
-        const window = await chromeCall(() =>
-          this.chrome.windows.create({ focused: false, type: 'normal', url: 'about:blank' }),
+        const windows = await chromeCall(() =>
+          this.chrome.windows.getAll({ windowTypes: ['normal'] }),
         );
-        receipt.creationAck = true;
-        receipt.windowId = window.id;
-        tab = window.tabs?.find(
-          (candidate) => Number.isSafeInteger(candidate.id) && candidate.id >= 0,
-        );
-        if (!tab)
-          throw new ConnectorError(
-            'outcome_unknown',
-            'new window was acknowledged without a tab identity',
-            { windowId: window.id },
+        const normal = windows.filter((window) => window.type === 'normal');
+        const selected =
+          normal.find((window) => window.id === params.windowId) ??
+          normal.find((window) => window.focused) ??
+          normal[0];
+        if (
+          !this.accepting ||
+          receipt.generation !== this.generation ||
+          this.closedOwners.has(owner)
+        )
+          fail('owner_closed', 'owner ended before tab creation dispatch');
+        if (selected) {
+          tab = await chromeCall(() =>
+            this.chrome.tabs.create({ active: false, url: 'about:blank', windowId: selected.id }),
           );
+          receipt.creationAck = true;
+        } else {
+          const window = await chromeCall(() =>
+            this.chrome.windows.create({ focused: false, type: 'normal', url: 'about:blank' }),
+          );
+          receipt.creationAck = true;
+          receipt.windowId = window.id;
+          tab = window.tabs?.find(
+            (candidate) => Number.isSafeInteger(candidate.id) && candidate.id >= 0,
+          );
+          if (!tab)
+            throw new ConnectorError(
+              'outcome_unknown',
+              'new window was acknowledged without a tab identity',
+              { windowId: window.id },
+            );
+        }
       }
       if (!tab || !Number.isSafeInteger(tab.id) || tab.id < 0)
         fail('outcome_unknown', 'Chrome acknowledged creation without an exact tab ID');

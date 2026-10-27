@@ -11,11 +11,16 @@
 
 use super::native_framing::{self, Direction, FrameError};
 use serde::{Serialize, Serializer};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// One native host's queued JSON budget; a single valid 64MiB message fits.
 const QUEUED_JSON_BYTES: usize = 128 * 1024 * 1024;
+
+/// Final local IPC egress budget, matching the existing client write budget.
+/// This limits shutdown drainage only; it never extends a command timeout or
+/// proves that a peer consumed any already queued fact.
+pub(crate) const IPC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DeliveryError {
@@ -39,6 +44,13 @@ impl ByteBudget {
     pub(crate) fn new() -> Self {
         Self {
             permits: Arc::new(Semaphore::new(QUEUED_JSON_BYTES)),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_with_capacity(bytes: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(bytes)),
         }
     }
 

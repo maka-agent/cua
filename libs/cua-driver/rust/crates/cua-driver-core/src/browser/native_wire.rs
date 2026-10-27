@@ -11,6 +11,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Instant;
 
+/// Already expanded trusted Host headers. This type selects no identity or grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Exact current document already admitted by the Host's origin and site policy.
+/// The DTO itself is metadata, never an authorization or a fresh browser grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativePreparationDocument {
+    pub frame_id: String,
+    pub loader_id: String,
+    pub url: String,
+}
+
+/// Explicit trusted Host policy for upgrading one existing physical claim.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativePreparationPolicy {
+    pub popup_enabled: bool,
+    pub header_enabled: bool,
+    pub headers: Vec<NativeHeader>,
+}
+
 const MAX_ID_BYTES: usize = 4096;
 
 /// Maximum finite normalized action batch accepted by the serialized actor.
@@ -131,6 +158,20 @@ impl MatchedNativeReply {
             && self.semantic_id == semantic_id
             && self.wire_context.as_ref() == wire_context
     }
+}
+
+/// Dispatch state observed by the broker's existing native writer.
+///
+/// Only the broker may produce this value from its dispatch state. It conveys
+/// native write progress, never Chrome execution or Host effect settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCdpWritePhase {
+    Queued,
+    Started,
+    Written,
+    Skipped,
+    Unknown,
 }
 
 /// In-process reply origin, separate from any native/page JSON fields.

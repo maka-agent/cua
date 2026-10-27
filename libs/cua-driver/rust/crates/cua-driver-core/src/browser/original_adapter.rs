@@ -906,7 +906,7 @@ impl OriginalWireAdapter {
                 "kind":"hello","protocol":1,"extensionId":self.expected_extension,
                 "instanceId":value["metadata"]["extensionInstanceId"],
                 "capabilities":{"metadata":true,"physicalClaims":true,"orderedCdpEvents":true,"flatChildSessions":true,
-                    "browserManagement":false,"nativeWindowProof":false,"adapter":"original_jsonrpc", "observedVersion":value["version"],"userTabsOrder":"provider","headerScope":"session","presentationOwner":"provider","cursorMovePresentation":true,"cursorHidePresentation":false,"createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider","downloadNotifications":true}
+                    "browserManagement":false,"nativeWindowProof":false,"adapter":"original_jsonrpc", "observedVersion":value["version"],"userTabsOrder":"provider","headerScope":"session","presentationOwner":"provider","cursorMovePresentation":true,"cursorHidePresentation":false,"createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider","attachmentPreparation":"full_preparation","downloadNotifications":true}
             }))]);
         }
         let call = task

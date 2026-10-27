@@ -128,24 +128,58 @@ pub struct CdpDialogState {
 /// What the reader routed back for one in-flight call.
 enum CallOutcome {
     Result(Value),
-    Error { code: Option<i64>, message: String },
+    Error {
+        code: Option<i64>,
+        message: String,
+        disposition: CdpFailureDisposition,
+    },
+    NativeFailure {
+        message: String,
+        disposition: CdpFailureDisposition,
+    },
     TransportFailure(String),
-    LocalRejected { code: String, message: String },
+    LocalRejected {
+        code: String,
+        message: String,
+    },
 }
 
-/// A remote error reply matched to one dispatched CDP request.
+/// Trusted failure classification for the caller's existing effect ledger.
+/// These values are produced inside Rust; native/page JSON cannot choose them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdpFailureDisposition {
+    /// An actual failed reply without locally retained unknown effect custody.
+    ReplyFailure,
+    /// The native provider retained this exact request's unknown effect.
+    NativeEffectUnknown,
+    /// The connector proved that it did not dispatch this request.
+    NotDispatched,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CdpFailureOrigin {
+    Reply,
+    NativeTransport,
+}
+
+/// A request-matched failed reply or native invocation terminal.
 ///
-/// Local policy rejection, socket failure and a missing reply do not construct
-/// this type. Callers can downcast the existing `anyhow::Error` without parsing
-/// its diagnostic text. A remote reply can omit its numeric code.
+/// Disposition separates a locally retained unknown effect from an ordinary
+/// failed reply. A native invocation terminal is not a Chrome rejection or an
+/// effect-settlement proof. Missing replies and whole-transport loss retain
+/// their existing generic unknown errors. Numeric codes are never invented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdpReplyError {
     method: String,
     code: Option<i64>,
     message: String,
+    disposition: CdpFailureDisposition,
+    origin: CdpFailureOrigin,
 }
 
 impl CdpReplyError {
+    pub fn disposition(&self) -> CdpFailureDisposition {
+        self.disposition
+    }
     pub fn method(&self) -> &str {
         &self.method
     }
@@ -161,6 +195,13 @@ impl CdpReplyError {
 
 impl std::fmt::Display for CdpReplyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.origin == CdpFailureOrigin::NativeTransport {
+            return write!(
+                formatter,
+                "CDP transport failed during {}: {}",
+                self.method, self.message
+            );
+        }
         match self.code {
             Some(code) => write!(
                 formatter,
@@ -187,6 +228,9 @@ pub struct NativeCdpRefusal {
 }
 
 impl NativeCdpRefusal {
+    pub fn disposition(&self) -> CdpFailureDisposition {
+        CdpFailureDisposition::NotDispatched
+    }
     pub fn method(&self) -> &str {
         &self.method
     }
@@ -275,12 +319,16 @@ impl Demux {
 
 /// Route one trusted CDP message through the existing pending/event state.
 fn route_json(v: Value, demux: &Demux) {
+    route_json_with_disposition(v, demux, CdpFailureDisposition::ReplyFailure);
+}
+fn route_json_with_disposition(v: Value, demux: &Demux, disposition: CdpFailureDisposition) {
     if let Some(id) = v.get("id").and_then(Value::as_u64) {
         let Some(tx) = demux.pending.lock().unwrap().remove(&id) else {
             return; // reply to a timed-out or unknown call
         };
         let outcome = match v.get("error") {
             Some(err) => CallOutcome::Error {
+                disposition,
                 code: err.get("code").and_then(Value::as_i64),
                 message: err
                     .get("message")
@@ -372,11 +420,23 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
 /// internal boundary; this enum is not an external or model-facing wire API.
 pub(crate) enum NativeCdpInbound {
     ChromeMessage(Value),
+    /// Trusted client metadata travels beside raw JSON, never inside it.
+    ClassifiedChromeMessage {
+        message: Value,
+        disposition: CdpFailureDisposition,
+    },
     /// Known pre-dispatch connector refusal; kind is validated upstream.
     LocalRejected {
         id: u64,
         code: String,
         message: String,
+    },
+    /// Fail only this exact native request. Neighboring requests retain their
+    /// own ordered write-phase facts and cannot be closed by this terminal.
+    RequestFailure {
+        id: u64,
+        reason: String,
+        disposition: CdpFailureDisposition,
     },
     TransportFailure(String),
 }
@@ -388,6 +448,7 @@ pub(crate) enum NativeCdpInbound {
 pub(crate) struct NativeCdpCommand {
     message: Value,
     wire_context: Option<NativeWireContext>,
+    reply_disposition: ReplyDisposition,
     connection: Weak<Demux>,
 }
 
@@ -396,6 +457,7 @@ pub(crate) struct NativeCdpCommand {
 pub(crate) struct NativeCdpDispatch {
     pub(crate) message: Value,
     pub(crate) wire_context: Option<NativeWireContext>,
+    pub(crate) reply_disposition: ReplyDisposition,
 }
 
 impl NativeCdpCommand {
@@ -407,6 +469,7 @@ impl NativeCdpCommand {
             Some(NativeCdpDispatch {
                 message: self.message,
                 wire_context: self.wire_context,
+                reply_disposition: self.reply_disposition,
             })
         }
     }
@@ -416,9 +479,25 @@ async fn read_native_loop(mut inbound: mpsc::Receiver<NativeCdpInbound>, demux: 
     while let Some(message) = inbound.recv().await {
         match message {
             NativeCdpInbound::ChromeMessage(message) => route_json(message, &demux),
+            NativeCdpInbound::ClassifiedChromeMessage {
+                message,
+                disposition,
+            } => route_json_with_disposition(message, &demux, disposition),
             NativeCdpInbound::LocalRejected { id, code, message } => {
                 if let Some(reply) = demux.pending.lock().unwrap().remove(&id) {
                     let _ = reply.send(CallOutcome::LocalRejected { code, message });
+                }
+            }
+            NativeCdpInbound::RequestFailure {
+                id,
+                reason,
+                disposition,
+            } => {
+                if let Some(reply) = demux.pending.lock().unwrap().remove(&id) {
+                    let _ = reply.send(CallOutcome::NativeFailure {
+                        message: reason,
+                        disposition,
+                    });
                 }
             }
             NativeCdpInbound::TransportFailure(message) => {
@@ -441,6 +520,7 @@ impl CdpWriter {
         message: Value,
         demux: &Arc<Demux>,
         wire_context: Option<&NativeWireContext>,
+        reply_disposition: ReplyDisposition,
     ) -> anyhow::Result<()> {
         match self {
             Self::WebSocket(writer) => writer
@@ -451,6 +531,7 @@ impl CdpWriter {
                 .send(NativeCdpCommand {
                     message,
                     wire_context: wire_context.cloned(),
+                    reply_disposition,
                     connection: Arc::downgrade(demux),
                 })
                 .await
@@ -475,8 +556,9 @@ impl Drop for CdpConnection {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ReplyDisposition {
+// Trusted caller intent stays inside Rust; native peers cannot deserialize it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyDisposition {
     Required,
     Observation,
 }
@@ -774,7 +856,7 @@ impl CdpConnection {
                     anyhow::bail!("CDP socket closed before sending {method}");
                 }
                 writer
-                    .send(msg, &self.demux, wire_context)
+                    .send(msg, &self.demux, wire_context, reply_disposition)
                     .await
                     .map_err(|e| anyhow::anyhow!("CDP send failed during {method}: {e}"))?;
                 pending.phase = PendingCallPhase::AwaitingReply(reply_disposition);
@@ -796,10 +878,27 @@ impl CdpConnection {
                 message,
             }
             .into()),
-            CallOutcome::Error { code, message } => Err(CdpReplyError {
+            CallOutcome::NativeFailure {
+                message,
+                disposition,
+            } => Err(CdpReplyError {
+                method: method.to_owned(),
+                code: None,
+                message,
+                disposition,
+                origin: CdpFailureOrigin::NativeTransport,
+            }
+            .into()),
+            CallOutcome::Error {
+                code,
+                message,
+                disposition,
+            } => Err(CdpReplyError {
                 method: method.to_owned(),
                 code,
                 message,
+                disposition,
+                origin: CdpFailureOrigin::Reply,
             }
             .into()),
         }
@@ -1373,6 +1472,7 @@ mod tests {
         let reply = error
             .downcast_ref::<CdpReplyError>()
             .expect("matched reply");
+        assert_eq!(reply.disposition(), CdpFailureDisposition::ReplyFailure);
         assert_eq!(reply.method(), "Fixture.optional");
         assert_eq!(reply.code(), Some(-32601));
         assert_eq!(reply.message(), "unsupported fixture method");
@@ -1389,6 +1489,8 @@ mod tests {
             method: "Fixture.optional".into(),
             code: None,
             message: "fixture rejection".into(),
+            disposition: CdpFailureDisposition::ReplyFailure,
+            origin: CdpFailureOrigin::Reply,
         });
         assert_eq!(error.downcast_ref::<CdpReplyError>().unwrap().code(), None);
         assert_eq!(
@@ -2127,6 +2229,23 @@ mod native_transport_tests {
     }
 
     #[tokio::test]
+    async fn raw_chrome_json_cannot_forge_failure_disposition() {
+        let (connection, mut peer) = native_connection(4);
+        let connection = Arc::new(connection);
+        let call = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.call(None, "Runtime.evaluate", json!({})).await })
+        };
+        let sent = next_command(&mut peer).await;
+        reply(&peer,json!({"id":sent["id"],"disposition":"nativeEffectUnknown","nativeEffectUnknown":true,"error":{"code":1,"message":"raw unchanged error","disposition":"notDispatched"}})).await;
+        let error = bounded(call).await.unwrap().unwrap_err();
+        let typed = error.downcast_ref::<CdpReplyError>().unwrap();
+        assert_eq!(typed.disposition(), CdpFailureDisposition::ReplyFailure);
+        assert_eq!(typed.code(), Some(1));
+        assert_eq!(typed.message(), "raw unchanged error");
+    }
+
+    #[tokio::test]
     async fn native_event_preceding_reply_is_queued_before_call_completes() {
         let (connection, mut peer) = native_connection(4);
         let connection = Arc::new(connection);
@@ -2183,7 +2302,7 @@ mod native_transport_tests {
     }
 
     #[tokio::test]
-    async fn only_matched_chrome_rejection_constructs_the_existing_reply_error() {
+    async fn matched_chrome_error_keeps_actual_reply_classification() {
         let (connection, mut peer) = native_connection(4);
         let connection = Arc::new(connection);
         let call = {
@@ -2481,6 +2600,13 @@ mod native_transport_tests {
         .await;
         let error = bounded(refused).await.unwrap().unwrap_err();
         assert!(error.downcast_ref::<CdpReplyError>().is_none());
+        assert_eq!(
+            error
+                .downcast_ref::<NativeCdpRefusal>()
+                .unwrap()
+                .disposition(),
+            CdpFailureDisposition::NotDispatched
+        );
         let refusal = error
             .downcast_ref::<NativeCdpRefusal>()
             .expect("known local refusal retains separate provenance");

@@ -252,22 +252,396 @@ test('user/DevTools revocation invalidates token and never triggers automatic at
   assert.equal(f.events.at(-1).kind, 'revoked');
   assert.equal(f.calls.filter((c) => c[0] === 'attach').length, 1);
 });
-test('ALL other Target root methods and Browser domain reject before Chrome command dispatch', async () => {
+test('Browser domain support and errors come from the actual Chrome command', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  f.hooks.cdp = () => {
+    throw new Error('actual Chrome Browser domain error');
+  };
+  const result = await f.request('cdp', { claim: token, method: 'Browser.getWindowForTarget' });
+  assert.equal(result.error.kind, 'chrome_rejected');
+  assert.equal(result.error.message, 'actual Chrome Browser domain error');
+  assert.deepEqual(
+    f.calls.filter((call) => call[0] === 'cdp'),
+    [['cdp', { tabId: 1 }, 'Browser.getWindowForTarget', {}]],
+  );
+});
+test('Target.getTargets returns actual debugger metadata and its exact native identity mapping', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  const targets = [
+    { id: 'target-1', tabId: 1, type: 'page', title: 'current', attached: true },
+    { id: 'foreign-target', tabId: 100, type: 'page', url: 'https://other.test/' },
+  ];
+  let reads = 0;
+  f.hooks.targets = () => {
+    reads++;
+    return targets;
+  };
+  const result = await f.request('cdp', {
+    claim: token,
+    method: 'Target.getTargets',
+    params: { filter: [{ type: 'iframe' }] },
+  });
+  assert.deepEqual(result.result.result, {
+    targetInfos: targets.map((target) => ({ ...target, targetId: target.id })),
+  });
+  assert.equal(reads, 1);
+  assert.equal(f.calls.filter((call) => call[0] === 'cdp').length, 0);
+});
+test('Target.getTargetInfo reaches Chrome for the actual root and observed child only', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  f.hooks.cdp = (source, method, params) => ({
+    targetInfo: { targetId: params.targetId ?? 'target-1', title: 'live' },
+  });
+  assert.equal(
+    (await f.request('cdp', { claim: token, method: 'Target.getTargetInfo' })).result.result
+      .targetInfo.title,
+    'live',
+  );
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        method: 'Target.getTargetInfo',
+        params: { targetId: 'target-1' },
+      })
+    ).result.result.targetInfo.title,
+    'live',
+  );
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.attachedToTarget', {
+    sessionId: 'child',
+    targetInfo: { targetId: 'frame-a' },
+  });
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        method: 'Target.getTargetInfo',
+        params: { targetId: 'frame-a' },
+      })
+    ).result.result.targetInfo.targetId,
+    'frame-a',
+  );
+  const before = f.calls.length;
+  const result = await f.request('cdp', {
+    claim: token,
+    method: 'Target.getTargetInfo',
+    params: { targetId: 'foreign-target' },
+  });
+  assert.equal(result.error.kind, 'target_unavailable');
+  assert.equal(f.calls.length, before);
+});
+test('Target.attachToTarget uses the actual matched Chrome session acknowledgement without inventing an ID', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  const pending = deferred();
+  f.hooks.cdp = (source, method) =>
+    method === 'Target.attachToTarget' ? pending.promise : { source };
+  const result = f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  await tick();
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        sessionId: 'actual-session',
+        method: 'Runtime.enable',
+      })
+    ).error.kind,
+    'child_session_unavailable',
+  );
+  pending.resolve({ sessionId: 'actual-session' });
+  assert.deepEqual((await result).result.result, { sessionId: 'actual-session' });
+  assert.deepEqual(
+    (
+      await f.request('cdp', {
+        claim: token,
+        sessionId: 'actual-session',
+        method: 'Runtime.enable',
+      })
+    ).result.result.source,
+    { tabId: 1, sessionId: 'actual-session' },
+  );
+  assert.equal(
+    f.calls.filter((call) => call[0] === 'cdp' && call[2] === 'Target.attachToTarget').length,
+    1,
+  );
+});
+test('target attach preserves actual child events before the acknowledgement and refuses foreign target mutation', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  f.hooks.cdp = (source, method) => {
+    if (method === 'Target.attachToTarget') {
+      f.chrome.debugger.onEvent.fire(source, 'Target.attachedToTarget', {
+        sessionId: 'actual-session',
+        targetInfo: { targetId: 'target-1' },
+      });
+      return { sessionId: 'actual-session' };
+    }
+    return {};
+  };
+  const result = await f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  assert.deepEqual(result.result.result, { sessionId: 'actual-session' });
+  assert.equal(f.events.at(-1).method, 'Target.attachedToTarget');
+  const before = f.calls.length;
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        method: 'Target.attachToTarget',
+        params: { targetId: 'foreign', flatten: true },
+      })
+    ).error.kind,
+    'target_unavailable',
+  );
+  assert.equal(f.calls.length, before);
+});
+test('a target attach result without a real session identity is unknown and is never replayed', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  f.hooks.cdp = () => ({});
+  const result = await f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  assert.equal(result.error.kind, 'outcome_unknown');
+  assert.deepEqual(result.error.details.acknowledgedResult, {});
+  assert.equal(f.calls.filter((call) => call[0] === 'cdp').length, 1);
+});
+test('an actual detach before a target attach ACK cannot resurrect that child session', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  const pending = deferred();
+  f.hooks.cdp = (source, method) => {
+    if (method === 'Target.attachToTarget') {
+      f.chrome.debugger.onEvent.fire(source, 'Target.attachedToTarget', {
+        sessionId: 'actual-session',
+        targetInfo: { targetId: 'target-1' },
+      });
+      return pending.promise;
+    }
+    return {};
+  };
+  const result = f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  await tick();
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.detachedFromTarget', {
+    sessionId: 'actual-session',
+  });
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        sessionId: 'actual-session',
+        method: 'Runtime.enable',
+      })
+    ).error.kind,
+    'child_session_unavailable',
+  );
+  pending.resolve({ sessionId: 'actual-session' });
+  assert.equal((await result).error.kind, 'outcome_unknown');
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        sessionId: 'actual-session',
+        method: 'Runtime.enable',
+      })
+    ).error.kind,
+    'child_session_unavailable',
+  );
+  assert.ok((await f.request('cdp', { claim: token, method: 'Runtime.enable' })).result);
+  assert.equal(
+    f.calls.filter((call) => call[0] === 'cdp' && call[2] === 'Target.attachToTarget').length,
+    1,
+  );
+});
+test('an actual pre-ACK detach stays final even if its attached event was not observed', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  const pending = deferred();
+  f.hooks.cdp = () => pending.promise;
+  const result = f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  await tick();
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.detachedFromTarget', {
+    sessionId: 'actual-session',
+  });
+  pending.resolve({ sessionId: 'actual-session' });
+  assert.equal((await result).error.kind, 'outcome_unknown');
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        sessionId: 'actual-session',
+        method: 'Runtime.enable',
+      })
+    ).error.kind,
+    'child_session_unavailable',
+  );
+  assert.equal(f.calls.filter((call) => call[0] === 'cdp').length, 1);
+});
+test('concurrent target attaches retain only their actual live child across another child detach', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  const first = deferred();
+  const second = deferred();
+  let calls = 0;
+  f.hooks.cdp = (source, method) =>
+    method === 'Target.attachToTarget' ? (++calls === 1 ? first.promise : second.promise) : {};
+  const a = f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  const b = f.request('cdp', {
+    claim: token,
+    method: 'Target.attachToTarget',
+    params: { targetId: 'target-1', flatten: true },
+  });
+  await tick();
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.attachedToTarget', {
+    sessionId: 'session-a',
+    targetInfo: { targetId: 'target-1' },
+  });
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.attachedToTarget', {
+    sessionId: 'session-b',
+    targetInfo: { targetId: 'target-1' },
+  });
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.detachedFromTarget', {
+    sessionId: 'session-a',
+  });
+  first.resolve({ sessionId: 'session-a' });
+  assert.equal((await a).error.kind, 'outcome_unknown');
+  second.resolve({ sessionId: 'session-b' });
+  assert.deepEqual((await b).result.result, { sessionId: 'session-b' });
+  assert.equal(
+    (await f.request('cdp', { claim: token, sessionId: 'session-a', method: 'Runtime.enable' }))
+      .error.kind,
+    'child_session_unavailable',
+  );
+  assert.ok(
+    (await f.request('cdp', { claim: token, sessionId: 'session-b', method: 'Runtime.enable' }))
+      .result,
+  );
+  assert.equal(calls, 2);
+});
+for (const earlyChildEvent of [false, true])
+  test(`a nested target attach cannot outlive its parent with early child event ${earlyChildEvent}`, async () => {
+    const f = fixture();
+    const token = await claim(f);
+    f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.attachedToTarget', {
+      sessionId: 'parent-session',
+      targetInfo: { targetId: 'frame-a' },
+    });
+    const pending = deferred();
+    f.hooks.cdp = (source, method) => {
+      if (method === 'Target.attachToTarget') {
+        if (earlyChildEvent)
+          f.chrome.debugger.onEvent.fire(source, 'Target.attachedToTarget', {
+            sessionId: 'new-child',
+            targetInfo: { targetId: 'frame-a' },
+          });
+        return pending.promise;
+      }
+      return {};
+    };
+    const result = f.request('cdp', {
+      claim: token,
+      sessionId: 'parent-session',
+      method: 'Target.attachToTarget',
+      params: { targetId: 'frame-a', flatten: true },
+    });
+    await tick();
+    f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.detachedFromTarget', {
+      sessionId: 'parent-session',
+    });
+    pending.resolve({ sessionId: 'new-child' });
+    const response = await result;
+    assert.equal(response.error.kind, 'outcome_unknown');
+    assert.deepEqual(response.error.details.acknowledgedResult, { sessionId: 'new-child' });
+    for (const sessionId of ['parent-session', 'new-child'])
+      assert.equal(
+        (await f.request('cdp', { claim: token, sessionId, method: 'Runtime.enable' })).error.kind,
+        'child_session_unavailable',
+      );
+    assert.ok((await f.request('cdp', { claim: token, method: 'Runtime.enable' })).result);
+    assert.equal(
+      f.calls.filter((call) => call[0] === 'cdp' && call[2] === 'Target.attachToTarget').length,
+      1,
+    );
+  });
+test('Target.detachFromTarget sends only an observed child and retires its descendants after the actual acknowledgement', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.attachedToTarget', {
+    sessionId: 'child',
+    targetInfo: { targetId: 'frame-a' },
+  });
+  f.chrome.debugger.onEvent.fire({ tabId: 1, sessionId: 'child' }, 'Target.attachedToTarget', {
+    sessionId: 'grandchild',
+    targetInfo: { targetId: 'frame-b' },
+  });
+  const pending = deferred();
+  f.hooks.cdp = (source, method) => (method === 'Target.detachFromTarget' ? pending.promise : {});
+  const result = f.request('cdp', {
+    claim: token,
+    method: 'Target.detachFromTarget',
+    params: { sessionId: 'child' },
+  });
+  await tick();
+  assert.ok(
+    (await f.request('cdp', { claim: token, sessionId: 'grandchild', method: 'Runtime.enable' }))
+      .result,
+  );
+  pending.resolve({});
+  assert.deepEqual((await result).result.result, {});
+  assert.equal(
+    (await f.request('cdp', { claim: token, sessionId: 'grandchild', method: 'Runtime.enable' }))
+      .error.kind,
+    'child_session_unavailable',
+  );
+  const before = f.calls.length;
+  assert.equal(
+    (
+      await f.request('cdp', {
+        claim: token,
+        method: 'Target.detachFromTarget',
+        params: { sessionId: 'foreign' },
+      })
+    ).error.kind,
+    'child_session_unavailable',
+  );
+  assert.equal(f.calls.length, before);
+});
+test('untracked global target creation is an explicit pending Host custody adaptation, not an Original capability classification', async () => {
   const f = fixture();
   const token = await claim(f);
   for (const method of [
     'Target.createTarget',
-    'Target.attachToTarget',
-    'Target.closeTarget',
+    'Target.createBrowserContext',
+    'Target.disposeBrowserContext',
     'Target.attachToBrowserTarget',
-    'Target.exposeDevToolsProtocol',
-    'Browser.getWindowForTarget',
-  ])
-    assert.equal(
-      (await f.request('cdp', { claim: token, method, params: { targetId: 'foreign' } })).error
-        .kind,
-      'unsupported',
-    );
+  ]) {
+    const result = await f.request('cdp', { claim: token, method, params: { url: 'about:blank' } });
+    assert.equal(result.error.kind, 'host_scope_required');
+  }
   assert.equal(
     (
       await f.request('cdp', {
@@ -278,7 +652,7 @@ test('ALL other Target root methods and Browser domain reject before Chrome comm
     ).error.kind,
     'invalid_request',
   );
-  assert.equal(f.calls.filter((c) => c[0] === 'cdp').length, 0);
+  assert.equal(f.calls.filter((call) => call[0] === 'cdp').length, 0);
 });
 test('child sessions are admitted only through exact observed parent and recursively retired', async () => {
   const f = fixture();

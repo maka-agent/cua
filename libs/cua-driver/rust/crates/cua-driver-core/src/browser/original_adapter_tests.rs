@@ -42,6 +42,7 @@ fn boot() -> (OriginalWireAdapter, NativeWireContext, Instant) {
         )
         .expect("matched getInfo");
     assert!(actions.iter().any(|action| matches!(action, NativeWireAction::BrokerMessage(value) if value["capabilities"]["userTabsOrder"] == "provider")));
+    assert!(actions.iter().any(|action| matches!(action, NativeWireAction::BrokerMessage(value) if value["capabilities"]["attachmentPreparation"] == "full_preparation")));
     (
         adapter,
         NativeWireContext::new(SID, "turn1").expect("trusted context"),

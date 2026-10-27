@@ -130,7 +130,7 @@ unsafe extern "system" {
         revision: *mut u32,
     ) -> i32;
     fn GetAclInformation(acl: Handle, information: Handle, length: u32, class: u32) -> i32;
-    fn GetAce(acl: Handle, index: u32, ace: *mut Handle) -> i32;
+    fn GetAce(acl: *const c_void, index: u32, ace: *mut Handle) -> i32;
 }
 
 struct OwnedHandle(Handle);

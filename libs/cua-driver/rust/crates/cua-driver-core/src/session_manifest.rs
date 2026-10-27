@@ -5,7 +5,9 @@
 //! managed, and user policy layers; it cannot introduce unreviewed tools.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "yaml")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -71,6 +73,21 @@ enum TerminationGrant {
     Deny,
     DriverLaunched,
     Any,
+}
+
+impl TryFrom<&str> for TerminationGrant {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "deny" => Ok(Self::Deny),
+            "driver_launched" => Ok(Self::DriverLaunched),
+            "any" => Ok(Self::Any),
+            other => Err(format!(
+                "unsupported application terminate scope '{other}'; expected deny, driver_launched, or any"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1140,16 +1157,7 @@ fn validate_applications(
                 ))
             }
         };
-        let terminate = match raw.terminate.as_deref().unwrap_or("deny") {
-            "deny" => TerminationGrant::Deny,
-            "driver_launched" => TerminationGrant::DriverLaunched,
-            "any" => TerminationGrant::Any,
-            other => {
-                return Err(format!(
-                    "unsupported application terminate scope '{other}'; expected deny, driver_launched, or any"
-                ))
-            }
-        };
+        let terminate = TerminationGrant::try_from(raw.terminate.as_deref().unwrap_or("deny"))?;
         if validated.iter().any(|application: &ApplicationGrant| {
             application.bundle_id == bundle_id && application.executable == executable
         }) {
@@ -1476,6 +1484,26 @@ fn now_unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn termination_grant_conversion_preserves_exact_scopes_without_yaml() {
+        for (scope, expected) in [
+            ("deny", TerminationGrant::Deny),
+            ("driver_launched", TerminationGrant::DriverLaunched),
+            ("any", TerminationGrant::Any),
+        ] {
+            assert_eq!(TerminationGrant::try_from(scope), Ok(expected));
+        }
+        for invalid in ["", "DENY", " deny", "driver_launched ", "all"] {
+            assert_eq!(
+                TerminationGrant::try_from(invalid),
+                Err(format!(
+                    "unsupported application terminate scope '{invalid}'; expected deny, driver_launched, or any"
+                )),
+                "invalid termination scope {invalid:?} must remain rejected"
+            );
+        }
+    }
 
     #[cfg(feature = "yaml")]
     fn manifest(source: &str) -> Result<SessionManifest, String> {

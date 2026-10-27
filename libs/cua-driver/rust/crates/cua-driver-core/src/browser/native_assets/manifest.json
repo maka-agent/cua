@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Maka Browser Connector",
-  "version": "0.0.3",
+  "version": "0.0.8",
   "minimum_chrome_version": "125",
   "permissions": [
     "debugger",
@@ -9,7 +9,9 @@
     "nativeMessaging",
     "tabGroups",
     "declarativeNetRequestWithHostAccess",
-    "downloads"
+    "downloads",
+    "scripting",
+    "webNavigation"
   ],
   "background": {
     "service_worker": "background.mjs",

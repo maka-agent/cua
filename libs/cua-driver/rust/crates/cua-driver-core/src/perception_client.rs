@@ -139,7 +139,7 @@ impl PerceptionWorkerConfig {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_test_containment(
         mut self,
         containment: containment::ContainmentLimits,

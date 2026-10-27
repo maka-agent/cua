@@ -1,14 +1,45 @@
 use super::*;
 use std::io::Cursor;
 
+// Earlier keepers consume their original semantic events. Dedicated V6
+// keepers assert the additive trusted metadata lane directly.
+fn semantic_control(client: &mut ClientConnection) -> Queued<ControlEvent> {
+    loop {
+        let (event, charge) = client.events.try_recv().unwrap().into_parts();
+        if !matches!(
+            event,
+            ControlEvent::CdpUnconfirmed { .. } | ControlEvent::CdpRouteClosed { .. }
+        ) {
+            return Queued::new(event, charge);
+        }
+    }
+}
+
+fn terminal_control(client: &mut ClientConnection) -> Queued<ControlEvent> {
+    loop {
+        let (event, charge) = client.events.try_recv().unwrap().into_parts();
+        if !matches!(
+            event,
+            ControlEvent::CdpUnconfirmed { event: None, .. } | ControlEvent::CdpRouteClosed { .. }
+        ) {
+            return Queued::new(event, charge);
+        }
+    }
+}
+
 fn fixture() -> NativeHostBroker {
+    fixture_with_output().0
+}
+
+fn fixture_with_output() -> (NativeHostBroker, mpsc::Receiver<NativeOutbound>) {
     let origin = ExtensionOrigin::from_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-    let (_, mut broker, _) = NativeHostBroker::channels(origin, LocalPrincipal::UnixUid(123));
+    let (_, mut broker, output_receiver) =
+        NativeHostBroker::channels(origin, LocalPrincipal::UnixUid(123));
     let mut output = Vec::new();
     broker.native(json!({"kind":"hello","protocol":1,"extensionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instanceId":"actual-fixture-instance","capabilities":{"metadata":true,"rawTabCdp":true,"nativeWindowProof":false}}), &mut output).unwrap();
     let bound = write(output.pop().unwrap());
     assert_eq!(bound["kind"], "bound");
-    broker
+    (broker, output_receiver)
 }
 
 fn write(outbound: NativeOutbound) -> Value {
@@ -65,7 +96,7 @@ fn attach(
         json!({"claim":token,"tabId":tab_id,"targetId":format!("opaque-target-{tab_id}")}),
     );
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::Reply { id: actual, outcome: ControlOutcome::Result(_) } if actual == id)
+        matches!(semantic_control(client).into_parts().0, ControlEvent::Reply { id: actual, outcome: ControlOutcome::Result(_) } if actual == id)
     );
     broker.bind_route(client.sender.lease.id, token).unwrap()
 }
@@ -123,10 +154,10 @@ fn out_of_order_control_results_keep_the_original_client_and_local_id() {
     );
     reply(&mut broker, &a, json!({"tabs":[{"id":11}]}));
     assert!(
-        matches!(first.events.try_recv().unwrap().into_parts().0, ControlEvent::Reply { id:1, outcome:ControlOutcome::Result(value) } if value["tabs"][0]["id"] == 11)
+        matches!(semantic_control(&mut first).into_parts().0, ControlEvent::Reply { id:1, outcome:ControlOutcome::Result(value) } if value["tabs"][0]["id"] == 11)
     );
     assert!(
-        matches!(second.events.try_recv().unwrap().into_parts().0, ControlEvent::Reply { id:1, outcome:ControlOutcome::Result(value) } if value["tabs"][0]["lastAccessed"] == 123.5)
+        matches!(semantic_control(&mut second).into_parts().0, ControlEvent::Reply { id:1, outcome:ControlOutcome::Result(value) } if value["tabs"][0]["lastAccessed"] == 123.5)
     );
 }
 
@@ -186,9 +217,17 @@ fn closing_one_cdp_route_keeps_physical_custody_and_late_ack_without_touching_si
     let mut output = Vec::new();
     broker.close_route(first.sender.lease.id, "fixture close", &mut output);
     assert!(matches!(
-        first.events.try_recv().unwrap().into_parts().0,
-        BrokerCdpEvent::TransportFailure(_)
+        terminal_control(&mut client).into_parts().0,
+        ControlEvent::CdpUnconfirmed {
+            id: 1,
+            event: Some(BrokerCdpEvent::TransportFailure(_)),
+            ..
+        }
     ));
+    assert!(
+        first.events.try_recv().is_err(),
+        "failure is delivered once in the atomic owner lane"
+    );
     assert!(
         output.is_empty(),
         "reader cancellation is not detach authority"
@@ -201,7 +240,7 @@ fn closing_one_cdp_route_keeps_physical_custody_and_late_ack_without_touching_si
         json!({"result":{"acknowledged":"once"}}),
     );
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::OrphanCdpCompletion { route, claim, id:1, event:BrokerCdpEvent::ChromeMessage(value),.. } if route == first.sender.lease.id.0 && claim == "claim-a" && value["result"]["acknowledged"] == "once")
+        matches!(semantic_control(&mut client).into_parts().0, ControlEvent::OrphanCdpCompletion { route, claim, id:1, event:BrokerCdpEvent::ChromeMessage(value),.. } if route == first.sender.lease.id.0 && claim == "claim-a" && value["result"]["acknowledged"] == "once")
     );
     let b = cdp(&mut broker, &client, &second, 1);
     assert_eq!(b["params"]["claim"], "claim-b");
@@ -245,8 +284,22 @@ fn native_eof_closes_all_routes_and_fences_previously_queued_frames() {
         &mut output,
     );
     broker.end_generation("fixture native EOF");
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpUnconfirmed {
+            id: 1,
+            write_phase: NativeCdpWritePhase::Queued,
+            event: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::GenerationClosed { .. }
+    ));
     assert!(
-        matches!(route.events.try_recv().unwrap().into_parts().0, BrokerCdpEvent::TransportFailure(reason) if reason.contains("do not replay"))
+        route.events.try_recv().is_err(),
+        "EOF cannot race phase metadata on the route lane"
     );
     let mut bytes = Vec::new();
     assert!(matches!(
@@ -297,11 +350,11 @@ fn early_revocation_never_publishes_a_live_claim_or_ends_unrelated_clients() {
         json!({"claim":"claim-a","tabId":11,"targetId":"opaque-target-11"}),
     );
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::ClaimUnavailable { .. }
     ));
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::Reply {
             id: 1,
             outcome: ControlOutcome::Unknown { .. }
@@ -353,7 +406,7 @@ fn header_cleanup_receipt_is_not_a_cdp_event_or_physical_detach_ack() {
     let mut output = Vec::new();
     broker.native(json!({"kind":"effects_cleanup","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","effect":"scoped_headers","cleanupConfirmed":false,"error":"actual header cleanup fixture error"}), &mut output).unwrap();
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::EffectsCleanup { claim, effect, cleanup_confirmed:false, error:Some(error) } if claim == "claim-a" && effect == "scoped_headers" && error == "actual header cleanup fixture error")
+        matches!(semantic_control(&mut client).into_parts().0, ControlEvent::EffectsCleanup { claim, effect, cleanup_confirmed:false, error:Some(error), wire_context:None } if claim == "claim-a" && effect == "scoped_headers" && error == "actual header cleanup fixture error")
     );
     assert!(
         route.events.try_recv().is_err(),
@@ -377,7 +430,8 @@ fn structured_cleanup_diagnostics_preserve_native_cause_without_releasing_claim(
         effect,
         cleanup_confirmed,
         error,
-    } = client.events.try_recv().unwrap().into_parts().0
+        wire_context: None,
+    } = semantic_control(&mut client).into_parts().0
     else {
         panic!("structured cleanup diagnostic must remain an effect receipt");
     };
@@ -521,7 +575,7 @@ fn unknown_attach_positive_custody_is_cleanup_only_and_preserves_error_details()
     let mut output = Vec::new();
     broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"cleanup was not confirmed","details":details}}),&mut output).unwrap();
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0,ControlEvent::Reply{id:1,outcome:ControlOutcome::Unknown{details:Some(actual),..}} if actual==details)
+        matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{id:1,outcome:ControlOutcome::Unknown{details:Some(actual),..}} if actual==details)
     );
     assert!(broker.claims["claim-unknown"].cleanup_only);
     assert!(
@@ -629,6 +683,7 @@ async fn full_control_queue_backpressures_without_closing_owner_or_siblings() {
             effect: "scoped_headers".to_owned(),
             cleanup_confirmed: false,
             error: Some("actual fixture cleanup error".to_owned()),
+            wire_context: None,
         },
         &mut output,
     );
@@ -677,7 +732,7 @@ fn closed_control_receiver_retains_custody_without_fabricating_ipc_eof() {
 }
 
 #[tokio::test]
-async fn immutable_wire_context_is_attached_per_request_and_absent_from_own_chrome_json() {
+async fn immutable_wire_context_is_attached_per_request_and_serialized_at_own_envelope() {
     let origin = ExtensionOrigin::from_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     let (handle, broker, mut native) =
         NativeHostBroker::channels(origin, LocalPrincipal::UnixUid(123));
@@ -706,11 +761,12 @@ async fn immutable_wire_context_is_attached_per_request_and_absent_from_own_chro
     let second_out = native.recv().await.unwrap();
     assert_eq!(first_out.wire_context(), Some(&first));
     assert_eq!(second_out.wire_context(), Some(&second));
-    assert!(
-        write(first_out).get("wireContext").is_none(),
-        "own Chrome protocol is unchanged"
-    );
-    assert!(write(second_out).get("wireContext").is_none());
+    let first_frame = write(first_out);
+    let second_frame = write(second_out);
+    assert_eq!(first_frame["wireContext"], json!(first));
+    assert_eq!(second_frame["wireContext"], json!(second));
+    assert!(first_frame["params"].get("wireContext").is_none());
+    assert!(second_frame["params"].get("wireContext").is_none());
     handle.native_eof("fixture EOF").await;
     task.await.unwrap();
 }
@@ -734,7 +790,7 @@ fn orphan_cdp_ack_uses_originating_context_instead_of_arrival_context() {
         Some(NativeWireContext::new("actual-host-session", "different-current-turn").unwrap());
     reply(&mut broker, &command, json!({"result":{"actual":"ack"}}));
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0,ControlEvent::OrphanCdpCompletion{wire_context:Some(context),..} if context==original)
+        matches!(semantic_control(&mut client).into_parts().0,ControlEvent::OrphanCdpCompletion{wire_context:Some(context),..} if context==original)
     );
     assert!(
         output.is_empty(),
@@ -749,8 +805,8 @@ fn download_metadata_has_no_inferred_owner_and_shares_one_immutable_payload() {
     let mut second = admit(&mut broker);
     let mut output = Vec::new();
     broker.native(json!({"kind":"download_changed","protocol":1,"generation":broker.generation,"download":{"id":"0","filename":"","url":"https://fixture.invalid/actual-final","status":"started"}}),&mut output).unwrap();
-    let a = first.events.try_recv().unwrap().into_parts().0;
-    let b = second.events.try_recv().unwrap().into_parts().0;
+    let a = semantic_control(&mut first).into_parts().0;
+    let b = semantic_control(&mut second).into_parts().0;
     match (&a, &b) {
         (
             ControlEvent::DownloadChanged { download: a },
@@ -801,7 +857,7 @@ fn session_header_controls_are_session_scoped_and_preserve_matched_facts() {
         "stateConfirmed":true,"active":true,"cleanupConfirmed":false
     });
     reply(&mut broker, &set, proof.clone());
-    match client.events.try_recv().unwrap().into_parts().0 {
+    match semantic_control(&mut client).into_parts().0 {
         ControlEvent::Reply {
             id: 1,
             outcome: ControlOutcome::Result(actual),
@@ -837,16 +893,16 @@ fn cursor_control_cannot_use_foreign_cleanup_only_or_nonfinite_claim_requests() 
     let mut output = Vec::new();
     broker.control(other.sender.lease.id, cursor(1, 12.5), &mut output);
     assert!(output.is_empty());
-    assert!(matches!(other.events.try_recv().unwrap().into_parts().0,
+    assert!(matches!(semantic_control(&mut other).into_parts().0,
         ControlEvent::Reply { outcome: ControlOutcome::ConnectorRejected { kind, .. }, .. } if kind == "claim_unavailable"));
     broker.control(owner.sender.lease.id, cursor(2, f64::NAN), &mut output);
     assert!(output.is_empty());
-    assert!(matches!(owner.events.try_recv().unwrap().into_parts().0,
+    assert!(matches!(semantic_control(&mut owner).into_parts().0,
         ControlEvent::Reply { outcome: ControlOutcome::ConnectorRejected { kind, .. }, .. } if kind == "invalid_request"));
     broker.claims.get_mut("claim-a").unwrap().cleanup_only = true;
     broker.control(owner.sender.lease.id, cursor(3, 12.5), &mut output);
     assert!(output.is_empty());
-    assert!(matches!(owner.events.try_recv().unwrap().into_parts().0,
+    assert!(matches!(semantic_control(&mut owner).into_parts().0,
         ControlEvent::Reply { outcome: ControlOutcome::ConnectorRejected { kind, .. }, .. } if kind == "claim_unavailable"));
     assert!(
         route.sender.lease.alive.load(Ordering::SeqCst),
@@ -877,7 +933,7 @@ fn cursor_control_uses_exact_optional_wire_field_and_ack_is_not_cleanup_proof() 
     );
     let ack = json!({"acknowledged":true});
     reply(&mut broker, &cursor, ack.clone());
-    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+    assert!(matches!(semantic_control(&mut client).into_parts().0,
         ControlEvent::Reply { id: 2, outcome: ControlOutcome::Result(actual) } if actual == ack));
     assert!(broker.claims["claim-a"].alive.load(Ordering::SeqCst));
     let encoded = serde_json::to_value(ControlRequest::MoveMouse {
@@ -1021,6 +1077,7 @@ fn turn_finish_fences_only_existing_same_client_session_turn_work_and_keeps_clea
         ControlRequest::StopCreatedTab {
             id: 5,
             creation: "fixture-opaque-creation".to_owned(),
+            tab_id: None,
         },
         Some(&scope),
     );
@@ -1086,7 +1143,7 @@ fn scope_fenced_written_attach_retains_exact_late_cleanup_only_custody() {
     broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],
         "error":{"kind":"outcome_unknown","message":"follow-up phase fenced after actual attach ACK",
             "details":{"custody":{"claim":"late-custody","tabId":11,"targetId":"actual-target"}}}}), &mut output).unwrap();
-    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+    assert!(matches!(semantic_control(&mut client).into_parts().0,
         ControlEvent::Reply { id:1,outcome:ControlOutcome::Unknown { details:Some(details), .. }} if details["custody"]["claim"]=="late-custody"));
     assert!(broker.claims["late-custody"].cleanup_only);
     assert!(matches!(
@@ -1128,7 +1185,7 @@ fn fenced_snapshot(
         output.is_empty(),
         "a local fence must not dispatch a native RPC"
     );
-    match client.events.try_recv().unwrap().into_parts().0 {
+    match semantic_control(client).into_parts().0 {
         ControlEvent::Reply {
             id: actual,
             outcome: ControlOutcome::Result(snapshot),
@@ -1139,7 +1196,7 @@ fn fenced_snapshot(
 
 fn expect_cdp_progress(client: &mut ClientConnection, claim: &str) {
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::ClaimCdpProgress { claim: actual } if actual == claim)
+        matches!(semantic_control(client).into_parts().0, ControlEvent::ClaimCdpProgress { claim: actual } if actual == claim)
     );
 }
 
@@ -1203,7 +1260,7 @@ fn exact_claim_fence_counts_queued_and_written_work_until_actual_terminal_receip
     assert!(matches!(skipped, WriteReport::Skipped { outer } if outer == queued_outer));
     broker.written(skipped, &mut output);
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::OrphanCdpCompletion { id:2,event:BrokerCdpEvent::LocalRejected { code, .. }, .. } if code == "not_dispatched")
+        matches!(semantic_control(&mut client).into_parts().0, ControlEvent::OrphanCdpCompletion { id:2,event:BrokerCdpEvent::LocalRejected { code, .. }, .. } if code == "not_dispatched")
     );
     expect_cdp_progress(&mut client, "claim-a");
     let waiting = fenced_snapshot(&mut broker, &mut client, 4, "claim-a");
@@ -1211,7 +1268,7 @@ fn exact_claim_fence_counts_queued_and_written_work_until_actual_terminal_receip
     assert_eq!(waiting["pending"][0]["id"], 1);
     reply(&mut broker, &written, json!({"result":{"actual":"ack"}}));
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::OrphanCdpCompletion { id:1,event:BrokerCdpEvent::ChromeMessage(value), .. } if value["result"]["actual"] == "ack")
+        matches!(semantic_control(&mut client).into_parts().0, ControlEvent::OrphanCdpCompletion { id:1,event:BrokerCdpEvent::ChromeMessage(value), .. } if value["result"]["actual"] == "ack")
     );
     expect_cdp_progress(&mut client, "claim-a");
     let drained = fenced_snapshot(&mut broker, &mut client, 5, "claim-a");
@@ -1226,7 +1283,7 @@ fn exact_claim_fence_counts_queued_and_written_work_until_actual_terminal_receip
 }
 
 #[test]
-fn unknown_cdp_cannot_be_cleared_by_duplicate_reply_detach_ack_or_generation_eof() {
+fn adapted_unknown_cdp_cannot_be_cleared_by_adapted_duplicate_detach_or_eof() {
     let mut broker = fixture();
     let mut client = admit(&mut broker);
     let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
@@ -1235,7 +1292,7 @@ fn unknown_cdp_cannot_be_cleared_by_duplicate_reply_detach_ack_or_generation_eof
     let mut output = Vec::new();
     broker.native_with_provenance(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"fixture ACK unavailable","details":{"nativeAcknowledged":true}}}), NativeReplyProvenance::Adapted, &mut output).unwrap();
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::OrphanCdpCompletion {
             event: BrokerCdpEvent::TransportFailure(reason),
             ..
@@ -1245,7 +1302,7 @@ fn unknown_cdp_cannot_be_cleared_by_duplicate_reply_detach_ack_or_generation_eof
     let snapshot = fenced_snapshot(&mut broker, &mut client, 3, "claim-a");
     assert_eq!(snapshot["pending"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["pending"][0]["unknownReason"], UNKNOWN_CDP_REASON);
-    reply(&mut broker, &command, json!({"result":{"late":true}}));
+    broker.native_with_provenance(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"result":{"result":{"late":true}}}), NativeReplyProvenance::Adapted, &mut output).unwrap();
     assert!(
         client.events.try_recv().is_err(),
         "a duplicate/late normalized reply cannot settle unknown custody"
@@ -1264,7 +1321,7 @@ fn unknown_cdp_cannot_be_cleared_by_duplicate_reply_detach_ack_or_generation_eof
         json!({"detached":true,"proof":"detach_ack"}),
     );
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::Reply {
             id: 4,
             outcome: ControlOutcome::Result(_)
@@ -1277,7 +1334,7 @@ fn unknown_cdp_cannot_be_cleared_by_duplicate_reply_detach_ack_or_generation_eof
     );
     broker.end_generation("fixture transport EOF");
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::GenerationClosed { .. }
     ));
     broker.control(
@@ -1289,7 +1346,7 @@ fn unknown_cdp_cannot_be_cleared_by_duplicate_reply_detach_ack_or_generation_eof
         &mut output,
     );
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::Reply {
             id: 6,
             outcome: ControlOutcome::Unknown { .. }
@@ -1323,7 +1380,7 @@ fn an_already_started_write_cannot_become_known_unsent_from_a_skipped_report() {
     fenced_snapshot(&mut broker, &mut client, 2, "claim-a");
     broker.written(WriteReport::Skipped { outer }, &mut output);
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::OrphanCdpCompletion {
             event: BrokerCdpEvent::TransportFailure(_),
             ..
@@ -1357,7 +1414,7 @@ fn a_foreign_claim_fence_is_unknown_and_leaves_the_other_owner_live() {
         &mut output,
     );
     assert!(matches!(
-        peer.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut peer).into_parts().0,
         ControlEvent::Reply {
             id: 1,
             outcome: ControlOutcome::Unknown { .. }
@@ -1394,7 +1451,7 @@ fn cdp_fence_keeps_exact_scoped_header_and_physical_cleanup_admissible() {
         json!({"cleanupConfirmed":true,"active":false,"stateConfirmed":true}),
     );
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::Reply {
             id: 3,
             outcome: ControlOutcome::Result(_)
@@ -1422,7 +1479,7 @@ fn a_revoked_claim_keeps_pending_cdp_observable_without_readmitting_execution() 
     let mut output = Vec::new();
     broker.native(json!({"kind":"revoked","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","reason":"actual debugger detach fixture"}), &mut output).unwrap();
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::ClaimUnavailable { claim, .. } if claim == "claim-a")
+        matches!(semantic_control(&mut client).into_parts().0, ControlEvent::ClaimUnavailable { claim, .. } if claim == "claim-a")
     );
     assert!(!broker.owns_active_claim(client.sender.lease.id, "claim-a"));
     assert!(matches!(
@@ -1433,7 +1490,7 @@ fn a_revoked_claim_keeps_pending_cdp_observable_without_readmitting_execution() 
     assert_eq!(snapshot["pending"].as_array().unwrap().len(), 1);
     reply(&mut broker, &command, json!({"result":{"terminal":true}}));
     assert!(matches!(
-        client.events.try_recv().unwrap().into_parts().0,
+        semantic_control(&mut client).into_parts().0,
         ControlEvent::OrphanCdpCompletion {
             event: BrokerCdpEvent::ChromeMessage(_),
             ..
@@ -1467,7 +1524,7 @@ fn a_variable_claim_snapshot_retains_its_own_queue_byte_charge() {
         },
         &mut output,
     );
-    let (event, charge) = client.events.try_recv().unwrap().into_parts();
+    let (event, charge) = semantic_control(&mut client).into_parts();
     let bytes = charge
         .as_ref()
         .expect("variable snapshots require an independent queue charge")
@@ -1497,7 +1554,7 @@ fn a_variable_claim_snapshot_retains_its_own_queue_byte_charge() {
 }
 
 #[tokio::test]
-async fn snapshot_budget_exhaustion_is_unknown_and_closes_only_its_own_peer() {
+async fn snapshot_and_unconfirmed_budget_exhaustion_close_only_own_peer_without_proof() {
     let mut broker = fixture();
     let mut client = admit(&mut broker);
     let other = admit(&mut broker);
@@ -1517,8 +1574,10 @@ async fn snapshot_budget_exhaustion_is_unknown_and_closes_only_its_own_peer() {
         },
         &mut output,
     );
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::GenerationClosed { reason } if reason == "owner CDP delivery budget exhausted; invocation and effect settlement remain unknown"));
     assert!(
-        matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::Reply { id:2,outcome:ControlOutcome::Unknown { reason, .. }} if reason == "claim CDP snapshot could not enter the bounded delivery queue")
+        matches!(semantic_control(&mut client).into_parts().0, ControlEvent::Reply { id:2,outcome:ControlOutcome::Unknown { reason, .. }} if reason == "claim CDP snapshot could not enter the bounded delivery queue")
     );
     assert!(!broker.clients[&client.sender.lease.id]
         .alive
@@ -1540,10 +1599,23 @@ async fn snapshot_budget_exhaustion_is_unknown_and_closes_only_its_own_peer() {
         ),
         "closing the lease must stop new wire admission"
     );
-    assert_eq!(output.len(), 1);
-    assert_eq!(
-        output[0].value["method"], "closeOwner",
-        "owner transport cleanup is separate from a CDP drain proof"
+    assert!(
+        output.is_empty(),
+        "resource failure cannot recursively invent a native cleanup effect"
+    );
+    assert!(!broker
+        .pending
+        .values()
+        .any(|pending| matches!(pending.kind, PendingKind::CloseOwner)));
+    broker.end_generation("actual later native EOF");
+    assert!(broker.stopped);
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::GenerationClosed { .. }
+    ));
+    assert!(
+        client.events.try_recv().is_err(),
+        "saturated EOF metadata must not recurse or emit an unbounded tail"
     );
     drop(first);
     drop(second);
@@ -1575,7 +1647,7 @@ fn actual_native_reply_can_end_raw_wait_while_its_effect_remains_unknown() {
         let mut output = Vec::new();
         broker.native_with_provenance(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"native request answered after caller cancellation"}}), provenance, &mut output).unwrap();
         assert!(
-            matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::OrphanCdpCompletion { event:BrokerCdpEvent::TransportFailure(reason), .. } if reason == "native claim request ended: outcome_unknown: native request answered after caller cancellation")
+            matches!(semantic_control(&mut client).into_parts().0, ControlEvent::OrphanCdpCompletion { event:BrokerCdpEvent::TransportFailure(reason), .. } if reason == "native claim request ended: outcome_unknown: native request answered after caller cancellation")
         );
         expect_cdp_progress(&mut client, "claim-a");
         let snapshot = fenced_snapshot(&mut broker, &mut client, 3, "claim-a");
@@ -1645,7 +1717,7 @@ fn typed_matched_reply_must_preserve_every_exact_pending_association() {
         assert!(client.events.try_recv().is_err());
         broker.end_generation("matched association protocol failure");
         assert!(matches!(
-            client.events.try_recv().unwrap().into_parts().0,
+            semantic_control(&mut client).into_parts().0,
             ControlEvent::GenerationClosed { .. }
         ));
         broker.control(
@@ -1657,7 +1729,7 @@ fn typed_matched_reply_must_preserve_every_exact_pending_association() {
             &mut output,
         );
         assert!(matches!(
-            client.events.try_recv().unwrap().into_parts().0,
+            semantic_control(&mut client).into_parts().0,
             ControlEvent::Reply {
                 id: 3,
                 outcome: ControlOutcome::Unknown { .. }
@@ -1686,6 +1758,7 @@ fn explicit_native_cleanup_preserves_exact_host_identity_without_execution_scope
         ControlRequest::StopCreatedTab {
             id: 4,
             creation: "actual-created-receipt-fixture".to_owned(),
+            tab_id: None,
         },
     ] {
         broker.input_context = Some(context.clone());
@@ -1707,5 +1780,1345 @@ fn explicit_native_cleanup_preserves_exact_host_identity_without_execution_scope
             "trusted identity is independent of execution fencing"
         );
         assert!(adapter_request.guard.is_live());
+    }
+}
+
+fn retire_locally(
+    broker: &mut NativeHostBroker,
+    client: &mut ClientConnection,
+    id: u64,
+    claim: &str,
+    cleanup_id: u64,
+) -> ControlOutcome {
+    let mut output = Vec::new();
+    broker.control(
+        client.sender.lease.id,
+        ControlRequest::RetireClaim {
+            id,
+            claim: claim.to_owned(),
+            cleanup_id,
+        },
+        &mut output,
+    );
+    assert!(
+        output.is_empty(),
+        "retirement cannot perform native effects"
+    );
+    match semantic_control(client).into_parts().0 {
+        ControlEvent::Reply {
+            id: actual,
+            outcome,
+        } if actual == id => outcome,
+        event => panic!("expected exact local retirement reply {id}, got {event:?}"),
+    }
+}
+
+#[test]
+fn more_than_sixty_four_turns_retire_only_after_exact_known_cleanup_and_drain() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    for turn in 0..80_u64 {
+        let id = turn * 4 + 1;
+        let token = format!("turn-claim-{turn}");
+        let _route = attach(&mut broker, &mut client, id, turn + 1, &token);
+        assert!(
+            fenced_snapshot(&mut broker, &mut client, id + 1, &token)["pending"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let command = request(
+            &mut broker,
+            &client,
+            ControlRequest::Detach {
+                id: id + 2,
+                claim: token.clone(),
+            },
+        );
+        reply(
+            &mut broker,
+            &command,
+            json!({"detached":true,"proof":"detach_ack"}),
+        );
+        assert!(matches!(semantic_control(&mut client).into_parts().0,
+            ControlEvent::Reply { id: actual, outcome: ControlOutcome::Result(_) } if actual == id + 2));
+        assert!(
+            matches!(retire_locally(&mut broker, &mut client, id + 3, &token, id + 2),
+            ControlOutcome::Result(result) if result == json!({"retired":true,"claim":token}))
+        );
+        assert!(
+            broker.claims.is_empty(),
+            "folded turn {turn} must release its claim bookkeeping"
+        );
+        assert!(broker.routes.is_empty());
+        assert!(broker.pending.is_empty());
+    }
+}
+
+#[test]
+fn active_claims_and_routes_have_no_invented_lifetime_count_limit() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let mut routes = Vec::new();
+    for id in 1..=300_u64 {
+        routes.push(attach(
+            &mut broker,
+            &mut client,
+            id,
+            id,
+            &format!("claim-{id}"),
+        ));
+    }
+    assert_eq!(broker.claims.len(), 300);
+    assert_eq!(broker.routes.len(), 300);
+    assert!(
+        broker.pending.is_empty(),
+        "the finite concurrent-request budget remains independent"
+    );
+    assert!(routes
+        .iter()
+        .all(|route| route.sender.lease.alive.load(Ordering::SeqCst)));
+}
+
+#[test]
+fn retirement_needs_same_owner_fence_exact_cleanup_id_and_known_raw_settlement() {
+    let mut broker = fixture();
+    let mut owner = admit(&mut broker);
+    let mut other = admit(&mut broker);
+    let route = attach(&mut broker, &mut owner, 1, 11, "claim-a");
+    let command = cdp(&mut broker, &owner, &route, 1);
+    let snapshot = fenced_snapshot(&mut broker, &mut owner, 2, "claim-a");
+    assert_eq!(snapshot["pending"].as_array().unwrap().len(), 1);
+    let detach = request(
+        &mut broker,
+        &owner,
+        ControlRequest::Detach {
+            id: 3,
+            claim: "claim-a".to_owned(),
+        },
+    );
+    reply(
+        &mut broker,
+        &detach,
+        json!({"detached":true,"proof":"detach_ack"}),
+    );
+    assert!(matches!(
+        semantic_control(&mut owner).into_parts().0,
+        ControlEvent::Reply { id: 3, .. }
+    ));
+    assert!(
+        matches!(
+            retire_locally(&mut broker, &mut owner, 4, "claim-a", 3),
+            ControlOutcome::Unknown { .. }
+        ),
+        "physical ACK cannot retire an unresolved CDP command"
+    );
+    reply(&mut broker, &command, json!({"result":{"finished":true}}));
+    assert!(matches!(
+        semantic_control(&mut owner).into_parts().0,
+        ControlEvent::OrphanCdpCompletion { id: 1, .. }
+    ));
+    expect_cdp_progress(&mut owner, "claim-a");
+    assert!(matches!(
+        retire_locally(&mut broker, &mut other, 1, "claim-a", 3),
+        ControlOutcome::Unknown { .. }
+    ));
+    assert!(matches!(
+        retire_locally(&mut broker, &mut owner, 5, "claim-a", 999),
+        ControlOutcome::Unknown { .. }
+    ));
+    assert!(broker.claims.contains_key("claim-a"));
+    assert!(matches!(
+        retire_locally(&mut broker, &mut owner, 6, "claim-a", 3),
+        ControlOutcome::Result(_)
+    ));
+    assert!(!broker.claims.contains_key("claim-a"));
+    assert!(
+        matches!(
+            retire_locally(&mut broker, &mut owner, 7, "claim-a", 3),
+            ControlOutcome::Unknown { .. }
+        ),
+        "retirement never creates a reusable cleanup authority"
+    );
+}
+
+#[test]
+fn synthetic_unknown_and_unrecognized_cleanup_never_authorize_retirement() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let command = cdp(&mut broker, &client, &route, 1);
+    fenced_snapshot(&mut broker, &mut client, 2, "claim-a");
+    let mut output = Vec::new();
+    broker.native_with_provenance(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"no matched RPC ACK"}}), NativeReplyProvenance::Adapted, &mut output).unwrap();
+    assert!(matches!(
+        semantic_control(&mut client).into_parts().0,
+        ControlEvent::OrphanCdpCompletion {
+            event: BrokerCdpEvent::TransportFailure(_),
+            ..
+        }
+    ));
+    expect_cdp_progress(&mut client, "claim-a");
+    let detach = request(
+        &mut broker,
+        &client,
+        ControlRequest::Detach {
+            id: 3,
+            claim: "claim-a".to_owned(),
+        },
+    );
+    reply(
+        &mut broker,
+        &detach,
+        json!({"detached":true,"proof":"unrecognized"}),
+    );
+    assert!(matches!(
+        semantic_control(&mut client).into_parts().0,
+        ControlEvent::Reply { id: 3, .. }
+    ));
+    assert!(broker.claims["claim-a"].cleanup_id.is_none());
+    assert!(matches!(
+        retire_locally(&mut broker, &mut client, 4, "claim-a", 3),
+        ControlOutcome::Unknown { .. }
+    ));
+    let detach = request(
+        &mut broker,
+        &client,
+        ControlRequest::Detach {
+            id: 5,
+            claim: "claim-a".to_owned(),
+        },
+    );
+    reply(
+        &mut broker,
+        &detach,
+        json!({"detached":true,"proof":"detach_ack"}),
+    );
+    let _ = semantic_control(&mut client);
+    assert!(matches!(
+        retire_locally(&mut broker, &mut client, 6, "claim-a", 5),
+        ControlOutcome::Unknown { .. }
+    ));
+    assert!(broker.claims.contains_key("claim-a"));
+    assert!(broker.pending.values().any(|pending| matches!(
+        pending.kind,
+        PendingKind::Cdp {
+            unknown: Some(_),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn unconfirmed_reports_actual_dispatch_for_every_route_request_before_failure() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let mut route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let written = cdp(&mut broker, &client, &route, 1);
+    let mut output = Vec::new();
+    for id in [2, 3] {
+        broker.cdp(
+            client.sender.lease.id,
+            route.sender.lease.id,
+            json!({"id":id,"method":"Runtime.evaluate","params":{"expression":"1"}}),
+            &mut output,
+        );
+    }
+    let started = output.pop().unwrap();
+    broker.pending[&started.outer.unwrap()]
+        .dispatch
+        .store(STARTED, Ordering::SeqCst);
+    let queued = output.pop().unwrap();
+    assert_eq!(
+        broker.pending[&queued.outer.unwrap()]
+            .dispatch
+            .load(Ordering::SeqCst),
+        QUEUED
+    );
+    broker.retire_route(route.sender.lease.id, "route canceled before outcomes");
+    let mut phases = HashMap::new();
+    for _ in 0..3 {
+        match client.events.try_recv().unwrap().into_parts().0 {
+            ControlEvent::CdpUnconfirmed {
+                claim,
+                route: actual,
+                id,
+                write_phase,
+                reason,
+                event,
+                wire_context,
+            } => {
+                assert_eq!(claim, "claim-a");
+                assert_eq!(actual, route.sender.lease.id.0);
+                assert_eq!(reason, UNKNOWN_CDP_REASON);
+                assert!(
+                    matches!(event, Some(BrokerCdpEvent::TransportFailure(reason)) if reason == UNKNOWN_CDP_REASON)
+                );
+                assert!(wire_context.is_none());
+                phases.insert(id, write_phase);
+            }
+            event => panic!("unconfirmed metadata must precede route failure: {event:?}"),
+        }
+    }
+    assert_eq!(phases[&1], NativeCdpWritePhase::Written);
+    assert_eq!(phases[&2], NativeCdpWritePhase::Queued);
+    assert_eq!(phases[&3], NativeCdpWritePhase::Started);
+    assert!(
+        matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpRouteClosed { route:actual, claim, .. } if actual == route.sender.lease.id.0 && claim == "claim-a"),
+        "route lifecycle marker must follow every exact per-ID fact"
+    );
+    assert!(
+        route.events.try_recv().is_err(),
+        "no separate failure can overtake another ID's atomic metadata"
+    );
+    assert_eq!(broker.pending.len(), 3);
+    assert!(broker
+        .pending
+        .contains_key(&canonical_id(written["id"].as_str()).unwrap()));
+}
+
+#[test]
+fn eof_reports_retired_route_requests_before_generation_closed() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let _command = cdp(&mut broker, &client, &route, 1);
+    fenced_snapshot(&mut broker, &mut client, 2, "claim-a");
+    broker.end_generation("native port EOF without response");
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpUnconfirmed {
+            id: 1,
+            write_phase: NativeCdpWritePhase::Written,
+            ..
+        }
+    ));
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::GenerationClosed { .. }
+    ));
+}
+
+#[test]
+fn stop_created_local_identity_binds_cleanup_without_leaking_metadata_or_fabricating_result() {
+    for known_tab in [None, Some(11)] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let _route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+        let _sibling = attach(&mut broker, &mut client, 2, 22, "claim-b");
+        fenced_snapshot(&mut broker, &mut client, 3, "claim-a");
+        let command = request(
+            &mut broker,
+            &client,
+            ControlRequest::StopCreatedTab {
+                id: 4,
+                creation: "actual-issued-creation".to_owned(),
+                tab_id: known_tab,
+            },
+        );
+        assert_eq!(
+            command["params"],
+            json!({"creation":"actual-issued-creation"}),
+            "local custody metadata is not a new extension RPC field"
+        );
+        reply(
+            &mut broker,
+            &command,
+            json!({"closed":true,"proof":"close_ack"}),
+        );
+        assert!(
+            matches!(semantic_control(&mut client).into_parts().0,
+            ControlEvent::Reply { id:4, outcome:ControlOutcome::Result(result) } if result == json!({"closed":true,"proof":"close_ack"})),
+            "actual native result remains intact without fabricated tab identity"
+        );
+        assert_eq!(broker.claims["claim-a"].cleanup_id, known_tab.map(|_| 4));
+        assert!(broker.claims["claim-b"].cleanup_id.is_none());
+        assert!(broker.claims["claim-b"].alive.load(Ordering::SeqCst));
+        let outcome = retire_locally(&mut broker, &mut client, 5, "claim-a", 4);
+        assert_eq!(
+            matches!(outcome, ControlOutcome::Result(_)),
+            known_tab.is_some()
+        );
+    }
+}
+
+#[test]
+fn late_actual_error_after_atomic_route_failure_preserves_new_cause_and_origin_context() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let mut route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let context = NativeWireContext::new("actual-old-session", "actual-old-turn").unwrap();
+    broker.input_context = Some(context.clone());
+    let command = cdp(&mut broker, &client, &route, 1);
+    broker.input_context = None;
+    broker.retire_route(route.sender.lease.id, "caller canceled before raw response");
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpUnconfirmed { id:1, event:Some(BrokerCdpEvent::TransportFailure(_)), wire_context:Some(actual), .. } if actual == context));
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpRouteClosed { route:actual, claim, .. } if actual == route.sender.lease.id.0 && claim == "claim-a"));
+    assert!(
+        broker.claims["claim-a"].alive.load(Ordering::SeqCst),
+        "route marker is not physical cleanup"
+    );
+    assert!(route.events.try_recv().is_err());
+    broker.input_context = Some(NativeWireContext::new("arrival-session", "arrival-turn").unwrap());
+    let mut output = Vec::new();
+    broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"actual later native error cause"}}), &mut output).unwrap();
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpUnconfirmed { id:1, event:None, wire_context:Some(actual), .. } if actual == context));
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::OrphanCdpCompletion { id:1, event:BrokerCdpEvent::TransportFailure(reason), wire_context:Some(actual), .. }
+        if reason == "native claim request ended: outcome_unknown: actual later native error cause" && actual == context));
+    assert!(
+        broker.pending.is_empty(),
+        "actual direct native response is raw terminal while effects stay unknown"
+    );
+    assert!(
+        output.is_empty(),
+        "late error cannot replay the original command"
+    );
+}
+
+#[test]
+fn unconfirmed_terminal_and_captured_context_own_an_independent_byte_charge() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let context = NativeWireContext::new("old-session", "old-turn-with-byte-accounting").unwrap();
+    broker.input_context = Some(context.clone());
+    let command = cdp(&mut broker, &client, &route, 1);
+    broker.input_context = None;
+    let before = broker.budget.available_bytes();
+    let mut output = Vec::new();
+    broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"actual charged native cause"}}), &mut output).unwrap();
+    let (event, charge) = client.events.try_recv().unwrap().into_parts();
+    let (route_event, route_charge) = client.events.try_recv().unwrap().into_parts();
+    assert!(matches!(route_event, ControlEvent::CdpRouteClosed { .. }));
+    assert_eq!(
+        route_charge.as_ref().unwrap().bytes(),
+        serde_json::to_vec(&route_event).unwrap().len()
+    );
+    drop(route_event);
+    drop(route_charge);
+    let bytes = charge
+        .as_ref()
+        .expect("each variable unconfirmed payload requires its own charge")
+        .bytes();
+    assert_eq!(bytes, serde_json::to_vec(&event).unwrap().len());
+    assert_eq!(broker.budget.available_bytes(), before - bytes);
+    assert!(
+        matches!(&event, ControlEvent::CdpUnconfirmed { event:Some(BrokerCdpEvent::TransportFailure(reason)), wire_context:Some(actual), .. }
+        if reason == "native claim request ended: outcome_unknown: actual charged native cause" && actual == &context)
+    );
+    drop(event);
+    assert_eq!(
+        broker.budget.available_bytes(),
+        before - bytes,
+        "socket writer still owns exact bytes"
+    );
+    drop(charge);
+    assert_eq!(broker.budget.available_bytes(), before);
+    assert!(output.is_empty());
+}
+
+#[tokio::test]
+async fn admitted_cdp_input_racing_route_retirement_is_exactly_known_unsent() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let mut other = admit(&mut broker);
+    let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let sibling = attach(&mut broker, &mut other, 1, 22, "claim-b");
+    let context = NativeWireContext::new("issued-session", "queued-old-turn").unwrap();
+    route
+        .sender
+        .send_json_with_context(
+            json!({"id":1,"method":"Input.insertText","params":{"text":"must not dispatch"}}),
+            Some(context.clone()),
+        )
+        .await
+        .unwrap();
+    let input = broker
+        .input
+        .try_recv()
+        .expect("actual RouteSender must have admitted one typed input");
+    assert!(matches!(&input, Input::Cdp { claim, .. } if claim == "claim-a"));
+    broker.retire_route(route.sender.lease.id, "route retired before actor dequeue");
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpRouteClosed { .. }
+    ));
+    broker.current_charge = input.charge();
+    broker.input_context = input.wire_context();
+    let mut output = Vec::new();
+    match input {
+        Input::Cdp {
+            client,
+            route,
+            claim,
+            message,
+            ..
+        } => {
+            broker.cdp_input(client, route, &claim, message, &mut output);
+        }
+        _ => panic!("expected the actual captured CDP input"),
+    }
+    broker.current_charge = None;
+    broker.input_context = None;
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpMessage { route:actual, claim,
+            event:BrokerCdpEvent::LocalRejected { id:1,code,message }, wire_context:Some(actual_context) }
+        if actual == route.sender.lease.id.0 && claim == "claim-a" && code == "not_dispatched" &&
+            message == "CDP route ended before native dispatch" && actual_context == context));
+    assert!(broker.pending.is_empty());
+    assert!(
+        output.is_empty(),
+        "the raced request must perform zero native effects"
+    );
+    assert!(client.sender.lease.alive.load(Ordering::SeqCst));
+    assert!(other.sender.lease.alive.load(Ordering::SeqCst));
+    assert!(other.events.try_recv().is_err());
+    let command = cdp(&mut broker, &other, &sibling, 1);
+    assert_eq!(command["params"]["claim"], "claim-b");
+}
+
+#[test]
+fn direct_own_reply_before_writer_flush_returns_proves_exact_frame_written() {
+    struct ReplyDuringFlush<'a> {
+        broker: &'a mut NativeHostBroker,
+        bytes: Vec<u8>,
+    }
+    impl Write for ReplyDuringFlush<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let body =
+                native_framing::read_frame(&mut Cursor::new(&self.bytes), Direction::HostToChrome)
+                    .unwrap()
+                    .unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let outer = canonical_id(request["id"].as_str()).unwrap();
+            assert_eq!(
+                self.broker.pending[&outer].dispatch.load(Ordering::SeqCst),
+                STARTED,
+                "the actual complete frame can be parsed before the writer resumes after flush"
+            );
+            let mut output = Vec::new();
+            self.broker.native(json!({"kind":"response","protocol":1,"generation":request["generation"],"id":request["id"],"error":{"kind":"outcome_unknown","message":"actual native invocation answered during flush"}}), &mut output).unwrap();
+            assert!(output.is_empty());
+            Ok(())
+        }
+    }
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let mut output = Vec::new();
+    broker.cdp(
+        client.sender.lease.id,
+        route.sender.lease.id,
+        json!({"id":1,"method":"Runtime.evaluate","params":{"expression":"1"}}),
+        &mut output,
+    );
+    let outbound = output.pop().unwrap();
+    let outer = outbound.outer.unwrap();
+    let report = outbound
+        .write_to(&mut ReplyDuringFlush {
+            broker: &mut broker,
+            bytes: Vec::new(),
+        })
+        .unwrap();
+    assert!(matches!(report, Some(WriteReport::Written { outer:actual, .. }) if actual == outer));
+    assert!(
+        matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpUnconfirmed { id:1, write_phase:NativeCdpWritePhase::Written,
+            event:Some(BrokerCdpEvent::TransportFailure(reason)), .. }
+        if reason == "native claim request ended: outcome_unknown: actual native invocation answered during flush"),
+        "transport write proof never fabricates Chrome or effect success"
+    );
+    assert!(broker.pending.is_empty());
+}
+
+#[test]
+fn adapted_or_original_semantic_matched_reply_never_promotes_started_to_written() {
+    use super::super::native_wire::MatchedNativeReply;
+    for adapted in [true, false] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+        let mut output = Vec::new();
+        broker.cdp(
+            client.sender.lease.id,
+            route.sender.lease.id,
+            json!({"id":1,"method":"Runtime.evaluate","params":{"expression":"1"}}),
+            &mut output,
+        );
+        let request = output.pop().unwrap().into_adapter_request();
+        assert!(request.guard.start_write());
+        let outer = request.semantic_id.as_ref().unwrap();
+        let provenance = if adapted {
+            NativeReplyProvenance::Adapted
+        } else {
+            NativeReplyProvenance::Matched(MatchedNativeReply::from_matched_rpc(
+                broker.generation.clone(),
+                broker.clients[&client.sender.lease.id].owner.clone(),
+                outer.clone(),
+                None,
+            ))
+        };
+        broker.native_with_provenance(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":outer,"error":{"kind":"outcome_unknown","message":"semantic activation or missing RPC response"}}), provenance, &mut output).unwrap();
+        assert!(matches!(
+            client.events.try_recv().unwrap().into_parts().0,
+            ControlEvent::CdpUnconfirmed {
+                write_phase: NativeCdpWritePhase::Started,
+                ..
+            }
+        ));
+        assert_eq!(
+            broker.pending.is_empty(),
+            !adapted,
+            "matched native termination and actual CDP full-frame write are distinct"
+        );
+    }
+}
+
+#[test]
+fn invalid_direct_response_bindings_never_promote_dispatch() {
+    for invalid in [
+        "protocol",
+        "generation",
+        "unissued_id",
+        "not_released",
+        "invalid_outcome",
+    ] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+        let mut output = Vec::new();
+        broker.cdp(
+            client.sender.lease.id,
+            route.sender.lease.id,
+            json!({"id":1,"method":"Runtime.evaluate","params":{"expression":"1"}}),
+            &mut output,
+        );
+        let request = output.pop().unwrap().into_adapter_request();
+        let outer = request.semantic_id.as_ref().unwrap();
+        let dispatch = broker.pending[&canonical_id(Some(outer)).unwrap()]
+            .dispatch
+            .clone();
+        if invalid != "not_released" {
+            assert!(request.guard.start_write());
+        }
+        let initial = dispatch.load(Ordering::SeqCst);
+        let mut response = json!({"kind":"response","protocol":1,"generation":broker.generation,"id":outer,"error":{"kind":"outcome_unknown","message":"untrusted malformed response"}});
+        match invalid {
+            "protocol" => response["protocol"] = json!(2),
+            "generation" => response["generation"] = json!("foreign-generation"),
+            "unissued_id" => response["id"] = json!("999999"),
+            "not_released" => {}
+            "invalid_outcome" => response["result"] = json!({"result":{}}),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            broker.native(response, &mut output),
+            Err(BrokerError::Protocol(_))
+        ));
+        assert_eq!(
+            dispatch.load(Ordering::SeqCst),
+            initial,
+            "invalid {invalid} cannot prove write progress"
+        );
+        assert!(client.events.try_recv().is_err());
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn late_cleanup_ack_in_unknown_result_retains_exact_purpose_bound_retirement_proof() {
+    for detach in [true, false] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let _route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+        fenced_snapshot(&mut broker, &mut client, 2, "claim-a");
+        let (request_value, physical_result) = if detach {
+            (
+                ControlRequest::Detach {
+                    id: 3,
+                    claim: "claim-a".to_owned(),
+                },
+                json!({"detached":true,"proof":"detach_ack"}),
+            )
+        } else {
+            (
+                ControlRequest::StopCreatedTab {
+                    id: 3,
+                    creation: "issued-creation".to_owned(),
+                    tab_id: Some(11),
+                },
+                json!({"closed":true,"proof":"close_ack"}),
+            )
+        };
+        let command = request(&mut broker, &client, request_value);
+        let mut output = Vec::new();
+        broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"],"error":{"kind":"outcome_unknown","message":"cleanup ACK arrived after caller cancellation","details":{"acknowledgedResult":physical_result}}}), &mut output).unwrap();
+        assert!(
+            matches!(
+                semantic_control(&mut client).into_parts().0,
+                ControlEvent::Reply {
+                    id: 3,
+                    outcome: ControlOutcome::Unknown { .. }
+                }
+            ),
+            "overall cancellation/effect uncertainty remains visible"
+        );
+        assert_eq!(broker.claims["claim-a"].cleanup_id, Some(3));
+        assert!(
+            matches!(
+                retire_locally(&mut broker, &mut client, 4, "claim-a", 3),
+                ControlOutcome::Result(_)
+            ),
+            "an exact positive physical cleanup receipt survives its cancelled caller"
+        );
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn actual_late_own_reply_after_abandoned_write_settles_raw_wait_and_preserves_orphan() {
+    for success in [true, false] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+        let context = NativeWireContext::new("old-session", "abandoned-turn").unwrap();
+        broker.input_context = Some(context.clone());
+        let mut output = Vec::new();
+        broker.cdp(
+            client.sender.lease.id,
+            route.sender.lease.id,
+            json!({"id":1,"method":"Input.insertText","params":{"text":"only once"}}),
+            &mut output,
+        );
+        broker.input_context = None;
+        let request = output.pop().unwrap().into_adapter_request();
+        assert!(request.guard.start_write());
+        let outer = canonical_id(request.semantic_id.as_deref()).unwrap();
+        broker.written(WriteReport::Abandoned { outer }, &mut output);
+        assert!(matches!(
+            client.events.try_recv().unwrap().into_parts().0,
+            ControlEvent::CdpUnconfirmed {
+                id: 1,
+                write_phase: NativeCdpWritePhase::Started,
+                event: Some(BrokerCdpEvent::TransportFailure(_)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            broker.pending[&outer].kind,
+            PendingKind::Cdp {
+                unknown: Some(_),
+                ..
+            }
+        ));
+        let mut wrong = json!({"kind":"response","protocol":1,"generation":"foreign-generation","id":outer.to_string(),"result":{"result":{"actual":true}}});
+        assert!(matches!(
+            broker.native(wrong.clone(), &mut output),
+            Err(BrokerError::Protocol(_))
+        ));
+        assert!(
+            broker.pending.contains_key(&outer),
+            "mismatched actual port reply cannot clear unknown custody"
+        );
+        wrong["generation"] = json!(broker.generation);
+        if !success {
+            wrong.as_object_mut().unwrap().remove("result");
+            wrong["error"] =
+                json!({"kind":"outcome_unknown","message":"actual late native failure cause"});
+        }
+        broker.native(wrong, &mut output).unwrap();
+        if !success {
+            assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+                ControlEvent::CdpUnconfirmed { id:1, write_phase:NativeCdpWritePhase::Written,
+                    event:None, wire_context:Some(actual), .. } if actual == context));
+        }
+        let event = client.events.try_recv().unwrap().into_parts().0;
+        assert!(
+            matches!(&event, ControlEvent::OrphanCdpCompletion { id:1, wire_context:Some(actual), .. } if actual == &context)
+        );
+        match event {
+            ControlEvent::OrphanCdpCompletion {
+                event: BrokerCdpEvent::ChromeMessage(value),
+                ..
+            } if success => assert_eq!(value["result"]["actual"], true),
+            ControlEvent::OrphanCdpCompletion {
+                event: BrokerCdpEvent::TransportFailure(reason),
+                ..
+            } if !success => assert_eq!(
+                reason,
+                "native claim request ended: outcome_unknown: actual late native failure cause"
+            ),
+            event => panic!("actual late receipt must retain its exact source outcome: {event:?}"),
+        }
+        assert!(
+            broker.pending.is_empty(),
+            "actual parsed Own reply terminates raw native invocation only"
+        );
+        assert!(
+            output.is_empty(),
+            "no replay or new native cleanup may be created"
+        );
+    }
+}
+
+#[test]
+fn ordered_route_open_early_events_replies_and_unknown_share_one_owner_fifo() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let command = request(
+        &mut broker,
+        &client,
+        ControlRequest::Attach { id: 1, tab_id: 11 },
+    );
+    reply(
+        &mut broker,
+        &command,
+        json!({"claim":"claim-a","tabId":11,"targetId":"opaque-target-11"}),
+    );
+    let _ = client.events.try_recv().unwrap();
+    let owner = broker.clients[&client.sender.lease.id].owner.clone();
+    let mut output = Vec::new();
+    broker.native(json!({"kind":"event","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","method":"Runtime.consoleAPICalled","params":{"sequence":1}}), &mut output).unwrap();
+    let mut route = broker
+        .bind_route_with_delivery(
+            client.sender.lease.id,
+            "claim-a",
+            RouteDelivery::Ordered { open_id: 9 },
+        )
+        .unwrap();
+    let context = NativeWireContext::new("captured-session", "reply-origin-turn").unwrap();
+    broker.input_context = Some(context.clone());
+    let known = cdp(&mut broker, &client, &route, 1);
+    broker.input_context = None;
+    reply(&mut broker, &known, json!({"result":{"sequence":2}}));
+    broker.native(json!({"kind":"event","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","method":"Debugger.paused","params":{"sequence":3}}), &mut output).unwrap();
+    let failed = cdp(&mut broker, &client, &route, 2);
+    broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":failed["id"],"error":{"kind":"outcome_unknown","message":"actual invocation unknown after earlier raw events"}}), &mut output).unwrap();
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpOpened { id:9, route:actual } if actual == route.sender.lease.id.0));
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpMessage { event:BrokerCdpEvent::ChromeMessage(value),wire_context:None,.. }
+        if value["method"] == "Runtime.consoleAPICalled" && value["params"]["sequence"] == 1));
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpMessage { event:BrokerCdpEvent::ChromeMessage(value),wire_context:Some(actual),.. }
+        if value["id"] == 1 && value["result"]["sequence"] == 2 && actual == context));
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpMessage { event:BrokerCdpEvent::ChromeMessage(value),wire_context:None,.. }
+        if value["method"] == "Debugger.paused" && value["params"]["sequence"] == 3));
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpUnconfirmed {
+            id: 2,
+            event: Some(BrokerCdpEvent::TransportFailure(_)),
+            ..
+        }
+    ));
+    assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpRouteClosed { route:actual,claim,.. } if actual == route.sender.lease.id.0 && claim == "claim-a"));
+    assert!(client.events.try_recv().is_err());
+    assert!(
+        route.events.try_recv().is_err(),
+        "production output must not duplicate into a parallel raw lane"
+    );
+    assert!(output.is_empty());
+}
+
+#[test]
+fn supplied_foreign_cleanup_identity_never_associates_a_local_retirement_receipt() {
+    for nested_unknown in [true, false] {
+        for operation in ["detach", "close", "stopCreated"] {
+            for foreign_field in ["claim", "tabId"] {
+                let mut broker = fixture();
+                let mut client = admit(&mut broker);
+                let _route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+                fenced_snapshot(&mut broker, &mut client, 2, "claim-a");
+                let (request_value, mut physical) = match operation {
+                    "detach" => (
+                        ControlRequest::Detach {
+                            id: 3,
+                            claim: "claim-a".to_owned(),
+                        },
+                        json!({"detached":true,"proof":"detach_ack"}),
+                    ),
+                    "close" => (
+                        ControlRequest::CloseTab {
+                            id: 3,
+                            claim: "claim-a".to_owned(),
+                        },
+                        json!({"closed":true,"proof":"close_ack"}),
+                    ),
+                    "stopCreated" => (
+                        ControlRequest::StopCreatedTab {
+                            id: 3,
+                            creation: "issued-creation".to_owned(),
+                            tab_id: Some(11),
+                        },
+                        json!({"closed":true,"proof":"close_ack"}),
+                    ),
+                    _ => unreachable!(),
+                };
+                physical[foreign_field] = if foreign_field == "claim" {
+                    json!("foreign-claim")
+                } else {
+                    json!(22)
+                };
+                let command = request(&mut broker, &client, request_value);
+                let mut response = json!({"kind":"response","protocol":1,"generation":broker.generation,"id":command["id"]});
+                if nested_unknown {
+                    response["error"] = json!({"kind":"outcome_unknown","message":"late mismatched cleanup identity","details":{"acknowledgedResult":physical}});
+                } else {
+                    response["result"] = physical;
+                }
+                let mut output = Vec::new();
+                broker.native(response, &mut output).unwrap();
+                let _ = semantic_control(&mut client);
+                assert!(
+                    broker.claims["claim-a"].cleanup_id.is_none(),
+                    "{operation} supplied foreign {foreign_field} cannot prove claim-a cleanup"
+                );
+                assert!(matches!(
+                    retire_locally(&mut broker, &mut client, 4, "claim-a", 3),
+                    ControlOutcome::Unknown { .. }
+                ));
+                assert!(broker.claims.contains_key("claim-a"));
+                assert!(output.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stopped_broker_drains_prior_messages_all_phase_facts_then_eof_after_reader_progress() {
+    let (mut broker, mut native_output) = fixture_with_output();
+    let mut client = admit(&mut broker);
+    let command = request(
+        &mut broker,
+        &client,
+        ControlRequest::Attach { id: 1, tab_id: 11 },
+    );
+    reply(
+        &mut broker,
+        &command,
+        json!({"claim":"claim-a","tabId":11,"targetId":"opaque-target-11"}),
+    );
+    let _ = client.events.try_recv().unwrap();
+    let route = broker
+        .bind_route_with_delivery(
+            client.sender.lease.id,
+            "claim-a",
+            RouteDelivery::Ordered { open_id: 2 },
+        )
+        .unwrap();
+    let _ = client.events.try_recv().unwrap();
+    let context = NativeWireContext::new("pending-session", "eof-old-turn").unwrap();
+    broker.input_context = Some(context.clone());
+    let _pending = cdp(&mut broker, &client, &route, 1);
+    broker.input_context = None;
+    let owner = broker.clients[&client.sender.lease.id].owner.clone();
+    let mut output = Vec::new();
+    for sequence in 0..EVENT_CAPACITY {
+        broker.native(json!({"kind":"event","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","method":"Runtime.consoleAPICalled","params":{"sequence":sequence}}), &mut output).unwrap();
+    }
+    assert_eq!(
+        client.events.len(),
+        EVENT_CAPACITY,
+        "the real owner channel must be full before EOF"
+    );
+    let handle = BrokerHandle {
+        input: broker.input_sender.clone(),
+        budget: broker.budget.clone(),
+    };
+    let task = tokio::spawn(broker.run());
+    handle
+        .native_eof("actual native EOF under output pressure")
+        .await;
+    assert!(
+        matches!(handle.identity().await, Err(BrokerError::Closed)),
+        "the actor must enter stopped drainage before the reader resumes"
+    );
+    assert!(
+        matches!(
+            native_output.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ),
+        "native writer scope must close before waiting on the slow local owner"
+    );
+    for sequence in 0..EVENT_CAPACITY {
+        let event = tokio::time::timeout(IPC_SHUTDOWN_DRAIN_TIMEOUT, client.events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_parts()
+            .0;
+        assert!(
+            matches!(event, ControlEvent::CdpMessage { event:BrokerCdpEvent::ChromeMessage(value), .. }
+            if value["params"]["sequence"] == sequence),
+            "earlier real CDP events cannot be dropped or overtaken"
+        );
+        handle.delivery_progress();
+    }
+    let phase = tokio::time::timeout(IPC_SHUTDOWN_DRAIN_TIMEOUT, client.events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(
+        matches!(phase, ControlEvent::CdpUnconfirmed { id:1,write_phase:NativeCdpWritePhase::Written,event:None,wire_context:Some(actual),.. } if actual == context)
+    );
+    handle.delivery_progress();
+    let eof = tokio::time::timeout(IPC_SHUTDOWN_DRAIN_TIMEOUT, client.events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(
+        matches!(eof, ControlEvent::GenerationClosed { reason } if reason == "actual native EOF under output pressure")
+    );
+    handle.delivery_progress();
+    tokio::time::timeout(IPC_SHUTDOWN_DRAIN_TIMEOUT, task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(client.events.try_recv().is_err());
+    assert!(output.is_empty());
+}
+
+// Append inside native_broker/tests.rs; reuses its actual broker/framing fixtures.
+fn claim_preparation_control(method: &str, id: u64, claim: &str) -> ControlRequest {
+    let mut value = json!({"method":method,"id":id,"claim":claim});
+    if method == "prepareClaim" {
+        value["document"] = json!({
+            "frameId":"actual-frame-fixture",
+            "loaderId":"actual-loader-fixture",
+            "url":"https://prepared.example.test/document"
+        });
+        value["policy"] = json!({
+            "popupEnabled":true,
+            "headerEnabled":true,
+            "headers":[{"name":"X-Preparation-Fixture","value":"one"}]
+        });
+    }
+    serde_json::from_value(value).expect("typed preparation control fixture")
+}
+
+#[test]
+fn preparation_and_popup_capture_existing_claim_context_before_ambient_turn_changes() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let _route = attach(&mut broker, &mut client, 1, 11, "preparation-claim");
+    let original = NativeWireContext::new(
+        "550e8400-e29b-41d4-a716-446655440000",
+        "original-preparation-turn",
+    )
+    .unwrap();
+    let newer =
+        NativeWireContext::new("550e8400-e29b-41d4-a716-446655440000", "later-ambient-turn")
+            .unwrap();
+    let mut output = Vec::new();
+    broker.input_context = Some(original.clone());
+    broker.control(
+        client.sender.lease.id,
+        claim_preparation_control("prepareClaim", 2, "preparation-claim"),
+        &mut output,
+    );
+    broker.control(
+        client.sender.lease.id,
+        claim_preparation_control("createPopupTab", 3, "preparation-claim"),
+        &mut output,
+    );
+    broker.input_context = Some(newer);
+    assert_eq!(output.len(), 2, "each admitted operation forwards once");
+    for (outbound, method) in output.into_iter().zip(["prepareClaim", "createPopupTab"]) {
+        let outer = outbound.outer.unwrap();
+        assert_eq!(
+            broker.pending[&outer].wire_context.as_ref(),
+            Some(&original),
+            "pending operation retains originating context before physical write"
+        );
+        assert_eq!(outbound.wire_context(), Some(&original));
+        let command = write(outbound);
+        assert_eq!(command["method"], method);
+        assert_eq!(command["params"]["claim"], "preparation-claim");
+        assert_eq!(command["wireContext"], json!(original));
+        assert!(command["params"].get("wireContext").is_none());
+        assert!(command["params"].get("hostSessionId").is_none());
+        assert!(command["params"].get("hostTurnId").is_none());
+        if method == "prepareClaim" {
+            assert_eq!(
+                command["params"]["document"]["frameId"],
+                "actual-frame-fixture"
+            );
+            assert_eq!(
+                command["params"]["document"]["loaderId"],
+                "actual-loader-fixture"
+            );
+            assert_eq!(command["params"]["policy"]["headers"][0]["value"], "one");
+        }
+    }
+    assert_eq!(
+        broker.claims.len(),
+        1,
+        "forwarding does not mint another claim"
+    );
+    assert!(
+        client.events.try_recv().is_err(),
+        "queueing a popup request is not a physical creation acknowledgement"
+    );
+}
+
+#[test]
+fn preparation_and_popup_refuse_foreign_claims_and_missing_context_before_dispatch() {
+    let mut broker = fixture();
+    let mut owner = admit(&mut broker);
+    let mut foreign = admit(&mut broker);
+    let _route = attach(&mut broker, &mut owner, 1, 11, "preparation-claim");
+    let captured = NativeWireContext::new(
+        "550e8400-e29b-41d4-a716-446655440000",
+        "trusted-preparation-turn",
+    )
+    .unwrap();
+    for (client, context) in [(&mut owner, None), (&mut foreign, Some(captured))] {
+        broker.input_context = context;
+        for (id, method) in [(2, "prepareClaim"), (3, "createPopupTab")] {
+            let mut output = Vec::new();
+            broker.control(
+                client.sender.lease.id,
+                claim_preparation_control(method, id, "preparation-claim"),
+                &mut output,
+            );
+            assert!(output.is_empty(), "{method} refusal must dispatch nothing");
+            assert!(
+                matches!(
+                    semantic_control(client).into_parts().0,
+                    ControlEvent::Reply {
+                        id: actual,
+                        outcome: ControlOutcome::ConnectorRejected { .. },
+                    } if actual == id
+                ),
+                "refusal must settle only the exact local request"
+            );
+        }
+    }
+    assert_eq!(
+        broker.claims["preparation-claim"].client,
+        owner.sender.lease.id
+    );
+    assert!(broker.claims["preparation-claim"]
+        .alive
+        .load(Ordering::SeqCst));
+    assert!(
+        broker.pending.is_empty(),
+        "refusals create no native pending invocation"
+    );
+}
+
+#[test]
+fn own_chunked_context_survives_reassembly_while_original_adapter_context_stays_sidechannel() {
+    use base64::Engine;
+
+    let mut broker = fixture();
+    let client = admit(&mut broker);
+    let original = NativeWireContext::new(
+        "550e8400-e29b-41d4-a716-446655440000",
+        "chunked-original-turn",
+    )
+    .unwrap();
+    // A valid existing header-control shape exercises actual logical framing;
+    // no new preparation document or policy limit is assumed by this fixture.
+    let header_value = "value".repeat((NATIVE_HOST_FRAME_BYTES + CHUNK_BYTES) / 5 + 1);
+    let mut output = Vec::new();
+    broker.input_context = Some(original.clone());
+    broker.control(
+        client.sender.lease.id,
+        ControlRequest::SetSessionHeaders {
+            id: 1,
+            headers: vec![ScopedHeader {
+                name: "X-Preparation-Fixture".to_owned(),
+                value: header_value.clone(),
+            }],
+        },
+        &mut output,
+    );
+    let outbound = output.pop().expect("one admitted header-control frame");
+    assert!(output.is_empty());
+    let outer = outbound.outer.unwrap();
+    let owner = outbound.owner.clone().unwrap();
+    let generation = outbound.generation.clone();
+    broker.input_context =
+        Some(NativeWireContext::new("550e8400-e29b-41d4-a716-446655440000", "newer-turn").unwrap());
+    let mut bytes = Vec::new();
+    assert!(matches!(
+        outbound.write_to(&mut bytes).unwrap(),
+        Some(WriteReport::Written { outer: actual }) if actual == outer
+    ));
+    let mut reader = Cursor::new(bytes);
+    let mut assembled = Vec::new();
+    let mut part_count = 0usize;
+    let mut expected_parts = None;
+    let mut expected_bytes = None;
+    while let Some(body) = native_framing::read_frame(&mut reader, Direction::HostToChrome).unwrap()
+    {
+        let frame: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(frame["kind"], "chunk");
+        assert_eq!(frame["generation"], generation);
+        assert_eq!(frame["owner"], owner);
+        assert_eq!(frame["logicalId"], outer.to_string());
+        assert_eq!(frame["part"], part_count);
+        assert!(
+            frame.get("wireContext").is_none(),
+            "context belongs to the assembled logical request, not a chunk grant"
+        );
+        let parts = usize::try_from(frame["parts"].as_u64().unwrap()).unwrap();
+        let length = usize::try_from(frame["bytes"].as_u64().unwrap()).unwrap();
+        if let Some(expected) = expected_parts {
+            assert_eq!(parts, expected);
+            assert_eq!(Some(length), expected_bytes);
+        } else {
+            expected_parts = Some(parts);
+            expected_bytes = Some(length);
+        }
+        assembled.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(frame["data"].as_str().unwrap())
+                .unwrap(),
+        );
+        part_count += 1;
+    }
+    assert!(
+        part_count > 1,
+        "fixture must cross an actual framing boundary"
+    );
+    assert_eq!(Some(part_count), expected_parts);
+    assert_eq!(Some(assembled.len()), expected_bytes);
+    let command: Value = serde_json::from_slice(&assembled).unwrap();
+    assert_eq!(command["method"], "setSessionHeaders");
+    assert_eq!(command["wireContext"], json!(original));
+    assert!(command["params"].get("wireContext").is_none());
+    assert_eq!(command["params"]["headers"][0]["value"], header_value);
+
+    broker.input_context = Some(original.clone());
+    broker.control(
+        client.sender.lease.id,
+        ControlRequest::Inventory { id: 2 },
+        &mut output,
+    );
+    let adapter = output.pop().unwrap().into_adapter_request();
+    assert_eq!(adapter.wire_context.as_ref(), Some(&original));
+    assert!(
+        adapter.message.event().get("wireContext").is_none(),
+        "Original translator receives trusted context through the Rust sidechannel"
+    );
+    assert!(adapter.message.event()["params"]
+        .get("wireContext")
+        .is_none());
+}
+
+#[test]
+fn popup_intent_metadata_preserves_exact_live_claim_and_actual_sender_without_host_cause() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let _route = attach(&mut broker, &mut client, 1, 11, "popup-source");
+    let owner = broker.clients[&client.sender.lease.id].owner.clone();
+    let captured = NativeWireContext::new("prepared-session", "old-prepared-turn").unwrap();
+    broker.input_context =
+        Some(NativeWireContext::new("another-session", "ambient-new-turn").unwrap());
+    let mut output = Vec::new();
+    broker.native(json!({"kind":"popup_requested","protocol":1,"generation":broker.generation,"owner":owner,"claim":"popup-source","tabId":11,"wireContext":captured,"url":"https://popup.invalid/actual","frameId":0,"documentId":"actual-chrome-document","sourceUrl":"https://source.invalid/actual","hostOperation":{"operationId":"page-spoof"}}),&mut output).unwrap();
+    let event = semantic_control(&mut client).into_parts().0;
+    assert!(
+        matches!(&event,ControlEvent::PopupRequested{claim,tab_id:11,wire_context,frame_id:Some(0),document_id:Some(document),source_url:Some(source),..} if claim=="popup-source"&&wire_context==&captured&&document=="actual-chrome-document"&&source=="https://source.invalid/actual")
+    );
+    let value = serde_json::to_value(event).unwrap();
+    assert!(
+        value["data"].get("hostOperation").is_none(),
+        "page metadata never creates a causal Host operation"
+    );
+    assert!(
+        output.is_empty(),
+        "metadata neither creates/adopts/navigates nor grants a child"
+    );
+    assert_eq!(broker.claims.len(), 1);
+}
+
+#[test]
+fn popup_metadata_refuses_missing_scope_wrong_tab_and_non_chrome_frame_identity() {
+    for invalid in ["context", "tab", "frame"] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let _route = attach(&mut broker, &mut client, 1, 11, "popup-source");
+        let owner = broker.clients[&client.sender.lease.id].owner.clone();
+        let mut value = json!({"kind":"popup_requested","protocol":1,"generation":broker.generation,"owner":owner,"claim":"popup-source","tabId":11,"wireContext":{"hostSessionId":"actual-session","hostTurnId":"actual-turn"},"url":"https://popup.invalid/","frameId":0});
+        match invalid {
+            "context" => {
+                value.as_object_mut().unwrap().remove("wireContext");
+            }
+            "tab" => value["tabId"] = json!(22),
+            _ => value["frameId"] = json!("cdp-string-frame"),
+        }
+        let mut output = Vec::new();
+        assert!(
+            broker.native(value, &mut output).is_err(),
+            "invalid {invalid}"
+        );
+        assert!(client.events.try_recv().is_err());
+        assert!(output.is_empty());
+    }
+    let mut broker = fixture();
+    let mut first = admit(&mut broker);
+    let mut other = admit(&mut broker);
+    let _route = attach(&mut broker, &mut first, 1, 11, "popup-source");
+    let other_owner = broker.clients[&other.sender.lease.id].owner.clone();
+    let mut output = Vec::new();
+    broker.native(json!({"kind":"popup_requested","protocol":1,"generation":broker.generation,"owner":other_owner,"claim":"popup-source","tabId":11,"wireContext":{"hostSessionId":"other-session","hostTurnId":"other-turn"},"url":"https://popup.invalid/"}),&mut output).unwrap();
+    assert!(first.events.try_recv().is_err() && other.events.try_recv().is_err());
+    assert!(output.is_empty());
+}
+
+#[test]
+fn fixed_cleanup_unknown_retains_only_actual_top_level_physical_proof() {
+    for foreign in [false, true] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let _route = attach(&mut broker, &mut client, 1, 11, "cleanup-source");
+        let detach = request(
+            &mut broker,
+            &client,
+            ControlRequest::Detach {
+                id: 2,
+                claim: "cleanup-source".into(),
+            },
+        );
+        let mut proof = json!({"detached":true,"proof":"detach_ack"});
+        if foreign {
+            proof["claim"] = json!("foreign");
+        }
+        let mut output = Vec::new();
+        broker.native(json!({"kind":"response","protocol":1,"generation":broker.generation,"id":detach["id"],"error":{"kind":"outcome_unknown","message":"actual fixed preparation cleanup remains unknown","details":{"physicalProof":proof}}}),&mut output).unwrap();
+        assert!(matches!(
+            semantic_control(&mut client).into_parts().0,
+            ControlEvent::Reply {
+                id: 2,
+                outcome: ControlOutcome::Unknown { .. }
+            }
+        ));
+        assert_eq!(
+            broker.claims["cleanup-source"].cleanup_id.is_some(),
+            !foreign
+        );
+        assert!(
+            output.is_empty(),
+            "known physical fact never becomes an all-effect ACK or replay"
+        );
     }
 }
