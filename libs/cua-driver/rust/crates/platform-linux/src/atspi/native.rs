@@ -1876,8 +1876,8 @@ async fn collect_visited_bounded_opts<'a>(
                 if has_action {
                     if let Some(Ok(ap)) = call(proxies.action()).await {
                         if native_observation.is_some() {
-                            if let Some(Ok(observed)) = call(ap.get_actions()).await {
-                                actions = observed.into_iter().map(|action| action.name).collect();
+                            if let Ok(observed) = native_action_names(&ap, None).await {
+                                actions = observed;
                                 native_actions_observed = true;
                             }
                         } else {
@@ -4014,6 +4014,40 @@ fn raw_ref(object_ref: &ObjectRef) -> RawObjectRef {
         name: object_ref.bus.clone(),
         path: object_ref.path.clone(),
     }
+}
+
+/// Original native action names, in do_action index order.
+///
+/// GetActions returns localized labels. The native profile instead uses the
+/// machine-readable GetName result verbatim, including an empty valid name.
+/// A failed read discards the whole list; it must not expose partial indices.
+async fn native_action_names(
+    ap: &atspi::proxy::action::ActionProxy<'_>,
+    session_id: Option<&str>,
+) -> Result<Vec<String>> {
+    element::check(session_id)?;
+    let count = call(ap.n_actions()).await;
+    element::check(session_id)?;
+    let count = match count {
+        Some(Ok(count)) => count,
+        Some(Err(error)) => return Err(anyhow!("{error}")),
+        None => anyhow::bail!("AT-SPI element lookup did not answer in time"),
+    };
+    if count < 0 {
+        anyhow::bail!("AT-SPI NActions returned a negative count");
+    }
+    let mut names = Vec::new();
+    for index in 0..count {
+        element::check(session_id)?;
+        let name = call(ap.get_name(index)).await;
+        element::check(session_id)?;
+        match name {
+            Some(Ok(name)) => names.push(name),
+            Some(Err(error)) => return Err(anyhow!("{error}")),
+            None => anyhow::bail!("AT-SPI element lookup did not answer in time"),
+        }
+    }
+    Ok(names)
 }
 
 /// Current action names of an Action proxy, index-aligned with `do_action`.

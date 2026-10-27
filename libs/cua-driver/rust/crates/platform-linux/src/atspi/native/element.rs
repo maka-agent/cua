@@ -227,6 +227,17 @@ async fn action_proxy<'conn>(
     object: &RawObjectRef,
     session_id: &str,
 ) -> Result<ActionProxy<'conn>> {
+    let accessible = checked(session_id, accessible_via_bus(conn, object)).await?;
+    // Read the interface names verbatim: a provider may advertise interfaces
+    // unknown to the atspi crate alongside the standard Action interface.
+    let interfaces: Vec<String> =
+        checked(session_id, accessible.inner().call("GetInterfaces", &())).await?;
+    if !interfaces
+        .iter()
+        .any(|name| name == "org.a11y.atspi.Action")
+    {
+        bail!("AT-SPI element does not implement Action");
+    }
     checked(
         session_id,
         ActionProxy::builder(conn.connection())
@@ -236,6 +247,27 @@ async fn action_proxy<'conn>(
             .build(),
     )
     .await
+}
+
+/// Native tool results render `Display`, so preserve the action reader's
+/// public cause-chain text here without flattening away its typed source.
+#[derive(Debug)]
+struct ActionReadError(anyhow::Error);
+
+impl std::fmt::Display for ActionReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "AT-SPI element does not expose actions; refresh get_window_state(): {:#}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ActionReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 fn failure(
@@ -268,7 +300,7 @@ async fn dispatch_action(
             unacknowledged: false,
         }),
         Some(Ok(false)) => Err(failure(
-            anyhow!("AT-SPI element refused action {index}"),
+            anyhow!("AT-SPI element refused action {index}; refresh get_window_state() to check its state"),
             true,
             transport,
         )),
@@ -434,16 +466,23 @@ pub(crate) fn click_native_element(
         .block_on(observation.scope(prepare(request, session_id)))
         .map_err(|error| failure(error, false, initial))?;
     if request.button == NativeClickButton::Left {
-        let proxy = runtime()
-            .block_on(observation.scope(async {
-                let proxy = action_proxy(conn, &located.object, session_id).await?;
-                let actions = checked(session_id, proxy.get_actions()).await?;
-                if actions.is_empty() {
-                    bail!("element has no primary accessibility action");
-                }
-                Ok::<_, anyhow::Error>(proxy)
-            }))
-            .map_err(|error| failure(error, false, initial))?;
+        let read = runtime().block_on(observation.scope(async {
+            let proxy = action_proxy(conn, &located.object, session_id).await?;
+            let actions = super::native_action_names(&proxy, Some(session_id)).await?;
+            Ok::<_, anyhow::Error>((proxy, actions))
+        }));
+        // A stopped invocation keeps its stop reason. Only an ordinary reader
+        // failure receives the original action-reader context.
+        check_retained(&observation, session_id).map_err(|error| failure(error, false, initial))?;
+        let (proxy, actions) =
+            read.map_err(|error| failure(ActionReadError(error).into(), false, initial))?;
+        if actions.is_empty() {
+            return Err(failure(
+                anyhow!("element has no primary accessibility action"),
+                false,
+                initial,
+            ));
+        }
         return dispatch_action_with_focus(&proxy, 0, request, &observation, session_id, false);
     }
 
@@ -501,11 +540,19 @@ pub(crate) fn click_native_element(
         )
     })?;
     let fallback = runtime().block_on(observation.scope(async {
+        // Membership failures replace the primary positional/setup error.
         let located = lookup(conn, request, session_id).await?;
-        let proxy = action_proxy(conn, &located.object, session_id).await?;
-        let actions = checked(session_id, proxy.get_actions()).await?;
-        let index = context_action(actions.iter().map(|action| action.name.as_str()));
-        Ok::<_, anyhow::Error>((proxy, index))
+        // Failure to read a context action preserves that primary error.
+        let proxy = match action_proxy(conn, &located.object, session_id).await {
+            Ok(proxy) => proxy,
+            Err(_) => return Ok(None),
+        };
+        let actions = match super::native_action_names(&proxy, Some(session_id)).await {
+            Ok(actions) => actions,
+            Err(_) => return Ok(None),
+        };
+        let index = context_action(actions.iter().map(String::as_str));
+        Ok::<_, anyhow::Error>(Some((proxy, index)))
     }));
     check_retained(&observation, session_id).map_err(|error| {
         after_window_input(
@@ -514,7 +561,11 @@ pub(crate) fn click_native_element(
         )
     })?;
     match fallback {
-        Ok((proxy, Some(index))) => dispatch_action_with_focus(
+        Err(error) => Err(after_window_input(
+            failure(error, false, initial),
+            previous_window_input_attempted,
+        )),
+        Ok(Some((proxy, Some(index)))) => dispatch_action_with_focus(
             &proxy,
             index,
             request,
@@ -574,6 +625,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn action_reader_display_preserves_the_public_cause_and_typed_error_chain() {
+        let missing_action = ActionReadError(anyhow!("AT-SPI element does not implement Action"));
+        assert_eq!(
+            missing_action.to_string(),
+            "AT-SPI element does not expose actions; refresh get_window_state(): AT-SPI element does not implement Action"
+        );
+
+        let cause = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reader disconnected");
+        let error: anyhow::Error =
+            ActionReadError(anyhow::Error::new(cause).context("reader failed")).into();
+        assert_eq!(
+            error.to_string(),
+            "AT-SPI element does not expose actions; refresh get_window_state(): reader failed: reader disconnected"
+        );
+        let cause = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("the original transport error must remain in the error chain");
+        assert_eq!(cause.kind(), std::io::ErrorKind::ConnectionReset);
     }
 
     #[test]

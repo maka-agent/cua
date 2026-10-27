@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::{
     protocol::{Content, ToolResult},
+    session_authorization::{EffectiveAuthorizationContext, SessionAuthorizationRegistry},
     tool::{Tool, ToolDef, ToolRegistry},
 };
 
@@ -166,6 +167,7 @@ impl Tool for Fake {
 struct Harness {
     registry: Arc<ToolRegistry>,
     ui: Arc<Mutex<Ui>>,
+    context: Arc<EffectiveAuthorizationContext>,
 }
 
 impl Harness {
@@ -204,11 +206,23 @@ impl Harness {
         registry.register_session_tools();
         let registry = Arc::new(registry);
         registry.init_self_weak();
-        Self { registry, ui }
+        // Each fake desktop is a separate runtime. Sharing the process
+        // compatibility context would give parallel harnesses one cursor.
+        let context = SessionAuthorizationRegistry::process()
+            .unwrap()
+            .legacy_context()
+            .unwrap();
+        Self {
+            registry,
+            ui,
+            context,
+        }
     }
 
     async fn run(&self, args: Value) -> ToolResult {
-        self.registry.invoke(super::RUN_STEPS_TOOL, args).await
+        self.registry
+            .invoke_with_context(super::RUN_STEPS_TOOL, args, self.context.clone())
+            .await
     }
 
     fn calls(&self, tool: &str) -> Vec<Value> {
