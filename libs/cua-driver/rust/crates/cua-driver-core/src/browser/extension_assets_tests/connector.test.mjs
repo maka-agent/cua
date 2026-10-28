@@ -1098,3 +1098,29 @@ test('explicit close waits for the same remove ACK or rejection after a synchron
     assert.equal(f.calls.filter((call) => call[0] === 'detach').length, 0);
   }
 });
+
+test('CDP debuggee source target is preserved separately from payload and session', async () => {
+  const f = fixture();
+  await claim(f);
+  for (const source of [{ tabId: 1 }, { tabId: 1, targetId: 'actual-source-target' }, { targetId: 'target-1' }]) {
+    f.chrome.debugger.onEvent.fire(source, 'Page.fileChooserOpened', {
+      backendNodeId: 17,
+      targetId: 'payload-target',
+      sourceTargetId: 'payload-source',
+    });
+    const actual = f.events.at(-1);
+    assert.equal(actual.method, 'Page.fileChooserOpened');
+    assert.equal(actual.sourceTargetId, source.targetId);
+    assert.equal(Object.hasOwn(actual, 'sourceTargetId'), source.targetId != null);
+    assert.equal(Object.hasOwn(actual, 'sessionId'), false);
+    assert.equal(actual.params.targetId, 'payload-target');
+    assert.equal(actual.params.sourceTargetId, 'payload-source');
+  }
+});
+
+test('hello declares debuggee-source preservation without acquiring a resource', () => {
+  const f = fixture();
+  assert.equal(f.connector.hello().capabilities.cdpEventSourceTarget, true);
+  assert.equal(f.connector.records.size, 0);
+  assert.deepEqual(f.calls, []);
+});

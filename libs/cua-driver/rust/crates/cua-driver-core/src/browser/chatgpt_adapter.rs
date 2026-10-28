@@ -18,7 +18,7 @@ use super::extension_wire::{
     ExtensionRpcTrace, ExtensionWireAction, ExtensionWireAdapter, ExtensionWireContext,
     ExtensionWireError, MatchedExtensionReply,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -1739,6 +1739,14 @@ impl ChatgptWireAdapter {
         let mut event = json!({"kind":"event","protocol":1,"generation":self.generation,"owner":claim.owner,"claim":token,"method":event_method,"params":event_params});
         if let Some(session) = source.get("sessionId").and_then(Value::as_str) {
             event["sessionId"] = json!(session);
+        }
+        if let Some(target) = source.get("targetId").filter(|target| !target.is_null()) {
+            let target = target.as_str().ok_or_else(|| {
+                ExtensionWireError::Protocol(
+                    "ChatGPT CDP event source target is invalid".to_owned(),
+                )
+            })?;
+            event["sourceTargetId"] = json!(target);
         }
         Ok(vec![ExtensionWireAction::BrokerMessage(event)])
     }

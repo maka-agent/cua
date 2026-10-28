@@ -6,14 +6,14 @@
 
 use std::io::Cursor;
 use std::sync::{
-    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex as StdMutex,
 };
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::action_record::ActionExecutionRecord;
 use crate::protocol::{Content, ToolResult};
@@ -28,8 +28,8 @@ use super::platform::{
 use super::pointer::BrowserPointerTool;
 use super::refusal::BrowserRefusal;
 use super::tools::{
-    BrowserClickTool, BrowserNavigateTool, BrowserPrepareTool, BrowserSelectTool, BrowserTypeTool,
-    GetBrowserStateTool, browser_protected_resource_scope,
+    browser_protected_resource_scope, BrowserClickTool, BrowserNavigateTool, BrowserPrepareTool,
+    BrowserSelectTool, BrowserTypeTool, GetBrowserStateTool,
 };
 use super::types::{
     BrowserClassification, BrowserEngineFamily, BrowserProcessRole, BrowserProduct,
@@ -740,12 +740,10 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 if !st.dom_click_readback_available {
                     return MockReply::err(-32000, "semantic click readback unavailable");
                 }
-                assert!(
-                    !call.params["functionDeclaration"]
-                        .as_str()
-                        .unwrap()
-                        .contains("activeElement")
-                );
+                assert!(!call.params["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("activeElement"));
                 let value = json!({
                     "innerText": format!("counter={}", st.dom_click_generation)
                 });
@@ -764,7 +762,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
 }
 
 /// Platform adapter pointing at the fixture endpoint: pid 1 is a
-/// Chromium browser owning extension window 7 at (0,0,800,600).
+/// Chromium browser owning native window 7 at (0,0,800,600).
 struct FixturePlatform {
     endpoint_state: Option<SharedState>,
     ws_url: String,
@@ -2297,12 +2295,10 @@ async fn requested_tab_screenshot_refuses_malformed_image_data() {
     let refusal = structured(&result);
     assert_eq!(refusal["status"], "refused", "{refusal}");
     assert_eq!(refusal["refusal"]["code"], "browser_route_unavailable");
-    assert!(
-        result
-            .content
-            .iter()
-            .all(|content| !matches!(content, Content::Image { .. }))
-    );
+    assert!(result
+        .content
+        .iter()
+        .all(|content| !matches!(content, Content::Image { .. })));
 }
 
 #[tokio::test]
@@ -2549,21 +2545,15 @@ async fn semantic_snapshot_uses_bounded_dom_fallback_only_for_known_size_failure
     assert_eq!(snap["status"], "ok", "{snap}");
     assert_eq!(snap["snapshot"]["complete"], false, "{snap}");
     let document_calls = recorded_calls(&f, "DOM.getDocument");
-    assert!(
-        document_calls
-            .iter()
-            .any(|(_, params)| params["depth"] == -1)
-    );
-    assert!(
-        document_calls
-            .iter()
-            .any(|(_, params)| params["depth"] == 256)
-    );
-    assert!(
-        document_calls
-            .iter()
-            .any(|(_, params)| params["depth"] == 8)
-    );
+    assert!(document_calls
+        .iter()
+        .any(|(_, params)| params["depth"] == -1));
+    assert!(document_calls
+        .iter()
+        .any(|(_, params)| params["depth"] == 256));
+    assert!(document_calls
+        .iter()
+        .any(|(_, params)| params["depth"] == 8));
 }
 
 #[tokio::test]
@@ -2578,16 +2568,12 @@ async fn semantic_snapshot_uses_bounded_dom_fallback_for_full_tree_timeout() {
     assert_eq!(snap["status"], "ok", "{snap}");
     assert_eq!(snap["snapshot"]["complete"], false, "{snap}");
     let document_calls = recorded_calls(&f, "DOM.getDocument");
-    assert!(
-        document_calls
-            .iter()
-            .any(|(_, params)| params["depth"] == -1)
-    );
-    assert!(
-        document_calls
-            .iter()
-            .any(|(_, params)| params["depth"] == 8)
-    );
+    assert!(document_calls
+        .iter()
+        .any(|(_, params)| params["depth"] == -1));
+    assert!(document_calls
+        .iter()
+        .any(|(_, params)| params["depth"] == 8));
     assert!(document_calls.iter().all(|(_, params)| {
         params["depth"] == -1 || params["depth"].as_i64().is_some_and(|depth| depth <= 8)
     }));
@@ -2605,16 +2591,12 @@ async fn semantic_snapshot_hydrates_truncated_fallback_branches() {
     let snap = semantic_snapshot_with(&f, &target, &tab, json!({"query": "Reply"})).await;
     assert_eq!(snap["status"], "ok", "{snap}");
     assert_eq!(snap["snapshot"]["complete"], false, "{snap}");
-    assert!(
-        snap["refs"]
-            .as_array()
-            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == "Reply"))
-    );
-    assert!(
-        recorded_calls(&f, "DOM.describeNode")
-            .iter()
-            .any(|(_, params)| params["backendNodeId"] == 999)
-    );
+    assert!(snap["refs"]
+        .as_array()
+        .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == "Reply")));
+    assert!(recorded_calls(&f, "DOM.describeNode")
+        .iter()
+        .any(|(_, params)| params["backendNodeId"] == 999));
 }
 
 #[tokio::test]
@@ -3403,11 +3385,9 @@ async fn typing_into_an_oopif_input_routes_to_the_child_session() {
         "typing must land in the contained child session: {inserts:?}"
     );
     let focuses = recorded_calls(&f, "DOM.focus");
-    assert!(
-        focuses
-            .iter()
-            .all(|(sess, _)| sess.as_deref().unwrap().starts_with("oopif-sess-"))
-    );
+    assert!(focuses
+        .iter()
+        .all(|(sess, _)| sess.as_deref().unwrap().starts_with("oopif-sess-")));
 }
 
 #[tokio::test]
@@ -3542,12 +3522,10 @@ async fn select_passes_the_matcher_as_cdp_arguments_and_reports_the_readback() {
             params["arguments"],
             json!([{ "value": field }, { "value": wanted }])
         );
-        assert!(
-            !params["functionDeclaration"]
-                .as_str()
-                .unwrap()
-                .contains(wanted)
-        );
+        assert!(!params["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains(wanted));
         assert!(recorded_calls(&f, "Runtime.evaluate")
             .iter()
             .all(|(_, params)| params["expression"] == "document.visibilityState === 'visible'"));
@@ -3623,7 +3601,7 @@ async fn select_in_an_oopif_routes_to_the_child_session() {
 // Chromium exposes page targets that live in no browser window — an extension
 // side panel, an offscreen document — and answers `Browser.getWindowForTarget`
 // for them with `-32000 Browser window not found`. Such a target can never be
-// the tab of the requested extension window, so candidate enumeration skips it;
+// the tab of the requested native window, so candidate enumeration skips it;
 // every other error keeps failing the whole proof.
 
 fn side_panel_target() -> Value {
@@ -3659,16 +3637,14 @@ async fn windowless_side_panel_target_is_skipped_and_bind_stays_exact() {
     assert_eq!(tabs[0]["url"], "https://fixture.test/");
     // The window-less target was asked for its window (and skipped), never attached to.
     let st = f.state.lock().unwrap();
-    assert!(
-        st.calls.iter().any(|(_, m, p)| {
-            m == "Browser.getWindowForTarget" && p["targetId"] == "T_SIDEPANEL"
-        })
-    );
-    assert!(
-        !st.calls
-            .iter()
-            .any(|(_, m, p)| { m == "Target.attachToTarget" && p["targetId"] == "T_SIDEPANEL" })
-    );
+    assert!(st
+        .calls
+        .iter()
+        .any(|(_, m, p)| { m == "Browser.getWindowForTarget" && p["targetId"] == "T_SIDEPANEL" }));
+    assert!(!st
+        .calls
+        .iter()
+        .any(|(_, m, p)| { m == "Target.attachToTarget" && p["targetId"] == "T_SIDEPANEL" }));
 }
 
 #[tokio::test]
@@ -3699,7 +3675,7 @@ async fn other_window_lookup_errors_still_fail_the_whole_proof() {
         s["refusal"]["message"]
             .as_str()
             .unwrap_or("")
-            .contains("Browser.getWindowForTarget failed while proving the extension window"),
+            .contains("Browser.getWindowForTarget failed while proving the native window"),
         "{s}"
     );
 }
@@ -3707,7 +3683,7 @@ async fn other_window_lookup_errors_still_fail_the_whole_proof() {
 #[tokio::test]
 async fn method_unsupported_keeps_the_electron_none_path() {
     // Electron omits the Browser domain method entirely: the candidate keeps a
-    // None geometry and binds through the single-page, single-extension-window
+    // None geometry and binds through the single-page, single-native-window
     // cardinality proof; the window-less skip must not drop it.
     let f = fixture_with(|st| {
         st.primary_window_error =

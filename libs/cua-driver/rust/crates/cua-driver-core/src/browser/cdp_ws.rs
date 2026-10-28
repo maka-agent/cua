@@ -23,7 +23,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -113,6 +113,9 @@ pub struct CdpEvent {
     /// The (parent) session the event is scoped to under flattened
     /// sessions, when present.
     pub session_id: Option<String>,
+    /// Actual extension debuggee source target, independent of CDP params.
+    /// WebSocket events without this source metadata leave it unset.
+    pub source_target_id: Option<String>,
     pub params: Value,
 }
 
@@ -344,6 +347,10 @@ fn route_json_with_disposition(v: Value, demux: &Demux, disposition: CdpFailureD
             method: method.to_owned(),
             session_id: v
                 .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            source_target_id: v
+                .get("sourceTargetId")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             params: v.get("params").cloned().unwrap_or(Value::Null),
@@ -1417,6 +1424,58 @@ mod tests {
     use std::sync::Arc as StdArc;
 
     #[test]
+    fn extension_source_target_is_separate_from_payload_and_session() {
+        let demux = Demux::new(None);
+        let (sender, mut events) = mpsc::unbounded_channel();
+        demux.subscribers.lock().unwrap().push(sender);
+        for (target, session) in [
+            (Some("actual-debuggee-target"), None),
+            (None, None),
+            (Some("actual-debuggee-target"), Some("actual-child-session")),
+        ] {
+            let mut message = json!({
+                "method":"Page.fileChooserOpened",
+                "params":{"backendNodeId":17,"targetId":"payload-target","sourceTargetId":"payload-source"},
+            });
+            if let Some(target) = target {
+                message["sourceTargetId"] = json!(target);
+            }
+            if let Some(session) = session {
+                message["sessionId"] = json!(session);
+            }
+            route_json(message, &demux);
+            let actual = events.try_recv().unwrap();
+            assert_eq!(actual.source_target_id.as_deref(), target);
+            assert_eq!(actual.session_id.as_deref(), session);
+            assert_eq!(actual.params["targetId"], "payload-target");
+            assert_eq!(actual.params["sourceTargetId"], "payload-source");
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_payload_cannot_create_debuggee_source_target_metadata() {
+        let server = MockCdpServer::start(StdArc::new(|_| {
+            MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Page.fileChooserOpened".into(),
+                session_id: None,
+                params: json!({"backendNodeId":17,"sourceTargetId":"payload-only","targetId":"also-payload"}),
+            }])
+        }))
+        .await;
+        let connection = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        let mut events = connection.subscribe();
+        connection
+            .call(None, "Emitter.go", json!({}))
+            .await
+            .unwrap();
+        let actual = events.try_recv().unwrap();
+        assert_eq!(actual.method, "Page.fileChooserOpened");
+        assert_eq!(actual.source_target_id, None);
+        assert_eq!(actual.session_id, None);
+        assert_eq!(actual.params["sourceTargetId"], "payload-only");
+    }
+
+    #[test]
     fn loopback_urls_are_accepted() {
         for ok in [
             "ws://127.0.0.1:9222/devtools/browser/abc",
@@ -1515,11 +1574,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<CdpReplyError>().is_none());
-        assert!(
-            error
-                .to_string()
-                .contains("existing-profile CDP policy refused")
-        );
+        assert!(error
+            .to_string()
+            .contains("existing-profile CDP policy refused"));
         conn.call(None, "Page.getFrameTree", json!({}))
             .await
             .unwrap();

@@ -108,10 +108,22 @@ struct ActiveRecording {
 }
 
 struct RetainedRecording {
-    // Directory custody continues until session cleanup, even after Windows
-    // consumes the returned file's retention at its next Start attempt.
+    // The wrapper directory lives until session cleanup. Only the Windows
+    // next-Start policy consumes `file`; a consumed record no longer owns any
+    // file deletion, including through the directory's recursive destructor.
     _directory: tempfile::TempDir,
     file: Option<PathBuf>,
+}
+
+impl Drop for RetainedRecording {
+    fn drop(&mut self) {
+        if self.file.is_none() {
+            // An earlier Start already consumed its one WAV unlink attempt.
+            // TempDir must not retry it or delete other wrapper contents.
+            self._directory.disable_cleanup(true);
+            let _ = std::fs::remove_dir(self._directory.path());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -687,6 +699,15 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
+    // These tests deliberately leave consumed files behind. This separate
+    // fixture guard cleans only their own generated directories after assertions.
+    struct TestDirectoryCleanup(PathBuf);
+    impl Drop for TestDirectoryCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     struct RetentionFactory {
         active: Arc<AtomicUsize>,
         lifetime: CompletedRecordingLifetime,
@@ -791,13 +812,20 @@ mod tests {
     }
 
     #[test]
-    fn failed_next_start_unlink_is_consumed_once_without_recursive_directory_removal() {
+    fn consumed_failed_unlink_is_not_retried_by_start_or_terminal_cleanup() {
+        let active = Arc::new(AtomicUsize::new(0));
         let recordings = AudioRecordings::new(Arc::new(RetentionFactory {
-            active: Arc::new(AtomicUsize::new(0)),
+            active: active.clone(),
             lifetime: CompletedRecordingLifetime::UntilNextStartAttempt,
         }));
         recordings.start("owner", Duration::from_secs(1)).unwrap();
         let old = recordings.stop("owner").unwrap();
+        let directory = old.filepath.parent().unwrap().to_path_buf();
+        let _fixture_cleanup = TestDirectoryCleanup(directory.clone());
+        let sibling = directory.join("own-wrapper-marker.txt");
+        std::fs::write(&sibling, b"own wrapper sibling").unwrap();
+        recordings.start("foreign", Duration::from_secs(1)).unwrap();
+        let foreign = recordings.stop("foreign").unwrap();
         std::fs::remove_file(&old.filepath).unwrap();
         std::fs::create_dir(&old.filepath).unwrap();
         let child = old.filepath.join("own-fixture.txt");
@@ -814,20 +842,56 @@ mod tests {
         let next = recordings.stop("owner").unwrap();
         std::fs::remove_file(child).unwrap();
         std::fs::remove_dir(&old.filepath).unwrap();
-        std::fs::write(&old.filepath, b"own fixture after the one deletion attempt").unwrap();
+        let historical = b"own fixture after the one deletion attempt";
+        std::fs::write(&old.filepath, historical).unwrap();
         recordings.start("owner", Duration::from_secs(1)).unwrap();
         assert!(
             !next.filepath.exists(),
             "only the latest retained result is released"
         );
+        assert_eq!(std::fs::read(&old.filepath).unwrap(), historical);
+        assert_eq!(std::fs::read(&foreign.filepath).unwrap(), foreign.bytes);
+        recordings.close_session("owner").unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&old.filepath).unwrap(), historical);
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"own wrapper sibling");
         assert!(
-            old.filepath.exists(),
-            "a consumed deletion failure must not be retried"
+            !next.filepath.parent().unwrap().exists(),
+            "empty consumed wrapper directories still finish their lifetime"
         );
+        assert_eq!(std::fs::read(&foreign.filepath).unwrap(), foreign.bytes);
         recordings.close_all().unwrap();
-        assert!(
-            !old.filepath.parent().unwrap().exists(),
-            "terminal cleanup still owns all temp directories"
+        assert!(!foreign.filepath.exists());
+        drop(recordings);
+        assert_eq!(std::fs::read(&old.filepath).unwrap(), historical);
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"own wrapper sibling");
+    }
+
+    #[test]
+    fn consumed_file_does_not_allow_terminal_cleanup_to_remove_wrapper_siblings() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let recordings = AudioRecordings::new(Arc::new(RetentionFactory {
+            active: active.clone(),
+            lifetime: CompletedRecordingLifetime::UntilNextStartAttempt,
+        }));
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        let old = recordings.stop("owner").unwrap();
+        let directory = old.filepath.parent().unwrap().to_path_buf();
+        let _fixture_cleanup = TestDirectoryCleanup(directory.clone());
+        let sibling = directory.join("own-wrapper-marker.txt");
+        std::fs::write(&sibling, b"consuming a WAV does not own this sibling").unwrap();
+        let refused = recordings
+            .start("owner", Duration::from_millis(99))
+            .unwrap_err();
+        assert!(refused.is::<InvalidAudioDuration>());
+        assert!(!old.filepath.exists());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        recordings.close_session("owner").unwrap();
+        recordings.close_all().unwrap();
+        drop(recordings);
+        assert_eq!(
+            std::fs::read(&sibling).unwrap(),
+            b"consuming a WAV does not own this sibling"
         );
     }
 

@@ -8,7 +8,7 @@
 //! No CDP demultiplexer, desktop runtime, selector or input implementation lives here.
 
 use super::broker_delivery::{
-    ByteBudget, ByteCharge, DeliveryError, IPC_SHUTDOWN_DRAIN_TIMEOUT, Queued,
+    ByteBudget, ByteCharge, DeliveryError, Queued, IPC_SHUTDOWN_DRAIN_TIMEOUT,
 };
 use super::extension_wire::{
     ExtensionCdpWritePhase, ExtensionFixedUiRequest, ExtensionPreparationDocument,
@@ -20,13 +20,13 @@ use super::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc,
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -384,6 +384,11 @@ pub(crate) enum ControlOutcome {
         details: Option<Value>,
     },
     ConnectorRejected {
+        kind: String,
+        message: String,
+        details: Option<Value>,
+    },
+    NotDispatched {
         kind: String,
         message: String,
         details: Option<Value>,
@@ -1373,7 +1378,7 @@ impl ExtensionHostBroker {
             client,
             ControlEvent::Reply {
                 id,
-                outcome: ControlOutcome::ConnectorRejected {
+                outcome: ControlOutcome::NotDispatched {
                     kind: kind.to_owned(),
                     message: message.to_owned(),
                     details: None,
@@ -1433,11 +1438,19 @@ impl ExtensionHostBroker {
                     output,
                 );
             } else {
-                self.reject_control(
+                // The echoed ID can alias an older still-live request. The
+                // duplicate itself did not dispatch, but this reply cannot prove
+                // that the older request named by the same ID had no effect.
+                self.emit_control(
                     client,
-                    id,
-                    "duplicate_local_id",
-                    "local control IDs cannot be replayed",
+                    ControlEvent::Reply {
+                        id,
+                        outcome: ControlOutcome::ConnectorRejected {
+                            kind: "duplicate_local_id".to_owned(),
+                            message: "local control IDs cannot be replayed".to_owned(),
+                            details: None,
+                        },
+                    },
                     output,
                 );
             }
@@ -3668,6 +3681,14 @@ impl ExtensionHostBroker {
                 }
                 event["sessionId"] = session.clone();
             }
+            if let Some(target) = value.get("sourceTargetId") {
+                if !target.is_string() {
+                    return Err(BrokerError::Protocol(
+                        "event source target is invalid".to_owned(),
+                    ));
+                }
+                event["sourceTargetId"] = target.clone();
+            }
             Some(event)
         };
         if let Some(record) = self.claims.get(&token) {
@@ -3904,7 +3925,7 @@ impl ExtensionHostBroker {
                             details: None,
                         }
                     } else {
-                        ControlOutcome::ConnectorRejected {
+                        ControlOutcome::NotDispatched {
                             kind: "not_dispatched".to_owned(),
                             message: reason.to_owned(),
                             details: None,
@@ -3957,7 +3978,7 @@ impl ExtensionHostBroker {
                 pending.client,
                 ControlEvent::Reply {
                     id: local_id,
-                    outcome: ControlOutcome::ConnectorRejected {
+                    outcome: ControlOutcome::NotDispatched {
                         kind: code,
                         message,
                         details: None,

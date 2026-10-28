@@ -26,12 +26,12 @@ pub use super::extension_wire::{
 };
 use super::local_ipc::{self, ExtensionEndpointIdentity, IpcError, ValidatedExtensionEndpoint};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
-        atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -204,6 +204,10 @@ pub struct ExtensionProviderCapabilities {
     pub turn_lifecycle_owner: ExtensionEffectOwner,
     #[serde(default)]
     pub download_notifications: bool,
+    /// The producer preserves actual debuggee source targets on CDP events.
+    /// This metadata contract grants no ownership, origin or upload authority.
+    #[serde(default)]
+    pub cdp_event_source_target: bool,
     /// A separate same-claim upgrade; metadata-only attachment never implies it.
     #[serde(default)]
     pub explicit_claim_preparation: bool,
@@ -255,8 +259,8 @@ pub async fn discover_registered_for(
     })?
 }
 /// Product convenience entry: reads the same selected sidecar as extension startup.
-pub async fn discover_installed_extension_endpoints()
--> Result<ExtensionEndpointDiscovery, ExtensionProviderError> {
+pub async fn discover_installed_extension_endpoints(
+) -> Result<ExtensionEndpointDiscovery, ExtensionProviderError> {
     let installed =
         tokio::task::spawn_blocking(super::extension_process::load_installed_selections)
             .await
@@ -1231,6 +1235,48 @@ impl ExtensionOperation {
             Self::EffectsCleanup { .. } => "effectsCleanup",
         }
     }
+    fn registers_session_request(&self) -> bool {
+        match self {
+            // These are Rust-local fences or the direct turn-ended message,
+            // not new requests through the logical session client.
+            Self::FenceCdp { .. }
+            | Self::RetireClaim { .. }
+            | Self::FinishTurn { .. }
+            | Self::SessionPopupRequested { .. }
+            | Self::SessionPreparationCleanup { .. }
+            | Self::PopupRequested { .. }
+            | Self::OrphanCdpCompletion { .. }
+            | Self::EffectsCleanup { .. } => false,
+            Self::Inventory
+            | Self::SessionInventory
+            | Self::Resolve { .. }
+            | Self::ResolveSessionTab { .. }
+            | Self::CommittedSessionTabUrl { .. }
+            | Self::Attach { .. }
+            | Self::Detach { .. }
+            | Self::CreateTab { .. }
+            | Self::CreatePopupTab { .. }
+            | Self::CreateSessionPopupTab { .. }
+            | Self::PrepareClaim { .. }
+            | Self::CloseTab { .. }
+            | Self::StopCreatedTab { .. }
+            | Self::SetScopedHeaders { .. }
+            | Self::ClearScopedHeaders { .. }
+            | Self::SetSessionHeaders { .. }
+            | Self::ClearSessionHeaders
+            | Self::MoveMousePresentation { .. }
+            | Self::PrepareUserTab { .. }
+            | Self::PrepareSessionTab { .. }
+            | Self::PrepareFixedSessionTab { .. }
+            | Self::SessionUi { .. }
+            | Self::ClearSessionPreparation { .. }
+            | Self::MuteCreatedTab { .. }
+            | Self::UnmuteCreatedTabIfActive { .. }
+            | Self::EnsureCreatedTabGroup { .. }
+            | Self::UpdateCreatedTabGroup { .. }
+            | Self::ReleaseCreatedTabGroup { .. } => true,
+        }
+    }
     fn mutation(&self) -> bool {
         !matches!(
             self,
@@ -1282,6 +1328,11 @@ pub enum ExtensionOperationOutcome {
         message: String,
         details: Option<Value>,
     },
+    NotDispatched {
+        kind: String,
+        message: String,
+        details: Option<Value>,
+    },
     Unknown {
         reason: String,
         details: Option<Value>,
@@ -1299,6 +1350,11 @@ impl ExtensionOperationOutcome {
                 })
             }
             Self::ConnectorRejected {
+                kind,
+                message,
+                details,
+            }
+            | Self::NotDispatched {
                 kind,
                 message,
                 details,
@@ -1381,6 +1437,11 @@ pub enum ExtensionRecoveredOperation {
     Group(ExtensionGroupProof),
     GroupReleased(ExtensionGroupReleaseProof),
     Refused {
+        kind: String,
+        message: String,
+        details: Option<Value>,
+    },
+    NotDispatched {
         kind: String,
         message: String,
         details: Option<Value>,
@@ -1491,6 +1552,13 @@ pub enum ExtensionProviderError {
         message: String,
         details: Option<Value>,
     },
+    #[error("extension connector refused ({kind}): {message}")]
+    NotDispatched {
+        kind: String,
+        message: String,
+        details: Option<Value>,
+        proof: Box<ExtensionUndispatchedControl>,
+    },
     #[error("Chrome rejected {operation}: {message}")]
     ChromeRejected {
         operation: String,
@@ -1505,6 +1573,23 @@ pub enum ExtensionProviderError {
     },
     #[error("extension provider protocol failed: {0}")]
     Protocol(String),
+}
+
+/// Rust-produced proof that this exact call never began a native frame.
+/// This is independent of logical registration and cannot clear older custody.
+/// Constructors remain inside the trusted Rust provider, not native JSON.
+#[derive(Clone, Debug)]
+pub struct ExtensionUndispatchedControl {
+    binding: uuid::Uuid,
+    host_operation: Option<ExtensionHostOperation>,
+    wire_context: Option<ExtensionWireContext>,
+    method: &'static str,
+}
+impl ExtensionUndispatchedControl {
+    /// Semantic operation refused before physical dispatch.
+    pub fn method(&self) -> &'static str {
+        self.method
+    }
 }
 
 struct ProviderInner {
@@ -1525,12 +1610,58 @@ impl Drop for ProviderInner {
     }
 }
 
+/// Logical session requests registered by one exact trusted call view.
+///
+/// Registration precedes transport admission. It proves neither physical dispatch,
+/// activation, success, NoEffect nor cleanup. The Host may snapshot the count only
+/// after its original call gates drain and its actual turn cleanup is acknowledged.
+#[derive(Clone, Debug)]
+pub struct ExtensionSessionRequestRegistration {
+    inner: Arc<SessionRequestRegistration>,
+}
+#[derive(Debug)]
+struct SessionRequestRegistration {
+    binding: uuid::Uuid,
+    host_operation: Option<ExtensionHostOperation>,
+    wire_context: Option<ExtensionWireContext>,
+    count: AtomicUsize,
+}
+impl ExtensionSessionRequestRegistration {
+    /// Number of logical requests registered by the captured call view.
+    pub fn count(&self) -> usize {
+        self.inner.count.load(Ordering::SeqCst)
+    }
+    fn matches(&self, provider: &ExtensionBrowserProvider) -> bool {
+        self.inner.binding == provider.inner.binding
+            && self.inner.host_operation == provider.host_operation
+            && self.inner.wire_context == provider.wire_context
+    }
+    fn register(&self) -> Result<(), ExtensionProviderError> {
+        let mut count = self.inner.count.load(Ordering::SeqCst);
+        loop {
+            let next = count
+                .checked_add(1)
+                .ok_or_else(|| protocol("session request registration count exhausted"))?;
+            match self.inner.count.compare_exchange_weak(
+                count,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => count = actual,
+            }
+        }
+    }
+}
+
 /// One owner connection, retained by the embedding Driver across extension epochs.
 #[derive(Clone)]
 pub struct ExtensionBrowserProvider {
     inner: Arc<ProviderInner>,
     host_operation: Option<ExtensionHostOperation>,
     wire_context: Option<ExtensionWireContext>,
+    session_request_registration: Option<ExtensionSessionRequestRegistration>,
 }
 /// Immutable call-scoped provider view sharing the same owner/transport actor.
 /// The name is an alias: it carries no extra session or authority store.
@@ -1562,6 +1693,7 @@ impl ExtensionBrowserProvider {
             inner,
             host_operation: None,
             wire_context: None,
+            session_request_registration: None,
         })
     }
     pub fn with_host_operation(
@@ -1572,6 +1704,7 @@ impl ExtensionBrowserProvider {
             inner: self.inner.clone(),
             host_operation: Some(context),
             wire_context: self.wire_context.clone(),
+            session_request_registration: self.session_request_registration.clone(),
         }
     }
     /// Supply exact trusted owner-session/turn metadata for this call view.
@@ -1581,7 +1714,42 @@ impl ExtensionBrowserProvider {
             inner: self.inner.clone(),
             host_operation: self.host_operation.clone(),
             wire_context: Some(context),
+            session_request_registration: self.session_request_registration.clone(),
         }
+    }
+    /// Observe logical registration on this same provider, operation and context.
+    /// Local argument/capability failures before registration leave the count alone;
+    /// every admitted request remains registered even when no frame is written.
+    pub fn observe_session_requests(&self) -> (Self, ExtensionSessionRequestRegistration) {
+        let registration = ExtensionSessionRequestRegistration {
+            inner: Arc::new(SessionRequestRegistration {
+                binding: self.inner.binding,
+                host_operation: self.host_operation.clone(),
+                wire_context: self.wire_context.clone(),
+                count: AtomicUsize::new(0),
+            }),
+        };
+        let mut observed = self.clone();
+        observed.session_request_registration = Some(registration.clone());
+        (observed, registration)
+    }
+    /// Reuse one call's existing registration observation across its purposes.
+    ///
+    /// # Errors
+    /// Refuses a different provider binding, Host operation or wire context.
+    pub fn with_session_request_registration(
+        &self,
+        registration: &ExtensionSessionRequestRegistration,
+    ) -> Result<Self, ExtensionProviderError> {
+        if !registration.matches(self) {
+            return Err(refused(
+                "context_mismatch",
+                "session request observation belongs to another captured call view",
+            ));
+        }
+        let mut observed = self.clone();
+        observed.session_request_registration = Some(registration.clone());
+        Ok(observed)
     }
     pub fn is_closed(&self) -> bool {
         !self.inner.alive.load(Ordering::SeqCst)
@@ -1598,23 +1766,90 @@ impl ExtensionBrowserProvider {
         self.inner.events.subscribe()
     }
 
+    fn preflight_error(
+        &self,
+        method: &'static str,
+        error: ExtensionProviderError,
+    ) -> ExtensionProviderError {
+        match error {
+            ExtensionProviderError::Refused {
+                kind,
+                message,
+                details,
+            } => self.undispatched_error(method, kind, message, details),
+            error => error,
+        }
+    }
+    fn undispatched_error(
+        &self,
+        method: &'static str,
+        kind: String,
+        message: String,
+        details: Option<Value>,
+    ) -> ExtensionProviderError {
+        ExtensionProviderError::NotDispatched {
+            kind,
+            message,
+            details,
+            proof: Box::new(ExtensionUndispatchedControl {
+                binding: self.inner.binding,
+                host_operation: self.host_operation.clone(),
+                wire_context: self.wire_context.clone(),
+                method,
+            }),
+        }
+    }
+    /// Validate a Rust-only no-dispatch proof against this captured call view.
+    /// No error text or native reply hint can supply this proof.
+    pub fn undispatched_control<'a>(
+        &self,
+        error: &'a ExtensionProviderError,
+    ) -> Option<&'a ExtensionUndispatchedControl> {
+        let ExtensionProviderError::NotDispatched { proof, .. } = error else {
+            return None;
+        };
+        (proof.binding == self.inner.binding
+            && proof.host_operation == self.host_operation
+            && proof.wire_context == self.wire_context)
+            .then_some(proof.as_ref())
+    }
     async fn control(
         &self,
         operation: ExtensionOperation,
         params: Value,
     ) -> Result<ControlReply, ExtensionProviderError> {
         let name = operation.method();
-        self.check_operation_capability(&operation)?;
+        self.check_operation_capability(&operation)
+            .map_err(|error| self.preflight_error(name, error))?;
         if self
             .host_operation
             .as_ref()
             .zip(self.wire_context.as_ref())
             .is_some_and(|(operation, wire)| operation.turn_id != wire.host_turn_id())
         {
-            return Err(refused(
-                "context_mismatch",
-                "receipt correlation and wire metadata name different trusted turns",
+            return Err(self.preflight_error(
+                name,
+                refused(
+                    "context_mismatch",
+                    "receipt correlation and wire metadata name different trusted turns",
+                ),
             ));
+        }
+        if let Some(registration) = self
+            .session_request_registration
+            .as_ref()
+            .filter(|_| operation.registers_session_request())
+        {
+            if !registration.matches(self) {
+                return Err(refused(
+                    "context_mismatch",
+                    "session request observation no longer matches its captured call view",
+                ));
+            }
+            // Mirrors the session client's tracker-before-send boundary. A
+            // later owner fence, zero-byte write or remote rejection cannot
+            // erase this logical cleanup obligation.
+            registration.register()?;
         }
         if !self.inner.alive.load(Ordering::SeqCst) {
             return Err(unknown(name, "owner IPC connection is closed"));
@@ -1631,9 +1866,23 @@ impl ExtensionBrowserProvider {
             })
             .await
             .map_err(|_| unknown(name, "runtime actor ended before admission"))?;
-        result
+        let reply = result
             .await
-            .map_err(|_| unknown(name, "runtime actor ended before receipt delivery"))
+            .map_err(|_| unknown(name, "runtime actor ended before receipt delivery"))?;
+        if let ExtensionOperationOutcome::NotDispatched {
+            kind,
+            message,
+            details,
+        } = &reply.outcome
+        {
+            return Err(self.undispatched_error(
+                name,
+                kind.clone(),
+                message.clone(),
+                details.clone(),
+            ));
+        }
+        Ok(reply)
     }
     fn check_operation_capability(
         &self,
@@ -2045,106 +2294,111 @@ impl ExtensionBrowserProvider {
         cleanup: &CleanupProof,
         drain: &ExtensionClaimCdpDrainProof,
     ) -> Result<(), ExtensionProviderError> {
-        self.check_claim(claim)?;
-        if drain.binding != self.inner.binding
-            || drain.provider != *self.identity()
-            || drain.claim != claim.token
-        {
-            return Err(refused(
-                "drain_unavailable",
-                "CDP drain proof belongs to another owner, generation or claim",
-            ));
-        }
-        let completions = self.pending_completions().await?;
-        if completions
-            .iter()
-            .any(|entry| unacknowledged_retirement_fact(&entry.operation, &claim.token))
-        {
-            return Err(refused(
-                "retirement_unsettled",
-                "claim effect or orphan receipts must be folded and acknowledged before retirement",
-            ));
-        }
-        let completion = completions
-            .into_iter()
-            .find(|completion| completion.id == cleanup.completion_id)
+        async {
+            self.check_claim(claim)?;
+            if drain.binding != self.inner.binding
+                || drain.provider != *self.identity()
+                || drain.claim != claim.token
+            {
+                return Err(refused(
+                    "drain_unavailable",
+                    "CDP drain proof belongs to another owner, generation or claim",
+                ));
+            }
+            let completions = self.pending_completions().await?;
+            if completions
+                .iter()
+                .any(|entry| unacknowledged_retirement_fact(&entry.operation, &claim.token))
+            {
+                return Err(refused(
+                    "retirement_unsettled",
+                    "claim effect or orphan receipts must be folded and acknowledged before retirement",
+                ));
+            }
+            let completion = completions
+                .into_iter()
+                .find(|completion| completion.id == cleanup.completion_id)
+                .ok_or_else(|| {
+                    refused(
+                        "cleanup_unavailable",
+                        "cleanup completion is not currently retained",
+                    )
+                })?;
+            let exact_operation = match &completion.operation {
+                ExtensionOperation::Detach {
+                    claim: issued,
+                    tab_id,
+                    target_id,
+                }
+                | ExtensionOperation::CloseTab {
+                    claim: issued,
+                    tab_id,
+                    target_id,
+                } => issued == &claim.token && *tab_id == claim.tab_id && target_id == &claim.target_id,
+                ExtensionOperation::StopCreatedTab { tab_id, .. } => *tab_id == Some(claim.tab_id),
+                _ => false,
+            };
+            if !exact_operation {
+                return Err(refused(
+                    "cleanup_unavailable",
+                    "cleanup completion does not belong to this exact claim or Created tab",
+                ));
+            }
+            if let ExtensionOperationOutcome::Unknown {
+                details: Some(details),
+                ..
+            } = &completion.outcome
+            {
+                if let Some(acknowledged) = details
+                    .get("acknowledgedResult")
+                    .or_else(|| details.get("physicalProof"))
+                {
+                    if acknowledged
+                        .get("claim")
+                        .is_some_and(|issued| issued.as_str() != Some(claim.token.as_str()))
+                        || acknowledged
+                            .get("tabId")
+                            .is_some_and(|issued| issued.as_u64() != Some(claim.tab_id))
+                        || acknowledged
+                            .get("targetId")
+                            .is_some_and(|issued| issued.as_str() != Some(claim.target_id.as_str()))
+                    {
+                        return Err(refused(
+                            "cleanup_unavailable",
+                            "acknowledged cleanup changed its issued claim or tab identity",
+                        ));
+                    }
+                }
+            }
+            let issued = match self.materialize_retained(&completion)? {
+                ExtensionRecoveredOperation::Cleanup(issued) => Some(issued),
+                ExtensionRecoveredOperation::Unknown { custody, .. } => custody.cleanup,
+                _ => None,
+            }
             .ok_or_else(|| {
                 refused(
                     "cleanup_unavailable",
-                    "cleanup completion is not currently retained",
+                    "cleanup completion has no known physical cleanup proof",
                 )
             })?;
-        let exact_operation = match &completion.operation {
-            ExtensionOperation::Detach {
-                claim: issued,
-                tab_id,
-                target_id,
-            }
-            | ExtensionOperation::CloseTab {
-                claim: issued,
-                tab_id,
-                target_id,
-            } => issued == &claim.token && *tab_id == claim.tab_id && target_id == &claim.target_id,
-            ExtensionOperation::StopCreatedTab { tab_id, .. } => *tab_id == Some(claim.tab_id),
-            _ => false,
-        };
-        if !exact_operation {
-            return Err(refused(
-                "cleanup_unavailable",
-                "cleanup completion does not belong to this exact claim or Created tab",
-            ));
-        }
-        if let ExtensionOperationOutcome::Unknown {
-            details: Some(details),
-            ..
-        } = &completion.outcome
-        {
-            if let Some(acknowledged) = details
-                .get("acknowledgedResult")
-                .or_else(|| details.get("physicalProof"))
-            {
-                if acknowledged
-                    .get("claim")
-                    .is_some_and(|issued| issued.as_str() != Some(claim.token.as_str()))
-                    || acknowledged
-                        .get("tabId")
-                        .is_some_and(|issued| issued.as_u64() != Some(claim.tab_id))
-                    || acknowledged
-                        .get("targetId")
-                        .is_some_and(|issued| issued.as_str() != Some(claim.target_id.as_str()))
-                {
-                    return Err(refused(
-                        "cleanup_unavailable",
-                        "acknowledged cleanup changed its issued claim or tab identity",
-                    ));
+            let absence_matches = match (&cleanup.tab_absence, &issued.tab_absence) {
+                (None, None) => true,
+                (Some(actual), Some(expected)) => {
+                    actual.tab_id == expected.tab_id
+                        && actual.extension_request_id == expected.extension_request_id
                 }
+                _ => false,
+            };
+            if cleanup.evidence != issued.evidence || !absence_matches {
+                return Err(refused(
+                    "cleanup_unavailable",
+                    "cleanup proof differs from the currently retained completion",
+                ));
             }
+            Ok::<(), ExtensionProviderError>(())
         }
-        let issued = match self.materialize_retained(&completion)? {
-            ExtensionRecoveredOperation::Cleanup(issued) => Some(issued),
-            ExtensionRecoveredOperation::Unknown { custody, .. } => custody.cleanup,
-            _ => None,
-        }
-        .ok_or_else(|| {
-            refused(
-                "cleanup_unavailable",
-                "cleanup completion has no known physical cleanup proof",
-            )
-        })?;
-        let absence_matches = match (&cleanup.tab_absence, &issued.tab_absence) {
-            (None, None) => true,
-            (Some(actual), Some(expected)) => {
-                actual.tab_id == expected.tab_id
-                    && actual.extension_request_id == expected.extension_request_id
-            }
-            _ => false,
-        };
-        if cleanup.evidence != issued.evidence || !absence_matches {
-            return Err(refused(
-                "cleanup_unavailable",
-                "cleanup proof differs from the currently retained completion",
-            ));
-        }
+        .await
+        .map_err(|error| self.preflight_error("retireClaim", error))?;
         let reply = self
             .control(
                 ExtensionOperation::RetireClaim {
@@ -2206,31 +2460,40 @@ impl ExtensionBrowserProvider {
         document: &ExtensionPreparationDocument,
         policy: &ExtensionPreparationPolicy,
     ) -> Result<ExtensionClaimPreparationProof, ExtensionProviderError> {
-        self.check_claim(claim)?;
+        self.check_claim(claim)
+            .map_err(|error| self.preflight_error("prepareClaim", error))?;
         if claim.cleanup_only {
-            return Err(refused(
-                "claim_unavailable",
-                "cleanup-only claim cannot acquire preparation",
+            return Err(self.preflight_error(
+                "prepareClaim",
+                refused(
+                    "claim_unavailable",
+                    "cleanup-only claim cannot acquire preparation",
+                ),
             ));
         }
-        let context = self.preparation_context()?;
+        let context = self
+            .preparation_context()
+            .map_err(|error| self.preflight_error("prepareClaim", error))?;
         if !self.capabilities()?.explicit_claim_preparation {
-            return Err(refused(
-                "unsupported",
-                "selected provider has no explicit same-claim preparation",
+            return Err(self.preflight_error(
+                "prepareClaim",
+                refused(
+                    "unsupported",
+                    "selected provider has no explicit same-claim preparation",
+                ),
             ));
-        }
-        if !self.inner.alive.load(Ordering::SeqCst) {
-            return Err(unknown("prepareClaim", "owner IPC connection is closed"));
         }
         let charge = self
             .inner
             .retained_payload_budget
             .try_charge(document)
             .map_err(|error| {
-                refused(
-                    "document_budget",
-                    &format!("retained document was not admitted: {error}"),
+                self.preflight_error(
+                    "prepareClaim",
+                    refused(
+                        "document_budget",
+                        &format!("retained document was not admitted: {error}"),
+                    ),
                 )
             })?;
         let document_binding =
@@ -3065,10 +3328,10 @@ impl ExtensionBrowserProvider {
         })
     }
     /// FIFO barrier for control operations only (attach/create/preparation/
-    /// headers/cleanup). For a Host operation not previously acknowledged,
-    /// absence after its enqueue has settled means no control dispatch; None
-    /// outcome remains in flight. Previously acknowledged operations are also
-    /// absent, so the Host must retain that distinction in its existing ledger.
+    /// headers/cleanup). None outcome remains in flight. Absence does not prove
+    /// no dispatch: nonretained completed reads and acknowledged mutations are
+    /// absent too. Only a Rust-produced NotDispatched phase proves zero dispatch;
+    /// the Host retains its independent operation and cleanup responsibilities.
     /// Generic CdpConnection calls have their maka pending/unknown semantics:
     /// this snapshot never authorizes replay of CDP input or JavaScript.
     pub async fn pending_operations(
@@ -3183,6 +3446,17 @@ impl ExtensionBrowserProvider {
             ExtensionOperationOutcome::Result(result) => result.clone(),
             ExtensionOperationOutcome::ChromeRejected { message, details } => {
                 return Ok(ExtensionRecoveredOperation::ChromeRejected {
+                    message: message.clone(),
+                    details: details.clone(),
+                });
+            }
+            ExtensionOperationOutcome::NotDispatched {
+                kind,
+                message,
+                details,
+            } => {
+                return Ok(ExtensionRecoveredOperation::NotDispatched {
+                    kind: kind.clone(),
                     message: message.clone(),
                     details: details.clone(),
                 });
@@ -4223,14 +4497,14 @@ async fn run_client(
                     ClientCommand::Close{reply}=>{disconnect("logical owner explicitly closed its IPC transport",&owner,&events,&mut pending,&mut opening,RouteReceipts{routes:&mut routes,retired_contexts:&mut retired_contexts},&mut next_id);writer=None;reader.abort();let _=reply.send(());None},
                     ClientCommand::Control{operation,params,context,wire_context,reply}=>{
                         if reply.is_closed(){None}
-                        else if !owner_admitting(&owner){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::ConnectorRejected{kind:"owner_closed".into(),message:"logical owner is closing; control was not dispatched".into(),details:None}});None}
+                        else if !owner_admitting(&owner){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::NotDispatched{kind:"owner_closed".into(),message:"logical owner is closing; control was not dispatched".into(),details:None}});None}
                         else if writer.is_none(){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::Unknown{reason:"owner IPC is closed".into(),details:None}});None}
                         else if matches!(&operation,ExtensionOperation::RetireClaim{claim,..} if claim_retirement_has_debt(claim,&routes,&retired_contexts,&pending)){
-                            let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::ConnectorRejected{kind:"retirement_unsettled".into(),message:"claim has deferred or unacknowledged facts before retirement".into(),details:None}});None
+                            let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::NotDispatched{kind:"retirement_unsettled".into(),message:"claim has deferred or unacknowledged facts before retirement".into(),details:None}});None
                         }
-                        else if pending.len()+opening.len()>=operation.pending_budget(){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::ConnectorRejected{kind:"request_budget".into(),message:"pending receipts must be applied and acknowledged before more requests".into(),details:None}});None}
+                        else if pending.len()+opening.len()>=operation.pending_budget(){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::NotDispatched{kind:"request_budget".into(),message:"pending receipts must be applied and acknowledged before more requests".into(),details:None}});None}
                         else if let Some(id)=next_id.checked_add(1){next_id=id;let method=operation.method();pending.insert(id,PendingControl{operation,context,wire_context:wire_context.clone(),reply:Some(reply),outcome:None});Some((true,with_wire_context(json!({"kind":"control","request":merge_request(method,id,params)}),wire_context.as_ref())))}
-                        else{let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::ConnectorRejected{kind:"request_budget".into(),message:"local request IDs exhausted".into(),details:None}});None}
+                        else{let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::NotDispatched{kind:"request_budget".into(),message:"local request IDs exhausted".into(),details:None}});None}
                     }
                     ClientCommand::OpenCdp{claim,reply}=>{
                         for entry in opening.values_mut(){entry.replies.retain(|reply|!reply.is_closed());}
@@ -4602,7 +4876,7 @@ fn fence_unsent(
             if let Some(id) = frame["request"]["id"].as_u64() {
                 let _ = finish_control(
                     id,
-                    ExtensionOperationOutcome::ConnectorRejected {
+                    ExtensionOperationOutcome::NotDispatched {
                         kind: "owner_closed".into(),
                         message: "logical owner closed before serial IPC dispatch".into(),
                         details: None,
@@ -5521,6 +5795,7 @@ mod tests {
                 inner,
                 host_operation: None,
                 wire_context: None,
+                session_request_registration: None,
             },
             server,
         )
@@ -5806,14 +6081,12 @@ mod tests {
         assert_eq!(orphan.wire_context, Some(original));
         // A metadata snapshot is local; it cannot replay the canceled command.
         assert_eq!(provider.pending_operations().await.unwrap().len(), 2);
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(20),
-                local_ipc::read_json(&mut server)
-            )
-            .await
-            .is_err()
-        );
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            local_ipc::read_json(&mut server)
+        )
+        .await
+        .is_err());
         provider.close().await;
     }
 
@@ -5995,11 +6268,9 @@ mod tests {
         })
         .await;
         assert_eq!(ready.len(), 2);
-        assert!(
-            ready
-                .iter()
-                .all(|entry| entry.wire_context == Some(original.clone()))
-        );
+        assert!(ready
+            .iter()
+            .all(|entry| entry.wire_context == Some(original.clone())));
         assert_eq!(ready.iter().filter(|entry|matches!(&entry.operation,ExtensionOperation::OrphanCdpCompletion{event:ExtensionCdpCompletionOutcome::TransportFailure(reason),..} if reason=="actual-old-turn-cause")).count(),1);
         provider.close().await;
     }
@@ -6411,40 +6682,36 @@ mod tests {
         let mut opening = HashMap::new();
         let (sender, _receiver) = mpsc::channel::<ClientCommand>(4);
         let actual = json!({"kind":"controlEvent","event":{"kind":"orphanCdpCompletion","data":{"route":94,"claim":"actual-native-error-claim","id":42,"wireContext":original,"event":{"kind":"transportFailure","data":"actual code1 timeout cause survives full ledger"}}}});
-        assert!(
-            apply_server(
-                actual,
-                &mut pending,
-                &mut opening,
-                RouteReceipts {
-                    routes: &mut routes,
-                    retired_contexts: &mut retired
-                },
-                ProviderEventContext {
-                    sender: &sender.downgrade(),
-                    events: &events,
-                    payload_budget: &ByteBudget::new()
-                },
-                &mut next_id
-            )
-            .is_err()
-        );
+        assert!(apply_server(
+            actual,
+            &mut pending,
+            &mut opening,
+            RouteReceipts {
+                routes: &mut routes,
+                retired_contexts: &mut retired
+            },
+            ProviderEventContext {
+                sender: &sender.downgrade(),
+                events: &events,
+                payload_budget: &ByteBudget::new()
+            },
+            &mut next_id
+        )
+        .is_err());
         assert!(
             matches!(&retired[&(94,42)].atomic_terminal,ExtensionCdpAtomicTerminal::UnretainedLate(ExtensionCdpCompletionOutcome::TransportFailure(reason)) if reason=="actual code1 timeout cause survives full ledger")
         );
         pending.remove(&1);
-        assert!(
-            flush_deferred_effects(
-                RouteReceipts {
-                    routes: &mut routes,
-                    retired_contexts: &mut retired
-                },
-                &mut pending,
-                &events,
-                &mut next_id
-            )
-            .is_err()
-        );
+        assert!(flush_deferred_effects(
+            RouteReceipts {
+                routes: &mut routes,
+                retired_contexts: &mut retired
+            },
+            &mut pending,
+            &events,
+            &mut next_id
+        )
+        .is_err());
         pending.remove(&2);
         flush_deferred_effects(
             RouteReceipts {
@@ -6607,12 +6874,10 @@ mod tests {
         let diagnostic: ExtensionMutationDiagnostic =
             decode(json!({"attempted":true,"mutationAcknowledged":false,"changed":null})).unwrap();
         assert_eq!(diagnostic.changed, None);
-        assert!(
-            decode::<ExtensionMutationDiagnostic>(
-                json!({"attempted":true,"mutationAcknowledged":false})
-            )
-            .is_err()
-        );
+        assert!(decode::<ExtensionMutationDiagnostic>(
+            json!({"attempted":true,"mutationAcknowledged":false})
+        )
+        .is_err());
     }
 
     #[cfg(unix)]
@@ -6909,12 +7174,10 @@ mod tests {
         .unwrap();
         let connection = bounded(open).await.unwrap().unwrap();
         drop(provider);
-        assert!(
-            bounded(local_ipc::read_json(&mut server))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(bounded(local_ipc::read_json(&mut server))
+            .await
+            .unwrap()
+            .is_none());
         bounded(async {
             while !connection.is_closed() {
                 tokio::task::yield_now().await;
@@ -6945,7 +7208,7 @@ mod tests {
         assert!(provider.is_closed());
         let response = bounded(result).await.unwrap();
         assert!(
-            matches!(response.outcome,ExtensionOperationOutcome::ConnectorRejected{ref kind,..}if kind=="owner_closed")
+            matches!(response.outcome,ExtensionOperationOutcome::NotDispatched{ref kind,..}if kind=="owner_closed")
         );
         bounded(close).await;
         assert!(
@@ -7087,6 +7350,24 @@ mod tests {
         assert!(tab.last_accessed.is_none());
         assert!(tab.window_id.is_none());
     }
+    #[test]
+    fn event_source_target_capability_is_explicit_and_never_inferred() {
+        let mut capabilities = maka_capabilities();
+        assert!(
+            !decode::<ExtensionProviderCapabilities>(capabilities.clone())
+                .unwrap()
+                .cdp_event_source_target
+        );
+        capabilities["cdpEventSourceTarget"] = json!(true);
+        assert!(
+            decode::<ExtensionProviderCapabilities>(capabilities.clone())
+                .unwrap()
+                .cdp_event_source_target
+        );
+        capabilities["cdpEventSourceTarget"] = json!("true");
+        assert!(decode::<ExtensionProviderCapabilities>(capabilities).is_err());
+    }
+
     #[test]
     fn routing_metadata_preserves_provider_scope_and_refuses_missing_lifecycle_fact() {
         let maka: ExtensionProviderCapabilities = decode(maka_capabilities()).unwrap();
@@ -7267,7 +7548,7 @@ mod tests {
             scoped.finish_turn(None).await.map(|_| ()),
         ] {
             assert!(
-                matches!(result,Err(ExtensionProviderError::Refused{ref kind,..})if kind=="unsupported")
+                matches!(result,Err(ExtensionProviderError::NotDispatched{ref kind,..})if kind=="unsupported")
             );
         }
         assert!(provider.pending_operations().await.unwrap().is_empty());
@@ -7572,16 +7853,12 @@ mod tests {
             REQUEST_BUDGET,
             "local retirement adds no retained mutation receipt"
         );
-        assert!(
-            retained
-                .iter()
-                .any(|entry| entry.id == cleanup.completion_id)
-        );
-        assert!(
-            retained
-                .iter()
-                .all(|entry| !matches!(&entry.operation, ExtensionOperation::RetireClaim { .. }))
-        );
+        assert!(retained
+            .iter()
+            .any(|entry| entry.id == cleanup.completion_id));
+        assert!(retained
+            .iter()
+            .all(|entry| !matches!(&entry.operation, ExtensionOperation::RetireClaim { .. })));
         provider
             .acknowledge_completion(cleanup.completion_id)
             .await
@@ -7606,32 +7883,32 @@ mod tests {
         foreign_claim.binding = uuid::Uuid::new_v4();
         assert!(
             matches!(bounded(provider.retire_claim(&foreign_claim, &cleanup, &drain)).await,
-            Err(ExtensionProviderError::Refused { kind, .. }) if kind == "claim_unavailable")
+            Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "claim_unavailable")
         );
         let mut foreign_drain = drain.clone();
         foreign_drain.binding = uuid::Uuid::new_v4();
         assert!(
             matches!(bounded(provider.retire_claim(&claim, &cleanup, &foreign_drain)).await,
-            Err(ExtensionProviderError::Refused { kind, .. }) if kind == "drain_unavailable")
+            Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "drain_unavailable")
         );
         foreign_drain = drain.clone();
         foreign_drain.provider.generation = uuid::Uuid::new_v4().to_string();
         assert!(
             matches!(bounded(provider.retire_claim(&claim, &cleanup, &foreign_drain)).await,
-            Err(ExtensionProviderError::Refused { kind, .. }) if kind == "drain_unavailable")
+            Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "drain_unavailable")
         );
         foreign_drain = drain.clone();
         foreign_drain.claim = other.token.clone();
         assert!(
             matches!(bounded(provider.retire_claim(&claim, &cleanup, &foreign_drain)).await,
-            Err(ExtensionProviderError::Refused { kind, .. }) if kind == "drain_unavailable")
+            Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "drain_unavailable")
         );
         let mut foreign_cleanup = cleanup.clone();
         foreign_cleanup.completion_id += 1000;
         for proof in [&foreign_cleanup, &other_cleanup] {
             assert!(
                 matches!(bounded(provider.retire_claim(&claim, proof, &drain)).await,
-                Err(ExtensionProviderError::Refused { kind, .. }) if kind == "cleanup_unavailable")
+                Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "cleanup_unavailable")
             );
         }
         assert_eq!(provider.pending_completions().await.unwrap().len(), 2);
@@ -7819,16 +8096,14 @@ mod tests {
                 .unwrap();
             assert!(
                 matches!(bounded(provider.retire_claim(&claim, &known, &drain)).await,
-                Err(ExtensionProviderError::Refused { kind, .. }) if kind == "cleanup_unavailable")
+                Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "cleanup_unavailable")
             );
             let retained = provider.pending_completions().await.unwrap();
             assert_eq!(retained.len(), 2);
             assert!(retained.iter().any(|entry| entry.id == id));
-            assert!(
-                retained
-                    .iter()
-                    .any(|entry| entry.id == unrelated.completion_id())
-            );
+            assert!(retained
+                .iter()
+                .any(|entry| entry.id == unrelated.completion_id()));
             let mut bytes = [0_u8; 4];
             assert_eq!(
                 server.try_read(&mut bytes).unwrap_err().kind(),
@@ -7962,7 +8237,7 @@ mod tests {
             let unknown_identity_cleanup = bounded(stop).await.unwrap().unwrap();
             assert!(
                 matches!(bounded(provider.retire_claim(&claim, &unknown_identity_cleanup, &drain)).await,
-            Err(ExtensionProviderError::Refused { kind, .. }) if kind == "cleanup_unavailable")
+            Err(ExtensionProviderError::NotDispatched { kind, .. }) if kind == "cleanup_unavailable")
             );
             inventory_barrier(&provider, &mut server).await;
             assert_eq!(provider.pending_completions().await.unwrap().len(), 2);
@@ -8234,7 +8509,7 @@ mod tests {
             .await;
             assert!(
                 matches!(bounded(provider.retire_claim(&claim,&cleanup,&drain)).await,
-                Err(ExtensionProviderError::Refused{kind,..})if kind=="retirement_unsettled")
+                Err(ExtensionProviderError::NotDispatched{kind,..})if kind=="retirement_unsettled")
             );
             assert_eq!(provider.pending_completions().await.unwrap().len(), 2);
             inventory_barrier(&provider, &mut server).await;
@@ -8286,7 +8561,7 @@ mod tests {
             }),
         ] {
             assert!(
-                matches!(view.prepare_claim(&claim,&document,&policy).await, Err(ExtensionProviderError::Refused{kind,..}) if kind=="context_required")
+                matches!(view.prepare_claim(&claim,&document,&policy).await, Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="context_required")
             );
             assert!(
                 matches!(view.create_popup_tab(&claim).await, Err(ExtensionProviderError::Refused{kind,..}) if kind=="context_required")
@@ -8296,18 +8571,18 @@ mod tests {
         let legacy_claim = attach_fixture(&legacy, &mut legacy_wire, 12, "legacy-claim").await;
         let legacy_view = preparation_view(&legacy, "legacy-turn");
         assert!(
-            matches!(legacy_view.prepare_claim(&legacy_claim,&document,&policy).await, Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported")
+            matches!(legacy_view.prepare_claim(&legacy_claim,&document,&policy).await, Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="unsupported")
         );
         let scoped = preparation_view(&provider, "new-turn");
         assert!(
-            matches!(scoped.prepare_claim(&legacy_claim,&document,&policy).await, Err(ExtensionProviderError::Refused{kind,..}) if kind=="claim_unavailable")
+            matches!(scoped.prepare_claim(&legacy_claim,&document,&policy).await, Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="claim_unavailable")
         );
         assert!(
             matches!(scoped.create_popup_tab(&legacy_claim).await, Err(ExtensionProviderError::Refused{kind,..}) if kind=="claim_unavailable")
         );
         provider.inner.retained_payload_budget.close();
         assert!(
-            matches!(scoped.prepare_claim(&claim,&document,&policy).await, Err(ExtensionProviderError::Refused{kind,..}) if kind=="document_budget")
+            matches!(scoped.prepare_claim(&claim,&document,&policy).await, Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="document_budget")
         );
         assert!(provider.pending_operations().await.unwrap().is_empty());
         assert!(legacy.pending_operations().await.unwrap().is_empty());
@@ -8664,7 +8939,7 @@ mod tests {
         let scoped = preparation_view(&provider, "budget-turn");
         assert!(
             matches!(bounded(scoped.prepare_claim(&claim,&preparation_document(),&ExtensionPreparationPolicy::default())).await,
-            Err(ExtensionProviderError::Refused{kind,..}) if kind=="document_budget")
+            Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="document_budget")
         );
         assert!(provider.pending_operations().await.unwrap().is_empty());
         assert_eq!(
@@ -8837,8 +9112,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn session_tab_selector_requires_captured_context_and_supported_contract_without_dispatch()
-     {
+    async fn session_tab_selector_requires_captured_context_and_supported_contract_without_dispatch(
+    ) {
         for supported in [false, true] {
             let mut capabilities = maka_capabilities();
             if supported {
@@ -8857,10 +9132,10 @@ mod tests {
                     ExtensionWireContext::new("managed-owner", "turn-current").unwrap(),
                 );
                 assert!(
-                    matches!(scoped.resolve_session_tab("2001").await,Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported")
+                    matches!(scoped.resolve_session_tab("2001").await,Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="unsupported")
                 );
                 assert!(
-                    matches!(scoped.prepare_session_tab(2001).await,Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported")
+                    matches!(scoped.prepare_session_tab(2001).await,Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="unsupported")
                 );
             }
             let mut bytes = [0u8; 1];
@@ -9041,7 +9316,7 @@ mod tests {
                 let scoped = provider
                     .with_wire_context(ExtensionWireContext::new("url-owner", "url-turn").unwrap());
                 assert!(
-                    matches!(scoped.committed_session_tab_url("2001").await,Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported")
+                    matches!(scoped.committed_session_tab_url("2001").await,Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="unsupported")
                 );
             }
             let mut bytes = [0u8; 1];
@@ -9144,7 +9419,7 @@ mod tests {
         let scoped = provider
             .with_wire_context(ExtensionWireContext::new("inventory-owner", "turn-A").unwrap());
         assert!(matches!(scoped.list_session_tabs(&[]).await,
-            Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported"));
+            Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="unsupported"));
         let mut bytes = [0u8; 1];
         assert_eq!(
             server.try_read(&mut bytes).unwrap_err().kind(),
@@ -9408,4 +9683,79 @@ mod tests {
     }
 
     include!("extension_fixed_session_tests.rs");
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_no_dispatch_is_bound_retained_and_independent_of_registration() {
+        for trusted in [false, true] {
+            let (provider, mut server) = preparation_fixture();
+            let claim = attach_fixture(&provider, &mut server, 11, "phase-claim").await;
+            let base = preparation_view(&provider, "phase-turn");
+            let (scoped, registration) = base.observe_session_requests();
+            let actual = scoped.clone();
+            let document = preparation_document();
+            let call = tokio::spawn(async move {
+                actual
+                    .prepare_claim(&claim, &document, &ExtensionPreparationPolicy::default())
+                    .await
+            });
+            let sent = request(&mut server).await;
+            let id = sent["request"]["id"].as_u64().unwrap();
+            assert_eq!(sent["request"]["method"], "prepareClaim");
+            local_ipc::write_json(
+                &mut server,
+                &json!({
+                    "kind":"controlEvent", "event":{"kind":"reply", "data":{
+                        "id":id, "outcome":{
+                            "kind":if trusted {"notDispatched"} else {"connectorRejected"},
+                            "data":{"kind":"not_dispatched","message":"not sent",
+                                "details":{"provenance":"local_refusal"}}
+                        }
+                    }}
+                }),
+            )
+            .await
+            .unwrap();
+            let error = bounded(call).await.unwrap().unwrap_err();
+            assert_eq!(
+                registration.count(),
+                1,
+                "physical NoDispatch never refunds an already registered logical request"
+            );
+            let proof = scoped.undispatched_control(&error);
+            assert_eq!(proof.is_some(), trusted);
+            if let Some(proof) = proof {
+                assert_eq!(proof.method(), "prepareClaim");
+                assert!(preparation_view(&provider, "other-turn")
+                    .undispatched_control(&error)
+                    .is_none());
+            } else {
+                assert!(
+                    matches!(error, ExtensionProviderError::Refused {ref kind,..} if kind == "not_dispatched")
+                );
+            }
+            let ready = provider.pending_completions().await.unwrap();
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].id, id);
+            let recovered = provider.recover_completion(id).await.unwrap();
+            if trusted {
+                assert!(
+                    matches!(recovered, ExtensionRecoveredOperation::NotDispatched {kind,..} if kind == "not_dispatched")
+                );
+            } else {
+                assert!(
+                    matches!(recovered, ExtensionRecoveredOperation::Refused {kind,..} if kind == "not_dispatched")
+                );
+            }
+            assert_eq!(
+                provider.pending_completions().await.unwrap().len(),
+                1,
+                "reading phase proof never acknowledges the actual operation receipt"
+            );
+            provider.acknowledge_completion(id).await.unwrap();
+            inventory_barrier(&provider, &mut server).await;
+            assert!(provider.pending_operations().await.unwrap().is_empty());
+            provider.close().await;
+        }
+    }
 }

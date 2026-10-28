@@ -127,12 +127,10 @@ fn peer_and_decoded_input_cannot_choose_a_foreign_owner() {
         )),
         Err(BrokerError::WrongPrincipal)
     ));
-    assert!(
-        serde_json::from_value::<ControlRequest>(
-            json!({"method":"inventory","id":1,"owner":"forged"})
-        )
-        .is_err()
-    );
+    assert!(serde_json::from_value::<ControlRequest>(
+        json!({"method":"inventory","id":1,"owner":"forged"})
+    )
+    .is_err());
     let first = admit(&mut broker);
     let second = admit(&mut broker);
     let a = request(
@@ -398,11 +396,9 @@ fn early_revocation_never_publishes_a_live_claim_or_ends_unrelated_clients() {
             outcome: ControlOutcome::Unknown { .. }
         }
     ));
-    assert!(
-        broker
-            .bind_route(client.sender.lease.id, "claim-a")
-            .is_err()
-    );
+    assert!(broker
+        .bind_route(client.sender.lease.id, "claim-a")
+        .is_err());
     assert!(!broker.stopped);
     let _ = request(
         &mut broker,
@@ -956,16 +952,16 @@ fn cursor_control_cannot_use_foreign_cleanup_only_or_nonfinite_claim_requests() 
     broker.control(other.sender.lease.id, cursor(1, 12.5), &mut output);
     assert!(output.is_empty());
     assert!(matches!(semantic_control(&mut other).into_parts().0,
-        ControlEvent::Reply { outcome: ControlOutcome::ConnectorRejected { kind, .. }, .. } if kind == "claim_unavailable"));
+        ControlEvent::Reply { outcome: ControlOutcome::NotDispatched { kind, .. }, .. } if kind == "claim_unavailable"));
     broker.control(owner.sender.lease.id, cursor(2, f64::NAN), &mut output);
     assert!(output.is_empty());
     assert!(matches!(semantic_control(&mut owner).into_parts().0,
-        ControlEvent::Reply { outcome: ControlOutcome::ConnectorRejected { kind, .. }, .. } if kind == "invalid_request"));
+        ControlEvent::Reply { outcome: ControlOutcome::NotDispatched { kind, .. }, .. } if kind == "invalid_request"));
     broker.claims.get_mut("claim-a").unwrap().cleanup_only = true;
     broker.control(owner.sender.lease.id, cursor(3, 12.5), &mut output);
     assert!(output.is_empty());
     assert!(matches!(semantic_control(&mut owner).into_parts().0,
-        ControlEvent::Reply { outcome: ControlOutcome::ConnectorRejected { kind, .. }, .. } if kind == "claim_unavailable"));
+        ControlEvent::Reply { outcome: ControlOutcome::NotDispatched { kind, .. }, .. } if kind == "claim_unavailable"));
     assert!(
         route.sender.lease.alive.load(Ordering::SeqCst),
         "local refusal does not retire an existing route"
@@ -1008,18 +1004,16 @@ fn cursor_control_uses_exact_optional_wire_field_and_ack_is_not_cleanup_proof() 
     .unwrap();
     assert_eq!(encoded["method"], "moveMouse");
     assert!(encoded.get("waitForArrival").is_none());
-    assert!(
-        serde_json::from_value::<ControlRequest>(
-            json!({"method":"setSessionHeaders","id":4,"headers":[],"owner":"forged"})
-        )
-        .is_err()
-    );
+    assert!(serde_json::from_value::<ControlRequest>(
+        json!({"method":"setSessionHeaders","id":4,"headers":[],"owner":"forged"})
+    )
+    .is_err());
 }
 
 #[test]
 fn adapter_guard_refuses_only_before_first_write_and_reports_semantic_write_once() {
     let mut broker = fixture();
-    let client = admit(&mut broker);
+    let mut client = admit(&mut broker);
     let mut output = Vec::new();
     broker.control(
         client.sender.lease.id,
@@ -1033,17 +1027,23 @@ fn adapter_guard_refuses_only_before_first_write_and_reports_semantic_write_once
     let first = output.pop().unwrap().into_adapter_request();
     let first_guard = first.guard.clone();
     assert_eq!(first.semantic_id.as_deref(), Some("1"));
+    let report = first_guard
+        .reject_before_write("fixture_refusal".to_owned(), "not sent".to_owned())
+        .expect("the original guard rejected before any frame");
     assert!(matches!(
-        first_guard.reject_before_write("fixture_refusal".to_owned(), "not sent".to_owned()),
-        Some(WriteReport::LocalRejected { outer: 1, .. })
+        report,
+        WriteReport::LocalRejected { outer: 1, .. }
     ));
+    broker.written(report, &mut output);
+    assert!(matches!(semantic_control(&mut client).into_parts().0,
+        ControlEvent::Reply { id: 1, outcome: ControlOutcome::NotDispatched { kind, message, details: None } }
+            if kind == "fixture_refusal" && message == "not sent"));
+    assert!(!broker.pending.contains_key(&1));
     assert!(!first_guard.start_write());
     assert!(!first_guard.was_started());
-    assert!(
-        first_guard
-            .reject_before_write("repeat".to_owned(), "not sent".to_owned())
-            .is_none()
-    );
+    assert!(first_guard
+        .reject_before_write("repeat".to_owned(), "not sent".to_owned())
+        .is_none());
     assert!(first_guard.written_report().is_none());
 
     broker.control(
@@ -1058,15 +1058,13 @@ fn adapter_guard_refuses_only_before_first_write_and_reports_semantic_write_once
     let second = output.pop().unwrap().into_adapter_request();
     let writer_guard = second.guard.clone();
     assert!(writer_guard.start_write());
-    assert!(
-        second
-            .guard
-            .reject_before_write(
-                "false_refusal".to_owned(),
-                "phase already started".to_owned()
-            )
-            .is_none()
-    );
+    assert!(second
+        .guard
+        .reject_before_write(
+            "false_refusal".to_owned(),
+            "phase already started".to_owned()
+        )
+        .is_none());
     writer_guard.frame_written();
     assert!(matches!(
         writer_guard.written_report(),
@@ -1089,12 +1087,10 @@ fn adapter_guard_refuses_only_before_first_write_and_reports_semantic_write_once
         second.guard.was_started(),
         "canceled followup remains outcome unknown rather than predispatch refusal"
     );
-    assert!(
-        second
-            .guard
-            .reject_before_write("false_refusal".to_owned(), "phase already sent".to_owned())
-            .is_none()
-    );
+    assert!(second
+        .guard
+        .reject_before_write("false_refusal".to_owned(), "phase already sent".to_owned())
+        .is_none());
 }
 
 fn queued_control_with_context(
@@ -1231,12 +1227,10 @@ fn scope_fenced_written_attach_retains_exact_late_cleanup_only_custody() {
     );
     assert!(!attach.guard.is_live());
     assert!(attach.guard.was_started());
-    assert!(
-        attach
-            .guard
-            .reject_before_write("false_refusal".to_owned(), "already sent".to_owned())
-            .is_none()
-    );
+    assert!(attach
+        .guard
+        .reject_before_write("false_refusal".to_owned(), "already sent".to_owned())
+        .is_none());
     assert!(finish.guard.is_live());
     assert_eq!(broker.pending.len(), 2);
     let mut output = Vec::new();
@@ -1325,19 +1319,15 @@ fn exact_claim_fence_counts_queued_and_written_work_until_actual_terminal_receip
     assert_eq!(snapshot["pending"][0]["id"], 1);
     assert_eq!(snapshot["pending"][1]["id"], 2);
     assert_eq!(snapshot["pending"][0]["route"], first.sender.lease.id.0);
-    assert!(
-        snapshot["pending"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["unknownReason"].is_null())
-    );
+    assert!(snapshot["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["unknownReason"].is_null()));
     assert!(broker.owns_active_claim(client.sender.lease.id, "claim-b"));
-    assert!(
-        broker
-            .pending
-            .contains_key(&canonical_id(sibling["id"].as_str()).unwrap())
-    );
+    assert!(broker
+        .pending
+        .contains_key(&canonical_id(sibling["id"].as_str()).unwrap()));
     assert!(matches!(
         broker.bind_route(client.sender.lease.id, "claim-a"),
         Err(BrokerError::ClaimUnavailable)
@@ -1683,16 +1673,12 @@ async fn snapshot_and_unconfirmed_budget_exhaustion_close_only_own_peer_without_
     assert!(
         matches!(semantic_control(&mut client).into_parts().0, ControlEvent::Reply { id:2,outcome:ControlOutcome::Unknown { reason, .. }} if reason == "claim CDP snapshot could not enter the bounded delivery queue")
     );
-    assert!(
-        !broker.clients[&client.sender.lease.id]
-            .alive
-            .load(Ordering::SeqCst)
-    );
-    assert!(
-        broker.clients[&other.sender.lease.id]
-            .alive
-            .load(Ordering::SeqCst)
-    );
+    assert!(!broker.clients[&client.sender.lease.id]
+        .alive
+        .load(Ordering::SeqCst));
+    assert!(broker.clients[&other.sender.lease.id]
+        .alive
+        .load(Ordering::SeqCst));
     assert!(broker.claims["claim-a"].cdp_fenced);
     assert!(broker.pending.values().any(
         |pending| matches!(&pending.kind, PendingKind::Cdp { claim, .. } if claim == "claim-a")
@@ -1718,12 +1704,10 @@ async fn snapshot_and_unconfirmed_budget_exhaustion_close_only_own_peer_without_
         output.is_empty(),
         "resource failure cannot recursively invent a extension cleanup effect"
     );
-    assert!(
-        !broker
-            .pending
-            .values()
-            .any(|pending| matches!(pending.kind, PendingKind::CloseOwner))
-    );
+    assert!(!broker
+        .pending
+        .values()
+        .any(|pending| matches!(pending.kind, PendingKind::CloseOwner)));
     broker.end_generation("actual later extension EOF");
     assert!(broker.stopped);
     assert!(matches!(
@@ -1828,11 +1812,9 @@ fn typed_matched_reply_must_preserve_every_exact_pending_association() {
             matches!(error, Err(BrokerError::Protocol(message)) if message == "matched extension reply changed its pending association"),
             "changed {changed} cannot authenticate another request's terminal result"
         );
-        assert!(
-            broker
-                .pending
-                .contains_key(&canonical_id(command["id"].as_str()).unwrap())
-        );
+        assert!(broker
+            .pending
+            .contains_key(&canonical_id(command["id"].as_str()).unwrap()));
         assert!(client.events.try_recv().is_err());
         broker.end_generation("matched association protocol failure");
         assert!(matches!(
@@ -1994,11 +1976,9 @@ fn active_claims_and_routes_have_no_invented_lifetime_count_limit() {
         broker.pending.is_empty(),
         "the finite concurrent-request budget remains independent"
     );
-    assert!(
-        routes
-            .iter()
-            .all(|route| route.sender.lease.alive.load(Ordering::SeqCst))
-    );
+    assert!(routes
+        .iter()
+        .all(|route| route.sender.lease.alive.load(Ordering::SeqCst)));
 }
 
 #[test]
@@ -2194,11 +2174,9 @@ fn unconfirmed_reports_actual_dispatch_for_every_route_request_before_failure() 
         "no separate failure can overtake another ID's atomic metadata"
     );
     assert_eq!(broker.pending.len(), 3);
-    assert!(
-        broker
-            .pending
-            .contains_key(&canonical_id(written["id"].as_str()).unwrap())
-    );
+    assert!(broker
+        .pending
+        .contains_key(&canonical_id(written["id"].as_str()).unwrap()));
 }
 
 #[test]
@@ -3030,7 +3008,7 @@ fn preparation_and_popup_refuse_foreign_claims_and_missing_context_before_dispat
                     semantic_control(client).into_parts().0,
                     ControlEvent::Reply {
                         id: actual,
-                        outcome: ControlOutcome::ConnectorRejected { .. },
+                        outcome: ControlOutcome::NotDispatched { .. },
                     } if actual == id
                 ),
                 "refusal must settle only the exact local request"
@@ -3041,11 +3019,9 @@ fn preparation_and_popup_refuse_foreign_claims_and_missing_context_before_dispat
         broker.claims["preparation-claim"].client,
         owner.sender.lease.id
     );
-    assert!(
-        broker.claims["preparation-claim"]
-            .alive
-            .load(Ordering::SeqCst)
-    );
+    assert!(broker.claims["preparation-claim"]
+        .alive
+        .load(Ordering::SeqCst));
     assert!(
         broker.pending.is_empty(),
         "refusals create no extension pending invocation"
@@ -3154,11 +3130,9 @@ fn maka_chunked_context_survives_reassembly_while_original_adapter_context_stays
         adapter.message.event().get("wireContext").is_none(),
         "ChatGPT translator receives trusted context through the Rust sidechannel"
     );
-    assert!(
-        adapter.message.event()["params"]
-            .get("wireContext")
-            .is_none()
-    );
+    assert!(adapter.message.event()["params"]
+        .get("wireContext")
+        .is_none());
 }
 
 #[test]
@@ -3328,7 +3302,7 @@ fn session_tab_control_requires_context_and_capability_and_forwards_exact_existi
                         "context_required"
                     };
                     assert!(
-                        matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind==expected)
+                        matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::NotDispatched{kind,..},..} if kind==expected)
                     );
                     assert!(broker.pending.is_empty());
                     assert!(broker.claims.is_empty());
@@ -3356,7 +3330,7 @@ fn committed_url_control_selector_requires_boolean_and_session_purpose() {
         } else {
             assert!(output.is_empty());
             assert!(
-                matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind=="invalid_request")
+                matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::NotDispatched{kind,..},..} if kind=="invalid_request")
             );
         }
     }
@@ -3398,7 +3372,7 @@ fn committed_url_control_checks_its_capability_and_context_before_same_resolve_d
                     "context_required"
                 };
                 assert!(
-                    matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind==expected)
+                    matches!(semantic_control(&mut client).into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::NotDispatched{kind,..},..} if kind==expected)
                 );
                 assert!(broker.pending.is_empty());
                 assert!(broker.claims.is_empty());
@@ -3440,7 +3414,7 @@ fn whole_session_inventory_selector_reaches_existing_method_only_with_context_an
                 assert!(matches!(
                     semantic_control(&mut client).into_parts().0,
                     ControlEvent::Reply {
-                        outcome: ControlOutcome::ConnectorRejected { .. },
+                        outcome: ControlOutcome::NotDispatched { .. },
                         ..
                     }
                 ));
@@ -3473,25 +3447,21 @@ fn whole_session_inventory_candidate_validation_is_not_a_global_inventory_fallba
         assert!(matches!(
             semantic_control(&mut client).into_parts().0,
             ControlEvent::Reply {
-                outcome: ControlOutcome::ConnectorRejected { .. },
+                outcome: ControlOutcome::NotDispatched { .. },
                 ..
             }
         ));
     }
     for value in [Value::Null, json!("true"), json!(1)] {
-        assert!(
-            serde_json::from_value::<ControlRequest>(
-                json!({"method":"inventory","id":1,"sessionOnly":value,"knownTabIds":[]})
-            )
-            .is_err()
-        );
-    }
-    assert!(
-        serde_json::from_value::<ControlRequest>(
-            json!({"method":"inventory","id":1,"sessionOnly":true,"knownTabIds":null})
+        assert!(serde_json::from_value::<ControlRequest>(
+            json!({"method":"inventory","id":1,"sessionOnly":value,"knownTabIds":[]})
         )
-        .is_err()
-    );
+        .is_err());
+    }
+    assert!(serde_json::from_value::<ControlRequest>(
+        json!({"method":"inventory","id":1,"sessionOnly":true,"knownTabIds":null})
+    )
+    .is_err());
 }
 
 fn physical_writer_value(value_len: usize) -> Value {
@@ -3642,14 +3612,12 @@ fn partial_native_prefix_or_body_failure_retains_started_unknown_eligible_dispat
         assert_eq!(dispatch.dispatch.load(Ordering::SeqCst), STARTED);
         assert!(dispatch.was_started());
         assert!(dispatch.written_report().is_none());
-        assert!(
-            dispatch
-                .reject_before_write(
-                    "do_not_replay".to_owned(),
-                    "a partial physical write cannot become a local skip".to_owned()
-                )
-                .is_none()
-        );
+        assert!(dispatch
+            .reject_before_write(
+                "do_not_replay".to_owned(),
+                "a partial physical write cannot become a local skip".to_owned()
+            )
+            .is_none());
         assert_eq!(dispatch.dispatch.load(Ordering::SeqCst), STARTED);
     }
 }
@@ -3730,4 +3698,125 @@ fn physical_owner_revocation_while_port_is_live_preserves_exact_original_chunk_c
     assert_eq!(dispatch.dispatch.load(Ordering::SeqCst), STARTED);
     assert!(dispatch.written_report().is_none());
     assert!(port_live.load(Ordering::SeqCst));
+}
+
+#[test]
+fn native_error_named_not_dispatched_cannot_mint_a_rust_dispatch_proof() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let command = request(
+        &mut broker,
+        &client,
+        ControlRequest::Inventory {
+            id: 1,
+            session_only: None,
+            known_tab_ids: None,
+        },
+    );
+    let mut output = Vec::new();
+    broker
+        .extension(
+            json!({
+                "kind":"response", "protocol":1, "generation":broker.generation,
+                "id":command["id"], "error":{
+                    "kind":"not_dispatched", "message":"not sent",
+                    "details":{"provenance":"local_refusal","dispatch":"skipped"}
+                }
+            }),
+            &mut output,
+        )
+        .unwrap();
+    assert!(output.is_empty());
+    assert!(matches!(semantic_control(&mut client).into_parts().0,
+        ControlEvent::Reply { id: 1, outcome: ControlOutcome::ConnectorRejected { kind, message, details: Some(details) } }
+            if kind == "not_dispatched" && message == "not sent"
+                && details["provenance"] == "local_refusal"));
+    assert!(broker.pending.is_empty());
+}
+
+#[test]
+fn duplicate_control_id_cannot_prove_the_original_written_request_undispatched() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let original = request(
+        &mut broker,
+        &client,
+        ControlRequest::Inventory {
+            id: 1,
+            session_only: None,
+            known_tab_ids: None,
+        },
+    );
+    let mut output = Vec::new();
+    broker.control(
+        client.sender.lease.id,
+        ControlRequest::Inventory {
+            id: 1,
+            session_only: None,
+            known_tab_ids: None,
+        },
+        &mut output,
+    );
+    assert!(output.is_empty());
+    assert!(matches!(semantic_control(&mut client).into_parts().0,
+        ControlEvent::Reply { id:1, outcome:ControlOutcome::ConnectorRejected {kind,..} }
+            if kind == "duplicate_local_id"));
+    assert_eq!(
+        broker.pending.len(),
+        1,
+        "the original written request retains custody"
+    );
+    reply(&mut broker, &original, json!({"tabs":[]}));
+    assert!(matches!(semantic_control(&mut client).into_parts().0,
+        ControlEvent::Reply { id:1, outcome:ControlOutcome::Result(result) }
+            if result["tabs"] == json!([])));
+    assert!(broker.pending.is_empty());
+}
+
+#[test]
+fn actual_event_source_target_is_forwarded_on_the_existing_claim_route() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let mut route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let command = cdp(&mut broker, &client, &route, 1);
+    for target in [Some("actual-debuggee-target"), None] {
+        let mut event = json!({"kind":"event","protocol":1,
+            "generation":broker.generation,"owner":command["owner"],"claim":"claim-a",
+            "method":"Page.fileChooserOpened","params":{"backendNodeId":17,"targetId":"payload-target"}});
+        if let Some(target) = target {
+            event["sourceTargetId"] = json!(target);
+        }
+        let mut output = Vec::new();
+        broker.extension(event, &mut output).unwrap();
+        assert!(output.is_empty());
+        let BrokerCdpEvent::ChromeMessage(actual) = route.events.try_recv().unwrap().into_parts().0
+        else {
+            panic!("real source event must remain on the existing Chrome-message route");
+        };
+        assert_eq!(actual["sourceTargetId"].as_str(), target);
+        assert!(actual.get("sessionId").is_none());
+        assert_eq!(actual["params"]["targetId"], "payload-target");
+    }
+    reply(&mut broker, &command, json!({"result":null}));
+}
+
+#[test]
+fn malformed_event_source_target_is_rejected_before_forwarding() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let mut route = attach(&mut broker, &mut client, 1, 11, "claim-a");
+    let command = cdp(&mut broker, &client, &route, 1);
+    let mut output = Vec::new();
+    let result = broker.extension(
+        json!({"kind":"event","protocol":1,
+        "generation":broker.generation,"owner":command["owner"],"claim":"claim-a",
+        "method":"Page.fileChooserOpened","sourceTargetId":17,"params":{"backendNodeId":17}}),
+        &mut output,
+    );
+    assert!(
+        matches!(result, Err(BrokerError::Protocol(message)) if message == "event source target is invalid")
+    );
+    assert!(output.is_empty());
+    assert!(route.events.try_recv().is_err());
+    reply(&mut broker, &command, json!({"result":null}));
 }

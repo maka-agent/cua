@@ -439,11 +439,9 @@ mod tests {
         );
         assert!(mutation.migrate_legacy_for(CHATGPT_HOST_NAME).unwrap());
         assert!(!mutation.migrate_legacy_for(CHATGPT_HOST_NAME).unwrap());
-        assert!(
-            !extension_host::installed_sidecar_path(&fixture.executable)
-                .unwrap()
-                .exists()
-        );
+        assert!(!extension_host::installed_sidecar_path(&fixture.executable)
+            .unwrap()
+            .exists());
         assert_eq!(
             std::fs::read(
                 extension_host::installed_adapter_path(&fixture.executable, CHATGPT_HOST_NAME)
@@ -493,12 +491,10 @@ mod tests {
                 .private_state_directory,
             maka.private_state_directory
         );
-        assert!(
-            catalog
-                .rejected
-                .iter()
-                .any(|entry| entry.adapter == CHATGPT_HOST_NAME)
-        );
+        assert!(catalog
+            .rejected
+            .iter()
+            .any(|entry| entry.adapter == CHATGPT_HOST_NAME));
         assert!(
             matches!(catalog.origin(&format!("chrome-extension://{}/", original.expected_extension_id)), Err(CatalogError::Refused(message)) if message == "invocation origin has no unique valid installed entry")
         );
@@ -560,7 +556,7 @@ mod tests {
         assert_eq!(catalog.rejected.len(), 1);
         assert_eq!(
             catalog.rejected[0].reason,
-            "unsupported installation protocol or adapter"
+            "installed extension catalog refused: unsupported installation protocol or adapter"
         );
         assert_eq!(
             std::fs::read(extension_host::installed_sidecar_path(&fixture.executable).unwrap())
@@ -594,11 +590,9 @@ mod tests {
             let catalog = load(&fixture.executable).unwrap();
             assert!(catalog.entries.is_empty());
             assert_eq!(catalog.rejected.len(), 1);
-            assert!(
-                catalog.rejected[0]
-                    .reason
-                    .starts_with(&format!("duplicate field `{field}`"))
-            );
+            assert!(catalog.rejected[0]
+                .reason
+                .starts_with(&format!("duplicate field `{field}`")));
         }
     }
 
@@ -613,18 +607,14 @@ mod tests {
         fixture.slot(CHATGPT_HOST_NAME, &changed);
         let catalog = load(&fixture.executable).unwrap();
         assert!(catalog.entries.is_empty());
-        assert!(
-            catalog
-                .rejected
-                .iter()
-                .any(|entry| entry.reason == "entry adapter disagrees with its exact catalog slot")
-        );
-        assert!(
-            catalog
-                .rejected
-                .iter()
-                .any(|entry| entry.reason.contains("entry disagrees with executable"))
-        );
+        assert!(catalog
+            .rejected
+            .iter()
+            .any(|entry| entry.reason == "entry adapter disagrees with its exact catalog slot"));
+        assert!(catalog
+            .rejected
+            .iter()
+            .any(|entry| entry.reason.contains("entry disagrees with executable")));
     }
 
     #[test]
@@ -660,7 +650,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_catalog_or_world_readable_selected_entry_is_rejected() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let fixture = Fixture::new();
         let maka = fixture.config(MAKA_HOST_NAME, 'a');
         fixture.slot(MAKA_HOST_NAME, &maka);

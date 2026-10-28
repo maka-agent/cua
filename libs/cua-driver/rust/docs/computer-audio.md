@@ -134,8 +134,14 @@ at the shared scalar-normalization boundary; Linux and macOS retain their
 existing normalization and parser. This static parser evidence is recorded in
 REA `ev_0410e5c48da4d23de959f107c47883ff7ccf03bd266b228a0254c662fde1cecd`.
 Hermetic policy tests do not prove native deletion success,
-Windows playback/capture, or error equivalence. Terminal Cua cleanup continues
-to own temporary directories, including a WAV whose earlier unlink failed.
+Windows playback/capture, or error equivalence. After Windows Start consumes a
+previous WAV slot, terminal cleanup does not retry that file or recursively
+remove other contents of its private wrapper directory. It only attempts to
+remove that directory if empty. An unconsumed result and an active capture keep
+the existing session cleanup. The wrapper directory is Cua-owned transport
+storage; its recursive cleanup is not part of the observed original completed-
+slot lifecycle. This rule does not establish cleanup by an outer host or
+operating-system temporary-file policy.
 
 Windows GNU cross-checks and pure timeline tests, and macOS API type checking
 and pure conversion/timeline tests, are structural evidence only. They do not

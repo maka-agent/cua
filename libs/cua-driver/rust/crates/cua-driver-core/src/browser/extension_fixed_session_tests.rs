@@ -90,7 +90,7 @@ async fn fixed_session_service_and_actual_host_context_are_required_before_dispa
         );
         if profile != Some("provider_session") {
             assert!(
-                matches!(view.prepare_session_tab(11).await,Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported")
+                matches!(view.prepare_session_tab(11).await,Err(ExtensionProviderError::NotDispatched{kind,..}) if kind=="unsupported")
             );
         }
         assert!(provider.pending_completions().await.unwrap().is_empty());

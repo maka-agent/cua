@@ -79,7 +79,7 @@ pub mod types;
 mod v2_tests;
 
 pub use adapter_support::{
-    BrowserCursorTracker, is_firefox, loopback_websocket_port, parse_devtools_active_port,
+    is_firefox, loopback_websocket_port, parse_devtools_active_port, BrowserCursorTracker,
 };
 pub use engine::BrowserEngine;
 pub use platform::{
@@ -90,9 +90,9 @@ pub use platform::{
     PrepareStrategy,
 };
 pub use refusal::{BrowserRefusal, BrowserRefusalCode};
-pub use semantic::{SEMANTIC_COMPUTED_STYLES, semantic_ax_tree};
+pub use semantic::{semantic_ax_tree, SEMANTIC_COMPUTED_STYLES};
 pub use setup_descriptor::{
-    BrowserSetupDescriptor, EXISTING_PROFILE_SETUP_READY_TIMEOUT, existing_profile_setup_descriptor,
+    existing_profile_setup_descriptor, BrowserSetupDescriptor, EXISTING_PROFILE_SETUP_READY_TIMEOUT,
 };
 pub use tools::register_browser_tools;
 pub use types::{
@@ -119,29 +119,29 @@ pub(crate) fn required_session_schema() -> serde_json::Value {
 }
 
 pub use extension_provider::{
-    CleanupEvidence, CleanupProof, ExtensionAttachmentPreparation, ExtensionBrowserOperation,
-    ExtensionBrowserProvider, ExtensionCdpCompletionOutcome, ExtensionClaimPreparationProof,
-    ExtensionCommittedTabUrl, ExtensionCreatedTab, ExtensionCreationReceipt,
-    ExtensionCursorPresentationAck, ExtensionDownloadMetadata, ExtensionDownloadStatus,
-    ExtensionEffectOwner, ExtensionEndpointDiscovery, ExtensionEndpointRejection,
-    ExtensionFixedSessionCleanupProof, ExtensionFixedSessionPreparedTab,
-    ExtensionFixedSessionReceipt, ExtensionFixedUiAck, ExtensionFixedUiAction,
-    ExtensionFixedUiColor, ExtensionFixedUiCursor, ExtensionFixedUiIdentity,
-    ExtensionFixedUiOperation, ExtensionFixedUiProof, ExtensionFixedUiRenderState,
-    ExtensionFixedUiRenderStatus, ExtensionFixedUiRequest, ExtensionGroupColor,
-    ExtensionGroupPresentation, ExtensionGroupProof, ExtensionGroupReleaseEvidence,
-    ExtensionGroupReleaseProof, ExtensionHeader, ExtensionHeaderPolicyScope, ExtensionHeaderProof,
-    ExtensionHeaderScope, ExtensionHostOperation, ExtensionKnownCustody,
-    ExtensionManagedGroupReceipt, ExtensionMetadataError, ExtensionMutationDiagnostic,
-    ExtensionOperation, ExtensionOperationCompletion, ExtensionOperationOutcome,
-    ExtensionPendingOperation, ExtensionPhysicalClaim, ExtensionPopupRequest,
-    ExtensionPreparationDocument, ExtensionPreparationDocumentBinding, ExtensionPreparationPolicy,
-    ExtensionPreparedTab, ExtensionProviderCapabilities, ExtensionProviderError,
-    ExtensionProviderEvent, ExtensionRecoveredOperation, ExtensionSessionCleanupObservation,
-    ExtensionSessionHeaderProof, ExtensionSessionPopupRequest, ExtensionSessionPreparation,
-    ExtensionSessionPreparedTab, ExtensionTabInfo, ExtensionUserTabsOrder,
     discover_installed_extension_endpoints, discover_registered, discover_registered_endpoints,
-    discover_registered_for,
+    discover_registered_for, CleanupEvidence, CleanupProof, ExtensionAttachmentPreparation,
+    ExtensionBrowserOperation, ExtensionBrowserProvider, ExtensionCdpCompletionOutcome,
+    ExtensionClaimPreparationProof, ExtensionCommittedTabUrl, ExtensionCreatedTab,
+    ExtensionCreationReceipt, ExtensionCursorPresentationAck, ExtensionDownloadMetadata,
+    ExtensionDownloadStatus, ExtensionEffectOwner, ExtensionEndpointDiscovery,
+    ExtensionEndpointRejection, ExtensionFixedSessionCleanupProof,
+    ExtensionFixedSessionPreparedTab, ExtensionFixedSessionReceipt, ExtensionFixedUiAck,
+    ExtensionFixedUiAction, ExtensionFixedUiColor, ExtensionFixedUiCursor,
+    ExtensionFixedUiIdentity, ExtensionFixedUiOperation, ExtensionFixedUiProof,
+    ExtensionFixedUiRenderState, ExtensionFixedUiRenderStatus, ExtensionFixedUiRequest,
+    ExtensionGroupColor, ExtensionGroupPresentation, ExtensionGroupProof,
+    ExtensionGroupReleaseEvidence, ExtensionGroupReleaseProof, ExtensionHeader,
+    ExtensionHeaderPolicyScope, ExtensionHeaderProof, ExtensionHeaderScope, ExtensionHostOperation,
+    ExtensionKnownCustody, ExtensionManagedGroupReceipt, ExtensionMetadataError,
+    ExtensionMutationDiagnostic, ExtensionOperation, ExtensionOperationCompletion,
+    ExtensionOperationOutcome, ExtensionPendingOperation, ExtensionPhysicalClaim,
+    ExtensionPopupRequest, ExtensionPreparationDocument, ExtensionPreparationDocumentBinding,
+    ExtensionPreparationPolicy, ExtensionPreparedTab, ExtensionProviderCapabilities,
+    ExtensionProviderError, ExtensionProviderEvent, ExtensionRecoveredOperation,
+    ExtensionSessionCleanupObservation, ExtensionSessionHeaderProof, ExtensionSessionPopupRequest,
+    ExtensionSessionPreparation, ExtensionSessionPreparedTab, ExtensionSessionRequestRegistration,
+    ExtensionTabInfo, ExtensionUserTabsOrder,
 };
 pub use local_ipc::{ExtensionEndpointIdentity, IpcError, ValidatedExtensionEndpoint};
 

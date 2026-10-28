@@ -97,7 +97,7 @@ fn fixed_controls_require_actual_profile_and_context_without_physical_claim_infe
                         "context_required"
                     };
                     assert!(
-                        matches!(event,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind==expected)
+                        matches!(event,ControlEvent::Reply{outcome:ControlOutcome::NotDispatched{kind,..},..} if kind==expected)
                     );
                 }
                 assert!(
@@ -127,7 +127,7 @@ fn fixed_control_invalid_scope_tab_or_ui_never_dispatches() {
                 broker.control(client.sender.lease.id, request, &mut output);
                 assert!(output.is_empty());
                 assert!(
-                    matches!(client.events.try_recv().unwrap().into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::ConnectorRejected{kind,..},..} if kind=="invalid_request")
+                    matches!(client.events.try_recv().unwrap().into_parts().0,ControlEvent::Reply{outcome:ControlOutcome::NotDispatched{kind,..},..} if kind=="invalid_request")
                 );
             }
         }
@@ -226,11 +226,9 @@ fn queued_fixed_cleanup_survives_its_fresh_turn_finish_while_business_work_is_fe
     );
     assert!(broker.pending[&business_id].scope_fence.is_some());
     assert_eq!(cleanup.wire_context(), Some(&context));
-    assert!(
-        cleanup.payload_for_transport()["params"]
-            .get("claim")
-            .is_none()
-    );
+    assert!(cleanup.payload_for_transport()["params"]
+        .get("claim")
+        .is_none());
 
     broker.control(
         client.sender.lease.id,
@@ -262,7 +260,7 @@ fn queued_fixed_cleanup_survives_its_fresh_turn_finish_while_business_work_is_fe
     let mut generated = Vec::new();
     broker.written(business_report.unwrap(), &mut generated);
     assert!(matches!(client.events.try_recv().unwrap().into_parts().0,
-        ControlEvent::Reply { id: 1, outcome: ControlOutcome::ConnectorRejected { kind, message, .. } }
+        ControlEvent::Reply { id: 1, outcome: ControlOutcome::NotDispatched { kind, message, .. } }
         if kind == "not_dispatched" && message == "extension command was fenced before any write"));
 
     let mut cleanup_bytes = Vec::new();

@@ -83,6 +83,7 @@ export class BrowserConnector {
       capabilities: {
         metadata: true,
         rawTabCdp: true,
+        cdpEventSourceTarget: true,
         flatChildSessions: true,
         tabLifecycle: true,
         browserManagement: false,
@@ -671,6 +672,7 @@ export class BrowserConnector {
       method,
       params,
       ...(source.sessionId ? { sessionId: source.sessionId } : {}),
+      ...(source.targetId != null ? { sourceTargetId: source.targetId } : {}),
     });
   }
   removeChild(record, sessionId, parent = null) {
