@@ -561,7 +561,7 @@ test('session purpose traverses the composed dispatch layers and returns only ac
         id: 1,
         windowId: 7,
         groupId: -1,
-        title: 'Actual Chrome title',
+        titleJson: '"Actual Chrome title"',
         url: 'https://actual.test/current',
         providerTabId: '1',
       },

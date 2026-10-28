@@ -27,30 +27,34 @@
 //! Scope: left-button taps (single/double/triple). Right/middle have no clean
 //! touch mapping; callers fall back to their existing routing for those.
 
+use crate::input::owned::{
+    set_cursor_pos as SetCursorPos, set_foreground_window as SetForegroundWindow,
+};
 use anyhow::{bail, Result};
 use core::ffi::c_void;
-use std::sync::Mutex;
+use cua_driver_core::windows_interruption::{
+    current_windows_input_binding, NativeInputReceipt, NativeInputRelease,
+};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{HANDLE, HWND, POINT, RECT};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{
-    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
-    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+    CreateSyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_DEFAULT,
+    POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
-    InjectSyntheticPointerInput, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
-    POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
+    POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_UP,
+    POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsWindow, LockSetForegroundWindow, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
-    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, LSFW_LOCK, LSFW_UNLOCK, PT_PEN, PT_TOUCH,
-    WS_EX_NOACTIVATE,
+    IsWindow, LockSetForegroundWindow, SetWindowLongPtrW, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    LSFW_LOCK, LSFW_UNLOCK, PT_PEN, PT_TOUCH, WS_EX_NOACTIVATE,
 };
 
 #[derive(Default)]
@@ -67,44 +71,114 @@ static FOREGROUND_LOCK_STATE: Mutex<ForegroundLockState> = Mutex::new(Foreground
 /// Prevent other processes from taking the foreground during a background
 /// launch. Windows automatically clears this lock on genuine user input; Drop
 /// still balances the documented unlock call and overlapping driver launches.
-pub struct ForegroundLockGuard {
-    held: bool,
+enum ForegroundLeaseState {
+    Prepared,
+    Holding,
+    UnlockPending,
+    Closed,
 }
-
+struct ForegroundLease {
+    state: Mutex<ForegroundLeaseState>,
+}
+impl NativeInputRelease for ForegroundLease {
+    fn release(&self) -> Result<(), String> {
+        let mut own = self
+            .state
+            .lock()
+            .map_err(|_| "native foreground lock guard mutex poisoned")?;
+        let mut global = FOREGROUND_LOCK_STATE
+            .lock()
+            .map_err(|_| "native foreground lock state mutex poisoned")?;
+        if matches!(*own, ForegroundLeaseState::Holding) {
+            global.holders = global
+                .holders
+                .checked_sub(1)
+                .ok_or("native foreground lock ownership underflow")?;
+            *own = if global.holders == 0 && global.locked {
+                ForegroundLeaseState::UnlockPending
+            } else {
+                ForegroundLeaseState::Closed
+            };
+        } else if matches!(*own, ForegroundLeaseState::Prepared) {
+            *own = ForegroundLeaseState::Closed;
+        }
+        if matches!(*own, ForegroundLeaseState::UnlockPending) {
+            if global.holders == 0 && global.locked {
+                // SAFETY: release only the process lock whose successful
+                // acquisition was counted by this existing shared owner.
+                unsafe { LockSetForegroundWindow(LSFW_UNLOCK) }
+                    .map_err(|error| format!("release owned native foreground lock: {error}"))?;
+                global.locked = false;
+            }
+            *own = ForegroundLeaseState::Closed;
+        }
+        Ok(())
+    }
+}
+impl Drop for ForegroundLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+pub struct ForegroundLockGuard {
+    lease: Arc<ForegroundLease>,
+    _receipt: Option<NativeInputReceipt>,
+}
 impl ForegroundLockGuard {
     pub fn acquire() -> Self {
-        let mut state = FOREGROUND_LOCK_STATE.lock().unwrap();
-        if state.holders == 0 {
-            state.locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) }.is_ok();
-            if state.locked {
-                tracing::debug!(target: "launch_app.focus_lock", "locked foreground changes during background launch");
-            } else {
-                tracing::warn!(target: "launch_app.focus_lock", "could not lock foreground changes during background launch");
+        let lease = Arc::new(ForegroundLease {
+            state: Mutex::new(ForegroundLeaseState::Prepared),
+        });
+        let receipt = match current_windows_input_binding() {
+            Some(binding) => match binding.retain_input_release(lease.clone()) {
+                Ok(receipt) => Some(receipt),
+                Err(_) => {
+                    let _ = lease.release();
+                    return Self {
+                        lease,
+                        _receipt: None,
+                    };
+                }
+            },
+            None => None,
+        };
+        {
+            let mut own = lease
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut state = FOREGROUND_LOCK_STATE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if matches!(*own, ForegroundLeaseState::Prepared) {
+                if state.holders == 0 {
+                    state.locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) }.is_ok();
+                }
+                if state.locked {
+                    state.holders += 1;
+                    *own = ForegroundLeaseState::Holding;
+                }
             }
         }
-        if state.locked {
-            state.holders += 1;
+        Self {
+            lease,
+            _receipt: receipt,
         }
-        Self { held: state.locked }
     }
-
     pub fn acquired(&self) -> bool {
-        self.held
+        matches!(
+            *self
+                .lease
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            ForegroundLeaseState::Holding
+        )
     }
 }
-
 impl Drop for ForegroundLockGuard {
     fn drop(&mut self) {
-        if !self.held {
-            return;
-        }
-        let mut state = FOREGROUND_LOCK_STATE.lock().unwrap();
-        state.holders = state.holders.saturating_sub(1);
-        if state.holders == 0 {
-            let _ = unsafe { LockSetForegroundWindow(LSFW_UNLOCK) };
-            state.locked = false;
-            tracing::debug!(target: "launch_app.focus_lock", "unlocked foreground changes after background launch");
-        }
+        let _ = self.lease.release();
     }
 }
 
@@ -118,17 +192,12 @@ pub(crate) unsafe fn force_foreground_attached(target: HWND) -> bool {
     if cur == target {
         return true;
     }
-    let my_tid = GetCurrentThreadId();
-    let mut pid = 0u32;
-    let cur_tid = GetWindowThreadProcessId(cur, Some(&mut pid));
-    let attached = cur_tid != 0 && cur_tid != my_tid;
-    if attached {
-        let _ = AttachThreadInput(my_tid, cur_tid, true);
-    }
+    let attachment = match crate::input::keyboard::InputQueueAttachment::attach(cur) {
+        Ok(attachment) => attachment,
+        Err(_) => return false,
+    };
     let _ = SetForegroundWindow(target);
-    if attached {
-        let _ = AttachThreadInput(my_tid, cur_tid, false);
-    }
+    drop(attachment);
     GetForegroundWindow() == target
 }
 
@@ -141,9 +210,28 @@ pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
     }
 
     const VK_NONAME: u8 = 0xFC;
-    unsafe {
-        keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
+    let pulse = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(VK_NONAME as u16),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let events = [pulse(KEYBD_EVENT_FLAGS(0)), pulse(KEYEVENTF_KEYUP)];
+    if unsafe { crate::input::owned::send_input(&events, std::mem::size_of::<INPUT>() as i32) }
+        != events.len() as u32
+    {
+        // Retry only the matching UP; never replay the focus pulse's DOWN.
+        let release = [pulse(KEYEVENTF_KEYUP)];
+        let _ = unsafe {
+            crate::input::owned::send_input(&release, std::mem::size_of::<INPUT>() as i32)
+        };
+        return (false, true);
     }
     for _ in 0..3 {
         if unsafe { force_foreground_attached(target) } {
@@ -166,56 +254,100 @@ pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
 /// while the window still RECEIVES the click/key. It is per-window (no session
 /// side effects) and reversed on drop. Covers the self-activation that the
 /// EnableWindow/UWP bypass cannot (WPF `UIElement.Focus()`→SetForegroundWindow).
-pub struct NoActivateGuard {
-    // Store the handle as an integer so the guard is `Send` and can be held
-    // across `.await` in the async tools.
-    root_addr: isize,
-    applied: bool,
+struct NoActivateState {
+    root: crate::input::owned::TargetWindow,
+    state: Mutex<(bool, bool)>, // added style bit, resource closed
 }
-
-impl NoActivateGuard {
-    /// Arm on the top-level (GA_ROOT) ancestor of `hwnd`.
-    pub fn arm(hwnd: HWND) -> Self {
-        unsafe {
-            let root = {
-                let r = GetAncestor(hwnd, GA_ROOT);
-                if r.0.is_null() {
-                    hwnd
-                } else {
-                    r
+impl NativeInputRelease for NoActivateState {
+    fn release(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "native no-activate guard mutex poisoned")?;
+        state.1 = true;
+        if state.0 {
+            let Some(root) = self.root.resolve()? else {
+                state.0 = false;
+                return Ok(());
+            };
+            let noactivate = WS_EX_NOACTIVATE.0 as isize;
+            // SAFETY: remove only the bit this exact guard actually added;
+            // preserve unrelated style changes, matching normal guard Drop.
+            unsafe {
+                let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
+                SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
+                if GetWindowLongPtrW(root, GWL_EXSTYLE) & noactivate != 0 {
+                    return Err("restore owned native no-activate style bit failed".into());
                 }
-            };
-            let prev = GetWindowLongPtrW(root, GWL_EXSTYLE);
-            let want = WS_EX_NOACTIVATE.0 as isize;
-            // Apply WS_EX_NOACTIVATE if not already set (prev can be 0, so don't
-            // gate on it — we just need to check the bit and set it if absent).
-            let applied = (prev & want) == 0 && {
-                SetWindowLongPtrW(root, GWL_EXSTYLE, prev | want);
-                // Confirm it took (cross-process SetWindowLongPtr can be denied
-                // by UIPI on higher-integrity targets).
-                (GetWindowLongPtrW(root, GWL_EXSTYLE) & want) != 0
-            };
-            Self {
-                root_addr: root.0 as isize,
-                applied,
             }
+            state.0 = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for NoActivateState {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+pub struct NoActivateGuard {
+    guard: Arc<NoActivateState>,
+    _receipt: Option<NativeInputReceipt>,
+}
+impl NoActivateGuard {
+    /// Arm the existing style change only after the native owner can retain its
+    /// restoration. A retired binding adds no new foreign-window state.
+    pub fn arm(hwnd: HWND) -> Self {
+        let root = unsafe {
+            let root = GetAncestor(hwnd, GA_ROOT);
+            if root.0.is_null() {
+                hwnd
+            } else {
+                root
+            }
+        };
+        let guard = Arc::new(NoActivateState {
+            root: crate::input::owned::TargetWindow::observe(root),
+            state: Mutex::new((false, false)),
+        });
+        let receipt = match current_windows_input_binding() {
+            Some(binding) => match binding.retain_input_release(guard.clone()) {
+                Ok(receipt) => Some(receipt),
+                Err(_) => {
+                    let _ = guard.release();
+                    return Self {
+                        guard,
+                        _receipt: None,
+                    };
+                }
+            },
+            None => None,
+        };
+        {
+            let mut state = guard
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !state.1 {
+                unsafe {
+                    let previous = GetWindowLongPtrW(root, GWL_EXSTYLE);
+                    let bit = WS_EX_NOACTIVATE.0 as isize;
+                    if previous & bit == 0 {
+                        SetWindowLongPtrW(root, GWL_EXSTYLE, previous | bit);
+                        state.0 = GetWindowLongPtrW(root, GWL_EXSTYLE) & bit != 0;
+                    }
+                }
+            }
+        }
+        Self {
+            guard,
+            _receipt: receipt,
         }
     }
 }
-
 impl Drop for NoActivateGuard {
     fn drop(&mut self) {
-        if self.applied {
-            unsafe {
-                let root = HWND(self.root_addr as *mut _);
-                let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
-                let noactivate = WS_EX_NOACTIVATE.0 as isize;
-                // Clear only the bit this guard added. Restoring the full
-                // captured value can clobber unrelated style changes the app
-                // made while the background action was in flight.
-                SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
-            }
-        }
+        let _ = self.guard.release();
     }
 }
 
@@ -238,6 +370,7 @@ fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
     unsafe {
         let dev = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
             .map_err(|e| anyhow::anyhow!("CreateSyntheticPointerDevice(PEN): {e}"))?;
+        let stroke = crate::input::owned::PointerStroke::new(dev, true)?;
         let pen_flags = if barrel { PEN_FLAG_BARREL } else { 0 };
         let mk = |flags| POINTER_TYPE_INFO {
             r#type: PT_PEN,
@@ -271,9 +404,9 @@ fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
         let mut result: Result<()> = Ok(());
         let n = count.max(1);
         for i in 0..n {
-            let r1 = InjectSyntheticPointerInput(dev, &[down]);
+            let r1 = stroke.send(&[down]);
             sleep(Duration::from_millis(25));
-            let r2 = InjectSyntheticPointerInput(dev, &[up]);
+            let r2 = stroke.send(&[up]);
             if let Err(e) = r1.and(r2) {
                 result = Err(anyhow::anyhow!("InjectSyntheticPointerInput(pen): {e}"));
                 break;
@@ -282,7 +415,7 @@ fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
                 sleep(Duration::from_millis(70));
             }
         }
-        let _ = DestroySyntheticPointerDevice(dev);
+        stroke.close()?;
         result?;
     }
     Ok(())
@@ -520,6 +653,7 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
     unsafe {
         let dev = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
             .map_err(|e| anyhow::anyhow!("CreateSyntheticPointerDevice(PEN): {e}"))?;
+        let stroke = crate::input::owned::PointerStroke::new(dev, true)?;
         let pen_flags = if barrel { PEN_FLAG_BARREL } else { 0 };
         let mk = |flags, x: i32, y: i32| POINTER_TYPE_INFO {
             r#type: PT_PEN,
@@ -549,7 +683,7 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
             sx0,
             sy0,
         );
-        let mut res = InjectSyntheticPointerInput(dev, &[down]);
+        let mut res = stroke.send(&[down]);
         // Interpolated in-contact moves so frameworks that gate drag-tracking on
         // motion (rather than a single down→up) see a continuous stroke.
         let steps = steps.max(1);
@@ -563,13 +697,13 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
                 x,
                 y,
             );
-            res = res.and(InjectSyntheticPointerInput(dev, &[mv]));
+            res = res.and(stroke.send(&[mv]));
         }
         // Release at the end.
         sleep(Duration::from_millis(8));
         let up = mk(POINTER_FLAG_UP, sx1, sy1);
-        res = res.and(InjectSyntheticPointerInput(dev, &[up]));
-        let _ = DestroySyntheticPointerDevice(dev);
+        res = res.and(stroke.send(&[up]));
+        stroke.close()?;
         res.map_err(|e| anyhow::anyhow!("InjectSyntheticPointerInput(pen drag): {e}"))?;
     }
     Ok(())
@@ -613,6 +747,7 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
             *dev_guard = d.0 as isize;
             d
         };
+        let stroke = crate::input::owned::PointerStroke::new(dev, false)?;
         let mk = |flags, x: i32, y: i32| POINTER_TYPE_INFO {
             r#type: PT_TOUCH,
             Anonymous: POINTER_TYPE_INFO_0 {
@@ -654,7 +789,7 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
             sx0,
             sy0,
         );
-        let mut res = InjectSyntheticPointerInput(dev, &[down]);
+        let mut res = stroke.send(&[down]);
         let steps = steps.clamp(1, 3);
         for i in 1..=steps {
             sleep(Duration::from_millis(2));
@@ -666,11 +801,11 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
                 x,
                 y,
             );
-            res = res.and(InjectSyntheticPointerInput(dev, &[mv]));
+            res = res.and(stroke.send(&[mv]));
         }
         sleep(Duration::from_millis(2));
         let up = mk(POINTER_FLAG_UP, sx1, sy1);
-        res = res.and(InjectSyntheticPointerInput(dev, &[up]));
+        res = res.and(stroke.send(&[up]));
         // Snap the cursor back to where the user left it. The OS processes the
         // promoted mouse messages slightly after injection, so a single restore
         // right after the `up` can be overrun by that late move — settle briefly,
@@ -681,7 +816,8 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
             sleep(Duration::from_millis(12));
             let _ = SetCursorPos(cpos.x, cpos.y);
         }
-        // device intentionally NOT destroyed — see TOUCH_DEV.
+        // The standing device remains; the contact has explicit owner custody.
+        stroke.close()?;
         res.map_err(|e| anyhow::anyhow!("InjectSyntheticPointerInput(touch drag): {e}"))?;
     }
     Ok(())

@@ -4,28 +4,38 @@
 //! (via ChildWindowFromPointEx), so the message never reaches the top-level
 //! chrome that would call SetForegroundWindow in response to WM_LBUTTONDOWN.
 
+use crate::input::owned::set_cursor_pos as SetCursorPos;
+use crate::input::owned::set_window_pos as SetWindowPos;
+use crate::input::owned::{post_message as PostMessageW, send_input as SendInput};
 use anyhow::{anyhow, bail, Result};
+use cua_driver_core::windows_interruption::{
+    current_windows_input_binding, NativeInputReceipt, NativeInputRelease,
+};
 use std::thread::sleep;
 use std::time::Duration;
-use windows::core::{Error, Owned};
+use std::{
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    sync::{Arc, Mutex},
+};
+use windows::core::Error;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::Debug::{self, GetThreadContext, CONTEXT};
 use windows::Win32::System::Threading;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, GetAncestor, GetClassLongPtrW, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, GetWindowLongPtrW, PostMessageW, SetCursorPos, SetWindowPos, WindowFromPoint,
-    CS_DBLCLKS, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE,
-    GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WS_EX_TOPMOST,
+    GetSystemMetrics, GetWindowLongPtrW, WindowFromPoint, CS_DBLCLKS, CWP_SKIPDISABLED,
+    CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE, GWL_EXSTYLE, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WS_EX_TOPMOST,
 };
 
 const MK_LBUTTON: u32 = 0x0001;
@@ -37,8 +47,43 @@ const CLICK_DELAY_MS: u64 = 35;
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
-struct SuspendedThread(Owned<HANDLE>);
-
+struct ThreadPause {
+    handle: OwnedHandle,
+    state: Mutex<(bool, bool)>, // actual suspension held, native resource closed
+}
+impl NativeInputRelease for ThreadPause {
+    fn phase(&self) -> cua_driver_core::windows_interruption::NativeReleasePhase {
+        cua_driver_core::windows_interruption::NativeReleasePhase::ResumeTarget
+    }
+    fn release(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "owned suspended-thread mutex poisoned")?;
+        state.1 = true;
+        if state.0 {
+            // SAFETY: the standard OwnedHandle keeps this exact opened thread
+            // object alive through ResumeThread, even if a thread ID is reused.
+            if unsafe { Threading::ResumeThread(HANDLE(self.handle.as_raw_handle())) } == u32::MAX {
+                return Err(format!(
+                    "resume owned suspended target thread: {}",
+                    Error::from_win32()
+                ));
+            }
+            state.0 = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for ThreadPause {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+struct SuspendedThread {
+    pause: Arc<ThreadPause>,
+    _receipt: Option<NativeInputReceipt>,
+}
 impl SuspendedThread {
     fn suspend(hwnd: HWND) -> windows::core::Result<Option<Self>> {
         let thread_id = unsafe { crate::input::GetWindowThreadProcessId(hwnd, None) };
@@ -49,11 +94,47 @@ impl SuspendedThread {
         let Ok(handle) = (unsafe { Threading::OpenThread(access, false, thread_id) }) else {
             return Ok(None);
         };
-        let handle = unsafe { Owned::new(handle) };
-        if unsafe { Threading::SuspendThread(*handle) } == u32::MAX {
-            return Ok(None);
+        // SAFETY: OpenThread returned ownership; transfer it exactly once to a
+        // Send+Sync standard OwnedHandle, not a borrowed/reinterpreted pointer.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        let pause = Arc::new(ThreadPause {
+            handle,
+            state: Mutex::new((false, false)),
+        });
+        let receipt = match current_windows_input_binding() {
+            Some(binding) => Some(binding.retain_input_release(pause.clone()).map_err(
+                |error| {
+                    Error::new(
+                        windows::core::HRESULT(0x80004005_u32 as i32),
+                        error.to_string(),
+                    )
+                },
+            )?),
+            None => None,
+        };
+        {
+            let mut state = pause.state.lock().map_err(|_| {
+                Error::new(
+                    windows::core::HRESULT(0x80004005_u32 as i32),
+                    "owned suspension mutex poisoned",
+                )
+            })?;
+            if state.1 {
+                return Err(Error::new(
+                    windows::core::HRESULT(0x80004004_u32 as i32),
+                    "native suspension owner retired",
+                ));
+            }
+            if unsafe { Threading::SuspendThread(HANDLE(pause.handle.as_raw_handle())) } == u32::MAX
+            {
+                return Ok(None);
+            }
+            state.0 = true;
         }
-        let suspended = Self(handle);
+        let suspended = Self {
+            pause,
+            _receipt: receipt,
+        };
         let mut context = AlignedContext(CONTEXT::default());
         #[cfg(target_arch = "x86_64")]
         {
@@ -63,25 +144,28 @@ impl SuspendedThread {
         {
             context.0.ContextFlags = Debug::CONTEXT_CONTROL_ARM64;
         }
-        if unsafe { GetThreadContext(*suspended.0, &mut context.0) }.is_err() {
+        if unsafe {
+            GetThreadContext(
+                HANDLE(suspended.pause.handle.as_raw_handle()),
+                &mut context.0,
+            )
+        }
+        .is_err()
+        {
             suspended.resume()?;
             return Ok(None);
         }
         Ok(Some(suspended))
     }
-
     fn resume(self) -> windows::core::Result<()> {
-        if unsafe { Threading::ResumeThread(*self.0) } == u32::MAX {
-            return Err(Error::from_win32());
-        }
-        drop(unsafe { std::ptr::read(&std::mem::ManuallyDrop::new(self).0) });
-        Ok(())
+        self.pause
+            .release()
+            .map_err(|error| Error::new(windows::core::HRESULT(0x80004005_u32 as i32), error))
     }
 }
-
 impl Drop for SuspendedThread {
     fn drop(&mut self) {
-        unsafe { Threading::ResumeThread(*self.0) };
+        let _ = self.pause.release();
     }
 }
 
@@ -657,17 +741,7 @@ fn send_click_synthesized_mods_impl(
             None
         };
         let noactivate = (!activate).then(|| crate::input::NoActivateGuard::arm(target));
-        if !activate {
-            let _ = SetWindowPos(
-                target,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            );
-        }
+        let _topmost = (!activate).then(|| crate::input::owned::TopmostGuard::raise(target));
 
         // Move the cursor so the OS hover state matches before the click; the
         // MOUSEEVENTF_MOVE input ensures Chromium's input filter sees a
@@ -954,6 +1028,7 @@ fn send_drag_synthesized_impl(
             }
         };
 
+        let mut _topmost = None;
         let noactivate = if activate {
             if !crate::input::force_foreground_assisted(target).0 {
                 let actual = GetForegroundWindow();
@@ -971,15 +1046,7 @@ fn send_drag_synthesized_impl(
             // SetForegroundWindow is lock-denied without UIAccess and isn't needed
             // for pointer input; NoActivateGuard keeps the press from activating it.
             let guard = crate::input::NoActivateGuard::arm(target);
-            let _ = SetWindowPos(
-                target,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            );
+            _topmost = Some(crate::input::owned::TopmostGuard::raise(target));
             Some(guard)
         };
 
@@ -1305,9 +1372,9 @@ mod wheel_tests {
     use windows::Win32::UI::Controls::WM_MOUSELEAVE;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
-        PeekMessageW, PostMessageW, RegisterClassW, SetWindowLongPtrW, UnregisterClassW,
-        CS_DBLCLKS, GWLP_USERDATA, MSG, PM_REMOVE, WINDOW_EX_STYLE, WM_LBUTTONDBLCLK,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSW, WS_POPUP,
+        PeekMessageW, RegisterClassW, SetWindowLongPtrW, UnregisterClassW, CS_DBLCLKS,
+        GWLP_USERDATA, MSG, PM_REMOVE, WINDOW_EX_STYLE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSW, WS_POPUP,
     };
 
     const TRACE_CAPACITY: usize = 1024;

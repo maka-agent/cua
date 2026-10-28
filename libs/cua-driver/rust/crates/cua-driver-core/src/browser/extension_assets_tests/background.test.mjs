@@ -118,7 +118,7 @@ test('background connects only own extension host and sends real metadata throug
   f.bind(p, 'gen-1');
   f.request(p, 1, 'inventory');
   await tick();
-  assert.equal(p.messages.at(-1).result.tabs[0].title, 'actual');
+  assert.equal(p.messages.at(-1).result.tabs[0].titleJson, '"actual"');
   assert.equal(
     f.calls.some((c) => c[0] === 'attach'),
     false,
@@ -160,7 +160,7 @@ test('late old-port response cannot enter a newly bound extension generation', a
   f.hooks.query = null;
   f.request(next, 1, 'inventory', {}, 'gen-2');
   await tick();
-  assert.equal(next.messages.at(-1).result.tabs[0].title, 'actual');
+  assert.equal(next.messages.at(-1).result.tabs[0].titleJson, '"actual"');
   next.disconnect();
 });
 test('reconnect cannot advertise ready transport while scoped-rule cleanup remains unacknowledged', async () => {

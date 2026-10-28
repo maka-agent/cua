@@ -147,23 +147,163 @@ impl RuntimeSession {
     /// or a new audio grant. The host must serialize admission and re-check its
     /// own approval before a later start.
     pub(crate) async fn discard_audio(&self) -> Result<(), String> {
+        self.discard_audio_capture(None).await.map(|_| ())
+    }
+
+    pub(crate) async fn discard_audio_completion(
+        &self,
+        expected: cua_driver_core::audio::AudioCompletion,
+    ) -> Result<bool, String> {
+        self.discard_audio_capture(Some(expected)).await
+    }
+
+    pub(crate) async fn discard_audio_output(
+        &self,
+        output: std::path::PathBuf,
+    ) -> Result<bool, String> {
+        let audio = self
+            .runtime
+            .audio
+            .clone()
+            .ok_or("computer audio is not enabled for this runtime")?;
+        let session = self.context.runtime_session_key(&self.public_session);
+        let expected =
+            tokio::task::spawn_blocking(move || audio.completion_for_output(&session, &output))
+                .await
+                .map_err(|error| format!("computer audio output lookup failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+        match expected {
+            Some(expected) => self.discard_audio_completion(expected).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn discard_audio_capture(
+        &self,
+        expected: Option<cua_driver_core::audio::AudioCompletion>,
+    ) -> Result<bool, String> {
         let runtime = self.runtime.clone();
         let session = self.context.runtime_session_key(&self.public_session);
-        // Keep the existing write-drain owned even if the host cancels its
-        // await while native cleanup is running. Shutdown uses this same lock.
+        // One owned cleanup task reserves the existing Closed entry before
+        // waiting on unrelated input. Losing this observation cannot re-open
+        // capture or release the tombstone ahead of read-admitted late starts.
         let cleanup = tokio::spawn(async move {
-            let _drained = runtime.lifecycle.write().await;
             let Some(audio) = runtime.audio.clone() else {
-                return Ok(());
+                return if expected.is_some() {
+                    Err("computer audio is not enabled for this runtime".into())
+                } else {
+                    Ok(false)
+                };
             };
-            tokio::task::spawn_blocking(move || audio.close_session(&session))
+            let reservation = match expected {
+                Some(expected) => tokio::task::spawn_blocking(move || {
+                    audio.reserve_close_completion(&session, &expected)
+                })
                 .await
-                .map_err(|error| format!("computer audio cleanup worker failed: {error}"))?
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    format!("computer audio capture comparison worker failed: {error}")
+                })?
+                .map_err(|error| error.to_string())?,
+                None => Some(audio.reserve_close_session(&session)),
+            };
+            let Some(reservation) = reservation else {
+                return Ok(false);
+            };
+            let (reservation, stopped) = tokio::task::spawn_blocking(move || {
+                let stopped = reservation.stop_native();
+                (reservation, stopped)
+            })
+            .await
+            .map_err(|error| format!("computer audio cleanup worker failed: {error}"))?;
+            let _drained = runtime.lifecycle.write().await;
+            stopped.map_err(|error| error.to_string())?;
+            reservation
+                .finish_after_drain()
+                .map_err(|error| error.to_string())?;
+            Ok(true)
         });
         cleanup
             .await
             .map_err(|error| format!("computer audio discard task failed: {error}"))?
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn windows_interruption_binding(
+        &self,
+        turn: String,
+        sink: Arc<dyn cua_driver_core::windows_interruption::InterruptionSink>,
+    ) -> Result<Arc<cua_driver_core::windows_interruption::WindowsInputBinding>, String> {
+        if !self.runtime.is_running() {
+            return Err("Cua Driver runtime has shut down".into());
+        }
+        cua_driver_core::windows_interruption::WindowsInputBinding::new(
+            self.context.runtime_session_key(&self.public_session),
+            turn,
+            sink,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn release_windows_inputs(
+        &self,
+        binding: Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<(), String> {
+        if binding.owner() != self.context.runtime_session_key(&self.public_session) {
+            return Err("native input owner belongs to another runtime session".into());
+        }
+        let backend = self
+            .runtime
+            .registry
+            .windows_interruption_backend()
+            .ok_or("Windows native interruption backend unavailable")?;
+        tokio::task::spawn_blocking(move || backend.release_binding_inputs(&binding))
+            .await
+            .map_err(|error| format!("native owned-input release worker failed: {error}"))?
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn close_windows_monitor(
+        &self,
+        binding: Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<(), String> {
+        if binding.owner() != self.context.runtime_session_key(&self.public_session) {
+            return Err("native monitor belongs to another runtime session".into());
+        }
+        let backend = self
+            .runtime
+            .registry
+            .windows_interruption_backend()
+            .ok_or("Windows native interruption backend unavailable")?;
+        // The exact observation resource can close independently of a blocked
+        // input read-admission. Acquiring the lifecycle write lock here would
+        // prevent a native-only process from ever retiring such a worker.
+        let cleanup = tokio::task::spawn_blocking(move || backend.close_binding(&binding));
+        cleanup
+            .await
+            .map_err(|error| format!("Windows native monitor close worker failed: {error}"))?
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn finish_windows_interruption(&self, turn: String) -> Result<(), String> {
+        let runtime = self.runtime.clone();
+        let owner = self.context.runtime_session_key(&self.public_session);
+        // Same read-admitted boundary as ordinary trusted cleanup. The owned
+        // task keeps the write-drain and native join if its observer is lost.
+        let cleanup = tokio::spawn(async move {
+            let _drained = runtime.lifecycle.write().await;
+            let backend = runtime
+                .registry
+                .windows_interruption_backend()
+                .ok_or("Windows native interruption backend unavailable")?;
+            tokio::task::spawn_blocking(move || backend.close_turn(&owner, &turn))
+                .await
+                .map_err(|error| {
+                    format!("Windows native interruption cleanup worker failed: {error}")
+                })?
+        });
+        cleanup
+            .await
+            .map_err(|error| format!("Windows native interruption cleanup task failed: {error}"))?
     }
 
     #[cfg(test)]
@@ -310,14 +450,34 @@ impl DriverRuntime {
         self.compatibility_context.runtime_scope_key()
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.shutdown.store(true, Ordering::Release);
         let _drained = self.lifecycle.write().await;
+        let mut failures = Vec::new();
         if let Some(maintenance) = self.stop_lifecycle_maintenance() {
-            let _ = tokio::task::spawn_blocking(move || maintenance.join()).await;
+            match tokio::task::spawn_blocking(move || maintenance.join()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => failures.push("runtime maintenance thread panicked".into()),
+                Err(error) => failures.push(format!("runtime maintenance join failed: {error}")),
+            }
+        }
+        if let Some(native) = self.registry.windows_interruption_backend() {
+            match tokio::task::spawn_blocking(move || native.close_all()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error),
+                Err(error) => failures.push(format!(
+                    "Windows native interruption shutdown worker failed: {error}"
+                )),
+            }
         }
         if let Some(audio) = self.audio.clone() {
-            let _ = tokio::task::spawn_blocking(move || audio.close_all()).await;
+            match tokio::task::spawn_blocking(move || audio.close_all()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error.to_string()),
+                Err(error) => {
+                    failures.push(format!("computer audio shutdown worker failed: {error}"))
+                }
+            }
         }
         self.authorization_registry.revoke_all();
         let runtime_prefix = format!(
@@ -333,7 +493,16 @@ impl DriverRuntime {
             &self.compatibility_context.runtime_scope_key(),
         );
         let recording = self.registry.recording.clone();
-        let _ = tokio::task::spawn_blocking(move || recording.stop_owner(None)).await;
+        match tokio::task::spawn_blocking(move || recording.stop_owner(None)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => failures.push(error.to_string()),
+            Err(error) => failures.push(format!("recording shutdown worker failed: {error}")),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     fn stop_lifecycle_maintenance(&self) -> Option<std::thread::JoinHandle<()>> {
@@ -550,39 +719,31 @@ impl Drop for DriverRuntime {
         self.authorization_registry.revoke_all();
         let runtime_scope = self.compatibility_context.runtime_scope_key();
         let runtime_prefix = format!("__cua_runtime_{runtime_scope}:");
-        if let Some(audio) = self.audio.clone() {
-            let registry = self.registry.clone();
-            let _ = std::thread::Builder::new()
-                .name("cua-audio-runtime-cleanup".into())
-                .spawn(move || {
-                    if let Some(maintenance) = maintenance {
-                        let _ = maintenance.join();
-                    }
+        let audio = self.audio.clone();
+        let native = self.registry.windows_interruption_backend();
+        let registry = self.registry.clone();
+        // Drop requests best-effort cleanup and cannot certify it. Explicit
+        // shutdown above awaits the same native/audio joins and returns errors.
+        let _ = std::thread::Builder::new()
+            .name("cua-runtime-cleanup".into())
+            .spawn(move || {
+                if let Some(maintenance) = maintenance {
+                    let _ = maintenance.join();
+                }
+                if let Some(native) = native {
+                    let _ = native.close_all();
+                }
+                if let Some(audio) = audio {
                     let _ = audio.close_all();
-                    cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
-                    cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
-                    cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
-                    cua_driver_core::snapshot_store::retire_runtime_scope(&runtime_scope);
-                    if was_running {
-                        let _ = registry.recording.stop_owner(None);
-                    }
-                });
-            return;
-        }
-        if let Some(maintenance) = maintenance {
-            let _ = maintenance.join();
-        }
-        cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
-        cua_driver_core::snapshot_store::retire_runtime_scope(&runtime_scope);
-        // Explicit `shutdown()` drains work and finalizes recordings. Drop is
-        // runtime-scoped and non-blocking so a retained binding cannot affect
-        // another generation.
-        if was_running {
-            let recording = self.registry.recording.clone();
-            let _ = recording.stop_owner(None);
-        }
+                }
+                cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
+                cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
+                cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
+                cua_driver_core::snapshot_store::retire_runtime_scope(&runtime_scope);
+                if was_running {
+                    let _ = registry.recording.stop_owner(None);
+                }
+            });
     }
 }
 
@@ -1037,7 +1198,7 @@ mod tests {
             "continuous authorized traffic must refresh the private idle clock"
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1085,7 +1246,7 @@ mod tests {
             "session-end hook must finalize recording after idle eviction"
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1163,7 +1324,7 @@ mod tests {
             Some("authorization_revoked")
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1205,7 +1366,7 @@ mod tests {
             .expect("closing a bound SDK session must end its native resources")
             .unwrap();
         assert!(cua_driver_core::session::is_session_ended(&internal));
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1224,7 +1385,7 @@ mod tests {
             .shutdown
             .clone();
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
 
         assert!(runtime.lifecycle_maintenance.lock().unwrap().is_none());
         assert!(
@@ -1255,7 +1416,7 @@ mod tests {
             Some(LifecycleMaintenance { shutdown, thread });
         let closing = runtime.clone();
         let shutdown = tokio::spawn(async move {
-            closing.shutdown().await;
+            closing.shutdown().await.unwrap();
         });
         reached.recv().await.unwrap();
         // A maintenance worker can be settling native idle-session cleanup.

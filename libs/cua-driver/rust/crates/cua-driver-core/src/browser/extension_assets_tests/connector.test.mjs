@@ -164,10 +164,10 @@ test('metadata is real, optional, and has no attach/focus effect', async () => {
   assert.equal(r.result.tabs.length, 3);
   assert.equal('lastAccessed' in r.result.tabs[0], false);
   assert.equal(r.result.tabs[1].lastAccessed, 123);
-  assert.equal(r.result.tabs[1].groupTitle, 'actual group');
+  assert.equal(r.result.tabs[1].groupTitleJson, '"actual group"');
   assert.deepEqual(f.calls, [['query', {}]]);
   f.hooks.groupError = true;
-  assert.equal('groupTitle' in (await f.request('inventory')).result.tabs[1], false);
+  assert.equal('groupTitleJson' in (await f.request('inventory')).result.tabs[1], false);
 });
 test('extension raw-ID resolution preserves Number grammar without mutating browser', async () => {
   const f = fixture();
@@ -283,7 +283,8 @@ test('Target.getTargets returns actual debugger metadata and its exact extension
     method: 'Target.getTargets',
     params: { filter: [{ type: 'iframe' }] },
   });
-  assert.deepEqual(result.result.result, {
+  assert.equal(typeof result.result.resultJson, 'string');
+  assert.deepEqual(JSON.parse(result.result.resultJson), {
     targetInfos: targets.map((target) => ({ ...target, targetId: target.id })),
   });
   assert.equal(reads, 1);
@@ -1027,7 +1028,7 @@ test('session inventory batches exact Host candidates in order without global qu
   const result = await request({ sessionOnly: true, knownTabIds: [100, 999, 2] });
   assert.equal(result.result.sessionOnly, true);
   assert.deepEqual(result.result.tabs.map((tab) => tab.id), [100, 2]);
-  assert.equal(result.result.tabs[1].groupTitle, 'actual group');
+  assert.equal(result.result.tabs[1].groupTitleJson, '"actual group"');
   assert.deepEqual(f.calls, [['get', 100], ['get', 999], ['get', 2]]);
   assert.equal(f.connector.records.size, 0);
   const before = f.calls.length;
@@ -1123,4 +1124,47 @@ test('hello declares debuggee-source preservation without acquiring a resource',
   assert.equal(f.connector.hello().capabilities.cdpEventSourceTarget, true);
   assert.equal(f.connector.records.size, 0);
   assert.deepEqual(f.calls, []);
+});
+
+test('closed metadata CDP reads carry original lone surrogates as ordinary JSON text', async () => {
+  const f = fixture();
+  f.tabs.get(1).title = '\ud800';
+  assert.equal(f.tabs.get(1).title.charCodeAt(0), 0xd800);
+  f.hooks.targets = () => [{ id: 'target-1', tabId: 1, type: 'page', attached: f.attached.has(1), title: '\ud800' }];
+  const token = await claim(f);
+  for (const [method, result] of [
+    ['DOM.describeNode', { node: { backendNodeId: 17, attributes: ['title', '\ud800'] } }],
+    ['Runtime.getProperties', { result: [{ name: '0', value: { objectId: 'owned-node', description: '\udc00' } }] }],
+  ]) {
+    f.hooks.cdp = () => result;
+    const response = await f.request('cdp', { claim: token, method, params: {} });
+    assert.equal(Object.hasOwn(response.result, 'result'), false);
+    assert.equal(response.result.resultJson.isWellFormed(), true);
+    const framed = JSON.parse(JSON.stringify(response));
+    assert.deepEqual(JSON.parse(framed.result.resultJson), result);
+  }
+  const response = await f.request('cdp', { claim: token, method: 'Target.getTargets', params: {} });
+  assert.equal(JSON.parse(response.result.resultJson).targetInfos[0].title, '\ud800');
+  f.hooks.cdp = () => ({ resultJson: 'ordinary-page-field' });
+  const value = await f.request('cdp', { claim: token, method: 'Runtime.evaluate', params: {} });
+  assert.deepEqual(value.result.result, { resultJson: 'ordinary-page-field' });
+  assert.equal(Object.hasOwn(value.result, 'resultJson'), false, 'page keys cannot select the private transport representation');
+});
+
+test('actual attached TargetInfo event preserves raw params and original claim source', async () => {
+  const f = fixture();
+  const token = await claim(f);
+  const params = { sessionId: 'raw-child', targetInfo: { targetId: 'actual-child', type: 'iframe', title: '\udc00' } };
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Target.attachedToTarget', params);
+  const event = f.events.findLast((value) => value.kind === 'event');
+  assert.equal(event.owner, 'owner-a');
+  assert.equal(event.claim, token);
+  assert.equal(event.generation, 'gen-1');
+  assert.equal(event.method, 'Target.attachedToTarget');
+  assert.equal(Object.hasOwn(event, 'params'), false);
+  assert.deepEqual(JSON.parse(JSON.parse(JSON.stringify(event)).paramsJson), params);
+  f.chrome.debugger.onEvent.fire({ tabId: 1 }, 'Page.frameNavigated', { paramsJson: 'ordinary-event-field' });
+  const ordinary = f.events.findLast((value) => value.kind === 'event');
+  assert.deepEqual(ordinary.params, { paramsJson: 'ordinary-event-field' });
+  assert.equal(Object.hasOwn(ordinary, 'paramsJson'), false);
 });

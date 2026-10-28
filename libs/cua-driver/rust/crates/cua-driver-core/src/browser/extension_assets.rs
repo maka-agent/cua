@@ -3,6 +3,10 @@
 
 pub(super) const EXTENSION_ASSETS: &[(&str, &str)] = &[
     (
+        "user-tab-context.mjs",
+        include_str!("extension_assets/user-tab-context.mjs"),
+    ),
+    (
         "fixed-ui.mjs",
         include_str!("extension_assets/fixed-ui.mjs"),
     ),
@@ -61,6 +65,10 @@ pub(super) const EXTENSION_ASSETS: &[(&str, &str)] = &[
     (
         "prepared-connector.mjs",
         include_str!("extension_assets/prepared-connector.mjs"),
+    ),
+    (
+        "user-history.mjs",
+        include_str!("extension_assets/user-history.mjs"),
     ),
     (
         "provider-connector.mjs",

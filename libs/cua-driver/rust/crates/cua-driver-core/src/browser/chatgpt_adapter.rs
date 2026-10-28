@@ -18,7 +18,7 @@ use super::extension_wire::{
     ExtensionRpcTrace, ExtensionWireAction, ExtensionWireAdapter, ExtensionWireContext,
     ExtensionWireError, MatchedExtensionReply,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, value::RawValue, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -88,7 +88,7 @@ struct Attaching {
     session: String,
     turn: String,
     revoked: bool,
-    events: Vec<(String, Value)>,
+    events: Vec<(String, Value, Option<String>)>,
     event_bytes: usize,
 }
 
@@ -142,8 +142,11 @@ enum PreparationPurpose {
 #[derive(Clone, Debug)]
 enum Stage {
     Bootstrap,
+    UserHistory,
+    NameSession,
     Inventory,
     SessionInventory,
+    UserTabRead,
     Resolve {
         tab: u64,
         source: InventorySource,
@@ -176,6 +179,13 @@ enum Stage {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WritePhase {
+    Unwritten,
+    AfterEarlierWrite,
+    Started,
+}
+
 #[derive(Clone, Debug)]
 struct Task {
     call: Option<Call>,
@@ -184,6 +194,8 @@ struct Task {
     attach_acknowledged: bool,
     finish_observed: bool,
     activation_epoch: Option<u64>,
+    write_phase: WritePhase,
+    initial_attach: Option<u64>,
 }
 
 /// One extension-port generation; the host serializes all trait calls.
@@ -256,14 +268,8 @@ impl ChatgptWireAdapter {
                     code: "request_budget".to_owned(),
                     message: error.to_string(),
                 })?;
-        if let Some(call) = task.call.as_ref() {
-            task.activation_epoch = if activates_session(method) {
-                Some(self.admit_activation(call))
-            } else if matches!(task.stage, Stage::Finish) {
-                Some(self.admit_finish(call))
-            } else {
-                task.activation_epoch
-            };
+        if task.write_phase == WritePhase::Started {
+            task.write_phase = WritePhase::AfterEarlierWrite;
         }
         let semantic_id = task.call.as_ref().map(|call| call.outer.clone());
         let released = task
@@ -285,11 +291,12 @@ impl ChatgptWireAdapter {
                     task.call.as_ref().and_then(|call| call.context.as_ref()),
                 )
             });
-        self.tasks.insert(id, task);
+        self.tasks.insert(id.clone(), task);
         let mut actions = vec![ExtensionWireAction::ExtensionFrame {
             message,
             semantic_id,
             trace,
+            phase: Some(id),
         }];
         if let Some(semantic_id) = released {
             actions.push(ExtensionWireAction::SemanticPayloadReleased { semantic_id });
@@ -828,7 +835,7 @@ impl ChatgptWireAdapter {
         // A completion also arises from expiry/EOF/protocol drain. Only the
         // codec's separate exact-ID event establishes an incoming matched reply.
         let category = match &completion.outcome {
-            Ok(Reply::Value(_)) => "result",
+            Ok(Reply::Value(_) | Reply::JsonText(_)) => "result",
             Ok(Reply::Void(_)) => "void_result",
             Err(RpcError::Remote(_)) => "extension_error",
             Err(RpcError::Protocol { .. }) => "protocol_error",
@@ -1000,7 +1007,35 @@ impl ChatgptWireAdapter {
             }
         };
         let value = match reply {
-            Reply::Value(value) => value,
+            Reply::JsonText(text) => {
+                let raw: &RawValue = serde_json::from_str(&text)
+                    .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+                let value = match completion.method {
+                    Method::GetUserTabs | Method::GetTabs => super::js_string::normalize_chatgpt_tabs(raw),
+                    Method::CreateTab | Method::ClaimUserTab => super::js_string::normalize_chatgpt_tab(raw),
+                    Method::ExecuteCdp if matches!(&task.stage, Stage::Cdp(scope) if matches!(scope.method.as_str(), "DOM.describeNode" | "Runtime.getProperties" | "Target.getTargets")) => {
+                        return self.complete_cdp_json(task, completion.method, text);
+                    }
+                    Method::ExecuteCdp if matches!(task.stage, Stage::PreTargets(_) | Stage::Targets(_)) => super::js_string::normalize_cdp_targets(raw),
+                    _ => serde_json::from_str(raw.get()),
+                }.map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+                value
+            }
+            Reply::Value(value) => match completion.method {
+                Method::GetUserTabs | Method::GetTabs => {
+                    let raw = serde_json::value::to_raw_value(&value)
+                        .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+                    super::js_string::normalize_chatgpt_tabs(&raw)
+                        .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?
+                }
+                Method::CreateTab | Method::ClaimUserTab => {
+                    let raw = serde_json::value::to_raw_value(&value)
+                        .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+                    super::js_string::normalize_chatgpt_tab(&raw)
+                        .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?
+                }
+                _ => value,
+            },
             Reply::Void(_) => Value::Null,
         };
         if matches!(task.stage, Stage::Attach(_)) {
@@ -1027,7 +1062,7 @@ impl ChatgptWireAdapter {
                 "kind":"hello","protocol":1,"extensionId":self.expected_extension,
                 "instanceId":value["metadata"]["extensionInstanceId"],
                 "capabilities":{"metadata":true,"physicalClaims":true,"orderedCdpEvents":true,"flatChildSessions":true,
-                    "browserManagement":false,"nativeWindowProof":false,"adapter":"chatgpt_jsonrpc", "observedVersion":value["version"],"userTabsOrder":"provider","headerScope":"session","presentationOwner":"provider","cursorMovePresentation":true,"cursorHidePresentation":false,"createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider","attachmentPreparation":"full_preparation","downloadNotifications":true,"sessionTabResolution":true,"sessionTabInventory":true,"sessionCommittedUrl":true,"sessionPreparation":"provider_session"}
+                    "browserManagement":false,"nativeWindowProof":false,"adapter":"chatgpt_jsonrpc", "observedVersion":value["version"],"userTabsOrder":"provider","headerScope":"session","presentationOwner":"provider","cursorMovePresentation":true,"cursorHidePresentation":false,"createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider","attachmentPreparation":"full_preparation","downloadNotifications":true,"sessionTabResolution":true,"sessionTabInventory":true,"sessionCommittedUrl":true,"userTabContextRead":value["apiSupportOverrides"]["BrowserUser.getTabContext"]==true,"sessionPreparation":"provider_session","sessionNaming":true,"userHistory":true,"sessionLogicalActive":true}
             }))]);
         }
         let call = task
@@ -1149,7 +1184,12 @@ impl ChatgptWireAdapter {
                 ));
             }
         }
-        if call.cancelled && !matches!(task.stage, Stage::Create | Stage::ObserveCreated(_)) {
+        if call.cancelled
+            && !matches!(
+                task.stage,
+                Stage::Create | Stage::ObserveCreated(_) | Stage::NameSession | Stage::UserHistory
+            )
+        {
             if let Some(custody) = self.partial_attachment(&task, &call) {
                 return Ok(self.failure(
                     &call,
@@ -1161,6 +1201,7 @@ impl ChatgptWireAdapter {
             return Ok(self.failure(&call,"outcome_unknown","ChatGPT operation completed after cancellation; no follow-up mutation was replayed",json!({"remoteAcknowledged":true,"remoteMethod":completion.method.as_str()})));
         }
         match task.stage {
+            Stage::UserTabRead => Ok(self.success(&call, json!({"value":value}))),
             Stage::Inventory => Ok(self.success(&call, json!({"tabs":project_inventory(value, InventorySource::User)?}))),
             Stage::SessionInventory => Ok(self.success(&call, json!({"tabs":project_inventory(value, InventorySource::ManagedSession)?,"sessionOnly":true}))),
             Stage::Resolve { tab: tab_id, source, session_only } => {
@@ -1329,8 +1370,8 @@ impl ChatgptWireAdapter {
                     .unwrap_or_default();
                 let mut actions =
                     self.success(&call, json!({"tabId":tab,"targetId":target,"claim":token}));
-                for (method, params) in early {
-                    actions.extend(self.notification(&method, params)?);
+                for (method, params, params_json) in early {
+                    actions.extend(self.notification_with_json(&method, params, params_json)?);
                 }
                 Ok(actions)
             }
@@ -1412,6 +1453,17 @@ impl ChatgptWireAdapter {
                     )),
                 }
             }
+            Stage::UserHistory => {
+                if call.cancelled { Ok(self.failure(&call, "outcome_unknown",
+                    "History observation ended after caller cancellation", Value::Null)) }
+                else { Ok(self.success(&call, json!({"items":value}))) }
+            }
+            Stage::NameSession => {
+                if call.cancelled { Ok(self.failure(&call, "outcome_unknown",
+                    "Session naming acknowledgement arrived after caller cancellation",
+                    json!({"acknowledgedResult":{"renamed":true}}))) }
+                else { Ok(self.success(&call, json!({"renamed":true}))) }
+            }
             Stage::SessionHeaders { active }=>{
                 let context=self.context(&call)?;
                 Ok(self.success(&call,json!({"stateConfirmed":true,"cleanupConfirmed":!active,"active":active,"pendingRemoval":false,"hostSessionId":context.host_session_id(),"hostTurnId":context.host_turn_id(),"generation":self.generation,"owner":call.owner})))
@@ -1440,6 +1492,8 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
                 attach_acknowledged: false,
                 finish_observed: false,
                 activation_epoch: None,
+                write_phase: WritePhase::Unwritten,
+                initial_attach: None,
             },
             Method::GetInfo,
             json!({}),
@@ -1477,37 +1531,16 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
         frame: Value,
         now: Instant,
     ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
-        let mut output = Vec::new();
-        for event in self.rpc.receive(frame, now) {
-            let result = match event {
-                RpcEvent::Reply(completion) => self.complete(completion, now),
-                RpcEvent::Send(message) => Ok(vec![ExtensionWireAction::ExtensionFrame {
-                    message,
-                    semantic_id: None,
-                    trace: None,
-                }]),
-                RpcEvent::Notification(notification) => self.notification(
-                    &notification.method,
-                    notification.params.unwrap_or(Value::Null),
-                ),
-                RpcEvent::IgnoredReply { .. } => Ok(Vec::new()),
-                RpcEvent::ProtocolViolation { message } => {
-                    Err(ExtensionWireError::Protocol(message))
-                }
-            };
-            match result {
-                Ok(actions) => output.extend(actions),
-                Err(error) => {
-                    let reason = error.to_string();
-                    // The codec may have produced terminal custody before a
-                    // generation violation. Flush it before ending the actor.
-                    output.extend(self.on_eof(&reason));
-                    output.push(ExtensionWireAction::TransportEnded { reason });
-                    break;
-                }
-            }
-        }
-        Ok(output)
+        let events = self.rpc.receive(frame, now);
+        self.extension_events(events, now)
+    }
+    fn on_extension_json(
+        &mut self,
+        frame: &RawValue,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let events = self.rpc.receive_json(frame, now);
+        self.extension_events(events, now)
     }
     fn on_cancel(&mut self, outer: &str) -> Vec<ExtensionWireAction> {
         for task in self.tasks.values_mut() {
@@ -1518,6 +1551,76 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
             }
         }
         Vec::new()
+    }
+    fn commit_write(&mut self, phase: &RequestId) -> Result<(), ExtensionWireError> {
+        let method = self.rpc.pending_method(phase).ok_or_else(|| {
+            ExtensionWireError::Protocol("write phase lost its exact pending RPC".to_owned())
+        })?;
+        let mut task = self.tasks.remove(phase).ok_or_else(|| {
+            ExtensionWireError::Protocol("write phase lost its exact adapter task".to_owned())
+        })?;
+        if task.write_phase == WritePhase::Started {
+            self.tasks.insert(phase.clone(), task);
+            return Err(ExtensionWireError::Protocol(
+                "local write phase was committed twice".to_owned(),
+            ));
+        }
+        task.write_phase = WritePhase::Started;
+        if let Some(call) = task.call.as_ref() {
+            task.activation_epoch = if activates_session(method) {
+                Some(self.admit_activation(call))
+            } else if matches!(task.stage, Stage::Finish) {
+                Some(self.admit_finish(call))
+            } else {
+                task.activation_epoch
+            };
+            if let Some(tab) = task.initial_attach.take() {
+                let context = call.context.as_ref().expect("validated attach context");
+                self.attaching.insert(
+                    tab,
+                    Attaching {
+                        owner: call.owner.clone(),
+                        session: context.host_session_id().to_owned(),
+                        turn: context.host_turn_id().to_owned(),
+                        revoked: false,
+                        events: Vec::new(),
+                        event_bytes: 0,
+                    },
+                );
+                self.children.retain(|(root, _), _| *root != tab);
+            }
+        }
+        self.tasks.insert(phase.clone(), task);
+        Ok(())
+    }
+    fn discard_unwritten(
+        &mut self,
+        phase: &RequestId,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let task = self.tasks.get(phase).ok_or_else(|| {
+            ExtensionWireError::Protocol("unwritten phase lost its exact adapter task".to_owned())
+        })?;
+        if task.write_phase != WritePhase::Unwritten || self.rpc.pending_method(phase).is_none() {
+            return Err(ExtensionWireError::Protocol(
+                "unwritten phase was already committed or lost its pending RPC".to_owned(),
+            ));
+        }
+        let task = self.tasks.remove(phase).expect("validated pending task");
+        self.rpc
+            .discard_unwritten(phase)
+            .expect("validated pending RPC");
+        let mut actions = Vec::new();
+        if let Some(call) = task.call {
+            if !call.payload_released {
+                actions.push(ExtensionWireAction::SemanticPayloadReleased {
+                    semantic_id: call.outer.clone(),
+                });
+            }
+            actions.push(ExtensionWireAction::SemanticFinished {
+                semantic_id: call.outer,
+            });
+        }
+        Ok(actions)
     }
     fn on_eof(&mut self, reason: &str) -> Vec<ExtensionWireAction> {
         self.ended = true;
@@ -1552,10 +1655,125 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
 }
 
 impl ChatgptWireAdapter {
+    fn extension_events(
+        &mut self,
+        events: Vec<RpcEvent>,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let mut output = Vec::new();
+        for event in events {
+            let result = match event {
+                RpcEvent::Reply(completion) => self.complete(completion, now),
+                RpcEvent::Send(message) => Ok(vec![ExtensionWireAction::ExtensionFrame {
+                    message,
+                    semantic_id: None,
+                    trace: None,
+                    phase: None,
+                }]),
+                RpcEvent::Notification(notification) => self.notification(
+                    &notification.method,
+                    notification.params.unwrap_or(Value::Null),
+                ),
+                RpcEvent::JsonNotification {
+                    method,
+                    params_json,
+                    ..
+                } => self.notification_json(&method, params_json.as_deref().unwrap_or("null")),
+                RpcEvent::IgnoredReply { .. } => Ok(Vec::new()),
+                RpcEvent::ProtocolViolation { message } => {
+                    Err(ExtensionWireError::Protocol(message))
+                }
+            };
+            match result {
+                Ok(actions) => output.extend(actions),
+                Err(error) => {
+                    let reason = error.to_string();
+                    // The codec may have produced terminal custody before a
+                    // generation violation. Flush it before ending the actor.
+                    output.extend(self.on_eof(&reason));
+                    output.push(ExtensionWireAction::TransportEnded { reason });
+                    break;
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn complete_cdp_json(
+        &mut self,
+        task: Task,
+        method: Method,
+        text: String,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let call = task.call.as_ref().ok_or_else(|| {
+            ExtensionWireError::Protocol("CDP task lost its semantic request".to_owned())
+        })?;
+        if call.cancelled {
+            return Ok(self.failure(call,"outcome_unknown","ChatGPT operation completed after cancellation; no follow-up mutation was replayed",json!({"remoteAcknowledged":true,"remoteMethod":method.as_str()})));
+        }
+        Ok(self.success(call, json!({"resultJson":text})))
+    }
+
+    fn notification_json(
+        &mut self,
+        method: &str,
+        text: &str,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let raw: &RawValue = serde_json::from_str(text)
+            .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+        let mut fields: std::collections::BTreeMap<String, Box<RawValue>> =
+            match serde_json::from_str(raw.get()) {
+                Ok(fields) => fields,
+                Err(_) => {
+                    let value = serde_json::from_str(raw.get())
+                        .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+                    return self.notification(method, value);
+                }
+            };
+        let event_method = fields
+            .get("method")
+            .and_then(|field| serde_json::from_str::<String>(field.get()).ok());
+        if method != "onCDPEvent" || event_method.as_deref() != Some("Target.attachedToTarget") {
+            let value = serde_json::from_str(raw.get())
+                .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+            return self.notification(method, value);
+        }
+        let Some(original) = fields.remove("params") else {
+            let value = serde_json::from_str(raw.get())
+                .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+            return self.notification(method, value);
+        };
+        let projected = super::cdp_ws::chrome_json_attached_params(original.get())
+            .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+        let mut params = Map::new();
+        for (key, value) in fields {
+            params.insert(
+                key,
+                serde_json::from_str(value.get())
+                    .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?,
+            );
+        }
+        params.insert("params".to_owned(), projected);
+        self.notification_with_json(
+            method,
+            Value::Object(params),
+            Some(original.get().to_owned()),
+        )
+    }
+
     fn notification(
         &mut self,
         method: &str,
         params: Value,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        self.notification_with_json(method, params, None)
+    }
+
+    fn notification_with_json(
+        &mut self,
+        method: &str,
+        params: Value,
+        params_json: Option<String>,
     ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
         if method == "onDownloadChange" {
             // Chatgpt notifications are global extension download metadata. They
@@ -1602,7 +1820,7 @@ impl ChatgptWireAdapter {
         };
         if method == "onCDPEvent" {
             if let Some(pending) = self.attaching.get_mut(&tab) {
-                let bytes = serde_json::to_vec(&params)
+                let bytes = serde_json::to_vec(&(&params, &params_json))
                     .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?
                     .len();
                 if pending.events.len() >= 64
@@ -1614,7 +1832,9 @@ impl ChatgptWireAdapter {
                 }
                 pending.event_bytes += bytes;
                 self.early_bytes += bytes;
-                pending.events.push((method.to_owned(), params));
+                pending
+                    .events
+                    .push((method.to_owned(), params, params_json));
                 return Ok(Vec::new());
             }
         }
@@ -1737,6 +1957,13 @@ impl ChatgptWireAdapter {
             }
         }
         let mut event = json!({"kind":"event","protocol":1,"generation":self.generation,"owner":claim.owner,"claim":token,"method":event_method,"params":event_params});
+        if let Some(text) = params_json {
+            event
+                .as_object_mut()
+                .expect("fixed event object")
+                .remove("params");
+            event["paramsJson"] = Value::String(text);
+        }
         if let Some(session) = source.get("sessionId").and_then(Value::as_str) {
             event["sessionId"] = json!(session);
         }
@@ -2041,7 +2268,8 @@ fn checked_tab(value: Value) -> Result<Value, ExtensionWireError> {
     let mut tab = Map::new();
     tab.insert("id".to_owned(), json!(id));
     for key in [
-        "title",
+        "titleJson",
+        "groupTitleJson",
         "url",
         "active",
         "faviconUrl",
@@ -2051,9 +2279,6 @@ fn checked_tab(value: Value) -> Result<Value, ExtensionWireError> {
         if let Some(value) = value.get(key) {
             tab.insert(key.to_owned(), value.clone());
         }
-    }
-    if let Some(group) = value.get("tabGroup") {
-        tab.insert("groupTitle".to_owned(), group.clone());
     }
     Ok(Value::Object(tab))
 }
@@ -2257,6 +2482,40 @@ impl ChatgptWireAdapter {
             return Ok(self.failure(&call,"custody_budget","Retained ChatGPT custody budget is exhausted; reconcile before admitting new mutations",Value::Null));
         }
         let (stage,extension,params)=match method.as_str() {
+            "readUserTab" => {
+                let tab = required_tab(&fields)?;
+                let expected = required_string(&fields, "expectedUrl")?;
+                let url = url::Url::parse(&expected).map_err(|_| ExtensionWireError::LocalRefusal {
+                    code: "invalid_request".to_owned(), message: "Tab reads require an HTTP or HTTPS URL".to_owned(),
+                })?;
+                if !matches!(url.scheme(), "http" | "https") {
+                    return Err(ExtensionWireError::LocalRefusal {code:"invalid_request".to_owned(),message:"Tab reads require an HTTP or HTTPS URL".to_owned()});
+                }
+                let read: super::user_tab_context::BrowserUserTabRead = serde_json::from_value(fields["read"].clone())
+                    .map_err(|error| ExtensionWireError::LocalRefusal {code:"invalid_request".to_owned(), message:format!("Invalid fixed user-tab read: {error}")})?;
+                let context = self.context(&call)?;
+                if self.leases.get(&tab).is_some_and(|(owner, session)| owner != &call.owner || session != context.host_session_id())
+                    || self.attaching.get(&tab).is_some_and(|entry| entry.owner != call.owner || entry.session != context.host_session_id())
+                    || self.claims.values().any(|claim| claim.tab == tab && claim.live && (claim.owner != call.owner || claim.session != context.host_session_id()))
+                {
+                    return Ok(self.failure(&call,"claim_unavailable","User-tab reads cannot cross another logical owner's raw tab",Value::Null));
+                }
+                let params = self.params(&call, json!({"tabId":tab,"expectedUrl":expected,"read":read}))?;
+                (Stage::UserTabRead, Method::ExecuteTabRead, params)
+            },
+            "userHistory" => {
+                let params = self.params(&call, fields.clone())?;
+                (Stage::UserHistory, Method::GetUserHistory, params)
+            }
+            "nameSession" => {
+                let name = required_string(&fields, "name")?;
+                if name.is_empty() {
+                    return Err(ExtensionWireError::LocalRefusal { code: "invalid_request".to_owned(),
+                        message: "name_session requires a name".to_owned() });
+                }
+                let params = self.params(&call, json!({"name":name}))?;
+                (Stage::NameSession, Method::NameSession, params)
+            }
             "inventory"=>{
                 if requested_session_only(&fields)? {
                     let candidates=fields.get("knownTabIds").and_then(Value::as_array).ok_or_else(||ExtensionWireError::LocalRefusal {code:"invalid_request".to_owned(),message:"session inventory requires candidate IDs".to_owned()})?;
@@ -2302,7 +2561,7 @@ impl ChatgptWireAdapter {
             },
             "prepareUserTab"=>{
                 let tab=required_tab(&fields)?;let session_only=requested_session_only(&fields)?;let context=self.context(&call)?.clone();
-                if self.leases.get(&tab).is_some_and(|(owner,session)|owner!=&call.owner||session!=context.host_session_id())||self.attaching.get(&tab).is_some_and(|entry|entry.owner!=call.owner||entry.session!=context.host_session_id())||self.claims.values().any(|claim|claim.tab==tab&&claim.live&&(claim.owner!=call.owner||claim.session!=context.host_session_id())){return Ok(self.failure(&call,"claim_unavailable","Preparation cannot reassign another owner's raw tab",Value::Null));}
+                if self.leases.get(&tab).is_some_and(|(owner,session)|owner!=&call.owner||session!=context.host_session_id())||self.attaching.get(&tab).is_some_and(|entry|entry.owner!=call.owner||entry.session!=context.host_session_id())||self.tasks.values().any(|task|task.initial_attach==Some(tab)&&task.call.as_ref().is_some_and(|pending|pending.owner!=call.owner||pending.context.as_ref().is_some_and(|scope|scope.host_session_id()!=context.host_session_id())))||self.claims.values().any(|claim|claim.tab==tab&&claim.live&&(claim.owner!=call.owner||claim.session!=context.host_session_id())){return Ok(self.failure(&call,"claim_unavailable","Preparation cannot reassign another owner's raw tab",Value::Null));}
                 if session_only {
                     let params=self.params(&call,json!({"tabId":tab}))?;
                     (Stage::PrepareClaim {tab,purpose:PreparationPurpose::Session},Method::ClaimUserTab,params)
@@ -2319,12 +2578,10 @@ impl ChatgptWireAdapter {
                 let tab=required_tab(&fields)?;
                 let context=self.context(&call)?.clone();
                 if self.claims.values().any(|claim|claim.tab==tab) {return Ok(self.failure(&call,"claim_unavailable","Tab already has a live host claim",Value::Null));}
-                if self.attaching.contains_key(&tab) {return Ok(self.failure(&call,"claim_unavailable","Raw tab has an admitted or uncertain attach reservation",Value::Null));}
+                if self.attaching.contains_key(&tab)||self.tasks.values().any(|task|task.initial_attach==Some(tab)) {return Ok(self.failure(&call,"claim_unavailable","Raw tab has an admitted or uncertain attach reservation",Value::Null));}
                 let lease=self.leases.get(&tab);
                 if lease.is_some_and(|(owner,session)|owner!=&call.owner||session!=context.host_session_id()) {return Ok(self.failure(&call,"claim_unavailable","Tab belongs to another host owner/session",Value::Null));}
                 let has_lease=lease.is_some();
-                self.attaching.insert(tab,Attaching {owner:call.owner.clone(),session:context.host_session_id().to_owned(),turn:context.host_turn_id().to_owned(),revoked:false,events:Vec::new(),event_bytes:0});
-                self.children.retain(|(root,_),_|*root!=tab);
                 let params=self.params(&call,if has_lease{json!({"target":{},"method":"Target.getTargets","commandParams":{}})}else{json!({"tabId":tab})})?;
                 if has_lease {(Stage::PreTargets(tab),Method::ExecuteCdp,params)}else{(Stage::ClaimForAttach(tab),Method::ClaimUserTab,params)}
             }
@@ -2402,6 +2659,10 @@ impl ChatgptWireAdapter {
             "closeOwner"=>return Ok(self.failure(&call,"outcome_unknown","Owner EOF is not cleanup proof; trusted Host turn finish must supply exact contexts",Value::Null)),
             _=>return Ok(self.failure(&call,"unsupported","This ChatGPT semantic adaptation has no source-proven mapping yet",json!({"method":method}))),
         };
+        let initial_attach = match &stage {
+            Stage::ClaimForAttach(tab) | Stage::PreTargets(tab) => Some(*tab),
+            _ => None,
+        };
         self.queue(
             Task {
                 call: Some(call),
@@ -2410,6 +2671,8 @@ impl ChatgptWireAdapter {
                 attach_acknowledged: false,
                 finish_observed: false,
                 activation_epoch: None,
+                write_phase: WritePhase::Unwritten,
+                initial_attach,
             },
             extension,
             params,
@@ -2427,7 +2690,10 @@ fn activates_session(method: Method) -> bool {
             | Method::ClaimUserTab
             | Method::Attach
             | Method::ExecuteCdp
+            | Method::ExecuteTabRead
             | Method::MoveMouse
+            | Method::NameSession
+            | Method::GetUserHistory
     )
 }
 
@@ -2465,6 +2731,8 @@ mod passive_phase_tests {
                             attach_acknowledged: false,
                             finish_observed: false,
                             activation_epoch: None,
+                            write_phase: WritePhase::Unwritten,
+                            initial_attach: None,
                         },
                         Method::GetUserTabs,
                         json!({"headers":"HEADER_SENTINEL"}),

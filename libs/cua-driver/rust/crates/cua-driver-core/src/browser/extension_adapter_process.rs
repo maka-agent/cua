@@ -24,8 +24,8 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, Write},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -69,6 +69,7 @@ struct RawFrameWrite {
 struct RawWrite {
     body: RawFrameWrite,
     port_live: Arc<AtomicBool>,
+    started: oneshot::Sender<oneshot::Sender<Result<(), String>>>,
     completion: oneshot::Sender<Result<RawWriteOutcome, String>>,
 }
 
@@ -84,6 +85,7 @@ fn write_raw(
     writer: &mut impl Write,
     request: &RawFrameWrite,
     port_live: &AtomicBool,
+    before_bytes: impl FnOnce() -> Result<(), String>,
 ) -> Result<RawWriteOutcome, String> {
     // This is the physical dispatch release point. EOF/error fences it even
     // while an async actor branch or admission future was already ready.
@@ -109,6 +111,7 @@ fn write_raw(
             });
         }
     }
+    before_bytes()?;
     let length = u32::try_from(request.payload.len()).map_err(|error| error.to_string())?;
     writer
         .write_all(&length.to_ne_bytes())
@@ -133,8 +136,29 @@ fn write_raw(
     Ok(RawWriteOutcome::Written)
 }
 
+fn write_owned(writer: &mut impl Write, request: RawWrite) -> Option<String> {
+    let RawWrite {
+        body,
+        port_live,
+        started,
+        completion,
+    } = request;
+    let result = write_raw(writer, &body, &port_live, || {
+        let (commit, acknowledged) = oneshot::channel();
+        started
+            .send(commit)
+            .map_err(|_| "extension write owner ended after dispatch started".to_owned())?;
+        acknowledged
+            .blocking_recv()
+            .map_err(|_| "extension write commit acknowledgement was lost".to_owned())?
+    });
+    let failed = result.as_ref().err().cloned();
+    let _ = completion.send(result);
+    failed
+}
+
 enum RawInput {
-    Message(Queued<Value>),
+    Message(Queued<Box<serde_json::value::RawValue>>),
     Eof,
 }
 
@@ -160,10 +184,7 @@ fn spawn_extension_io() -> Result<ExtensionIo, AdapterProcessError> {
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             while let Some(request) = writes.blocking_recv() {
-                let result = write_raw(&mut stdout, &request.body, &request.port_live);
-                let failed = result.as_ref().err().cloned();
-                let _ = request.completion.send(result);
-                if let Some(reason) = failed {
+                if let Some(reason) = write_owned(&mut stdout, request) {
                     writer_live.store(false, Ordering::SeqCst);
                     writer_failure.send_replace(Some(reason));
                     return;
@@ -179,14 +200,16 @@ fn spawn_extension_io() -> Result<ExtensionIo, AdapterProcessError> {
             loop {
                 let value = match extension_framing::read_frame(&mut stdin, Direction::ChromeToHost)
                 {
-                    Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            reader_live.store(false, Ordering::SeqCst);
-                            failure_send.send_replace(Some(error.to_string()));
-                            return;
+                    Ok(Some(bytes)) => {
+                        match serde_json::from_slice::<Box<serde_json::value::RawValue>>(&bytes) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                reader_live.store(false, Ordering::SeqCst);
+                                failure_send.send_replace(Some(error.to_string()));
+                                return;
+                            }
                         }
-                    },
+                    }
                     Ok(None) => {
                         reader_live.store(false, Ordering::SeqCst);
                         // Liveness never waits for raw queue admission. The actor
@@ -393,6 +416,7 @@ impl Actor {
         id: Option<&str>,
         charge: Option<Arc<ByteCharge>>,
         trace: Option<ExtensionRpcTrace>,
+        phase: Option<super::chatgpt_rpc_v2::RequestId>,
     ) -> Result<(), AdapterProcessError> {
         let guard = match id {
             Some(id) => Some(
@@ -415,9 +439,12 @@ impl Actor {
                     "extension port ended before this phase".to_owned(),
                 ) {
                     self.broker.write_report(report).await;
+                    self.discard_unwritten_phase(phase.as_ref(), id).await?;
                 } else if let Some(id) = id {
                     self.cancel_semantic(id).await?;
                 }
+            } else {
+                self.discard_unwritten_phase(phase.as_ref(), id).await?;
             }
             return Ok(());
         }
@@ -427,7 +454,7 @@ impl Actor {
                 if let Some(guard) = &guard {
                     if let Some(report)=guard.reject_before_write("extension_message_budget".to_owned(),"selected extension protocol cannot encode this frame within Chrome's host-to-browser limit".to_owned()) {
                         self.broker.write_report(report).await;
-                        if let Some(id)=id { let actions=self.adapter.on_cancel(id); self.actions(actions).await?; }
+                        self.discard_unwritten_phase(phase.as_ref(), id).await?;
                         return Ok(());
                     }
                 }
@@ -436,6 +463,7 @@ impl Actor {
             Err(error) => return Err(error.into()),
         };
         drop(message);
+        let (started, mut start) = oneshot::channel();
         let (completion, done) = oneshot::channel();
         let request = RawWrite {
             body: RawFrameWrite {
@@ -445,13 +473,30 @@ impl Actor {
                 _charge: charge,
             },
             port_live: self.io.port_live.clone(),
+            started,
             completion,
         };
         let sender = self.io.output.clone();
         let deadline = tokio::time::sleep(DRAIN_DEADLINE);
         tokio::pin!(deadline);
         tokio::select! { result=sender.send(request)=>result.map_err(|_|AdapterProcessError::Ended("extension writer ended".to_owned()))?, _=self.io.failure.changed()=>return Err(self.failure().await), _=&mut deadline=>return Err(AdapterProcessError::Ended("extension writer admission deadline expired; outcome remains unknown".to_owned())) };
-        let result = tokio::select! { result=done=>result.map_err(|_|AdapterProcessError::Ended("extension write completion was lost; outcome remains unknown".to_owned()))?.map_err(AdapterProcessError::Ended)?, _=self.io.failure.changed()=>return Err(self.failure().await), _=&mut deadline=>return Err(AdapterProcessError::Ended("extension write deadline expired; outcome remains unknown".to_owned())) };
+        tokio::pin!(done);
+        let mut awaiting_start = true;
+        let result = loop {
+            tokio::select! { result= &mut start, if awaiting_start => {
+                    awaiting_start = false;
+                    if let Ok(acknowledge) = result {
+                        let committed = phase.as_ref().map_or(Ok(()), |phase| self.adapter.commit_write(phase));
+                        let failed = committed.as_ref().err().map(ToString::to_string);
+                        let _ = acknowledge.send(committed.map_err(|error| error.to_string()));
+                        if let Some(reason) = failed {
+                            return Err(AdapterProcessError::Ended(reason));
+                        }
+                    }
+                }
+                result = &mut done => break result.map_err(|_|AdapterProcessError::Ended("extension write completion was lost; outcome remains unknown".to_owned()))?.map_err(AdapterProcessError::Ended)?, _=self.io.failure.changed()=>return Err(self.failure().await), _=&mut deadline=>return Err(AdapterProcessError::Ended("extension write deadline expired; outcome remains unknown".to_owned())),
+            }
+        };
         match result {
             RawWriteOutcome::Written => {
                 if let Some(guard) = guard {
@@ -469,6 +514,7 @@ impl Actor {
                         self.broker.write_report(report).await;
                     }
                 }
+                self.discard_unwritten_phase(phase.as_ref(), id).await?;
             }
             RawWriteOutcome::FencedAfterEarlierWrite => {
                 if let Some(id) = id {
@@ -478,6 +524,20 @@ impl Actor {
                     self.cancel_semantic(id).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn discard_unwritten_phase(
+        &mut self,
+        phase: Option<&super::chatgpt_rpc_v2::RequestId>,
+        semantic: Option<&str>,
+    ) -> Result<(), AdapterProcessError> {
+        if let Some(phase) = phase {
+            let actions = self.adapter.discard_unwritten(phase)?;
+            self.actions(actions).await?;
+        } else if let Some(semantic) = semantic {
+            self.finish_semantic(semantic).await;
         }
         Ok(())
     }
@@ -504,8 +564,18 @@ impl Actor {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn extension(&mut self, value: Value) -> Result<(), AdapterProcessError> {
-        let actions = self.adapter.on_extension(value, Instant::now())?;
+        let json = serde_json::value::to_raw_value(&value)
+            .map_err(|error| AdapterProcessError::Ended(error.to_string()))?;
+        self.extension_json(&json).await
+    }
+
+    async fn extension_json(
+        &mut self,
+        frame: &serde_json::value::RawValue,
+    ) -> Result<(), AdapterProcessError> {
+        let actions = self.adapter.on_extension_json(frame, Instant::now())?;
         self.actions(actions).await
     }
 
@@ -549,6 +619,7 @@ impl Actor {
                         message,
                         semantic_id,
                         trace,
+                        phase,
                     } => {
                         if terminal_reason.is_some() {
                             // A malformed adapter tail cannot release more
@@ -558,7 +629,7 @@ impl Actor {
                         let charge = semantic_id
                             .as_ref()
                             .and_then(|id| payloads.get(id).cloned());
-                        self.write_phase(message, semantic_id.as_deref(), charge, trace)
+                        self.write_phase(message, semantic_id.as_deref(), charge, trace, phase)
                             .await?;
                         if let Some(id) = semantic_id {
                             if let Some(left) = frames.get_mut(&id) {
@@ -726,7 +797,7 @@ impl Actor {
                 _=expiry.tick()=>{self.cancel_dead().await?;let actions=self.adapter.expire(Instant::now());self.actions(actions).await?;},
                 frame=self.outgoing.recv()=>match frame {Some(frame)=>self.semantic(frame).await?,None=>return Ok(())},
                 raw=self.io.input.recv()=>match raw {
-                    Some(RawInput::Message(raw))=>{let (value,charge)=raw.into_parts();self.extension(value).await?;drop(charge);},
+                    Some(RawInput::Message(raw))=>{let (value,charge)=raw.into_parts();self.extension_json(&value).await?;drop(charge);},
                     Some(RawInput::Eof)|None=>return Ok(()),
                 }
             }
@@ -761,7 +832,7 @@ pub(crate) async fn run(
     let settlement = async {
         while let Ok(RawInput::Message(raw)) = actor.io.input.try_recv() {
             let (value, charge) = raw.into_parts();
-            let _ = actor.extension(value).await;
+            let _ = actor.extension_json(&value).await;
             drop(charge);
         }
     };
@@ -818,7 +889,7 @@ mod tests {
         };
         let mut writer = Cursor::new(Vec::new());
         assert_eq!(
-            write_raw(&mut writer, &request, &AtomicBool::new(true)).unwrap(),
+            write_raw(&mut writer, &request, &AtomicBool::new(true), || Ok(())).unwrap(),
             RawWriteOutcome::Written
         );
         let bytes = writer.into_inner();
@@ -828,7 +899,7 @@ mod tests {
 
     #[test]
     fn passive_frame_trace_requires_complete_flush_and_contains_only_captured_metadata() {
-        use super::super::extension_wire::{ExtensionWireContext, rpc_phase_test::Capture};
+        use super::super::extension_wire::{rpc_phase_test::Capture, ExtensionWireContext};
         struct FlushFailure;
         impl Write for FlushFailure {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -857,7 +928,13 @@ mod tests {
         let port_live = AtomicBool::new(false);
         tracing::subscriber::with_default(capture.clone(), || {
             assert_eq!(
-                write_raw(&mut Cursor::new(Vec::new()), &request, &port_live).unwrap(),
+                write_raw(
+                    &mut Cursor::new(Vec::new()),
+                    &request,
+                    &port_live,
+                    || Ok(())
+                )
+                .unwrap(),
                 RawWriteOutcome::FencedBeforeWrite
             );
             assert!(
@@ -865,14 +942,14 @@ mod tests {
                 "a fence cannot produce write completion"
             );
             port_live.store(true, Ordering::SeqCst);
-            assert!(write_raw(&mut FlushFailure, &request, &port_live).is_err());
+            assert!(write_raw(&mut FlushFailure, &request, &port_live, || Ok(())).is_err());
             assert!(
                 capture.rows().is_empty(),
                 "a partial write/failed flush cannot produce write completion"
             );
             let mut bytes = Cursor::new(Vec::new());
             assert_eq!(
-                write_raw(&mut bytes, &request, &port_live).unwrap(),
+                write_raw(&mut bytes, &request, &port_live, || Ok(())).unwrap(),
                 RawWriteOutcome::Written
             );
             assert_eq!(&bytes.get_ref()[4..], request.payload);
@@ -918,7 +995,7 @@ mod tests {
         live.store(false, Ordering::SeqCst);
         let mut writer = Cursor::new(Vec::new());
         assert_eq!(
-            write_raw(&mut writer, &request, &live).unwrap(),
+            write_raw(&mut writer, &request, &live, || Ok(())).unwrap(),
             RawWriteOutcome::FencedBeforeWrite
         );
         assert!(writer.into_inner().is_empty());
@@ -1020,6 +1097,7 @@ mod tests {
             message: json!({"method":"must-not-dispatch"}),
             semantic_id: None,
             trace: None,
+            phase: None,
         });
         assert!(
             actions.len() > MAX_SEMANTICS,
@@ -1102,6 +1180,7 @@ mod tests {
                     message: json!({"method":"must-not-dispatch-after-retirement"}),
                     semantic_id: None,
                     trace: None,
+                    phase: None,
                 },
             ])
         }
@@ -1282,6 +1361,130 @@ mod tests {
             );
             drop(charge);
             assert_eq!(budget.available_bytes(), available);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_writer_commits_before_bytes_and_never_refunds_a_started_failure() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct ObservedWriter {
+            written: Arc<AtomicUsize>,
+            remaining: Option<usize>,
+        }
+        impl Write for ObservedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == Some(0) {
+                    return Err(io::Error::other("actual partial writer failure"));
+                }
+                let length = self
+                    .remaining
+                    .map_or(bytes.len(), |left| left.min(bytes.len()));
+                if let Some(left) = &mut self.remaining {
+                    *left -= length;
+                }
+                self.written.fetch_add(length, Ordering::SeqCst);
+                Ok(length)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for case in ["fenced", "ack_lost", "partial", "written"] {
+            let origin = ExtensionOrigin::from_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+            let (broker, service, mut outgoing) =
+                ExtensionHostBroker::channels(origin, LocalPrincipal::UnixUid(123));
+            let broker_task = tokio::spawn(service.run());
+            broker.extension_message(json!({"kind":"hello","protocol":1,"extensionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instanceId":"first-write-fixture","capabilities":{"metadata":true}})).await.unwrap();
+            let bound = tokio::time::timeout(Duration::from_secs(5), outgoing.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_adapter_request();
+            let guard = bound.guard;
+            let port_live = Arc::new(AtomicBool::new(case != "fenced"));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let (started, start) = oneshot::channel();
+            let (completion, done) = oneshot::channel();
+            let request = RawWrite {
+                body: RawFrameWrite {
+                    payload:
+                        br#"{"jsonrpc":"2.0","id":"owned-phase","method":"getInfo","params":{}}"#
+                            .to_vec(),
+                    trace: None,
+                    guard: Some(guard.clone()),
+                    _charge: None,
+                },
+                port_live,
+                started,
+                completion,
+            };
+            let written = bytes.clone();
+            let writer = std::thread::spawn(move || {
+                write_owned(
+                    &mut ObservedWriter {
+                        written,
+                        remaining: (case == "partial").then_some(2),
+                    },
+                    request,
+                )
+            });
+            let start = tokio::time::timeout(Duration::from_secs(5), start)
+                .await
+                .unwrap();
+            assert_eq!(
+                bytes.load(Ordering::SeqCst),
+                0,
+                "no header byte precedes the owner ACK: {case}"
+            );
+            if case == "fenced" {
+                assert!(start.is_err());
+                assert!(!guard.was_started());
+            } else {
+                assert!(
+                    guard.was_started(),
+                    "the actual guard wins before notifying its owner"
+                );
+                let acknowledge = start.unwrap();
+                if case == "ack_lost" {
+                    drop(acknowledge);
+                } else {
+                    acknowledge.send(Ok(())).unwrap();
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), done)
+                .await
+                .unwrap()
+                .unwrap();
+            let failed = writer.join().unwrap();
+            match case {
+                "fenced" => {
+                    assert_eq!(result.unwrap(), RawWriteOutcome::FencedBeforeWrite);
+                    assert!(failed.is_none());
+                    assert_eq!(bytes.load(Ordering::SeqCst), 0);
+                }
+                "written" => {
+                    assert_eq!(result.unwrap(), RawWriteOutcome::Written);
+                    assert!(failed.is_none());
+                    assert!(bytes.load(Ordering::SeqCst) > 4);
+                }
+                _ => {
+                    assert!(result.is_err());
+                    assert!(failed.is_some());
+                    assert!(
+                        guard.was_started(),
+                        "ACK loss/partial failure never becomes an unwritten phase"
+                    );
+                    assert_eq!(
+                        bytes.load(Ordering::SeqCst),
+                        if case == "partial" { 2 } else { 0 }
+                    );
+                }
+            }
+            broker_task.abort();
+            let _ = broker_task.await;
         }
     }
 }

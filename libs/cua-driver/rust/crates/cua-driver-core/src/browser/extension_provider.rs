@@ -220,6 +220,18 @@ pub struct ExtensionProviderCapabilities {
     /// Supports the captured-session URL-only purpose, not an ownership grant.
     #[serde(default)]
     pub session_committed_url: bool,
+    /// Fixed user-tab reads without a debugger claim or tab preparation.
+    #[serde(default)]
+    pub user_tab_context_read: bool,
+    /// Explicit whole-browser history transport, independent of page consent.
+    #[serde(default)]
+    pub user_history: bool,
+    /// Provider-owned session naming. Host-owned groups use their existing receipts.
+    #[serde(default)]
+    pub session_naming: bool,
+    /// Session inventory active flags are provider logical activity, not OS focus.
+    #[serde(default)]
+    pub session_logical_active: bool,
 }
 
 /// Global observed metadata: no owner, claim or tab is attributed here.
@@ -309,13 +321,14 @@ pub async fn discover_installed_extension_endpoints(
 
 /// Actual Chrome tab metadata. No activity time or public tab ID is invented.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "ExtensionTabInfoWire")]
 pub struct ExtensionTabInfo {
     pub id: u64,
     pub window_id: Option<i64>,
     pub index: Option<i64>,
     pub group_id: Option<i64>,
-    pub title: Option<String>,
+    #[serde(rename = "titleJson")]
+    pub title: Option<super::JsonStringLiteral>,
     pub url: Option<String>,
     #[serde(default)]
     pub last_opened: Option<String>,
@@ -324,7 +337,79 @@ pub struct ExtensionTabInfo {
     pub pending_url: Option<String>,
     pub active: Option<bool>,
     pub last_accessed: Option<f64>,
-    pub group_title: Option<String>,
+    #[serde(rename = "groupTitleJson")]
+    pub group_title: Option<super::JsonStringLiteral>,
+}
+
+// Legacy scalar metadata and the new JSON-text fields have distinct keys.
+// Never infer an encoding from the contents of a legacy page-controlled title.
+#[derive(Default)]
+enum MetadataField<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for MetadataField<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionTabInfoWire {
+    id: u64,
+    window_id: Option<i64>,
+    index: Option<i64>,
+    group_id: Option<i64>,
+    #[serde(default)]
+    title: MetadataField<Option<String>>,
+    #[serde(default)]
+    title_json: MetadataField<Option<super::JsonStringLiteral>>,
+    url: Option<String>,
+    last_opened: Option<String>,
+    provider_tab_id: Option<String>,
+    pending_url: Option<String>,
+    active: Option<bool>,
+    last_accessed: Option<f64>,
+    #[serde(default)]
+    group_title: MetadataField<Option<String>>,
+    #[serde(default)]
+    group_title_json: MetadataField<Option<super::JsonStringLiteral>>,
+}
+fn metadata_string(
+    encoded: MetadataField<Option<super::JsonStringLiteral>>,
+    legacy: MetadataField<Option<String>>,
+) -> Result<Option<super::JsonStringLiteral>, serde_json::Error> {
+    match (encoded, legacy) {
+        (MetadataField::Missing, MetadataField::Missing) => Ok(None),
+        (MetadataField::Present(value), MetadataField::Missing) => Ok(value),
+        (MetadataField::Missing, MetadataField::Present(value)) => Ok(value.map(Into::into)),
+        (MetadataField::Present(_), MetadataField::Present(_)) => {
+            Err(<serde_json::Error as serde::de::Error>::custom(
+                "metadata supplies both scalar and JSON-text strings",
+            ))
+        }
+    }
+}
+impl TryFrom<ExtensionTabInfoWire> for ExtensionTabInfo {
+    type Error = serde_json::Error;
+
+    fn try_from(wire: ExtensionTabInfoWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: wire.id,
+            window_id: wire.window_id,
+            index: wire.index,
+            group_id: wire.group_id,
+            title: metadata_string(wire.title_json, wire.title)?,
+            url: wire.url,
+            last_opened: wire.last_opened,
+            provider_tab_id: wire.provider_tab_id,
+            pending_url: wire.pending_url,
+            active: wire.active,
+            last_accessed: wire.last_accessed,
+            group_title: metadata_string(wire.group_title_json, wire.group_title)?,
+        })
+    }
 }
 
 /// The transport receipt is internal Rust-host data, not model-facing JSON.
@@ -1068,6 +1153,14 @@ struct ClaimCdpSnapshotFields {
 /// Operations describe pending transport receipts, not a second tab ledger.
 #[derive(Clone, Debug)]
 pub enum ExtensionOperation {
+    /// A fixed read; captured logical-session activation may still occur.
+    ReadUserTab {
+        tab_id: u64,
+    },
+    UserHistory,
+    NameSession {
+        name: String,
+    },
     Inventory,
     SessionInventory,
     Resolve {
@@ -1199,6 +1292,9 @@ pub enum ExtensionOperation {
 impl ExtensionOperation {
     fn method(&self) -> &'static str {
         match self {
+            Self::ReadUserTab { .. } => "readUserTab",
+            Self::UserHistory => "userHistory",
+            Self::NameSession { .. } => "nameSession",
             Self::Inventory | Self::SessionInventory => "inventory",
             Self::Resolve { .. }
             | Self::ResolveSessionTab { .. }
@@ -1247,7 +1343,10 @@ impl ExtensionOperation {
             | Self::PopupRequested { .. }
             | Self::OrphanCdpCompletion { .. }
             | Self::EffectsCleanup { .. } => false,
-            Self::Inventory
+            Self::UserHistory
+            | Self::NameSession { .. }
+            | Self::ReadUserTab { .. }
+            | Self::Inventory
             | Self::SessionInventory
             | Self::Resolve { .. }
             | Self::ResolveSessionTab { .. }
@@ -1281,6 +1380,7 @@ impl ExtensionOperation {
         !matches!(
             self,
             Self::Inventory
+                | Self::ReadUserTab { .. }
                 | Self::SessionInventory
                 | Self::Resolve { .. }
                 | Self::ResolveSessionTab { .. }
@@ -1417,6 +1517,12 @@ pub struct ExtensionKnownCustody {
 /// Unknown positive-ACK capabilities are cleanup-only and remain old-generation.
 #[derive(Clone, Debug)]
 pub enum ExtensionRecoveredOperation {
+    /// Exact positive acknowledgement; the retained operation carries the requested title.
+    SessionNamed {
+        name: String,
+    },
+    /// History never mints a tab/claim or a site permission.
+    UserHistory,
     SessionHeaders(ExtensionSessionHeaderProof),
     CursorPresentation(ExtensionCursorPresentationAck),
     TurnFinished(ExtensionTurnFinishAck),
@@ -1889,6 +1995,9 @@ impl ExtensionBrowserProvider {
         operation: &ExtensionOperation,
     ) -> Result<(), ExtensionProviderError> {
         let supported = match operation {
+            ExtensionOperation::ReadUserTab { .. } => self.capabilities()?.user_tab_context_read,
+            ExtensionOperation::UserHistory => self.capabilities()?.user_history,
+            ExtensionOperation::NameSession { .. } => self.capabilities()?.session_naming,
             ExtensionOperation::SessionInventory => self.capabilities()?.session_tab_inventory,
             ExtensionOperation::CommittedSessionTabUrl { .. } => {
                 self.capabilities()?.session_committed_url
@@ -1951,6 +2060,87 @@ impl ExtensionBrowserProvider {
         }
         Ok(())
     }
+    /// Query browser-wide history after the embedding Host's distinct history consent.
+    /// This transport method neither grants permission nor creates tab ownership.
+    pub async fn user_history(&self, options: Value) -> Result<Value, ExtensionProviderError> {
+        let reply = self
+            .control(ExtensionOperation::UserHistory, json!({"options":options}))
+            .await?;
+        let result = reply.outcome.into_result("userHistory")?;
+        let items = result
+            .get("items")
+            .filter(|value| value.is_array())
+            .ok_or_else(|| protocol("history result lacks items"))?;
+        for row in items.as_array().expect("checked array") {
+            if !row.get("url").is_some_and(Value::is_string)
+                || !row.get("dateVisited").is_some_and(Value::is_string)
+                || row.get("title").is_some_and(|value| !value.is_string())
+            {
+                return Err(protocol("history item has invalid fields"));
+            }
+        }
+        Ok(items.clone())
+    }
+    /// Rename the captured original session; an uncertain result is never replayed.
+    pub async fn name_session(&self, name: &str) -> Result<(), ExtensionProviderError> {
+        if name.is_empty() {
+            return Err(refused("invalid_request", "name_session requires a name"));
+        }
+        let reply = self
+            .control(
+                ExtensionOperation::NameSession {
+                    name: name.to_owned(),
+                },
+                json!({"name":name}),
+            )
+            .await?;
+        let result = reply.outcome.into_result("nameSession")?;
+        if result.get("renamed") != Some(&Value::Bool(true)) {
+            return Err(protocol("session name acknowledgement missing"));
+        }
+        Ok(())
+    }
+    /// Run a fixed, URL-guarded read without claiming, preparing or focusing a tab.
+    /// Host authorization must retain the exact expected URL throughout this call.
+    /// The ChatGPT adapter can activate its logical session; this is not a claim.
+    ///
+    /// # Errors
+    /// Returns an admission/capability refusal, the original read failure, or
+    /// transport uncertainty. It never retries through another tab or transport.
+    pub async fn read_user_tab(
+        &self,
+        tab_id: u64,
+        expected_url: &str,
+        read: super::user_tab_context::BrowserUserTabRead,
+    ) -> Result<Value, ExtensionProviderError> {
+        self.require_session_tab_context()?;
+        if tab_id == 0 || tab_id > 9_007_199_254_740_991 {
+            return Err(refused(
+                "invalid_request",
+                "Tab reads require a positive safe tab ID",
+            ));
+        }
+        let url = url::Url::parse(expected_url)
+            .map_err(|_| refused("invalid_request", "Tab reads require an HTTP or HTTPS URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(refused(
+                "invalid_request",
+                "Tab reads require an HTTP or HTTPS URL",
+            ));
+        }
+        let reply = self
+            .control(
+                ExtensionOperation::ReadUserTab { tab_id },
+                json!({"tabId":tab_id, "expectedUrl":expected_url, "read":read}),
+            )
+            .await?;
+        let result = reply.outcome.into_result("readUserTab")?;
+        result
+            .get("value")
+            .cloned()
+            .ok_or_else(|| protocol("user-tab read result lacks its value"))
+    }
+
     pub async fn list_user_tabs(&self) -> Result<Vec<ExtensionTabInfo>, ExtensionProviderError> {
         let reply = self
             .control(ExtensionOperation::Inventory, json!({}))
@@ -3486,6 +3676,13 @@ impl ExtensionBrowserProvider {
             outcome: ExtensionOperationOutcome::Result(result.clone()),
         };
         Ok(match &completion.operation {
+            ExtensionOperation::UserHistory => ExtensionRecoveredOperation::UserHistory,
+            ExtensionOperation::NameSession { name } => {
+                if result.get("renamed") != Some(&Value::Bool(true)) {
+                    return Err(protocol("session name acknowledgement missing"));
+                }
+                ExtensionRecoveredOperation::SessionNamed { name: name.clone() }
+            }
             ExtensionOperation::SetSessionHeaders { .. }
             | ExtensionOperation::ClearSessionHeaders => {
                 let context = completion.wire_context.as_ref().ok_or_else(|| {
@@ -3672,6 +3869,7 @@ impl ExtensionBrowserProvider {
                 wire_context: completion.wire_context.clone(),
             },
             ExtensionOperation::Inventory
+            | ExtensionOperation::ReadUserTab { .. }
             | ExtensionOperation::SessionInventory
             | ExtensionOperation::Resolve { .. }
             | ExtensionOperation::ResolveSessionTab { .. }
@@ -4424,6 +4622,7 @@ enum ControlEvent {
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum ExtensionCdpCompletionOutcome {
     ChromeMessage(Value),
+    ChromeJson(String),
     LocalRejected {
         id: u64,
         code: String,
@@ -5127,6 +5326,9 @@ fn apply_server(
                 // legacy route handler remains the one CDP demultiplexer.
                 let reply_id = match &event {
                     ExtensionCdpCompletionOutcome::ChromeMessage(value) => value["id"].as_u64(),
+                    ExtensionCdpCompletionOutcome::ChromeJson(text) => {
+                        super::cdp_ws::chrome_json_reply_id(text)
+                    }
                     ExtensionCdpCompletionOutcome::LocalRejected { id, .. } => Some(*id),
                     ExtensionCdpCompletionOutcome::TransportFailure(_) => {
                         return Err(protocol(
@@ -5573,6 +5775,9 @@ fn apply_cdp_frame(
     };
     let reply_id = match &decoded {
         ExtensionCdpCompletionOutcome::ChromeMessage(value) => value["id"].as_u64(),
+        ExtensionCdpCompletionOutcome::ChromeJson(text) => {
+            super::cdp_ws::chrome_json_reply_id(text)
+        }
         ExtensionCdpCompletionOutcome::LocalRejected { id, .. } => Some(*id),
         ExtensionCdpCompletionOutcome::TransportFailure(_) => None,
     };
@@ -5600,6 +5805,17 @@ fn apply_cdp_frame(
                 ExtensionCdpInbound::ChromeMessage(value)
             }
         }
+        ExtensionCdpCompletionOutcome::ChromeJson(message_json) => {
+            let disposition = completed
+                .as_ref()
+                .map_or(CdpFailureDisposition::ReplyFailure, |(_, metadata)| {
+                    metadata.failure_disposition()
+                });
+            ExtensionCdpInbound::ChromeJson {
+                message_json,
+                disposition,
+            }
+        }
         ExtensionCdpCompletionOutcome::LocalRejected { id, code, message } => {
             ExtensionCdpInbound::LocalRejected { id, code, message }
         }
@@ -5615,6 +5831,9 @@ fn apply_cdp_frame(
             ExtensionCdpInbound::ChromeMessage(value)
             | ExtensionCdpInbound::ClassifiedChromeMessage { message: value, .. } => {
                 ExtensionCdpCompletionOutcome::ChromeMessage(value)
+            }
+            ExtensionCdpInbound::ChromeJson { message_json, .. } => {
+                ExtensionCdpCompletionOutcome::ChromeJson(message_json)
             }
             ExtensionCdpInbound::LocalRejected { id, code, message } => {
                 ExtensionCdpCompletionOutcome::LocalRejected { id, code, message }
@@ -9759,6 +9978,144 @@ mod tests {
             inventory_barrier(&provider, &mut server).await;
             assert!(provider.pending_operations().await.unwrap().is_empty());
             provider.close().await;
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordered_raw_metadata_reply_crosses_the_existing_ipc_and_exact_context() {
+        let (provider, mut server) = fixture();
+        let claim = attach_fixture(&provider, &mut server, 170, "raw-metadata-claim").await;
+        let connection = open_fixture(&provider, &mut server, claim, 170).await;
+        let original = ExtensionWireContext::new("raw-owner", "raw-turn").unwrap();
+        let call = {
+            let context = original.clone();
+            tokio::spawn(async move {
+                connection
+                    .call_metadata_observation_with_extension_context(
+                        &context,
+                        None,
+                        super::super::cdp_ws::CdpMetadataRead::DescribeNode,
+                        json!({"objectId":"element"}),
+                    )
+                    .await
+            })
+        };
+        let sent = request(&mut server).await;
+        let body = r#"{"node":{"backendNodeId":17,"attributes":["title","\ud800"]}}"#;
+        let text = format!(r#"{{"id":{},"result":{body}}}"#, sent["message"]["id"]);
+        ordered_message_fixture(
+            &mut server,
+            170,
+            "raw-metadata-claim",
+            json!({"kind":"chromeJson","data":text}),
+            Some(&original),
+        )
+        .await;
+        assert_eq!(bounded(call).await.unwrap().unwrap(), body);
+        assert!(provider.pending_operations().await.unwrap().is_empty());
+        provider.close().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_actual_reply_after_required_close_retains_original_context_and_sticky_unknown() {
+        let (provider, mut server) = fixture();
+        let claim = attach_fixture(&provider, &mut server, 171, "raw-retired-claim").await;
+        let connection = open_fixture(&provider, &mut server, claim, 171).await;
+        let original = ExtensionWireContext::new("raw-owner", "old-raw-turn").unwrap();
+        let call = {
+            let context = original.clone();
+            tokio::spawn(async move {
+                connection
+                    .call_with_extension_context(
+                        &context,
+                        None,
+                        "DOM.describeNode",
+                        json!({"objectId":"original-element"}),
+                    )
+                    .await
+            })
+        };
+        let sent = request(&mut server).await;
+        call.abort();
+        let _ = call.await;
+        assert_eq!(request(&mut server).await["kind"], "closeCdp");
+        let _new_view = provider
+            .with_wire_context(ExtensionWireContext::new("raw-owner", "new-raw-turn").unwrap());
+        let text = format!(
+            r#"{{"id":{},"result":{{"node":{{"backendNodeId":17,"attributes":["title","\ud800"]}}}}}}"#,
+            sent["message"]["id"]
+        );
+        ordered_message_fixture(
+            &mut server,
+            171,
+            "raw-retired-claim",
+            json!({"kind":"chromeJson","data":text}),
+            Some(&original),
+        )
+        .await;
+        let ready = bounded(async {
+            loop {
+                let ready = provider.pending_completions().await.unwrap();
+                if ready.iter().any(|entry| {
+                    matches!(
+                        &entry.operation,
+                        ExtensionOperation::OrphanCdpCompletion { .. }
+                    )
+                }) {
+                    break ready;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let orphan = ready
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.operation,
+                    ExtensionOperation::OrphanCdpCompletion { .. }
+                )
+            })
+            .unwrap();
+        assert_eq!(orphan.wire_context, Some(original));
+        assert!(
+            matches!(&orphan.operation, ExtensionOperation::OrphanCdpCompletion { event:ExtensionCdpCompletionOutcome::ChromeJson(actual), .. } if actual == &text)
+        );
+        assert_eq!(ready.iter().filter(|entry| matches!(&entry.operation, ExtensionOperation::EffectsCleanup { effect,cleanup_confirmed:false,.. } if effect == "extension_cdp_effect")).count(), 1, "actual raw result does not clear original Unknown cleanup debt");
+        provider.close().await;
+    }
+}
+
+#[cfg(test)]
+mod metadata_string_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_legacy_titles_and_explicit_json_text_have_one_lossless_authority() {
+        let legacy: ExtensionTabInfo =
+            serde_json::from_value(json!({"id":17,"title":"\"quoted\"","groupTitle":" group "}))
+                .unwrap();
+        assert_eq!(legacy.title.unwrap().json(), r#""\"quoted\"""#);
+        assert_eq!(legacy.group_title.unwrap().json(), r#"" group ""#);
+        let encoded: ExtensionTabInfo = serde_json::from_value(
+            json!({"id":17,"titleJson":r#""\ud800""#,"groupTitleJson":r#""\udc00""#}),
+        )
+        .unwrap();
+        assert_eq!(encoded.title.as_ref().unwrap().json(), r#""\ud800""#);
+        assert_eq!(encoded.group_title.as_ref().unwrap().json(), r#""\udc00""#);
+        let wire = serde_json::to_value(encoded).unwrap();
+        assert_eq!(wire["titleJson"], r#""\ud800""#);
+        assert!(wire.get("title").is_none());
+        for conflicting in [
+            json!({"id":17,"title":"old","titleJson":"\"new\""}),
+            json!({"id":17,"title":null,"titleJson":"\"new\""}),
+            json!({"id":17,"groupTitle":"old","groupTitleJson":null}),
+        ] {
+            let error = serde_json::from_value::<ExtensionTabInfo>(conflicting).unwrap_err();
+            assert!(
+                error.to_string().contains("both scalar and JSON-text"),
+                "{error}"
+            );
         }
     }
 }

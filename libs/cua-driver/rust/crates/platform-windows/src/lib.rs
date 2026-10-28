@@ -27,6 +27,8 @@ use cua_driver_core::tool::ToolRegistry;
 pub mod audio;
 pub mod diagnostics;
 pub mod health_report;
+#[cfg(any(target_os = "windows", test))]
+pub mod interruption;
 pub mod overlay;
 pub mod pip;
 pub mod recording_hooks;

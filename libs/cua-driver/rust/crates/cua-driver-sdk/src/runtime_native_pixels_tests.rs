@@ -257,7 +257,7 @@ async fn native_frame_abi_preserves_f64_bits_and_bound_authority() {
     );
     assert_eq!(calls.lock().unwrap().len(), 4);
     drop(abi);
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -312,7 +312,7 @@ async fn ending_the_bound_session_refuses_native_frame_without_using_compatibili
     );
     assert_eq!(compatibility.get(NATIVE_WINDOW_PIXELS_ARG), None);
     assert_eq!(calls.lock().unwrap().len(), 3);
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
     assert!(sibling
         .invoke_in_frame("click", args, CoordinateFrame::NativeWindow)
         .await

@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::time::Instant;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, value::RawValue, Map, Value};
 
 /// Hard resource ceiling for this bounded extension generation's pending requests.
 const MAX_PENDING: usize = 4096;
@@ -35,6 +35,7 @@ pub(crate) enum Method {
     #[cfg(test)]
     DetachTarget,
     ExecuteCdp,
+    ExecuteTabRead,
     #[cfg(test)]
     FocusTab,
     TurnEnded,
@@ -42,8 +43,8 @@ pub(crate) enum Method {
     MarkTab,
     FinalizeTabs,
     GetCommittedTabUrl,
-    #[cfg(test)]
     NameSession,
+    GetUserHistory,
     MoveMouse,
 }
 
@@ -66,6 +67,7 @@ impl Method {
             #[cfg(test)]
             Self::DetachTarget => "detachTarget",
             Self::ExecuteCdp => "executeCdp",
+            Self::ExecuteTabRead => "executeTabRead",
             #[cfg(test)]
             Self::FocusTab => "focusTab",
             Self::TurnEnded => "turnEnded",
@@ -73,8 +75,8 @@ impl Method {
             Self::MarkTab => "markTab",
             Self::FinalizeTabs => "finalizeTabs",
             Self::GetCommittedTabUrl => "getCommittedTabUrl",
-            #[cfg(test)]
             Self::NameSession => "nameSession",
+            Self::GetUserHistory => "getUserHistory",
             Self::MoveMouse => "moveMouse",
         }
     }
@@ -100,9 +102,10 @@ impl Method {
             | Self::Detach
             | Self::TurnEnded
             | Self::FinalizeTabs
-            | Self::MoveMouse => true,
+            | Self::MoveMouse
+            | Self::NameSession => true,
             #[cfg(test)]
-            Self::AttachTarget | Self::DetachTarget | Self::MarkTab | Self::NameSession => true,
+            Self::AttachTarget | Self::DetachTarget | Self::MarkTab => true,
             _ => false,
         }
     }
@@ -112,15 +115,35 @@ impl Method {
             #[cfg(test)]
             Self::Ping => result.as_str() == Some("pong"),
             Self::GetInfo | Self::CreateTab | Self::ClaimUserTab => result.is_object(),
-            Self::GetUserTabs | Self::GetTabs => result.is_array(),
+            Self::GetUserTabs | Self::GetTabs | Self::GetUserHistory => result.is_array(),
             // The authorized host always injects session_id. The original
             // no-session focusTab branch returning undefined is not this contract.
             #[cfg(test)]
             Self::FocusTab => result.is_boolean(),
             Self::GetCommittedTabUrl => result.is_string(),
             // CDP method results remain opaque to this correlation layer.
-            Self::ExecuteCdp => true,
+            Self::ExecuteCdp | Self::ExecuteTabRead => true,
             _ => result.is_null(),
+        }
+    }
+
+    fn accepts_result_json(self, json: &str) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Ping => {
+                serde_json::from_str::<Value>(json)
+                    .ok()
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    == Some("pong")
+            }
+            Self::GetInfo | Self::CreateTab | Self::ClaimUserTab => json.starts_with('{'),
+            Self::GetUserTabs | Self::GetTabs | Self::GetUserHistory => json.starts_with('['),
+            #[cfg(test)]
+            Self::FocusTab => matches!(json, "true" | "false"),
+            Self::GetCommittedTabUrl => json.starts_with('"'),
+            Self::ExecuteCdp | Self::ExecuteTabRead => true,
+            _ => json == "null",
         }
     }
 }
@@ -169,6 +192,8 @@ pub(crate) enum VoidAck {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Reply {
     Value(Value),
+    /// Original result JSON retained before any Unicode-scalar Value decoding.
+    JsonText(String),
     Void(VoidAck),
 }
 
@@ -268,8 +293,17 @@ pub(crate) enum RpcEvent {
     Reply(Completion),
     Send(Value),
     Notification(Notification),
-    IgnoredReply { id: Value },
-    ProtocolViolation { message: String },
+    JsonNotification {
+        sequence: u64,
+        method: String,
+        params_json: Option<String>,
+    },
+    IgnoredReply {
+        id: Value,
+    },
+    ProtocolViolation {
+        message: String,
+    },
 }
 
 /// Rejects a new local operation before any extension write can be attempted.
@@ -405,12 +439,97 @@ impl RpcCodec {
         Ok(Outbound { id, message })
     }
 
+    fn pending_sequence(&self, id: &RequestId) -> Option<u64> {
+        let sequence = id
+            .as_str()
+            .strip_prefix(self.prefix.as_str())?
+            .parse()
+            .ok()?;
+        self.pending
+            .get(&sequence)
+            .filter(|pending| pending.id == *id)
+            .map(|_| sequence)
+    }
+
+    pub(crate) fn pending_method(&self, id: &RequestId) -> Option<Method> {
+        self.pending_sequence(id)
+            .and_then(|sequence| self.pending.get(&sequence))
+            .map(|pending| pending.method)
+    }
+
+    /// Removes only an exact local request whose physical writer never started.
+    /// No remote completion or rollback is inferred, and its ID stays consumed.
+    pub(crate) fn discard_unwritten(&mut self, id: &RequestId) -> Option<Method> {
+        let sequence = self.pending_sequence(id)?;
+        self.pending.remove(&sequence).map(|pending| pending.method)
+    }
+
     /// Consumes one already-decoded extension JSON object after expiring deadlines first.
     ///
     /// Extension ping requests get a pong effect. Notifications preserve arrival order.
     /// Malformed matched mutation replies remain unknown and are never replayed.
     #[must_use]
     pub(crate) fn receive(&mut self, message: Value, now: Instant) -> Vec<RpcEvent> {
+        self.receive_with_result_json(message, now, None, None)
+    }
+
+    /// Preserve opaque result text until the original pending method is matched.
+    pub(crate) fn receive_json(&mut self, frame: &RawValue, now: Instant) -> Vec<RpcEvent> {
+        let mut effects: Vec<_> = self.expire(now).into_iter().map(RpcEvent::Reply).collect();
+        if self.closed {
+            return effects;
+        }
+        if !frame.get().starts_with('{') {
+            effects.extend(self.receive(Value::Null, now));
+            return effects;
+        }
+        let mut fields: BTreeMap<String, Box<RawValue>> = match serde_json::from_str(frame.get()) {
+            Ok(fields) => fields,
+            Err(error) => {
+                effects.extend(self.protocol_failure(&format!(
+                    "extension message is not a usable protocol object: {error}"
+                )));
+                return effects;
+            }
+        };
+        let result_json = fields.remove("result");
+        let params_json = fields.remove("params");
+        let mut object = Map::new();
+        for (key, raw) in fields {
+            let value = match serde_json::from_str(raw.get()) {
+                Ok(value) => value,
+                Err(error) => {
+                    effects.extend(self.protocol_failure(&format!(
+                        "extension protocol field is unavailable: {error}"
+                    )));
+                    return effects;
+                }
+            };
+            object.insert(key, value);
+        }
+        // Presence is independent of the raw token's value, including null.
+        if result_json.is_some() {
+            object.insert("result".to_owned(), Value::Null);
+        }
+        if params_json.is_some() {
+            object.insert("params".to_owned(), Value::Null);
+        }
+        effects.extend(self.receive_with_result_json(
+            Value::Object(object),
+            now,
+            result_json,
+            params_json,
+        ));
+        effects
+    }
+
+    fn receive_with_result_json(
+        &mut self,
+        message: Value,
+        now: Instant,
+        result_json: Option<Box<RawValue>>,
+        params_json: Option<Box<RawValue>>,
+    ) -> Vec<RpcEvent> {
         let mut effects: Vec<_> = self.expire(now).into_iter().map(RpcEvent::Reply).collect();
         if self.closed {
             return effects;
@@ -433,6 +552,20 @@ impl RpcCodec {
                 effects.extend(self.protocol_failure("extension request contains response fields"));
                 return effects;
             }
+            if !(method == "onCDPEvent" && !object.contains_key("id")) {
+                if let Some(raw) = params_json.as_ref() {
+                    let value = match serde_json::from_str(raw.get()) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            effects.extend(self.protocol_failure(&format!(
+                                "extension params decoding failed: {error}"
+                            )));
+                            return effects;
+                        }
+                    };
+                    object.insert("params".to_owned(), value);
+                }
+            }
             if let Some(id) = object.remove("id") {
                 if !valid_wire_id(&id) {
                     effects.extend(self.protocol_failure("extension request id is invalid"));
@@ -451,11 +584,19 @@ impl RpcCodec {
                     return effects;
                 };
                 self.notification_sequence = sequence;
-                effects.push(RpcEvent::Notification(Notification {
-                    sequence,
-                    method,
-                    params: object.remove("params"),
-                }));
+                if method == "onCDPEvent" && params_json.is_some() {
+                    effects.push(RpcEvent::JsonNotification {
+                        sequence,
+                        method,
+                        params_json: params_json.map(|raw| raw.get().to_owned()),
+                    });
+                } else {
+                    effects.push(RpcEvent::Notification(Notification {
+                        sequence,
+                        method,
+                        params: object.remove("params"),
+                    }));
+                }
             }
             return effects;
         }
@@ -491,7 +632,11 @@ impl RpcCodec {
             phase = "reply_id_matched",
             "extension RPC phase"
         );
-        effects.push(RpcEvent::Reply(complete_response(pending, object)));
+        effects.push(RpcEvent::Reply(complete_response_json(
+            pending,
+            object,
+            result_json,
+        )));
         effects
     }
 
@@ -569,6 +714,51 @@ fn valid_wire_id(id: &Value) -> bool {
     matches!(id, Value::String(_) | Value::Number(_))
 }
 
+fn complete_response_json(
+    pending: Pending,
+    mut object: Map<String, Value>,
+    result_json: Option<Box<RawValue>>,
+) -> Completion {
+    let Some(raw) = result_json else {
+        return complete_response(pending, object);
+    };
+    if object.contains_key("error") {
+        // Retain both-presence rejection, including result:null/error:null.
+        return complete_response(pending, object);
+    }
+    if !pending.method.accepts_result_json(raw.get()) {
+        return pending.failed(
+            LossCause::Protocol,
+            "extension result does not match the method's source-known top-level type".to_owned(),
+        );
+    }
+    if matches!(
+        pending.method,
+        Method::ExecuteCdp
+            | Method::GetUserTabs
+            | Method::GetTabs
+            | Method::CreateTab
+            | Method::ClaimUserTab
+    ) {
+        return Completion {
+            id: pending.id,
+            method: pending.method,
+            outcome: Ok(Reply::JsonText(raw.get().to_owned())),
+        };
+    }
+    let value = match serde_json::from_str(raw.get()) {
+        Ok(value) => value,
+        Err(error) => {
+            return pending.failed(
+                LossCause::Protocol,
+                format!("extension result decoding failed: {error}"),
+            )
+        }
+    };
+    object.insert("result".to_owned(), value);
+    complete_response(pending, object)
+}
+
 fn complete_response(pending: Pending, mut object: Map<String, Value>) -> Completion {
     let result = object.remove("result");
     let error = object.remove("error");
@@ -641,6 +831,39 @@ mod tests {
     fn codec() -> RpcCodec {
         RpcCodec::new("test-generation".to_owned(), 16)
             .expect("test generation and limit are valid")
+    }
+
+    #[test]
+    fn unwritten_discard_is_exact_and_does_not_reuse_ids_or_expire_the_other_call() {
+        let now = Instant::now();
+        let mut rpc = codec();
+        let first = rpc
+            .begin(Method::GetTabs, json!({}), now + Duration::from_secs(1))
+            .unwrap();
+        let sibling = rpc
+            .begin(
+                Method::GetUserTabs,
+                json!({}),
+                now + Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(rpc.discard_unwritten(&first.id), Some(Method::GetTabs));
+        assert_eq!(rpc.discard_unwritten(&first.id), None);
+        assert_eq!(rpc.pending_method(&sibling.id), Some(Method::GetUserTabs));
+        assert!(rpc.expire(now + Duration::from_secs(2)).is_empty());
+        let replacement = rpc
+            .begin(Method::GetTabs, json!({}), now + Duration::from_secs(10))
+            .unwrap();
+        assert_ne!(first.id, replacement.id);
+        assert_eq!(rpc.pending_len(), 2);
+        assert!(matches!(
+            &rpc.receive(
+                json!({"jsonrpc":"2.0","id":first.id.as_str(),"result":[]}),
+                now
+            )[..],
+            [RpcEvent::IgnoredReply { .. }]
+        ));
+        assert_eq!(rpc.pending_len(), 2);
     }
 
     fn one_reply(events: Vec<RpcEvent>) -> Completion {
@@ -1068,6 +1291,135 @@ mod tests {
             codec.pending_len(),
             0,
             "protocol closure retires all pending calls"
+        );
+    }
+    #[test]
+    fn raw_results_match_the_original_pending_method_and_preserve_lone_surrogates() {
+        let now = Instant::now();
+        let mut rpc = codec();
+        let first = rpc
+            .begin(Method::GetTabs, json!({}), now + Duration::from_secs(1))
+            .unwrap();
+        let second = rpc
+            .begin(Method::ExecuteCdp, json!({}), now + Duration::from_secs(1))
+            .unwrap();
+        let text = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":[{{"id":17,"title":"\ud800"}}]}}"#,
+            serde_json::to_string(first.id.as_str()).unwrap()
+        );
+        let raw: &RawValue = serde_json::from_str(&text).unwrap();
+        let completion = one_reply(rpc.receive_json(raw, now));
+        assert_eq!(completion.id, first.id);
+        assert_eq!(completion.method, Method::GetTabs);
+        assert!(
+            matches!(completion.outcome, Ok(Reply::JsonText(ref body)) if body == r#"[{"id":17,"title":"\ud800"}]"#)
+        );
+        assert_eq!(rpc.pending_len(), 1);
+        let stale = rpc.receive_json(raw, now);
+        assert!(matches!(stale.as_slice(), [RpcEvent::IgnoredReply { .. }]));
+        let remaining = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{{"node":{{"backendNodeId":17,"attributes":["title","\udc00"]}}}}}}"#,
+            serde_json::to_string(second.id.as_str()).unwrap()
+        );
+        let completion =
+            one_reply(rpc.receive_json(serde_json::from_str(&remaining).unwrap(), now));
+        assert_eq!(completion.id, second.id);
+        assert!(matches!(completion.outcome, Ok(Reply::JsonText(_))));
+        assert_eq!(rpc.pending_len(), 0);
+    }
+
+    #[test]
+    fn raw_outer_map_keeps_null_presence_extra_fields_and_last_wins() {
+        let now = Instant::now();
+        for (suffix, expected) in [
+            ("", Some(VoidAck::IdOnly)),
+            (r#", "result":null"#, Some(VoidAck::ExplicitNull)),
+            (r#", "result":null,"error":null"#, None),
+            (r#", "error":null"#, None),
+            (r#", "unused":0"#, None),
+            (r#", "method":null"#, None),
+        ] {
+            let mut rpc = codec();
+            let request = rpc
+                .begin(Method::NameSession, json!({}), now + Duration::from_secs(1))
+                .unwrap();
+            let text = format!(
+                r#"{{"jsonrpc":"2.0","id":{}{suffix}}}"#,
+                serde_json::to_string(request.id.as_str()).unwrap()
+            );
+            let rows = rpc.receive_json(serde_json::from_str(&text).unwrap(), now);
+            let completion = rows
+                .into_iter()
+                .find_map(|row| match row {
+                    RpcEvent::Reply(completion) => Some(completion),
+                    _ => None,
+                })
+                .unwrap();
+            match expected {
+                Some(expected) => {
+                    assert_eq!(completion.outcome, Ok(Reply::Void(expected)), "{suffix}")
+                }
+                None => assert!(completion.outcome.is_err(), "{suffix}"),
+            }
+        }
+        let mut rpc = codec();
+        let request = rpc
+            .begin(Method::NameSession, json!({}), now + Duration::from_secs(1))
+            .unwrap();
+        let text = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":false,"result":null}}"#,
+            serde_json::to_string(request.id.as_str()).unwrap()
+        );
+        assert_eq!(
+            one_reply(rpc.receive_json(serde_json::from_str(&text).unwrap(), now)).outcome,
+            Ok(Reply::Void(VoidAck::ExplicitNull))
+        );
+    }
+
+    #[test]
+    fn raw_notifications_keep_the_same_sequence_and_unexpanded_cdp_params() {
+        let now = Instant::now();
+        let mut rpc = codec();
+        let raw: &RawValue = serde_json::from_str(r#"{"jsonrpc":"2.0","method":"onCDPEvent","params":{"method":"Target.attachedToTarget","params":{"targetInfo":{"title":"\ud800"}}}}"#).unwrap();
+        assert!(
+            matches!(rpc.receive_json(raw, now).as_slice(), [RpcEvent::JsonNotification { sequence:1, method, params_json:Some(text) }] if method == "onCDPEvent" && text.contains(r#"\ud800"#))
+        );
+        assert!(matches!(
+            rpc.receive_json(raw, now).as_slice(),
+            [RpcEvent::JsonNotification { sequence: 2, .. }]
+        ));
+    }
+    #[test]
+    fn raw_json_parser_keeps_surrogates_without_accepting_malformed_escapes() {
+        for text in [
+            r#""\ud800""#,
+            r#""\udc00""#,
+            r#"{"value":"\ud800","\udc00":null}"#,
+        ] {
+            assert!(serde_json::from_str::<Value>(text).is_err(), "{text}");
+            let raw: Box<RawValue> = serde_json::from_str(text).unwrap();
+            assert_eq!(raw.get(), text);
+            assert!(serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok());
+            let encoded = serde_json::to_string(&raw.get()).unwrap();
+            assert_eq!(serde_json::from_str::<String>(&encoded).unwrap(), text);
+        }
+        for text in [r#""\ud800\!""#, r#""\ud800\u""#] {
+            assert!(
+                serde_json::from_str::<Box<RawValue>>(text).is_err(),
+                "{text}"
+            );
+            assert!(
+                serde_json::from_str::<serde::de::IgnoredAny>(text).is_err(),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<String>(r#""\ud83d\ude00""#).unwrap(),
+            "😀"
+        );
+        assert_eq!(
+            serde_json::from_str::<String>(r#""\\ud800""#).unwrap(),
+            r#"\ud800"#
         );
     }
 }

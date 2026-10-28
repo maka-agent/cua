@@ -120,6 +120,14 @@ where
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum ControlRequest {
+    ReadUserTab {
+        id: u64,
+        #[serde(rename = "tabId")]
+        tab_id: u64,
+        #[serde(rename = "expectedUrl")]
+        expected_url: String,
+        read: super::user_tab_context::BrowserUserTabRead,
+    },
     Inventory {
         id: u64,
         #[serde(
@@ -268,6 +276,14 @@ pub(crate) enum ControlRequest {
         id: u64,
         keep: Option<Vec<ExtensionKeepTab>>,
     },
+    UserHistory {
+        id: u64,
+        options: Value,
+    },
+    NameSession {
+        id: u64,
+        name: String,
+    },
     SetSessionHeaders {
         id: u64,
         headers: Vec<ScopedHeader>,
@@ -344,7 +360,8 @@ impl ControlRequest {
     }
     fn id(&self) -> u64 {
         match self {
-            Self::Inventory { id, .. }
+            Self::ReadUserTab { id, .. }
+            | Self::Inventory { id, .. }
             | Self::Resolve { id, .. }
             | Self::Attach { id, .. }
             | Self::Detach { id, .. }
@@ -367,6 +384,7 @@ impl ControlRequest {
             | Self::EnsureCreatedTabGroup { id, .. }
             | Self::UpdateCreatedTabGroup { id, .. }
             | Self::ReleaseCreatedTabGroup { id, .. } => *id,
+            Self::UserHistory { id, .. } | Self::NameSession { id, .. } => *id,
             Self::FinishTurn { id, .. }
             | Self::SetSessionHeaders { id, .. }
             | Self::ClearSessionHeaders { id }
@@ -579,6 +597,8 @@ impl<'de> Deserialize<'de> for SharedDownload {
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub(crate) enum BrokerCdpEvent {
     ChromeMessage(Value),
+    /// Full Chrome frame JSON text; serialized as an ordinary String through IPC.
+    ChromeJson(String),
     LocalRejected {
         id: u64,
         code: String,
@@ -921,7 +941,7 @@ struct ClientState {
 }
 #[derive(Default)]
 struct BufferedEvents {
-    events: VecDeque<Value>,
+    events: VecDeque<BrokerCdpEvent>,
     charges: VecDeque<Option<Arc<ByteCharge>>>,
     bytes: usize,
     revoked: Option<String>,
@@ -1348,7 +1368,7 @@ impl ExtensionHostBroker {
         while let Some(event) = early.events.pop_front() {
             let prior_charge = self.current_charge.take();
             self.current_charge = early.charges.pop_front().unwrap_or(None);
-            self.emit_cdp_with_context(id, BrokerCdpEvent::ChromeMessage(event), None);
+            self.emit_cdp_with_context(id, event, None);
             self.current_charge = prior_charge;
         }
         let lease = Arc::new(RouteLease {
@@ -1574,6 +1594,50 @@ impl ExtensionHostBroker {
             );
             return;
         }
+        if let ControlRequest::ReadUserTab {
+            tab_id,
+            expected_url,
+            ..
+        } = &request
+        {
+            let valid = *tab_id > 0
+                && *tab_id <= 9_007_199_254_740_991
+                && url::Url::parse(expected_url)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+            if !valid {
+                self.reject_control(
+                    client,
+                    id,
+                    "invalid_request",
+                    "Tab reads require a positive safe tab ID and HTTP or HTTPS URL",
+                    output,
+                );
+                return;
+            }
+            if self.input_context.is_none() {
+                self.reject_control(
+                    client,
+                    id,
+                    "context_required",
+                    "user-tab reads require captured trusted wire context",
+                    output,
+                );
+                return;
+            }
+            if !self.identity.as_ref().is_some_and(|identity| {
+                identity.capabilities["userTabContextRead"].as_bool() == Some(true)
+            }) {
+                self.reject_control(
+                    client,
+                    id,
+                    "unsupported",
+                    "selected provider does not support fixed user-tab context reads",
+                    output,
+                );
+                return;
+            }
+        }
+
         let session_inventory = matches!(
             &request,
             ControlRequest::Inventory {
@@ -1745,6 +1809,16 @@ impl ExtensionHostBroker {
                 }
                 ("createPopupTab", json!({"claim":claim}), ControlKind::Other)
             }
+            ControlRequest::ReadUserTab {
+                tab_id,
+                expected_url,
+                read,
+                ..
+            } => (
+                "readUserTab",
+                json!({"tabId":tab_id,"expectedUrl":expected_url,"read":read}),
+                ControlKind::Other,
+            ),
             ControlRequest::Inventory { known_tab_ids, .. } => {
                 let params = if session_inventory {
                     json!({"sessionOnly":true,"knownTabIds":known_tab_ids.expect("validated session inventory candidates")})
@@ -1837,6 +1911,12 @@ impl ExtensionHostBroker {
                     self.fence_existing_scope(client, context);
                 }
                 ("finishTurn", json!({"keep":keep}), ControlKind::Other)
+            }
+            ControlRequest::UserHistory { options, .. } if options.is_object() => {
+                ("userHistory", options, ControlKind::Other)
+            }
+            ControlRequest::NameSession { name, .. } if !name.is_empty() => {
+                ("nameSession", json!({"name":name}), ControlKind::Other)
             }
             ControlRequest::SetSessionHeaders { headers, .. } => (
                 "setSessionHeaders",
@@ -2803,6 +2883,9 @@ impl ExtensionHostBroker {
                             let (event, charge) = event.into_parts();
                             let id = match &event {
                                 BrokerCdpEvent::ChromeMessage(value) => value["id"].as_u64(),
+                                BrokerCdpEvent::ChromeJson(text) => {
+                                    super::cdp_ws::chrome_json_reply_id(text)
+                                }
                                 BrokerCdpEvent::LocalRejected { id, .. } => Some(*id),
                                 BrokerCdpEvent::TransportFailure(_) => None,
                             };
@@ -3049,12 +3132,23 @@ impl ExtensionHostBroker {
                         ))
                     }
                 } else {
-                    let result = value["result"].get("result").ok_or_else(|| {
-                        BrokerError::Protocol(
-                            "CDP success lacks its exact Chrome result".to_owned(),
-                        )
-                    })?;
-                    BrokerCdpEvent::ChromeMessage(json!({"id":inner_id,"result":result}))
+                    match (
+                        value["result"].get("result"),
+                        value["result"].get("resultJson"),
+                    ) {
+                        (Some(result), None) => {
+                            BrokerCdpEvent::ChromeMessage(json!({"id":inner_id,"result":result}))
+                        }
+                        (None, Some(Value::String(text))) => {
+                            BrokerCdpEvent::ChromeJson(chrome_result_json(inner_id, text)?)
+                        }
+                        _ => {
+                            return Err(BrokerError::Protocol(
+                                "CDP success lacks one exact Chrome result representation"
+                                    .to_owned(),
+                            ))
+                        }
+                    }
                 };
                 // A response parsed from the selected Maka extension port proves
                 // its exact issued frame reached that peer, even if the serial
@@ -3672,6 +3766,11 @@ impl ExtensionHostBroker {
                 .as_str()
                 .filter(|method| !method.is_empty())
                 .ok_or_else(|| BrokerError::Protocol("event lacks CDP method".to_owned()))?;
+            if value.get("params").is_some() && value.get("paramsJson").is_some() {
+                return Err(BrokerError::Protocol(
+                    "CDP event contains two params representations".to_owned(),
+                ));
+            }
             let mut event = json!({"method":method,"params":value.get("params").cloned().unwrap_or_else(||json!({}))});
             if let Some(session) = value.get("sessionId") {
                 if !session.is_string() {
@@ -3689,7 +3788,24 @@ impl ExtensionHostBroker {
                 }
                 event["sourceTargetId"] = target.clone();
             }
-            Some(event)
+            Some(if let Some(text) = value.get("paramsJson") {
+                let text = text.as_str().ok_or_else(|| {
+                    BrokerError::Protocol("raw CDP event params are not JSON text".to_owned())
+                })?;
+                if method != "Target.attachedToTarget" {
+                    return Err(BrokerError::Protocol(
+                        "event has no closed JSON-text params grammar".to_owned(),
+                    ));
+                }
+                BrokerCdpEvent::ChromeJson(chrome_event_json(
+                    method,
+                    text,
+                    event.get("sessionId").and_then(Value::as_str),
+                    event.get("sourceTargetId").and_then(Value::as_str),
+                )?)
+            } else {
+                BrokerCdpEvent::ChromeMessage(event)
+            })
         };
         if let Some(record) = self.claims.get(&token) {
             if record.client != client {
@@ -3726,11 +3842,7 @@ impl ExtensionHostBroker {
                     output,
                 );
             } else if let Some(route) = record.route {
-                self.emit_cdp(
-                    route,
-                    BrokerCdpEvent::ChromeMessage(event.expect("non-revoked event was built")),
-                    output,
-                );
+                self.emit_cdp(route, event.expect("non-revoked event was built"), output);
             } else if let Some(record) = self.claims.get_mut(&token) {
                 if !buffer_event(
                     &mut record.early,
@@ -4008,9 +4120,50 @@ fn error_fields(value: &Value) -> Result<(&str, &str), BrokerError> {
     }
 }
 
+fn chrome_result_json(id: u64, text: &str) -> Result<String, BrokerError> {
+    #[derive(Serialize)]
+    struct Reply<'a> {
+        id: u64,
+        result: &'a serde_json::value::RawValue,
+    }
+    let raw = serde_json::from_str(text).map_err(|error| {
+        BrokerError::Protocol(format!("raw CDP result is invalid JSON: {error}"))
+    })?;
+    serde_json::to_string(&Reply { id, result: raw })
+        .map_err(|error| BrokerError::Protocol(error.to_string()))
+}
+
+fn chrome_event_json(
+    method: &str,
+    text: &str,
+    session_id: Option<&str>,
+    source_target_id: Option<&str>,
+) -> Result<String, BrokerError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Event<'a> {
+        method: &'a str,
+        params: &'a serde_json::value::RawValue,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_target_id: Option<&'a str>,
+    }
+    let params = serde_json::from_str(text).map_err(|error| {
+        BrokerError::Protocol(format!("raw CDP event params are invalid JSON: {error}"))
+    })?;
+    serde_json::to_string(&Event {
+        method,
+        params,
+        session_id,
+        source_target_id,
+    })
+    .map_err(|error| BrokerError::Protocol(error.to_string()))
+}
+
 fn buffer_event(
     buffer: &mut BufferedEvents,
-    value: Value,
+    value: BrokerCdpEvent,
     charge: Option<Arc<ByteCharge>>,
 ) -> bool {
     let Ok(bytes) = extension_framing::encode_json(&value, Direction::HostToChrome) else {

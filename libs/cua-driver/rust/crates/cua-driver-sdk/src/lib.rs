@@ -173,6 +173,17 @@ impl std::fmt::Debug for AudioCompletion {
 }
 
 impl AudioCompletion {
+    /// Return actual output metadata from the manager's bound snapshot.
+    /// The caller cannot use it to select or authorize another session.
+    pub fn output_path(&self) -> Result<std::path::PathBuf, DriverError> {
+        self.native
+            .output_path()
+            .map(std::path::Path::to_owned)
+            .ok_or_else(|| DriverError::Protocol {
+                reason: "native audio observation has no owned output metadata".into(),
+            })
+    }
+
     /// Wait for the bound capture and its output writes to settle.
     ///
     /// Native cleanup/join and WAV retrieval remain separate operations.
@@ -1714,6 +1725,129 @@ fn native_move_arguments(
     }))
 }
 
+#[cfg(target_os = "windows")]
+pub use cua_driver_core::windows_interruption::{
+    InterruptionSink as WindowsInterruptionSink, PhysicalInput as WindowsPhysicalInput,
+};
+
+/// Host-only Windows input producer, bound to one actual embedded session.
+/// Neither generated bindings nor model JSON can construct or substitute it.
+#[cfg(target_os = "windows")]
+pub struct WindowsInterruptionBinding {
+    owner: std::sync::Weak<NativeAbiSession>,
+    binding: Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+}
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for WindowsInterruptionBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WindowsInterruptionBinding")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsInterruptionBinding {
+    /// Settle only native-owned foreign guards and injected DOWN/UP state.
+    /// A native-only process owner may then exit and join that exact helper;
+    /// this result alone never acknowledges thread/process or action completion.
+    pub async fn release_native_inputs(&self) -> Result<(), DriverError> {
+        let owner = self.owner.upgrade().ok_or(DriverError::Shutdown)?;
+        owner.release_windows_inputs(self.binding.clone()).await
+    }
+    /// Join only this exact native monitor while input may still be blocked.
+    /// The native-only process owner must separately settle/exit its workers;
+    /// this is not a whole-session or input-release acknowledgement.
+    pub async fn close_monitor(&self) -> Result<(), DriverError> {
+        let owner = self.owner.upgrade().ok_or(DriverError::Shutdown)?;
+        owner.close_windows_monitor(self.binding.clone()).await
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl CuaDriverSession {
+    pub fn create_windows_interruption(
+        &self,
+        turn: String,
+        sink: Arc<dyn WindowsInterruptionSink>,
+    ) -> Result<Arc<WindowsInterruptionBinding>, DriverError> {
+        let SessionBackend::Embedded(owner) = &self.backend else {
+            return Err(DriverError::Protocol {
+                reason: "Windows native interruption requires an embedded trusted session".into(),
+            });
+        };
+        Ok(Arc::new(WindowsInterruptionBinding {
+            owner: Arc::downgrade(owner),
+            binding: owner.create_windows_interruption(turn, sink)?,
+        }))
+    }
+    pub async fn finish_windows_interruption(&self, turn: String) -> Result<(), DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(owner) => owner.finish_windows_interruption(turn).await,
+            _ => Err(DriverError::Protocol {
+                reason: "Windows native interruption cleanup requires an embedded trusted session"
+                    .into(),
+            }),
+        }
+    }
+    pub async fn call_tool_with_windows_interruption(
+        &self,
+        name: String,
+        arguments_json: String,
+        binding: Arc<WindowsInterruptionBinding>,
+    ) -> Result<ToolResult, DriverError> {
+        self.invoke_windows_interruption(
+            &name,
+            parse_arguments(&name, &arguments_json)?,
+            binding,
+            runtime::CoordinateFrame::Screenshot,
+        )
+        .await
+    }
+    pub async fn call_tool_with_native_window_pixels_and_windows_interruption(
+        &self,
+        name: String,
+        arguments_json: String,
+        binding: Arc<WindowsInterruptionBinding>,
+    ) -> Result<ToolResult, DriverError> {
+        self.invoke_windows_interruption(
+            &name,
+            parse_arguments(&name, &arguments_json)?,
+            binding,
+            runtime::CoordinateFrame::NativeWindow,
+        )
+        .await
+    }
+    async fn invoke_windows_interruption(
+        &self,
+        name: &str,
+        arguments: Value,
+        binding: Arc<WindowsInterruptionBinding>,
+        frame: runtime::CoordinateFrame,
+    ) -> Result<ToolResult, DriverError> {
+        let SessionBackend::Embedded(owner) = &self.backend else {
+            return Err(DriverError::Protocol {
+                reason: "Windows native interruption requires an embedded trusted session".into(),
+            });
+        };
+        if !binding
+            .owner
+            .upgrade()
+            .is_some_and(|expected| Arc::ptr_eq(owner, &expected))
+        {
+            return Err(DriverError::Protocol {
+                reason: "native interruption producer belongs to another SDK binding".into(),
+            });
+        }
+        normalize_result(
+            name,
+            owner
+                .invoke_with_windows_interruption(name, arguments, frame, binding.binding.clone())
+                .await?,
+        )
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl CuaDriverSession {
     pub async fn call_tool(
@@ -2059,6 +2193,50 @@ impl CuaDriverSession {
             | SessionBackend::Service { .. }
             | SessionBackend::Remote(_) => Err(DriverError::Protocol {
                 reason: "trusted audio discard is unavailable for this session backend".into(),
+            }),
+        }
+    }
+
+    /// Discard only this binding's still-current observed capture.
+    ///
+    /// A stale observation cannot touch a replacement capture or its files.
+    /// Matching completed artifacts are also cleaned; false means no matching
+    /// active capture required native stop. Authority comes from this actual immutable session, never the
+    /// observation or caller-selected identity. This trusted Rust-only method
+    /// does not appear in UniFFI, C ABI or agent schemas.
+    pub async fn discard_audio_completion(
+        &self,
+        completion: AudioCompletion,
+    ) -> Result<bool, DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(session) => {
+                session.discard_audio_completion(completion.native).await
+            }
+            SessionBackend::PrivateWorker { .. }
+            | SessionBackend::Service { .. }
+            | SessionBackend::Remote(_) => Err(DriverError::Protocol {
+                reason: "trusted audio capture discard is unavailable for this session backend"
+                    .into(),
+            }),
+        }
+    }
+
+    /// Trusted adapter cleanup of this session's existing owned audio output.
+    ///
+    /// This resolves only actual capture/retained ownership in this binding,
+    /// then verifies its original completion observation before cleanup. It
+    /// never opens or deletes an arbitrary caller path. No model/C ABI surface.
+    pub async fn discard_audio_output(
+        &self,
+        output: std::path::PathBuf,
+    ) -> Result<bool, DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(session) => session.discard_audio_output(output).await,
+            SessionBackend::PrivateWorker { .. }
+            | SessionBackend::Service { .. }
+            | SessionBackend::Remote(_) => Err(DriverError::Protocol {
+                reason: "trusted audio output discard is unavailable for this session backend"
+                    .into(),
             }),
         }
     }

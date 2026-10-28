@@ -1262,6 +1262,7 @@ pub struct ToolRegistry {
     _recording_state_readers: Vec<crate::session::RecordingStateReaderRegistration>,
     runtime_cleanups: Vec<RuntimeCleanup>,
     capture_service: Arc<crate::capture_runtime::CaptureService>,
+    windows_interruption: Option<Arc<dyn crate::windows_interruption::WindowsInterruptionBackend>>,
     /// Runtime-owned protected-consent broker shared by every resource
     /// adapter. Keeping it at the canonical dispatch boundary prevents
     /// browser, desktop, and file adapters from growing independent provider
@@ -1336,6 +1337,7 @@ impl ToolRegistry {
             _recording_state_readers: vec![recording_state_reader],
             runtime_cleanups: Vec::new(),
             capture_service,
+            windows_interruption: None,
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
@@ -1459,6 +1461,23 @@ impl ToolRegistry {
     pub fn retain_runtime_cleanup(&mut self, cleanup: impl FnOnce() + Send + Sync + 'static) {
         self.runtime_cleanups
             .push(RuntimeCleanup(Some(Box::new(cleanup))));
+    }
+
+    /// Register one actual Windows monitor resource during trusted assembly.
+    pub fn retain_windows_interruption_backend(
+        &mut self,
+        backend: Arc<dyn crate::windows_interruption::WindowsInterruptionBackend>,
+    ) -> Result<(), String> {
+        if self.windows_interruption.is_some() {
+            return Err("Windows interruption backend already installed".into());
+        }
+        self.windows_interruption = Some(backend);
+        Ok(())
+    }
+    pub fn windows_interruption_backend(
+        &self,
+    ) -> Option<Arc<dyn crate::windows_interruption::WindowsInterruptionBackend>> {
+        self.windows_interruption.clone()
     }
 
     /// Register the four platform-independent recording/replay tools.
@@ -2507,10 +2526,16 @@ impl ToolRegistry {
                     _cursor_action: _cursor_action.clone(),
                     _lifecycle_dispatch: lifecycle_dispatch.clone(),
                 },
-                crate::recording::scope_dispatch_click_capture(
-                    pending_turn.as_ref(),
-                    tool.invoke(args.clone()),
-                ),
+                crate::recording::scope_dispatch_click_capture(pending_turn.as_ref(), async {
+                    match &self.windows_interruption {
+                        Some(backend) => {
+                            backend
+                                .invoke(tool.as_ref(), resolved_name, args.clone())
+                                .await
+                        }
+                        None => tool.invoke(args.clone()).await,
+                    }
+                }),
             )
             .await;
         match resolved_name {

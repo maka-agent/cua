@@ -128,3 +128,6 @@ pub mod window_target;
 
 pub use cua_driver_contract::{CaptureScope, EscalationReason, TOOL_INVOCATION_FAILED_CODE};
 pub use recording::RecordingSession;
+
+/// Windows-only physical user interruption resource, never a model authority.
+pub mod windows_interruption;

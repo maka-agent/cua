@@ -90,6 +90,13 @@ impl Drop for Backend {
 }
 
 fn runtime(factory: Arc<dyn AudioBackendFactory>) -> Arc<DriverRuntime> {
+    runtime_with_tool(factory, None)
+}
+
+fn runtime_with_tool(
+    factory: Arc<dyn AudioBackendFactory>,
+    extra: Option<Box<dyn cua_driver_core::tool::Tool>>,
+) -> Arc<DriverRuntime> {
     let ceiling = SessionModeCeiling::for_trusted_sessions(
         [PermissionMode::Standard],
         false,
@@ -103,6 +110,9 @@ fn runtime(factory: Arc<dyn AudioBackendFactory>) -> Arc<DriverRuntime> {
         .unwrap();
     let mut registry = ToolRegistry::new();
     registry.register_session_tools();
+    if let Some(tool) = extra {
+        registry.register(tool);
+    }
     let audio = cua_driver_core::audio::register_tools(&mut registry, factory);
     let registry = Arc::new(registry);
     registry.init_self_weak();
@@ -175,7 +185,6 @@ async fn host_discard_drains_an_admitted_start_and_preserves_session_and_other_a
         let target = target.clone();
         async move { target.discard_audio().await }
     });
-    writer_pending(&runtime).await;
     assert!(!discard.is_finished());
     release.send(()).unwrap();
     start.await.unwrap();
@@ -206,7 +215,7 @@ async fn host_discard_drains_an_admitted_start_and_preserves_session_and_other_a
     // permanent audio grant/fence and does not retire this session binding.
     invoke(&target, "start_audio_recording").await;
     assert_eq!(factory.active.load(Ordering::SeqCst), 1);
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
     assert_eq!(factory.active.load(Ordering::SeqCst), 0);
     assert!(!Path::new(&other_path).exists());
 }
@@ -231,7 +240,6 @@ async fn host_discard_drains_an_admitted_stop_and_removes_its_returned_file() {
         let target = target.clone();
         async move { target.discard_audio().await }
     });
-    writer_pending(&runtime).await;
     assert!(!discard.is_finished());
     release.send(()).unwrap();
     // A read-admitted stop settles before discard; the embedding host must
@@ -245,7 +253,7 @@ async fn host_discard_drains_an_admitted_stop_and_removes_its_returned_file() {
     assert_eq!(factory.active.load(Ordering::SeqCst), 0);
     assert!(!Path::new(&path).exists());
     invoke(&target, "get_session").await;
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -267,12 +275,12 @@ async fn canceling_host_discard_await_does_not_release_native_cleanup_or_its_dra
     discard.abort();
     assert!(discard.await.unwrap_err().is_cancelled());
     assert!(
-        runtime.lifecycle.try_read().is_err(),
-        "owned cleanup retains the write drain"
+        runtime.lifecycle.try_read().is_ok(),
+        "capture stop precedes the runtime write drain; Closed still fences audio starts"
     );
     let shutdown = tokio::spawn({
         let runtime = runtime.clone();
-        async move { runtime.shutdown().await }
+        async move { runtime.shutdown().await.unwrap() }
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         while runtime.is_running() {
@@ -428,7 +436,7 @@ async fn host_wait_keeps_old_epoch_owned_until_native_completion_without_exposin
     assert!(!Path::new(&path).exists());
     invoke(&new, "start_audio_recording").await;
     invoke(&new, "stop_audio_recording").await;
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -447,7 +455,7 @@ async fn host_discard_settles_a_native_completion_wait_without_deadlock() {
     waiting.await.unwrap().unwrap();
     assert_eq!(factory.active.load(Ordering::SeqCst), 0);
     invoke(&target, "get_session").await;
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -472,7 +480,10 @@ async fn host_wait_reports_native_failure_and_refuses_an_absent_or_unsupported_c
         target.discard_audio().await.unwrap_err(),
         "fixture native finalization failed"
     );
-    runtime.shutdown().await;
+    assert_eq!(
+        runtime.shutdown().await.unwrap_err(),
+        "computer audio cleanup failed: fixture native finalization failed"
+    );
 
     let unsupported = self::runtime(Arc::new(Factory::default()));
     let target = session(&unsupported, "audio-wait-unsupported").await;
@@ -481,7 +492,7 @@ async fn host_wait_reports_native_failure_and_refuses_an_absent_or_unsupported_c
         target.audio_completion().await.err().unwrap(),
         "native audio completion observation is unavailable for this backend"
     );
-    unsupported.shutdown().await;
+    unsupported.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -535,7 +546,10 @@ async fn host_snapshot_keeps_the_original_capture_before_first_wait_poll_and_rep
         target.discard_audio().await.unwrap_err(),
         "fixture native finalization failed"
     );
-    runtime.shutdown().await;
+    assert_eq!(
+        runtime.shutdown().await.unwrap_err(),
+        "computer audio cleanup failed: fixture native finalization failed"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -558,9 +572,209 @@ async fn host_snapshot_retains_native_completion_that_precedes_registration() {
     };
     // Shutdown joins the already-completed native worker and removes outputs;
     // the detached observation remains the same capture's finalization result.
-    runtime.shutdown().await;
+    runtime.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), completion.wait())
         .await
         .expect("a pre-registration completion must not be lost")
         .unwrap();
+}
+
+struct BlockedSessionState {
+    gate: Arc<Gate>,
+    def: cua_driver_core::tool::ToolDef,
+}
+#[async_trait::async_trait]
+impl cua_driver_core::tool::Tool for BlockedSessionState {
+    fn def(&self) -> &cua_driver_core::tool::ToolDef {
+        &self.def
+    }
+    async fn invoke(&self, _: serde_json::Value) -> CoreToolResult {
+        let gate = self.gate.clone();
+        tokio::task::spawn_blocking(move || gate.once())
+            .await
+            .unwrap();
+        CoreToolResult::text("task-owned metadata read settled")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_discard_stops_capture_before_unrelated_admitted_read_drain_and_keeps_late_start_closed(
+) {
+    use std::{future::Future, task::Poll};
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let (read_gate, mut read_entered, release_read) = gate();
+    let (stop_gate, mut stop_entered, release_stop) = gate();
+    let factory = Arc::new(Factory {
+        stopping: Some(stop_gate),
+        ..Factory::default()
+    });
+    let metadata = Box::new(BlockedSessionState {
+        gate: read_gate,
+        def: cua_driver_core::tool::ToolDef {
+            name: "get_session_state".into(),
+            description: "task-owned admitted read fixture".into(),
+            input_schema: json!({"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        },
+    });
+    let runtime = runtime_with_tool(factory.clone(), Some(metadata));
+    let target = session(&runtime, "discard-blocked-unrelated-read").await;
+    invoke(&target, "start_audio_recording").await;
+    let read = tokio::spawn({
+        let target = target.clone();
+        async move { invoke(&target, "get_session_state").await }
+    });
+    read_entered.recv().await.unwrap();
+    let discard = tokio::spawn({
+        let target = target.clone();
+        async move { target.discard_audio().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), stop_entered.recv())
+        .await
+        .expect("native stop must enter while the unrelated SDK read remains admitted")
+        .unwrap();
+    // There is no queued lifecycle writer until native stop settles. Poll the
+    // real SDK start through read admission, then let Closed decide its fate.
+    let mut late = Box::pin(target.invoke("start_audio_recording", json!({})));
+    std::future::poll_fn(|context| match late.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => {
+            panic!("the real capture-state stop gate must keep this late start pending")
+        }
+    })
+    .await;
+    release_stop.send(()).unwrap();
+    let late = late.await.unwrap();
+    assert_eq!(late.is_error, Some(true));
+    assert_eq!(
+        late.structured_content.unwrap()["refusal"]["message"],
+        "computer audio session is closed"
+    );
+    assert_eq!(
+        factory.active.load(Ordering::SeqCst),
+        0,
+        "revocation has stopped native capture before unrelated read settlement"
+    );
+    assert_eq!(
+        factory.paths.lock().unwrap().len(),
+        1,
+        "a read-admitted late start never reaches the backend"
+    );
+    writer_pending(&runtime).await;
+    assert!(
+        !discard.is_finished(),
+        "the original unrelated read still owns its admission"
+    );
+    release_read.send(()).unwrap();
+    read.await.unwrap();
+    discard.await.unwrap().unwrap();
+    // A new trusted host admission can reuse this same session only after the
+    // prior read drain released Closed; no unrelated state is reset.
+    invoke(&target, "start_audio_recording").await;
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    invoke(&target, "stop_audio_recording").await;
+    invoke(&target, "get_session").await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_capture_retirement_does_not_discard_replacement_in_same_bound_session() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let target = session(&runtime, "conditional-capture-discard").await;
+    invoke(&target, "start_audio_recording").await;
+    let old = target.audio_completion().await.unwrap();
+    let stopped = invoke(&target, "stop_audio_recording").await;
+    let old_file = PathBuf::from(
+        stopped.structured_content.as_ref().unwrap()["filepath"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(old_file.exists());
+    old.wait().await.unwrap();
+    invoke(&target, "start_audio_recording").await;
+    let current = target.audio_completion().await.unwrap();
+    assert!(!target.discard_audio_completion(old).await.unwrap());
+    assert!(
+        !old_file.exists(),
+        "retiring the exact old receipt also releases its retained WAV"
+    );
+    assert_eq!(
+        factory.active.load(Ordering::SeqCst),
+        1,
+        "old capture cleanup must leave the actual new native worker alive"
+    );
+    let unrelated = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(unrelated.path(), b"task-owned unrelated file").unwrap();
+    assert!(!target
+        .discard_audio_output(unrelated.path().to_owned())
+        .await
+        .unwrap());
+    assert_eq!(
+        std::fs::read(unrelated.path()).unwrap(),
+        b"task-owned unrelated file"
+    );
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), current.wait())
+            .await
+            .is_err()
+    );
+    assert!(target.discard_audio_completion(current).await.unwrap());
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    invoke(&target, "start_audio_recording").await;
+    let adapted = target.audio_completion().await.unwrap();
+    let owned_output = adapted.output_path().unwrap().to_owned();
+    assert!(target.discard_audio_output(owned_output).await.unwrap());
+    adapted.wait().await.unwrap();
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    let alive = target.invoke("get_session_state", json!({})).await.unwrap();
+    assert_ne!(
+        alive.is_error,
+        Some(true),
+        "capture cleanup preserves the same session"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_completed_wav_cleanup_does_not_gain_recursive_directory_deletion_after_error() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let factory = Arc::new(CompletingFactory::default());
+    let runtime = runtime(factory.clone());
+    let target = session(&runtime, "conditional-capture-wrapper-error").await;
+    invoke(&target, "start_audio_recording").await;
+    let old = target.audio_completion().await.unwrap();
+    let stopped = invoke(&target, "stop_audio_recording").await;
+    let old_file = PathBuf::from(
+        stopped.structured_content.as_ref().unwrap()["filepath"]
+            .as_str()
+            .unwrap(),
+    );
+    let wrapper = old_file.parent().unwrap().to_owned();
+    let sentinel = wrapper.join("unowned-fixture-sentinel");
+    std::fs::write(&sentinel, b"preserve fixture content").unwrap();
+    invoke(&target, "start_audio_recording").await;
+    let error = target.discard_audio_completion(old).await.unwrap_err();
+    assert!(error.contains("wrapper"), "{error}");
+    assert!(!old_file.exists(), "owned WAV unlink already settled");
+    assert_eq!(
+        factory.active.load(Ordering::SeqCst),
+        1,
+        "replacement is not the failed wrapper's capture"
+    );
+    target.discard_audio().await.unwrap();
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"preserve fixture content",
+        "later terminal cleanup must not retry recursively"
+    );
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_file(sentinel).unwrap();
+    std::fs::remove_dir(wrapper).unwrap();
 }

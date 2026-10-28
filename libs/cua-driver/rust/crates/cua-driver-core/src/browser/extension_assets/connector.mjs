@@ -263,14 +263,15 @@ export class BrowserConnector {
     const result = { id: tab.id };
     for (const key of ['windowId', 'index', 'groupId'])
       if (Number.isSafeInteger(tab[key])) result[key] = tab[key];
-    for (const key of ['title', 'url']) if (typeof tab[key] === 'string') result[key] = tab[key];
+    if (typeof tab.title === 'string') result.titleJson = JSON.stringify(tab.title);
+    if (typeof tab.url === 'string') result.url = tab.url;
     if (typeof tab.lastAccessed === 'number' && Number.isFinite(tab.lastAccessed))
       result.lastAccessed = tab.lastAccessed;
     if (typeof tab.groupId === 'number' && tab.groupId !== -1 && this.chrome.tabGroups) {
       try {
         const group = await this.chrome.tabGroups.get(tab.groupId);
         const title = typeof group?.title === 'string' ? group.title.trim() : '';
-        if (title) result.groupTitle = title;
+        if (title) result.groupTitleJson = JSON.stringify(title);
       } catch {
         /* Optional metadata is unavailable; never invent a group. */
       }
@@ -621,6 +622,8 @@ export class BrowserConnector {
       } else if (method === 'Target.detachFromTarget') {
         this.removeChild(record, commandParams.sessionId);
       }
+      if (['DOM.describeNode', 'Runtime.getProperties', 'Target.getTargets'].includes(method))
+        return { resultJson: JSON.stringify(result ?? null) };
       return { result: result ?? null };
     } finally {
       physical.inFlight.delete(call);
@@ -670,7 +673,7 @@ export class BrowserConnector {
       owner: record.owner,
       claim: record.token,
       method,
-      params,
+      ...(method === 'Target.attachedToTarget' ? { paramsJson: JSON.stringify(params) } : { params }),
       ...(source.sessionId ? { sessionId: source.sessionId } : {}),
       ...(source.targetId != null ? { sourceTargetId: source.targetId } : {}),
     });

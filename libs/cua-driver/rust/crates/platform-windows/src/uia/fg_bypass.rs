@@ -29,48 +29,95 @@
 //! is therefore gated on `is_xaml_host_hwnd || is_chromium_target_window` and is
 //! a no-op for other hosts.
 
+use cua_driver_core::windows_interruption::{
+    current_windows_input_binding, NativeInputReceipt, NativeInputRelease,
+};
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsWindow, GA_ROOT};
 
 /// RAII guard that disables a window on construction and restores its
 /// previous enabled-state on Drop. Always re-arms on Drop even if the
 /// wrapped action panics.
-pub struct DisabledHwndGuard {
-    hwnd: HWND,
-    was_enabled: bool,
-    armed: bool,
+struct DisabledWindow {
+    target: crate::input::owned::TargetWindow,
+    state: Mutex<(bool, bool)>, // this guard disabled an enabled window, closed
 }
-
-impl DisabledHwndGuard {
-    /// Disable `hwnd` for the lifetime of the guard. No-op for null HWND.
-    pub fn disable(hwnd: HWND) -> Self {
-        if hwnd.0.is_null() {
-            return Self {
-                hwnd,
-                was_enabled: false,
-                armed: false,
+impl NativeInputRelease for DisabledWindow {
+    fn release(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "native disabled-window guard mutex poisoned")?;
+        state.1 = true;
+        if state.0 {
+            let Some(hwnd) = self.target.resolve()? else {
+                state.0 = false;
+                return Ok(());
             };
+            unsafe {
+                // Restore only a window this guard actually disabled. A
+                // destroyed target has no remaining disabled-window resource.
+                if IsWindow(hwnd).as_bool() {
+                    let _ = EnableWindow(hwnd, true);
+                    if !IsWindowEnabled(hwnd).as_bool() {
+                        return Err("restore owned disabled native target failed".into());
+                    }
+                }
+            }
+            state.0 = false;
         }
-        // `EnableWindow` returns nonzero iff the window was *previously
-        // disabled* — invert to get the "was enabled" state we want to
-        // restore at Drop time.
-        let was_disabled = unsafe { EnableWindow(hwnd, false).as_bool() };
+        Ok(())
+    }
+}
+impl Drop for DisabledWindow {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+pub struct DisabledHwndGuard {
+    guard: Arc<DisabledWindow>,
+    _receipt: Option<NativeInputReceipt>,
+}
+impl DisabledHwndGuard {
+    pub fn disable(hwnd: HWND) -> Self {
+        let guard = Arc::new(DisabledWindow {
+            target: crate::input::owned::TargetWindow::observe(hwnd),
+            state: Mutex::new((false, false)),
+        });
+        let receipt = match current_windows_input_binding() {
+            Some(binding) => match binding.retain_input_release(guard.clone()) {
+                Ok(receipt) => Some(receipt),
+                Err(_) => {
+                    let _ = guard.release();
+                    return Self {
+                        guard,
+                        _receipt: None,
+                    };
+                }
+            },
+            None => None,
+        };
+        {
+            let mut state = guard
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !state.1 && !hwnd.0.is_null() && unsafe { IsWindowEnabled(hwnd) }.as_bool() {
+                let _ = unsafe { EnableWindow(hwnd, false) };
+                state.0 = !unsafe { IsWindowEnabled(hwnd) }.as_bool();
+            }
+        }
         Self {
-            hwnd,
-            was_enabled: !was_disabled,
-            armed: true,
+            guard,
+            _receipt: receipt,
         }
     }
 }
-
 impl Drop for DisabledHwndGuard {
     fn drop(&mut self) {
-        if self.armed {
-            unsafe {
-                let _ = EnableWindow(self.hwnd, self.was_enabled);
-            }
-        }
+        let _ = self.guard.release();
     }
 }
 

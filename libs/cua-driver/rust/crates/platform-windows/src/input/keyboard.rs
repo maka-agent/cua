@@ -15,21 +15,22 @@
 //! the existing `set_value` tool; this module deliberately stays
 //! Win32-only so the unit tests don't depend on UIA initialisation.
 
+use crate::input::owned::set_foreground_window as SetForegroundWindow;
+use crate::input::owned::{post_message as PostMessageW, send_input as SendInput};
 use anyhow::{bail, Result};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
     VIRTUAL_KEY,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, GetGUIThreadInfo, GetParent, GetWindowThreadProcessId,
-    IsChild, PostMessageW, GUITHREADINFO, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    IsChild, GUITHREADINFO, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
 use crate::win32::{foreground_matches_target_or_owned_window, windows::ForegroundTarget};
 
@@ -666,7 +667,7 @@ fn with_confirmed_foreground<T>(
         }
         // Attach before inserting anything: attaching resets the shared key
         // state, which must not race with modifiers the body is about to send.
-        attachment = InputQueueAttachment::attach(actual);
+        attachment = InputQueueAttachment::attach(actual)?;
         body(attachment.as_ref(), foreground_target)
     })();
 
@@ -699,25 +700,87 @@ enum UnitRead {
 
 /// The caller's thread attached to the foreground thread's input queue for
 /// the duration of one foreground input transaction; detaches on drop.
-struct InputQueueAttachment {
+struct QueueAttachment {
     own_thread: u32,
     target_thread: u32,
+    state: std::sync::Mutex<(bool, bool)>, // attached, resource closed
 }
-
+impl cua_driver_core::windows_interruption::NativeInputRelease for QueueAttachment {
+    fn release(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "native input-queue attachment mutex poisoned")?;
+        state.1 = true;
+        if state.0 {
+            // SAFETY: only detach the exact pair whose successful attachment
+            // was acquired by this native guard; never inspect user key state.
+            if !unsafe {
+                windows::Win32::System::Threading::AttachThreadInput(
+                    self.own_thread,
+                    self.target_thread,
+                    false,
+                )
+            }
+            .as_bool()
+            {
+                return Err(format!(
+                    "detach owned native input queues: {}",
+                    windows::core::Error::from_win32()
+                ));
+            }
+            state.0 = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for QueueAttachment {
+    fn drop(&mut self) {
+        let _ = cua_driver_core::windows_interruption::NativeInputRelease::release(self);
+    }
+}
+pub(crate) struct InputQueueAttachment {
+    attachment: std::sync::Arc<QueueAttachment>,
+    _receipt: Option<cua_driver_core::windows_interruption::NativeInputReceipt>,
+}
 impl InputQueueAttachment {
-    fn attach(foreground: HWND) -> Option<Self> {
+    pub(crate) fn attach(foreground: HWND) -> Result<Option<Self>> {
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
         let target_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
         let own_thread = unsafe { GetCurrentThreadId() };
         if target_thread == 0 || target_thread == own_thread {
-            return None;
+            return Ok(None);
         }
-        unsafe { AttachThreadInput(own_thread, target_thread, true) }
-            .as_bool()
-            .then_some(Self {
-                own_thread,
-                target_thread,
-            })
+        let attachment = std::sync::Arc::new(QueueAttachment {
+            own_thread,
+            target_thread,
+            state: std::sync::Mutex::new((false, false)),
+        });
+        let receipt = match cua_driver_core::windows_interruption::current_windows_input_binding() {
+            Some(binding) => Some(
+                binding
+                    .retain_input_release(attachment.clone())
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            ),
+            None => None,
+        };
+        {
+            let mut state = attachment
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native input attachment mutex poisoned"))?;
+            if state.1 {
+                bail!("native input-queue attachment owner retired");
+            }
+            if !unsafe { AttachThreadInput(own_thread, target_thread, true) }.as_bool() {
+                return Ok(None);
+            }
+            state.0 = true;
+        }
+        Ok(Some(Self {
+            attachment,
+            _receipt: receipt,
+        }))
     }
 
     /// Block until the foreground thread has retrieved all input inserted so
@@ -775,8 +838,9 @@ impl InputQueueAttachment {
 
 impl Drop for InputQueueAttachment {
     fn drop(&mut self) {
-        use windows::Win32::System::Threading::AttachThreadInput;
-        let _ = unsafe { AttachThreadInput(self.own_thread, self.target_thread, false) };
+        let _ = cua_driver_core::windows_interruption::NativeInputRelease::release(
+            self.attachment.as_ref(),
+        );
     }
 }
 

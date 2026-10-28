@@ -907,6 +907,8 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
             all(target_os = "linux", not(target_env = "musl"))
         ))]
         None,
+        #[cfg(target_os = "windows")]
+        None,
     )
 }
 
@@ -1108,6 +1110,9 @@ unsafe fn session_invoke_in_frame(
         all(target_os = "linux", not(target_env = "musl"))
     ))]
     native_request: Option<NativeRequest>,
+    #[cfg(target_os = "windows")] windows_binding: Option<
+        Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    >,
 ) -> CuaDriverStatus {
     let SessionInvokeRequest {
         name,
@@ -1169,6 +1174,18 @@ unsafe fn session_invoke_in_frame(
             executor,
             async move {
                 let invocation = session.invoke_in_frame(&name, arguments, frame);
+                #[cfg(target_os = "windows")]
+                let invocation = async move {
+                    match windows_binding {
+                        Some(binding) => {
+                            cua_driver_core::windows_interruption::with_windows_input_binding(
+                                binding, invocation,
+                            )
+                            .await
+                        }
+                        None => invocation.await,
+                    }
+                };
                 #[cfg(any(
                     target_os = "macos",
                     all(target_os = "linux", not(target_env = "musl"))
@@ -1288,7 +1305,10 @@ pub unsafe extern "C" fn cua_driver_shutdown_v1(
         *out_operation = spawn_completion(
             executor,
             async move {
-                runtime.shutdown().await;
+                runtime
+                    .shutdown()
+                    .await
+                    .map_err(|reason| AbiFailure::new(CuaDriverStatus::Internal, reason))?;
                 Ok("null".into())
             },
             callback,
@@ -1793,8 +1813,10 @@ impl NativeAbiDriver {
                     .clone()
             }
         };
-        runtime.shutdown().await;
-        Ok(())
+        runtime
+            .shutdown()
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
     }
 }
 
@@ -1809,6 +1831,76 @@ unsafe impl Send for NativeAbiSession {}
 unsafe impl Sync for NativeAbiSession {}
 
 impl NativeAbiSession {
+    #[cfg(target_os = "windows")]
+    fn windows_runtime_session(&self) -> Result<Arc<RuntimeSession>, DriverError> {
+        let handle = self.handle.lock().unwrap();
+        // SAFETY: same lock as close/invoke prevents destruction while cloning
+        // the exact immutable authorized session; no JSON can substitute it.
+        unsafe {
+            handle
+                .cast::<CuaDriverSessionHandle>()
+                .as_ref()
+                .ok_or(DriverError::Shutdown)
+                .map(|handle| handle.session.clone())
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn create_windows_interruption(
+        &self,
+        turn: String,
+        sink: Arc<dyn cua_driver_core::windows_interruption::InterruptionSink>,
+    ) -> Result<Arc<cua_driver_core::windows_interruption::WindowsInputBinding>, DriverError> {
+        self.windows_runtime_session()?
+            .windows_interruption_binding(turn, sink)
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn finish_windows_interruption(
+        &self,
+        turn: String,
+    ) -> Result<(), DriverError> {
+        self.windows_runtime_session()?
+            .finish_windows_interruption(turn)
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn release_windows_inputs(
+        &self,
+        binding: Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<(), DriverError> {
+        self.windows_runtime_session()?
+            .release_windows_inputs(binding)
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn close_windows_monitor(
+        &self,
+        binding: Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<(), DriverError> {
+        self.windows_runtime_session()?
+            .close_windows_monitor(binding)
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn invoke_with_windows_interruption(
+        &self,
+        name: &str,
+        arguments: Value,
+        frame: crate::runtime::CoordinateFrame,
+        binding: Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<Value, DriverError> {
+        self.invoke_in_frame(name, arguments, frame, Some(binding))
+            .await
+    }
+
     pub(crate) async fn audio_completion(
         &self,
     ) -> Result<cua_driver_core::audio::AudioCompletion, DriverError> {
@@ -1852,6 +1944,49 @@ impl NativeAbiSession {
             .map_err(|reason| DriverError::Protocol { reason })
     }
 
+    pub(crate) async fn discard_audio_completion(
+        &self,
+        expected: cua_driver_core::audio::AudioCompletion,
+    ) -> Result<bool, DriverError> {
+        let session = {
+            let handle = self.handle.lock().unwrap();
+            // Same actual immutable session retained under its handle lock.
+            unsafe {
+                handle
+                    .cast::<CuaDriverSessionHandle>()
+                    .as_ref()
+                    .ok_or(DriverError::Shutdown)?
+                    .session
+                    .clone()
+            }
+        };
+        session
+            .discard_audio_completion(expected)
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
+    pub(crate) async fn discard_audio_output(
+        &self,
+        output: std::path::PathBuf,
+    ) -> Result<bool, DriverError> {
+        let session = {
+            let handle = self.handle.lock().unwrap();
+            unsafe {
+                handle
+                    .cast::<CuaDriverSessionHandle>()
+                    .as_ref()
+                    .ok_or(DriverError::Shutdown)?
+                    .session
+                    .clone()
+            }
+        };
+        session
+            .discard_audio_output(output)
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+
     pub(crate) fn close(&self) {
         let mut handle = self.handle.lock().unwrap();
         unsafe { ffi::session_destroy(&mut *handle) };
@@ -1866,6 +2001,8 @@ impl NativeAbiSession {
                 target_os = "macos",
                 all(target_os = "linux", not(target_env = "musl"))
             ))]
+            None,
+            #[cfg(target_os = "windows")]
             None,
         )
         .await
@@ -1884,6 +2021,8 @@ impl NativeAbiSession {
                 target_os = "macos",
                 all(target_os = "linux", not(target_env = "musl"))
             ))]
+            None,
+            #[cfg(target_os = "windows")]
             None,
         )
         .await
@@ -2022,6 +2161,9 @@ impl NativeAbiSession {
             all(target_os = "linux", not(target_env = "musl"))
         ))]
         native_request: Option<NativeRequest>,
+        #[cfg(target_os = "windows")] windows_binding: Option<
+            Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+        >,
     ) -> Result<Value, DriverError> {
         let arguments = serde_json::to_vec(&arguments).map_err(|error| DriverError::Protocol {
             reason: format!("serialize {name} session ABI arguments: {error}"),
@@ -2046,6 +2188,8 @@ impl NativeAbiSession {
                 all(target_os = "linux", not(target_env = "musl"))
             ))]
             let public_entry = public_entry && native_request.is_none();
+            #[cfg(target_os = "windows")]
+            let public_entry = public_entry && windows_binding.is_none();
             let status = unsafe {
                 if public_entry {
                     ffi::session_invoke(
@@ -2082,6 +2226,8 @@ impl NativeAbiSession {
                             all(target_os = "linux", not(target_env = "musl"))
                         ))]
                         native_request,
+                        #[cfg(target_os = "windows")]
+                        windows_binding,
                     )
                 }
             };

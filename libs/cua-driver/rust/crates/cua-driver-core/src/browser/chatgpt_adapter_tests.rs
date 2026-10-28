@@ -6,6 +6,57 @@ const GEN: &str = "11111111-1111-4111-8111-111111111111";
 const SID: &str = "22222222-2222-4222-8222-222222222222";
 const EXT: &str = "hehggadaopoacecdllhhajmbjkdcmajg";
 
+// Translator unit fixtures explicitly cross the local first-write boundary before
+// delivering replies. These synchronous hooks do not prove OS bytes or Chrome.
+impl ChatgptWireAdapter {
+    fn written_actions(
+        &mut self,
+        actions: Vec<ExtensionWireAction>,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        for action in &actions {
+            if let ExtensionWireAction::ExtensionFrame {
+                phase: Some(phase), ..
+            } = action
+            {
+                self.commit_write(phase)?;
+            }
+        }
+        Ok(actions)
+    }
+    fn written_start(
+        &mut self,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let actions = ExtensionWireAdapter::start(self, now)?;
+        self.written_actions(actions)
+    }
+    fn written_semantic(
+        &mut self,
+        envelope: Value,
+        context: Option<&ExtensionWireContext>,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let actions = ExtensionWireAdapter::on_semantic(self, envelope, context, now)?;
+        self.written_actions(actions)
+    }
+    fn written_extension_json(
+        &mut self,
+        frame: &RawValue,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let actions = ExtensionWireAdapter::on_extension_json(self, frame, now)?;
+        self.written_actions(actions)
+    }
+    fn written_extension(
+        &mut self,
+        frame: Value,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let actions = ExtensionWireAdapter::on_extension(self, frame, now)?;
+        self.written_actions(actions)
+    }
+}
+
 fn frame(actions: &[ExtensionWireAction]) -> Value {
     actions
         .iter()
@@ -33,10 +84,10 @@ fn boot() -> (ChatgptWireAdapter, ExtensionWireContext, Instant) {
     let now = Instant::now();
     let mut adapter =
         ChatgptWireAdapter::new(GEN.to_owned(), EXT.to_owned()).expect("valid adapter");
-    let request = frame(&adapter.start(now).expect("bootstrap"));
+    let request = frame(&adapter.written_start(now).expect("bootstrap"));
     let info = json!({"type":"extension","version":"observed","metadata":{"extensionId":EXT,"extensionInstanceId":"instance"}});
     let actions = adapter
-        .on_extension(
+        .written_extension(
             json!({"jsonrpc":"2.0","id":request["id"],"result":info}),
             now,
         )
@@ -60,7 +111,7 @@ fn reply(
     now: Instant,
 ) -> Vec<ExtensionWireAction> {
     adapter
-        .on_extension(
+        .written_extension(
             json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
             now,
         )
@@ -72,7 +123,7 @@ fn metadata_preserves_provider_order_iso_and_opaque_id_without_clock_facts() {
     let (mut adapter, _, now) = boot();
     let request = frame(
         &adapter
-            .on_semantic(semantic("1", "inventory", json!({})), None, now)
+            .written_semantic(semantic("1", "inventory", json!({})), None, now)
             .expect("metadata"),
     );
     let actions = reply(
@@ -88,7 +139,7 @@ fn metadata_preserves_provider_order_iso_and_opaque_id_without_clock_facts() {
         "2026-10-27T00:00:00.000Z"
     );
     assert_eq!(value["result"]["tabs"][0]["providerTabId"], "opaque");
-    assert_eq!(value["result"]["tabs"][0]["groupTitle"], "actual");
+    assert_eq!(value["result"]["tabs"][0]["groupTitleJson"], "\"actual\"");
     assert!(value["result"]["tabs"][0].get("lastAccessed").is_none());
 }
 
@@ -96,7 +147,7 @@ fn metadata_preserves_provider_order_iso_and_opaque_id_without_clock_facts() {
 fn mutation_without_trusted_context_has_no_native_dispatch() {
     let (mut adapter, _, now) = boot();
     assert!(matches!(
-        adapter.on_semantic(semantic("1", "createTab", json!({})), None, now),
+        adapter.written_semantic(semantic("1", "createTab", json!({})), None, now),
         Err(ExtensionWireError::LocalRefusal { .. })
     ));
     assert_eq!(adapter.rpc.pending_len(), 0);
@@ -107,7 +158,7 @@ fn cancelled_attach_keeps_only_cleanup_receipt_after_exact_void_ack() {
     let (mut adapter, context, now) = boot();
     let claim = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "attach", json!({"tabId":7})),
                 Some(&context),
                 now,
@@ -131,7 +182,7 @@ fn cancelled_attach_keeps_only_cleanup_receipt_after_exact_void_ack() {
     ));
     adapter.on_cancel("1");
     let actions = adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
         .expect("void ack");
     assert!(!actions
         .iter()
@@ -143,7 +194,7 @@ fn cancelled_attach_keeps_only_cleanup_receipt_after_exact_void_ack() {
         .expect("cleanup receipt");
     assert!(!adapter.claims[token].live);
     assert!(adapter
-        .on_semantic(
+        .written_semantic(
             semantic(
                 "2",
                 "cdp",
@@ -160,7 +211,7 @@ fn finish_cancels_pending_attach_and_cannot_resume_it_after_stop() {
     let (mut adapter, context, now) = boot();
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "attach", json!({"tabId":7})),
                 Some(&context),
                 now,
@@ -169,7 +220,7 @@ fn finish_cancels_pending_attach_and_cannot_resume_it_after_stop() {
     );
     let finish = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "finishTurn", json!({"keep":null})),
                 Some(&context),
                 now,
@@ -190,7 +241,7 @@ fn created_stop_observes_absence_only_after_logical_finish_ack() {
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("create"),
     );
     let created = response(&reply(
@@ -201,7 +252,7 @@ fn created_stop_observes_absence_only_after_logical_finish_ack() {
     ));
     let creation = created["result"]["creation"].clone();
     assert!(adapter
-        .on_semantic(
+        .written_semantic(
             semantic("2", "stopCreatedTab", json!({"creation":creation})),
             Some(&context),
             now
@@ -209,7 +260,7 @@ fn created_stop_observes_absence_only_after_logical_finish_ack() {
         .is_err());
     let finish = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "finishTurn", json!({"keep":null})),
                 Some(&context),
                 now,
@@ -217,14 +268,14 @@ fn created_stop_observes_absence_only_after_logical_finish_ack() {
             .expect("finish"),
     );
     let ack = adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("void ack");
     let logical = response(&ack);
     assert_eq!(logical["result"]["turnFinished"], true);
     assert!(logical["result"].get("closed").is_none());
     let observe = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("4", "stopCreatedTab", json!({"creation":creation})),
                 Some(&context),
                 now,
@@ -256,7 +307,7 @@ fn before_attach_ack(
 ) -> Value {
     let mut request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(id, "attach", json!({"tabId":tab})),
                 Some(context),
                 now,
@@ -292,7 +343,7 @@ fn attached(
     let attach = before_attach_ack(adapter, context, id, tab, now);
     let probe = frame(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
             .expect("exact void attach acknowledgement"),
     );
     let targets = frame(&reply(adapter, &probe, json!({"result":{"value":0}}), now));
@@ -314,7 +365,7 @@ fn settled_old_token_never_detaches_a_new_raw_tab_epoch() {
     let old = attached(&mut adapter, &context, "1", 7, now);
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "detach", json!({"claim":old})),
                 Some(&context),
                 now,
@@ -322,13 +373,13 @@ fn settled_old_token_never_detaches_a_new_raw_tab_epoch() {
             .expect("owned detach"),
     );
     let ack = adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
         .expect("detach acknowledgement");
     assert_eq!(response(&ack)["result"]["proof"], "detach_ack");
     let new = attached(&mut adapter, &context, "3", 7, now);
     assert_ne!(new, old);
     assert!(adapter
-        .on_semantic(
+        .written_semantic(
             semantic("4", "detach", json!({"claim":old})),
             Some(&context),
             now
@@ -357,7 +408,7 @@ fn move_and_header_turn_activation_retire_the_whole_session_at_finish() {
         };
         let activation = frame(
             &adapter
-                .on_semantic(semantic("3", operation, params), Some(&turn2), now)
+                .written_semantic(semantic("3", operation, params), Some(&turn2), now)
                 .expect("admit source-proven session activation"),
         );
         let extension_result = if operation == "moveMouse" {
@@ -368,7 +419,7 @@ fn move_and_header_turn_activation_retire_the_whole_session_at_finish() {
         reply(&mut adapter, &activation, extension_result, now);
         let finish = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic("4", "finishTurn", json!({"keep":null})),
                     Some(&turn2),
                     now,
@@ -376,18 +427,18 @@ fn move_and_header_turn_activation_retire_the_whole_session_at_finish() {
                 .expect("finish the moved session"),
         );
         adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
             .expect("finish acknowledgement");
         for token in [&first, &second] {
             assert!(
                 !adapter.claims[token].live,
                 "{operation} must retire every matching physical claim"
             );
-            assert!(adapter.on_semantic(semantic("5", "cdp", json!({"claim":token,"method":"Input.insertText","params":{"text":"forbidden"}})), Some(&turn2), now).is_err());
+            assert!(adapter.written_semantic(semantic("5", "cdp", json!({"claim":token,"method":"Input.insertText","params":{"text":"forbidden"}})), Some(&turn2), now).is_err());
         }
         assert!(
             adapter
-                .on_semantic(semantic("6", "finishTurn", json!({})), Some(&turn2), now)
+                .written_semantic(semantic("6", "finishTurn", json!({})), Some(&turn2), now)
                 .is_err(),
             "finish ACK does not authorize replay"
         );
@@ -401,7 +452,7 @@ fn locally_refused_cdp_does_not_activate_a_different_turn() {
     let token = attached(&mut adapter, &context, "1", 7, now);
     let turn2 = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     assert!(adapter
-        .on_semantic(
+        .written_semantic(
             semantic(
                 "2",
                 "cdp",
@@ -416,7 +467,7 @@ fn locally_refused_cdp_does_not_activate_a_different_turn() {
     assert_eq!(adapter.claims[&token].turn, "turn1");
     let finish = frame(
         &adapter
-            .on_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
             .expect("original admitted turn remains current"),
     );
     assert_eq!(finish["params"]["turn_id"], "turn1");
@@ -428,7 +479,7 @@ fn late_old_turn_acknowledgement_cannot_rewind_the_current_turn() {
     let token = attached(&mut adapter, &turn1, "1", 7, now);
     let old = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "2",
                     "cdp",
@@ -442,7 +493,7 @@ fn late_old_turn_acknowledgement_cannot_rewind_the_current_turn() {
     let turn2 = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     let new = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "moveMouse", json!({"claim":token,"x":1,"y":2})),
                 Some(&turn2),
                 now,
@@ -457,7 +508,7 @@ fn late_old_turn_acknowledgement_cannot_rewind_the_current_turn() {
     assert_eq!(adapter.session_turns[SID].turn, "turn2");
     assert_eq!(adapter.claims[&token].turn, "turn2");
     assert!(adapter
-        .on_semantic(semantic("4", "finishTurn", json!({})), Some(&turn1), now)
+        .written_semantic(semantic("4", "finishTurn", json!({})), Some(&turn1), now)
         .is_err());
     assert_eq!(adapter.rpc.pending_len(), 0);
 }
@@ -467,16 +518,16 @@ fn unknown_finish_is_consumed_and_never_replayed() {
     let (mut adapter, context, now) = boot();
     let token = attached(&mut adapter, &context, "1", 7, now);
     adapter
-        .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+        .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
         .expect("single finish dispatch");
     let expired = adapter.expire(now + DEADLINE + Duration::from_millis(1));
     assert_eq!(response(&expired)["error"]["kind"], "outcome_unknown");
     assert!(adapter
-        .on_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
+        .written_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
         .is_err());
     let turn2 = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     assert!(adapter
-        .on_semantic(
+        .written_semantic(
             semantic("4", "moveMouse", json!({"claim":token,"x":1,"y":2})),
             Some(&turn2),
             now
@@ -491,7 +542,7 @@ fn post_attach_probe_protocol_failure_keeps_non_executable_cleanup_custody() {
     let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
     let probe = frame(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
             .expect("attach acknowledgement"),
     );
     let output = reply(&mut adapter, &probe, json!({"result":{"value":99}}), now);
@@ -508,7 +559,7 @@ fn post_attach_probe_protocol_failure_keeps_non_executable_cleanup_custody() {
     assert!(!adapter.claims[token].live);
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "detach", json!({"claim":token})),
                 Some(&context),
                 now,
@@ -530,7 +581,7 @@ fn changed_post_attach_target_keeps_receipt_without_claiming_new_identity() {
     let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
     let probe = frame(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
             .expect("attach acknowledgement"),
     );
     let targets = frame(&reply(
@@ -567,14 +618,14 @@ fn clearing_headers_after_finish_does_not_reactivate_the_turn() {
     attached(&mut adapter, &context, "1", 7, now);
     let finish = frame(
         &adapter
-            .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
             .expect("finish"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("finish acknowledgement");
     assert!(adapter
-        .on_semantic(
+        .written_semantic(
             semantic("3", "clearSessionHeaders", json!({})),
             Some(&context),
             now
@@ -594,7 +645,7 @@ fn target_and_browser_domain_names_are_forwarded_without_invented_capability_ref
         let token = attached(&mut adapter, &context, "1", 7, now);
         let request = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(
                         "2",
                         "cdp",
@@ -609,7 +660,7 @@ fn target_and_browser_domain_names_are_forwarded_without_invented_capability_ref
         assert_eq!(request["params"]["target"]["tabId"], 7);
         assert_eq!(request["params"]["method"], method);
         assert_eq!(request["params"]["commandParams"], json!({}));
-        let error = adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"actual extension rejection"}}), now).expect("matched ChatGPT rejection");
+        let error = adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"actual extension rejection"}}), now).expect("matched ChatGPT rejection");
         assert_eq!(response(&error)["error"]["kind"], "outcome_unknown");
         assert_eq!(
             response(&error)["error"]["details"]["provenance"],
@@ -626,7 +677,7 @@ fn extension_download_metadata_preserves_actual_id_without_fabricating_ownership
     let (mut adapter, _, now) = boot();
     let event = json!({"id":"0","filename":"/native/fixture.file","url":"https://fixture.invalid/file","status":"complete"});
     let output = adapter
-        .on_extension(
+        .written_extension(
             json!({"jsonrpc":"2.0","method":"onDownloadChange","params":event}),
             now,
         )
@@ -656,11 +707,11 @@ fn protocol_end_flushes_prior_positive_attach_custody_before_actor_shutdown() {
     let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
     let _probe = frame(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
             .expect("positive attach ACK"),
     );
     let actions = adapter
-        .on_extension(json!({"jsonrpc":"bad"}), now)
+        .written_extension(json!({"jsonrpc":"bad"}), now)
         .expect("ordered terminal normalization");
     let terminal = response(&actions);
     assert_eq!(terminal["error"]["details"]["custody"]["tabId"], 7);
@@ -683,7 +734,7 @@ fn tokenless_detach_uses_the_existing_revocation_envelope_without_cleanup_proof(
     let (mut adapter, context, now) = boot();
     let token = attached(&mut adapter, &context, "1", 7, now);
     let actions = adapter
-        .on_extension(
+        .written_extension(
             json!({"jsonrpc":"2.0","method":"onCDPDetach","params":{"tabId":7}}),
             now,
         )
@@ -707,7 +758,7 @@ fn old_same_turn_failure_cannot_reopen_an_acknowledged_finish() {
     let token = attached(&mut adapter, &turn1, "1", 7, now);
     let old = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "2",
                     "cdp",
@@ -720,26 +771,26 @@ fn old_same_turn_failure_cannot_reopen_an_acknowledged_finish() {
     );
     let finish = frame(
         &adapter
-            .on_semantic(semantic("3", "finishTurn", json!({})), Some(&turn1), now)
+            .written_semantic(semantic("3", "finishTurn", json!({})), Some(&turn1), now)
             .expect("exact turn finish"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("finish acknowledgement");
     adapter
-        .on_extension(
+        .written_extension(
             json!({"jsonrpc":"2.0","id":old["id"],"error":{"code":1,"message":"late old failure"}}),
             now,
         )
         .expect("matched older extension failure");
     assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
     assert!(adapter
-        .on_semantic(semantic("4", "finishTurn", json!({})), Some(&turn1), now)
+        .written_semantic(semantic("4", "finishTurn", json!({})), Some(&turn1), now)
         .is_err());
     let turn2 = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     let next = frame(
         &adapter
-            .on_semantic(semantic("5", "createTab", json!({})), Some(&turn2), now)
+            .written_semantic(semantic("5", "createTab", json!({})), Some(&turn2), now)
             .expect("new trusted turn remains available"),
     );
     assert_eq!(next["method"], "createTab");
@@ -752,7 +803,7 @@ fn activation_uncertainty_preserves_the_single_original_turn_cleanup_attempt() {
     let token = attached(&mut adapter, &context, "1", 7, now);
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "2",
                     "cdp",
@@ -763,19 +814,19 @@ fn activation_uncertainty_preserves_the_single_original_turn_cleanup_attempt() {
             )
             .expect("accepted extension call"),
     );
-    adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"uncertain activation"}}), now).expect("matched extension failure");
+    adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"uncertain activation"}}), now).expect("matched extension failure");
     let finish = frame(
         &adapter
-            .on_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
             .expect("unknown activation must not forbid cleanup"),
     );
     assert_eq!(finish["method"], "turnEnded");
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("actual cleanup acknowledgement");
     assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
     assert!(adapter
-        .on_semantic(semantic("4", "finishTurn", json!({})), Some(&context), now)
+        .written_semantic(semantic("4", "finishTurn", json!({})), Some(&context), now)
         .is_err());
 }
 
@@ -784,7 +835,7 @@ fn bootstrap_timeout_ends_the_native_generation_without_retry_or_fabricated_hell
     let now = Instant::now();
     let mut adapter =
         ChatgptWireAdapter::new(GEN.to_owned(), EXT.to_owned()).expect("valid adapter");
-    let first = adapter.start(now).expect("single bootstrap call");
+    let first = adapter.written_start(now).expect("single bootstrap call");
     assert_eq!(frame(&first)["method"], "getInfo");
     let expired = adapter.expire(now + DEADLINE + Duration::from_millis(1));
     assert!(adapter.ended);
@@ -809,7 +860,7 @@ fn capped_user_inventory_absence_is_unknown_but_present_raw_id_still_resolves() 
         let (mut adapter, _, now) = boot();
         let request = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic("1", "resolve", json!({"rawId":raw_id.to_string()})),
                     None,
                     now,
@@ -840,7 +891,7 @@ fn managed_raw_id_resolves_through_the_exact_uncapped_owned_session_inventory() 
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("existing owned creation"),
     );
     reply(
@@ -851,7 +902,7 @@ fn managed_raw_id_resolves_through_the_exact_uncapped_owned_session_inventory() 
     );
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "resolve", json!({"rawId":"2001"})),
                 Some(&context),
                 now,
@@ -878,7 +929,7 @@ fn known_managed_id_without_its_trusted_context_does_not_borrow_session_authorit
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("owned creation"),
     );
     reply(
@@ -889,7 +940,7 @@ fn known_managed_id_without_its_trusted_context_does_not_borrow_session_authorit
     );
     let request = frame(
         &adapter
-            .on_semantic(semantic("2", "resolve", json!({"rawId":"2001"})), None, now)
+            .written_semantic(semantic("2", "resolve", json!({"rawId":"2001"})), None, now)
             .expect("context-free metadata remains global inventory"),
     );
     assert_eq!(request["method"], "getUserTabs");
@@ -902,7 +953,7 @@ fn managed_inventory_native_rejection_does_not_fabricate_a_readonly_outcome() {
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("owned creation"),
     );
     reply(
@@ -913,7 +964,7 @@ fn managed_inventory_native_rejection_does_not_fabricate_a_readonly_outcome() {
     );
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "resolve", json!({"rawId":"2001"})),
                 Some(&context),
                 now,
@@ -921,7 +972,7 @@ fn managed_inventory_native_rejection_does_not_fabricate_a_readonly_outcome() {
             .expect("managed metadata request"),
     );
     assert_eq!(request["method"], "getTabs");
-    let actions = adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"extension failure after possible activation"}}), now).expect("matched extension rejection");
+    let actions = adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"extension failure after possible activation"}}), now).expect("matched extension rejection");
     assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
     assert_eq!(
         response(&actions)["error"]["details"]["provenance"],
@@ -940,11 +991,11 @@ fn child_attach(
     token: &str,
     now: Instant,
 ) -> Value {
-    frame(&adapter.on_semantic(semantic(outer,"cdp",json!({"claim":token,"method":"Target.attachToTarget","params":{"targetId":"target-7","flatten":true}})), Some(context), now).expect("admitted child attach under exact root"))
+    frame(&adapter.written_semantic(semantic(outer,"cdp",json!({"claim":token,"method":"Target.attachToTarget","params":{"targetId":"target-7","flatten":true}})), Some(context), now).expect("admitted child attach under exact root"))
 }
 
 fn child_event(adapter: &mut ChatgptWireAdapter, method: &str, params: Value, now: Instant) {
-    adapter.on_extension(json!({"jsonrpc":"2.0","method":"onCDPEvent","params":{"source":{"tabId":7},"method":method,"params":params}}), now).expect("actual scoped CDP event");
+    adapter.written_extension(json!({"jsonrpc":"2.0","method":"onCDPEvent","params":{"source":{"tabId":7},"method":method,"params":params}}), now).expect("actual scoped CDP event");
 }
 
 fn child_input(
@@ -955,7 +1006,7 @@ fn child_input(
     child: &str,
     now: Instant,
 ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
-    adapter.on_semantic(semantic(outer,"cdp",json!({"claim":token,"sessionId":child,"method":"Input.insertText","params":{"text":"fixture-only"}})), Some(context), now)
+    adapter.written_semantic(semantic(outer,"cdp",json!({"claim":token,"sessionId":child,"method":"Input.insertText","params":{"text":"fixture-only"}})), Some(context), now)
 }
 
 #[test]
@@ -1059,7 +1110,7 @@ fn child_detach_ack_retires_exact_session_without_requiring_a_detach_event() {
     let token = attached(&mut adapter, &context, "1", 7, now);
     let attach = child_attach(&mut adapter, &context, "2", &token, now);
     reply(&mut adapter, &attach, json!({"sessionId":"child"}), now);
-    let detach = frame(&adapter.on_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"sessionId":"child"}})),Some(&context),now).expect("exact known child detach"));
+    let detach = frame(&adapter.written_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"sessionId":"child"}})),Some(&context),now).expect("exact known child detach"));
     reply(&mut adapter, &detach, json!({}), now);
     assert!(child_input(&mut adapter, &context, "4", &token, "child", now).is_err());
     assert!(!adapter.children.contains_key(&(7, "child".to_owned())));
@@ -1106,7 +1157,7 @@ fn parent_detach_before_nested_attach_ack_does_not_grant_an_orphan_session() {
         json!({"sessionId":"parent","targetInfo":{"targetId":"parent-target"}}),
         now,
     );
-    let attach = frame(&adapter.on_semantic(semantic("2","cdp",json!({"claim":token,"sessionId":"parent","method":"Target.attachToTarget","params":{"targetId":"target-7","flatten":true}})),Some(&context),now).expect("nested attach from an actual parent"));
+    let attach = frame(&adapter.written_semantic(semantic("2","cdp",json!({"claim":token,"sessionId":"parent","method":"Target.attachToTarget","params":{"targetId":"target-7","flatten":true}})),Some(&context),now).expect("nested attach from an actual parent"));
     child_event(
         &mut adapter,
         "Target.detachedFromTarget",
@@ -1130,7 +1181,7 @@ fn old_root_attach_ack_cannot_grant_a_child_to_a_new_physical_claim_epoch() {
     let attach = child_attach(&mut adapter, &context, "2", &old, now);
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "detach", json!({"claim":old})),
                 Some(&context),
                 now,
@@ -1138,7 +1189,7 @@ fn old_root_attach_ack_cannot_grant_a_child_to_a_new_physical_claim_epoch() {
             .expect("old exact root detach"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
         .expect("actual old root detach ACK");
     let new = attached(&mut adapter, &context, "4", 7, now);
     let result = response(&reply(
@@ -1163,8 +1214,8 @@ fn parent_detach_does_not_erase_an_already_matched_child_cleanup_ack() {
         json!({"sessionId":"parent","targetInfo":{"targetId":"parent-target"}}),
         now,
     );
-    adapter.on_extension(json!({"jsonrpc":"2.0","method":"onCDPEvent","params":{"source":{"tabId":7,"sessionId":"parent"},"method":"Target.attachedToTarget","params":{"sessionId":"child","targetInfo":{"targetId":"child-target"}}}}),now).expect("actual nested child event");
-    let detach = frame(&adapter.on_semantic(semantic("2","cdp",json!({"claim":token,"sessionId":"parent","method":"Target.detachFromTarget","params":{"sessionId":"child"}})),Some(&context),now).expect("authorized nested child cleanup"));
+    adapter.written_extension(json!({"jsonrpc":"2.0","method":"onCDPEvent","params":{"source":{"tabId":7,"sessionId":"parent"},"method":"Target.attachedToTarget","params":{"sessionId":"child","targetInfo":{"targetId":"child-target"}}}}),now).expect("actual nested child event");
+    let detach = frame(&adapter.written_semantic(semantic("2","cdp",json!({"claim":token,"sessionId":"parent","method":"Target.detachFromTarget","params":{"sessionId":"child"}})),Some(&context),now).expect("authorized nested child cleanup"));
     child_event(
         &mut adapter,
         "Target.detachedFromTarget",
@@ -1187,7 +1238,7 @@ fn target_id_only_child_detach_ack_retires_known_session_without_a_detach_event(
     let token = attached(&mut adapter, &context, "1", 7, now);
     let attach = child_attach(&mut adapter, &context, "2", &token, now);
     reply(&mut adapter, &attach, json!({"sessionId":"child"}), now);
-    let detach = frame(&adapter.on_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("source-supported target-only cleanup"));
+    let detach = frame(&adapter.written_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("source-supported target-only cleanup"));
     reply(&mut adapter, &detach, json!({}), now);
     assert!(child_input(&mut adapter, &context, "4", &token, "child", now).is_err());
 }
@@ -1208,7 +1259,7 @@ fn explicit_child_session_precedes_the_ignored_target_id_in_detach() {
         json!({"sessionId":"second","targetInfo":{"targetId":"second-target"}}),
         now,
     );
-    let detach = frame(&adapter.on_semantic(semantic("2","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"sessionId":"first","targetId":"ignored-foreign-target"}})),Some(&context),now).expect("Chromium ignores targetId when exact sessionId is supplied"));
+    let detach = frame(&adapter.written_semantic(semantic("2","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"sessionId":"first","targetId":"ignored-foreign-target"}})),Some(&context),now).expect("Chromium ignores targetId when exact sessionId is supplied"));
     assert_eq!(
         detach["params"]["commandParams"]["targetId"],
         "ignored-foreign-target"
@@ -1223,7 +1274,7 @@ fn target_only_cleanup_ack_fences_an_earlier_pending_attach_without_inventing_it
     let (mut adapter, context, now) = boot();
     let token = attached(&mut adapter, &context, "1", 7, now);
     let attach = child_attach(&mut adapter, &context, "2", &token, now);
-    let detach = frame(&adapter.on_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("exact owned target cleanup"));
+    let detach = frame(&adapter.written_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("exact owned target cleanup"));
     reply(&mut adapter, &detach, json!({}), now);
     let result = response(&reply(
         &mut adapter,
@@ -1241,7 +1292,7 @@ fn attached_event_between_target_cleanup_admission_and_ack_never_leaves_live_aut
     let (mut adapter, context, now) = boot();
     let token = attached(&mut adapter, &context, "1", 7, now);
     let attach = child_attach(&mut adapter, &context, "2", &token, now);
-    let detach=frame(&adapter.on_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("owned target cleanup"));
+    let detach=frame(&adapter.written_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("owned target cleanup"));
     child_event(
         &mut adapter,
         "Target.attachedToTarget",
@@ -1268,7 +1319,7 @@ fn attached_event_after_target_cleanup_ack_cannot_revive_an_earlier_pending_atta
     let (mut adapter, context, now) = boot();
     let token = attached(&mut adapter, &context, "1", 7, now);
     let attach = child_attach(&mut adapter, &context, "2", &token, now);
-    let detach=frame(&adapter.on_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("owned target cleanup"));
+    let detach=frame(&adapter.written_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("owned target cleanup"));
     reply(&mut adapter, &detach, json!({}), now);
     child_event(
         &mut adapter,
@@ -1292,7 +1343,7 @@ fn a_later_explicit_child_attach_receipt_is_not_reassigned_to_earlier_cleanup() 
     let (mut adapter, context, now) = boot();
     let token = attached(&mut adapter, &context, "1", 7, now);
     let old = child_attach(&mut adapter, &context, "2", &token, now);
-    let detach=frame(&adapter.on_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("owned target cleanup"));
+    let detach=frame(&adapter.written_semantic(semantic("3","cdp",json!({"claim":token,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("owned target cleanup"));
     let new = child_attach(&mut adapter, &context, "4", &token, now);
     reply(&mut adapter, &new, json!({"sessionId":"later-child"}), now);
     reply(&mut adapter, &detach, json!({}), now);
@@ -1309,10 +1360,10 @@ fn a_later_explicit_child_attach_receipt_is_not_reassigned_to_earlier_cleanup() 
 fn old_root_pending_target_cleanup_cannot_quarantine_a_new_claim_event() {
     let (mut adapter, context, now) = boot();
     let old = attached(&mut adapter, &context, "1", 7, now);
-    let old_target_cleanup=frame(&adapter.on_semantic(semantic("2","cdp",json!({"claim":old,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("old scoped target cleanup"));
+    let old_target_cleanup=frame(&adapter.written_semantic(semantic("2","cdp",json!({"claim":old,"method":"Target.detachFromTarget","params":{"targetId":"target-7"}})),Some(&context),now).expect("old scoped target cleanup"));
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "detach", json!({"claim":old})),
                 Some(&context),
                 now,
@@ -1320,7 +1371,7 @@ fn old_root_pending_target_cleanup_cannot_quarantine_a_new_claim_event() {
             .expect("old root cleanup"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
         .expect("actual old root detach ACK");
     let new = attached(&mut adapter, &context, "4", 7, now);
     child_event(
@@ -1346,7 +1397,7 @@ fn matched_native_error_is_transport_terminal_without_claiming_chrome_rejection(
     let token = attached(&mut adapter, &context, "1", 7, now);
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "2",
                     "cdp",
@@ -1357,7 +1408,7 @@ fn matched_native_error_is_transport_terminal_without_claiming_chrome_rejection(
             )
             .expect("actual extension CDP request"),
     );
-    let actions=adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"extension handler answered"}}),now).expect("matched actual extension error");
+    let actions=adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"extension handler answered"}}),now).expect("matched actual extension error");
     let (message, terminal) = actions
         .iter()
         .find_map(|action| match action {
@@ -1385,7 +1436,7 @@ fn cancelled_positive_native_ack_keeps_terminal_metadata_and_unknown_attach_cust
     let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
     adapter.on_cancel("1");
     let actions = adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
         .expect("actual id-only extension acknowledgement");
     let (message, terminal) = actions
         .iter()
@@ -1411,7 +1462,7 @@ fn timeout_eof_and_malformed_native_replies_cannot_mint_answered_rpc_metadata() 
         let token = attached(&mut adapter, &context, "1", 7, now);
         let request = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(
                         "2",
                         "cdp",
@@ -1425,7 +1476,7 @@ fn timeout_eof_and_malformed_native_replies_cannot_mint_answered_rpc_metadata() 
         let actions=match cause {
             "timeout"=>adapter.expire(now+DEADLINE+Duration::from_millis(1)),
             "eof"=>adapter.on_eof("fixture transport ended"),
-            _=>adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"result":{"remoteAcknowledged":true},"error":{"code":1,"message":"conflicting response outcomes"}}),now).expect("malformed reply normalized as unknown"),
+            _=>adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"result":{"remoteAcknowledged":true},"error":{"code":1,"message":"conflicting response outcomes"}}),now).expect("malformed reply normalized as unknown"),
         };
         assert!(
             !actions
@@ -1442,14 +1493,14 @@ fn out_of_order_native_replies_keep_their_exact_semantic_owner_and_context() {
     let (mut adapter, _, now) = boot();
     let first = frame(
         &adapter
-            .on_semantic(semantic("1", "inventory", json!({})), None, now)
+            .written_semantic(semantic("1", "inventory", json!({})), None, now)
             .expect("first readonly request"),
     );
     let mut other = semantic("2", "inventory", json!({}));
     other["owner"] = json!("owner-b");
     let second = frame(
         &adapter
-            .on_semantic(other, None, now)
+            .written_semantic(other, None, now)
             .expect("another exact authenticated owner"),
     );
     let actions = reply(&mut adapter, &second, json!([]), now);
@@ -1474,7 +1525,7 @@ fn earlier_native_phase_ack_cannot_tag_a_later_phase_timeout_as_answered() {
     let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
     let probe = frame(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
             .expect("actual earlier attach ACK"),
     );
     assert_eq!(probe["params"]["method"], "Runtime.evaluate");
@@ -1498,7 +1549,7 @@ fn session_only_resolve_uses_actual_uncapped_session_inventory_without_acquiring
     let (mut adapter, context, now) = boot();
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&context),
                 now,
@@ -1535,7 +1586,7 @@ fn session_only_resolve_uses_actual_uncapped_session_inventory_without_acquiring
 fn session_only_resolve_rejects_missing_context_and_malformed_selector_without_dispatch() {
     let (mut adapter, context, now) = boot();
     assert!(matches!(
-        adapter.on_semantic(
+        adapter.written_semantic(
             semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
             None,
             now
@@ -1544,7 +1595,7 @@ fn session_only_resolve_rejects_missing_context_and_malformed_selector_without_d
     ));
     for invalid in [Value::Null, json!("true"), json!(1), json!({})] {
         assert!(matches!(
-            adapter.on_semantic(
+            adapter.written_semantic(
                 semantic("2", "resolve", json!({"rawId":"2001","sessionOnly":invalid})),
                 Some(&context),
                 now
@@ -1562,7 +1613,7 @@ fn finished_turn_cannot_session_resolve_after_lease_removal_but_next_turn_can_qu
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("actual owned creation"),
     );
     reply(
@@ -1573,22 +1624,22 @@ fn finished_turn_cannot_session_resolve_after_lease_removal_but_next_turn_can_qu
     );
     let finish = frame(
         &adapter
-            .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
             .expect("finish exact turn"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("actual finish ACK");
     assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
     assert!(adapter.leases.is_empty());
     assert!(matches!(
-        adapter.on_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now),
+        adapter.written_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now),
         Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "turn_finished"
     ));
     assert_eq!(adapter.rpc.pending_len(), 0);
     let global = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("4", "resolve", json!({"rawId":"2001","sessionOnly":false})),
                 Some(&context),
                 now,
@@ -1602,7 +1653,7 @@ fn finished_turn_cannot_session_resolve_after_lease_removal_but_next_turn_can_qu
     let next = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("5", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&next),
                 now,
@@ -1625,7 +1676,7 @@ fn session_only_resolve_never_reassigns_a_foreign_logical_lease() {
         let (mut adapter, context, now) = boot();
         let create = frame(
             &adapter
-                .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
                 .expect("actual original owner"),
         );
         reply(
@@ -1640,11 +1691,11 @@ fn session_only_resolve_never_reassigns_a_foreign_logical_lease() {
         if same_session {
             envelope["owner"] = json!("foreign-owner");
             assert!(
-                matches!(adapter.on_semantic(envelope, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_has_foreign_custody")
+                matches!(adapter.written_semantic(envelope, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_has_foreign_custody")
             );
         } else {
             assert!(matches!(
-                adapter.on_semantic(envelope, Some(&foreign), now),
+                adapter.written_semantic(envelope, Some(&foreign), now),
                 Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "claim_unavailable"
             ));
         }
@@ -1664,7 +1715,7 @@ fn managed_resolve_native_failure_and_finish_uncertainty_keep_session_unavailabl
         let pending = if finishing {
             let create = frame(
                 &adapter
-                    .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                    .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
                     .expect("active turn"),
             );
             reply(
@@ -1675,13 +1726,13 @@ fn managed_resolve_native_failure_and_finish_uncertainty_keep_session_unavailabl
             );
             frame(
                 &adapter
-                    .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+                    .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
                     .expect("actual pending finish"),
             )
         } else {
             frame(
                 &adapter
-                    .on_semantic(
+                    .written_semantic(
                         semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                         Some(&context),
                         now,
@@ -1691,10 +1742,10 @@ fn managed_resolve_native_failure_and_finish_uncertainty_keep_session_unavailabl
         };
         if finishing {
             assert!(
-                matches!(adapter.on_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_unavailable")
+                matches!(adapter.written_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_unavailable")
             );
         }
-        let actions = adapter.on_extension(json!({"jsonrpc":"2.0","id":pending["id"],"error":{"code":1,"message":"extension failure after possible activation"}}), now).expect("matched extension terminal");
+        let actions = adapter.written_extension(json!({"jsonrpc":"2.0","id":pending["id"],"error":{"code":1,"message":"extension failure after possible activation"}}), now).expect("matched extension terminal");
         assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
         assert_eq!(
             response(&actions)["error"]["details"]["provenance"],
@@ -1712,7 +1763,7 @@ fn managed_resolve_native_failure_and_finish_uncertainty_keep_session_unavailabl
             }
         );
         assert!(
-            matches!(adapter.on_semantic(semantic("4", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_unavailable")
+            matches!(adapter.written_semantic(semantic("4", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_unavailable")
         );
         assert_eq!(adapter.rpc.pending_len(), 0);
     }
@@ -1723,7 +1774,7 @@ fn old_managed_metadata_reply_cannot_confirm_a_new_turn_or_acquire_a_row() {
     let (mut adapter, context, now) = boot();
     let old = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&context),
                 now,
@@ -1733,7 +1784,7 @@ fn old_managed_metadata_reply_cannot_confirm_a_new_turn_or_acquire_a_row() {
     let next = ExtensionWireContext::new(SID, "turn2").expect("new trusted turn");
     let new = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&next),
                 now,
@@ -1757,7 +1808,7 @@ fn detached_managed_session_preparation_claims_directly_after_actual_session_met
     let token = attached(&mut adapter, &context, "1", 2001, now);
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "detach", json!({"claim":token})),
                 Some(&context),
                 now,
@@ -1765,13 +1816,13 @@ fn detached_managed_session_preparation_claims_directly_after_actual_session_met
             .expect("exact physical detach"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
         .expect("physical detach ACK");
     assert!(adapter.claims.is_empty());
     assert_eq!(adapter.leases[&2001], ("owner".to_owned(), SID.to_owned()));
     let metadata = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&context),
                 now,
@@ -1787,7 +1838,7 @@ fn detached_managed_session_preparation_claims_directly_after_actual_session_met
     );
     let claim = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "4",
                     "prepareUserTab",
@@ -1828,7 +1879,7 @@ fn session_metadata_does_not_consume_the_existing_acquisition_budget() {
     }
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&context),
                 now,
@@ -1848,7 +1899,7 @@ fn forced_session_preparation_uses_direct_native_claim_and_confirms_exact_purpos
     let (mut adapter, context, now) = boot();
     let claim = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "1",
                     "prepareUserTab",
@@ -1885,14 +1936,14 @@ fn forced_session_preparation_uses_direct_native_claim_and_confirms_exact_purpos
 fn forced_session_preparation_refuses_untrusted_or_finished_scope_before_native_effects() {
     let (mut adapter, context, now) = boot();
     assert!(
-        matches!(adapter.on_semantic(semantic("1", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), None, now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
+        matches!(adapter.written_semantic(semantic("1", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), None, now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
     );
     assert!(
-        matches!(adapter.on_semantic(semantic("2", "prepareUserTab", json!({"tabId":2001,"sessionOnly":"true"})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "invalid_request")
+        matches!(adapter.written_semantic(semantic("2", "prepareUserTab", json!({"tabId":2001,"sessionOnly":"true"})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "invalid_request")
     );
     let create = frame(
         &adapter
-            .on_semantic(semantic("3", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("3", "createTab", json!({})), Some(&context), now)
             .expect("actual active turn"),
     );
     reply(
@@ -1903,14 +1954,14 @@ fn forced_session_preparation_refuses_untrusted_or_finished_scope_before_native_
     );
     let finish = frame(
         &adapter
-            .on_semantic(semantic("4", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("4", "finishTurn", json!({})), Some(&context), now)
             .expect("finish trusted turn"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("actual finish ACK");
     assert!(
-        matches!(adapter.on_semantic(semantic("5", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "turn_finished")
+        matches!(adapter.written_semantic(semantic("5", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "turn_finished")
     );
     assert!(adapter.leases.is_empty());
     assert!(adapter.claims.is_empty());
@@ -1924,7 +1975,7 @@ fn strict_session_prepare_does_not_invent_filtered_inventory_or_normalization_pr
         if known_lease {
             let create = frame(
                 &adapter
-                    .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                    .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
                     .expect("existing actual logical owner"),
             );
             reply(
@@ -1935,7 +1986,7 @@ fn strict_session_prepare_does_not_invent_filtered_inventory_or_normalization_pr
             );
         }
         let actions = adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "2",
                     "prepareUserTab",
@@ -1972,7 +2023,7 @@ fn strict_session_prepare_does_not_invent_filtered_inventory_or_normalization_pr
     let (mut adapter, context, now) = boot();
     let before = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "prepareUserTab", json!({"tabId":7})),
                 Some(&context),
                 now,
@@ -2003,7 +2054,7 @@ fn session_preparation_native_error_or_cancel_never_replays_or_echoes_success() 
         let (mut adapter, context, now) = boot();
         let claim = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(
                         "1",
                         "prepareUserTab",
@@ -2024,7 +2075,7 @@ fn session_preparation_native_error_or_cancel_never_replays_or_echoes_success() 
                 now,
             )
         } else {
-            adapter.on_extension(json!({"jsonrpc":"2.0","id":claim["id"],"error":{"code":1,"message":"ClaimUserTab failed after possible preparation"}}), now).expect("actual extension rejection")
+            adapter.written_extension(json!({"jsonrpc":"2.0","id":claim["id"],"error":{"code":1,"message":"ClaimUserTab failed after possible preparation"}}), now).expect("actual extension rejection")
         };
         assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
         assert!(response(&actions).get("result").is_none());
@@ -2068,7 +2119,7 @@ fn visible_session_inventory_miss_does_not_delete_owned_logical_or_creation_rows
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("actual owned creation"),
     );
     let created = response(&reply(
@@ -2083,7 +2134,7 @@ fn visible_session_inventory_miss_does_not_delete_owned_logical_or_creation_rows
         .to_owned();
     let lookup = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("2", "resolve", json!({"rawId":"7","sessionOnly":true})),
                 Some(&context),
                 now,
@@ -2110,7 +2161,7 @@ fn late_session_preparation_ack_after_finish_retains_metadata_without_reactivati
     let (mut adapter, context, now) = boot();
     let claim = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "1",
                     "prepareUserTab",
@@ -2123,16 +2174,16 @@ fn late_session_preparation_ack_after_finish_retains_metadata_without_reactivati
     );
     let finish = frame(
         &adapter
-            .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
             .expect("finish admitted turn"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("actual finish ACK");
     let next = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     let metadata = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})),
                 Some(&next),
                 now,
@@ -2172,7 +2223,7 @@ fn session_preparation_foreign_returned_id_never_becomes_ack_metadata_or_a_lease
         let (mut adapter, context, now) = boot();
         let claim = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(
                         "1",
                         "prepareUserTab",
@@ -2213,7 +2264,7 @@ fn acknowledged_close_retires_exact_creation_and_lease_across_more_than_the_budg
         let tab = 1000 + index as u64;
         let create = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(&(3 * index + 1).to_string(), "createTab", json!({})),
                     Some(&context),
                     now,
@@ -2239,7 +2290,7 @@ fn acknowledged_close_retires_exact_creation_and_lease_across_more_than_the_budg
         );
         let close = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(
                         &(3 * index + 3).to_string(),
                         "closeTab",
@@ -2285,7 +2336,7 @@ fn detach_ack_and_unproven_or_contradictory_close_results_retain_logical_custody
         let (mut adapter, context, now) = boot();
         let create = frame(
             &adapter
-                .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
                 .expect("real creation"),
         );
         let created = response(&reply(
@@ -2301,7 +2352,7 @@ fn detach_ack_and_unproven_or_contradictory_close_results_retain_logical_custody
         let claim = attached(&mut adapter, &context, "2", 7, now);
         let close = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic("3", "closeTab", json!({"claim":claim})),
                     Some(&context),
                     now,
@@ -2318,7 +2369,7 @@ fn detach_ack_and_unproven_or_contradictory_close_results_retain_logical_custody
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("real creation before detach"),
     );
     let created = response(&reply(
@@ -2334,7 +2385,7 @@ fn detach_ack_and_unproven_or_contradictory_close_results_retain_logical_custody
     let claim = attached(&mut adapter, &context, "2", 7, now);
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "detach", json!({"claim":claim})),
                 Some(&context),
                 now,
@@ -2343,7 +2394,7 @@ fn detach_ack_and_unproven_or_contradictory_close_results_retain_logical_custody
     );
     let terminal = response(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
             .expect("real detach ACK"),
     );
     assert_eq!(terminal["result"]["proof"], "detach_ack");
@@ -2357,7 +2408,7 @@ fn close_native_error_and_foreign_request_cannot_remove_owned_logical_records() 
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("actual owner creates"),
     );
     let created = response(&reply(
@@ -2374,19 +2425,19 @@ fn close_native_error_and_foreign_request_cannot_remove_owned_logical_records() 
     let mut foreign = semantic("3", "closeTab", json!({"claim":claim}));
     foreign["owner"] = json!("foreign-owner");
     assert!(
-        matches!(adapter.on_semantic(foreign, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "claim_unavailable")
+        matches!(adapter.written_semantic(foreign, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "claim_unavailable")
     );
     assert_eq!(adapter.rpc.pending_len(), 0);
     let close = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("4", "closeTab", json!({"claim":claim})),
                 Some(&context),
                 now,
             )
             .expect("exact owner close"),
     );
-    let output = adapter.on_extension(json!({"jsonrpc":"2.0","id":close["id"],"error":{"code":1,"message":"close effect unknown"}}), now).expect("extension error correlated");
+    let output = adapter.written_extension(json!({"jsonrpc":"2.0","id":close["id"],"error":{"code":1,"message":"close effect unknown"}}), now).expect("extension error correlated");
     assert_eq!(response(&output)["error"]["kind"], "outcome_unknown");
     assert!(adapter.claims.contains_key(&claim));
     assert!(adapter.creations.contains_key(&creation));
@@ -2402,7 +2453,7 @@ fn late_positive_close_keeps_outer_unknown_but_collects_exact_old_custody() {
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("real creation"),
     );
     let created = response(&reply(
@@ -2418,7 +2469,7 @@ fn late_positive_close_keeps_outer_unknown_but_collects_exact_old_custody() {
     let claim = attached(&mut adapter, &context, "2", 7, now);
     let close = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "closeTab", json!({"claim":claim})),
                 Some(&context),
                 now,
@@ -2447,7 +2498,7 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
-            .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+            .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("old creation"),
     );
     let old_created = response(&reply(
@@ -2463,7 +2514,7 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
     let old_claim = attached(&mut adapter, &context, "2", 7, now);
     let close = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("3", "closeTab", json!({"claim":old_claim})),
                 Some(&context),
                 now,
@@ -2472,7 +2523,7 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
     );
     let detach = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("4", "detach", json!({"claim":old_claim})),
                 Some(&context),
                 now,
@@ -2480,20 +2531,20 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
             .expect("physical detach while close pending"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":detach["id"]}), now)
         .expect("detach ACK");
     let finish = frame(
         &adapter
-            .on_semantic(semantic("5", "finishTurn", json!({})), Some(&context), now)
+            .written_semantic(semantic("5", "finishTurn", json!({})), Some(&context), now)
             .expect("old turn finish"),
     );
     adapter
-        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("old turn finish ACK");
     let next = ExtensionWireContext::new(SID, "turn2").expect("new immutable turn");
     let create = frame(
         &adapter
-            .on_semantic(semantic("6", "createTab", json!({})), Some(&next), now)
+            .written_semantic(semantic("6", "createTab", json!({})), Some(&next), now)
             .expect("actual new creation with reused raw ID"),
     );
     let new_created = response(&reply(
@@ -2509,7 +2560,7 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
     assert_ne!(old_creation, new_creation);
     let pre = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("7", "attach", json!({"tabId":7})),
                 Some(&next),
                 now,
@@ -2524,7 +2575,7 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
     ));
     let probe = frame(
         &adapter
-            .on_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+            .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
             .expect("new physical attach ACK"),
     );
     let targets = frame(&reply(
@@ -2549,13 +2600,13 @@ fn old_close_ack_cannot_collect_new_turn_reused_raw_tab_custody() {
 fn old_generation_close_reply_does_not_enter_new_generation_custody() {
     let (mut old, context, now) = boot();
     let create = frame(
-        &old.on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+        &old.written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
             .expect("old creation"),
     );
     reply(&mut old, &create, json!({"id":7,"url":"about:blank"}), now);
     let old_claim = attached(&mut old, &context, "2", 7, now);
     let close = frame(
-        &old.on_semantic(
+        &old.written_semantic(
             semantic("3", "closeTab", json!({"claim":old_claim})),
             Some(&context),
             now,
@@ -2565,12 +2616,12 @@ fn old_generation_close_reply_does_not_enter_new_generation_custody() {
     let generation = "33333333-3333-4333-8333-333333333333";
     let mut new = ChatgptWireAdapter::new(generation.to_owned(), EXT.to_owned())
         .expect("new independent generation");
-    let info = frame(&new.start(now).expect("new bootstrap"));
-    new.on_extension(json!({"jsonrpc":"2.0","id":info["id"],"result":{"type":"extension","version":"observed","metadata":{"extensionId":EXT,"extensionInstanceId":"instance-new"}}}), now).expect("new actual identity ACK");
+    let info = frame(&new.written_start(now).expect("new bootstrap"));
+    new.written_extension(json!({"jsonrpc":"2.0","id":info["id"],"result":{"type":"extension","version":"observed","metadata":{"extensionId":EXT,"extensionInstanceId":"instance-new"}}}), now).expect("new actual identity ACK");
     let mut create = semantic("1", "createTab", json!({}));
     create["generation"] = json!(generation);
     let create = frame(
-        &new.on_semantic(create, Some(&context), now)
+        &new.written_semantic(create, Some(&context), now)
             .expect("new real creation"),
     );
     let created = response(&reply(
@@ -2584,7 +2635,7 @@ fn old_generation_close_reply_does_not_enter_new_generation_custody() {
         .expect("new receipt")
         .to_owned();
     let ignored = new
-        .on_extension(
+        .written_extension(
             json!({"jsonrpc":"2.0","id":close["id"],"result":{"success":true}}),
             now,
         )
@@ -2619,7 +2670,7 @@ fn committed_session_url_uses_only_actual_owned_native_url_and_preserves_empty_s
         envelope["params"]["pendingUrl"] = json!("https://caller.invalid/pending");
         let request = frame(
             &adapter
-                .on_semantic(envelope, Some(&context), now)
+                .written_semantic(envelope, Some(&context), now)
                 .expect("captured owned URL purpose"),
         );
         assert_eq!(request["method"], "getCommittedTabUrl");
@@ -2658,7 +2709,7 @@ fn committed_session_url_uses_only_actual_owned_native_url_and_preserves_empty_s
 fn committed_url_selector_requires_strict_session_purpose_and_trusted_context_before_dispatch() {
     let (mut adapter, context, now) = boot();
     assert!(
-        matches!(adapter.on_semantic(committed_url_semantic("1", "7"), None, now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
+        matches!(adapter.written_semantic(committed_url_semantic("1", "7"), None, now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
     );
     for session in [None, Some(json!(false))] {
         let mut envelope = committed_url_semantic("2", "7");
@@ -2672,14 +2723,14 @@ fn committed_url_selector_requires_strict_session_purpose_and_trusted_context_be
             }
         }
         assert!(
-            matches!(adapter.on_semantic(envelope, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "invalid_request")
+            matches!(adapter.written_semantic(envelope, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "invalid_request")
         );
     }
     for value in [Value::Null, json!(1), json!("true"), json!({}), json!([])] {
         let mut envelope = committed_url_semantic("3", "7");
         envelope["params"]["committedUrlOnly"] = value;
         assert!(
-            matches!(adapter.on_semantic(envelope, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "invalid_request")
+            matches!(adapter.written_semantic(envelope, Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "invalid_request")
         );
     }
     assert_eq!(adapter.rpc.pending_len(), 0);
@@ -2693,7 +2744,7 @@ fn committed_url_false_keeps_both_existing_generic_and_strict_metadata_purposes(
         let (mut adapter, context, now) = boot();
         let request = frame(
             &adapter
-                .on_semantic(
+                .written_semantic(
                     semantic(
                         "1",
                         "resolve",
@@ -2730,7 +2781,7 @@ fn committed_url_foreign_local_scope_is_refused_before_native_ownership_is_borro
         let (mut adapter, context, now) = boot();
         let create = frame(
             &adapter
-                .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
                 .expect("real owner creation"),
         );
         reply(
@@ -2745,11 +2796,11 @@ fn committed_url_foreign_local_scope_is_refused_before_native_ownership_is_borro
         if same_session {
             envelope["owner"] = json!("foreign-owner");
             assert!(
-                matches!(adapter.on_semantic(envelope,Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_has_foreign_custody")
+                matches!(adapter.written_semantic(envelope,Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_has_foreign_custody")
             );
         } else {
             assert!(
-                matches!(adapter.on_semantic(envelope,Some(&foreign),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="claim_unavailable")
+                matches!(adapter.written_semantic(envelope,Some(&foreign),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="claim_unavailable")
             );
         }
         assert_eq!(adapter.rpc.pending_len(), 0);
@@ -2769,7 +2820,7 @@ fn committed_url_remote_or_malformed_reply_stays_unknown_with_activation_custody
         let (mut adapter, context, now) = boot();
         let request = frame(
             &adapter
-                .on_semantic(committed_url_semantic("1", "7"), Some(&context), now)
+                .written_semantic(committed_url_semantic("1", "7"), Some(&context), now)
                 .expect("actual URL method"),
         );
         let actions = reply(&mut adapter, &request, invalid, now);
@@ -2786,16 +2837,16 @@ fn committed_url_remote_or_malformed_reply_stays_unknown_with_activation_custody
             .iter()
             .any(|action| matches!(action, ExtensionWireAction::ExtensionFrame { .. })));
         assert!(
-            matches!(adapter.on_semantic(committed_url_semantic("2","7"),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_unavailable")
+            matches!(adapter.written_semantic(committed_url_semantic("2","7"),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_unavailable")
         );
     }
     let (mut adapter, context, now) = boot();
     let request = frame(
         &adapter
-            .on_semantic(committed_url_semantic("1", "7"), Some(&context), now)
+            .written_semantic(committed_url_semantic("1", "7"), Some(&context), now)
             .expect("actual owned URL method"),
     );
-    let actions=adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"actual owned URL read refused"}}),now).expect("actual extension error");
+    let actions=adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"actual owned URL read refused"}}),now).expect("actual extension error");
     let terminal = response(&actions);
     assert_eq!(terminal["error"]["kind"], "outcome_unknown");
     assert_eq!(
@@ -2826,7 +2877,7 @@ fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback
         if matches!(mode, "finished" | "finishing" | "finish-unknown" | "closed") {
             let create = frame(
                 &adapter
-                    .on_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
+                    .written_semantic(semantic("1", "createTab", json!({})), Some(&context), now)
                     .expect("real owner"),
             );
             reply(
@@ -2839,22 +2890,22 @@ fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback
         if matches!(mode, "finished" | "finishing" | "finish-unknown") {
             let finish = frame(
                 &adapter
-                    .on_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+                    .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
                     .expect("actual finish transition"),
             );
             match mode {
                 "finished" => {
                     adapter
-                        .on_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
+                        .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
                         .expect("actual finish ACK");
                 }
                 "finish-unknown" => {
-                    adapter.on_extension(json!({"jsonrpc":"2.0","id":finish["id"],"error":{"code":1,"message":"finish uncertain"}}),now).expect("actual finish error");
+                    adapter.written_extension(json!({"jsonrpc":"2.0","id":finish["id"],"error":{"code":1,"message":"finish uncertain"}}),now).expect("actual finish error");
                 }
                 _ => {}
             }
             assert!(
-                matches!(adapter.on_semantic(committed_url_semantic("3","7"),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code==if mode=="finished" {"turn_finished"} else {"session_unavailable"})
+                matches!(adapter.written_semantic(committed_url_semantic("3","7"),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code==if mode=="finished" {"turn_finished"} else {"session_unavailable"})
             );
             continue;
         }
@@ -2862,7 +2913,7 @@ fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback
             let claim = attached(&mut adapter, &context, "2", 7, now);
             let close = frame(
                 &adapter
-                    .on_semantic(
+                    .written_semantic(
                         semantic("3", "closeTab", json!({"claim":claim})),
                         Some(&context),
                         now,
@@ -2874,15 +2925,15 @@ fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback
         }
         let request = frame(
             &adapter
-                .on_semantic(committed_url_semantic("4", "7"), Some(&context), now)
+                .written_semantic(committed_url_semantic("4", "7"), Some(&context), now)
                 .expect("strict request has no local/global bypass"),
         );
         assert_eq!(request["method"], "getCommittedTabUrl");
         let actions=match mode {
-            "missing-result"=>adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"]}),now).expect("source nonvoid method cannot accept id-only ACK"),
+            "missing-result"=>adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"]}),now).expect("source nonvoid method cannot accept id-only ACK"),
             "timeout"=>adapter.expire(now+DEADLINE+Duration::from_millis(1)),
             "eof"=>adapter.on_eof("owned URL connection ended"),
-            "closed"=>adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"Tab is not part of this browser session"}}),now).expect("extension actual owned check refuses closed row"),
+            "closed"=>adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"Tab is not part of this browser session"}}),now).expect("extension actual owned check refuses closed row"),
             _=>unreachable!("each mode handled"),
         };
         assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
@@ -2899,13 +2950,13 @@ fn canceled_old_committed_url_retains_actual_payload_in_its_original_unknown_sco
     let (mut adapter, context, now) = boot();
     let old = frame(
         &adapter
-            .on_semantic(committed_url_semantic("1", "7"), Some(&context), now)
+            .written_semantic(committed_url_semantic("1", "7"), Some(&context), now)
             .expect("old captured URL request"),
     );
     let next = ExtensionWireContext::new(SID, "turn2").expect("new trusted turn");
     let new = frame(
         &adapter
-            .on_semantic(committed_url_semantic("2", "7"), Some(&next), now)
+            .written_semantic(committed_url_semantic("2", "7"), Some(&next), now)
             .expect("new captured URL request"),
     );
     let actions = reply(
@@ -2945,7 +2996,7 @@ fn whole_session_inventory_calls_get_tabs_once_even_empty_without_acquiring_meta
     for candidates in [json!([]), json!([2001, 51])] {
         let (mut adapter, context, now) = boot();
         let actions = adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "1",
                     "inventory",
@@ -2990,7 +3041,7 @@ fn whole_session_inventory_calls_get_tabs_once_even_empty_without_acquiring_meta
     let (mut adapter, context, now) = boot();
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "1",
                     "inventory",
@@ -3020,16 +3071,16 @@ fn whole_session_inventory_refuses_invalid_candidates_before_native_and_keeps_ac
         json!({"sessionOnly":null,"knownTabIds":[]}),
     ] {
         assert!(
-            matches!(adapter.on_semantic(semantic("1","inventory",params),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="invalid_request")
+            matches!(adapter.written_semantic(semantic("1","inventory",params),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="invalid_request")
         );
         assert_eq!(adapter.rpc.pending_len(), 0);
     }
     assert!(
-        matches!(adapter.on_semantic(semantic("1","inventory",json!({"sessionOnly":true,"knownTabIds":[]})),None,now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="wire_context_required")
+        matches!(adapter.written_semantic(semantic("1","inventory",json!({"sessionOnly":true,"knownTabIds":[]})),None,now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="wire_context_required")
     );
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "1",
                     "inventory",
@@ -3040,14 +3091,14 @@ fn whole_session_inventory_refuses_invalid_candidates_before_native_and_keeps_ac
             )
             .unwrap(),
     );
-    let actions=adapter.on_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"activation is not known"}}),now).unwrap();
+    let actions=adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"activation is not known"}}),now).unwrap();
     assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");
     assert_eq!(
         adapter.session_turns[SID].phase,
         TurnPhase::ActivationUnknown
     );
     assert!(
-        matches!(adapter.on_semantic(semantic("2","inventory",json!({"sessionOnly":true,"knownTabIds":[]})),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_unavailable")
+        matches!(adapter.written_semantic(semantic("2","inventory",json!({"sessionOnly":true,"knownTabIds":[]})),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_unavailable")
     );
 }
 
@@ -3057,7 +3108,7 @@ fn whole_session_inventory_late_reply_cannot_satisfy_replacement_turn() {
     let params = json!({"sessionOnly":true,"knownTabIds":[]});
     let old = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic("1", "inventory", params.clone()),
                 Some(&context),
                 now,
@@ -3067,7 +3118,7 @@ fn whole_session_inventory_late_reply_cannot_satisfy_replacement_turn() {
     let next = ExtensionWireContext::new(SID, "turn2").unwrap();
     let new = frame(
         &adapter
-            .on_semantic(semantic("2", "inventory", params), Some(&next), now)
+            .written_semantic(semantic("2", "inventory", params), Some(&next), now)
             .unwrap(),
     );
     assert_eq!(
@@ -3087,7 +3138,7 @@ fn whole_session_inventory_cancellation_preserves_late_native_reply_without_repl
     let (mut adapter, context, now) = boot();
     let request = frame(
         &adapter
-            .on_semantic(
+            .written_semantic(
                 semantic(
                     "1",
                     "inventory",
@@ -3118,7 +3169,7 @@ fn notification_keeps_actual_source_target_and_never_uses_payload_as_provenance(
             source["targetId"] = json!(target);
         }
         let actions = adapter
-            .on_extension(
+            .written_extension(
                 json!({
                     "jsonrpc":"2.0","method":"onCDPEvent",
                     "params":{"source":source,"method":"Page.fileChooserOpened",
@@ -3140,4 +3191,341 @@ fn notification_keeps_actual_source_target_and_never_uses_payload_as_provenance(
         assert!(event.get("sessionId").is_none());
         assert_eq!(event["params"]["targetId"], "payload-target");
     }
+}
+
+fn queued_phase(actions: &[ExtensionWireAction]) -> RequestId {
+    actions
+        .iter()
+        .find_map(|action| match action {
+            ExtensionWireAction::ExtensionFrame {
+                phase: Some(phase), ..
+            } => Some(phase.clone()),
+            _ => None,
+        })
+        .expect("actual locally minted pending RPC phase")
+}
+
+#[test]
+fn zero_frame_discard_preserves_the_old_turn_children_and_other_pending_rpc() {
+    for finishing in [false, true] {
+        let (mut adapter, context, now) = boot();
+        let token = attached(&mut adapter, &context, "1", 7, now);
+        let child = child_attach(&mut adapter, &context, "2", &token, now);
+        reply(
+            &mut adapter,
+            &child,
+            json!({"sessionId":"actual-child"}),
+            now,
+        );
+        let epoch = adapter.session_turns[SID].epoch;
+        let next = ExtensionWireContext::new(SID, "turn2").unwrap();
+        let queued = ExtensionWireAdapter::on_semantic(
+            &mut adapter,
+            if finishing {
+                semantic("3", "finishTurn", json!({}))
+            } else {
+                semantic(
+                    "3",
+                    "inventory",
+                    json!({"sessionOnly":true,"knownTabIds":[]}),
+                )
+            },
+            Some(if finishing { &context } else { &next }),
+            now,
+        )
+        .unwrap();
+        let phase = queued_phase(&queued);
+        let sibling = ExtensionWireAdapter::on_semantic(
+            &mut adapter,
+            semantic("4", "inventory", json!({})),
+            None,
+            now,
+        )
+        .unwrap();
+        let sibling_phase = queued_phase(&sibling);
+        assert_eq!(adapter.session_turns[SID].epoch, epoch);
+        assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+        assert_eq!(adapter.session_turns[SID].turn, context.host_turn_id());
+        assert!(adapter.claims[&token].live);
+        assert_eq!(adapter.claims[&token].turn, context.host_turn_id());
+        assert_eq!(
+            adapter.children[&(7, "actual-child".into())].state,
+            ChildState::Live
+        );
+        let discarded = adapter.discard_unwritten(&phase).unwrap();
+        assert!(
+            matches!(&discarded[..], [ExtensionWireAction::SemanticFinished { semantic_id }] if semantic_id=="3")
+        );
+        assert!(!adapter.tasks.contains_key(&phase));
+        assert!(adapter.rpc.pending_method(&phase).is_none());
+        assert!(adapter.tasks.contains_key(&sibling_phase));
+        assert_eq!(
+            adapter.rpc.pending_method(&sibling_phase),
+            Some(Method::GetUserTabs)
+        );
+        adapter.commit_write(&sibling_phase).unwrap();
+        reply(&mut adapter, &frame(&sibling), json!([]), now);
+        assert!(adapter
+            .expire(now + DEADLINE + Duration::from_secs(1))
+            .is_empty());
+        assert!(adapter
+            .on_extension(
+                json!({"jsonrpc":"2.0","id":phase.as_str(),"result":null}),
+                now
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(adapter.session_turns[SID].epoch, epoch);
+        assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+        assert!(adapter.claims[&token].live);
+        assert_eq!(
+            adapter.children[&(7, "actual-child".into())].state,
+            ChildState::Live
+        );
+    }
+}
+
+#[test]
+fn initial_attach_reservation_commits_only_at_the_same_actual_phase_start() {
+    let (mut adapter, context, now) = boot();
+    let queued = ExtensionWireAdapter::on_semantic(
+        &mut adapter,
+        semantic("1", "attach", json!({"tabId":8})),
+        Some(&context),
+        now,
+    )
+    .unwrap();
+    let phase = queued_phase(&queued);
+    assert!(!adapter.attaching.contains_key(&8));
+    assert!(!adapter.session_turns.contains_key(SID));
+    assert!(adapter
+        .on_semantic(
+            semantic("2", "attach", json!({"tabId":8})),
+            Some(&context),
+            now
+        )
+        .is_err());
+    adapter.discard_unwritten(&phase).unwrap();
+    assert!(adapter.tasks.is_empty());
+    assert!(!adapter.attaching.contains_key(&8));
+    let replacement = ExtensionWireAdapter::on_semantic(
+        &mut adapter,
+        semantic("3", "attach", json!({"tabId":8})),
+        Some(&context),
+        now,
+    )
+    .unwrap();
+    let replacement_phase = queued_phase(&replacement);
+    assert_ne!(phase, replacement_phase);
+    adapter.commit_write(&replacement_phase).unwrap();
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+    assert_eq!(adapter.attaching[&8].turn, context.host_turn_id());
+    assert!(adapter.discard_unwritten(&replacement_phase).is_err());
+    assert!(adapter.tasks.contains_key(&replacement_phase));
+    assert!(adapter.rpc.pending_method(&replacement_phase).is_some());
+    assert!(adapter.commit_write(&replacement_phase).is_err());
+}
+
+#[test]
+fn started_finish_cannot_be_refunded_and_expiry_remains_unknown() {
+    let (mut adapter, context, now) = boot();
+    let token = attached(&mut adapter, &context, "1", 7, now);
+    let queued = ExtensionWireAdapter::on_semantic(
+        &mut adapter,
+        semantic("2", "finishTurn", json!({})),
+        Some(&context),
+        now,
+    )
+    .unwrap();
+    let phase = queued_phase(&queued);
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
+    adapter.commit_write(&phase).unwrap();
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finishing);
+    assert!(!adapter.claims[&token].live);
+    assert!(adapter.discard_unwritten(&phase).is_err());
+    let expired = adapter.expire(now + DEADLINE + Duration::from_secs(1));
+    assert_eq!(response(&expired)["error"]["kind"], "outcome_unknown");
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::FinishUnknown);
+    assert!(adapter
+        .on_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now)
+        .is_err());
+}
+
+#[test]
+fn a_fenced_followup_keeps_the_earlier_actual_attach_ack_custody() {
+    let (mut adapter, context, now) = boot();
+    let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
+    let next = ExtensionWireAdapter::on_extension(
+        &mut adapter,
+        json!({"jsonrpc":"2.0","id":attach["id"]}),
+        now,
+    )
+    .unwrap();
+    let phase = queued_phase(&next);
+    assert_eq!(
+        adapter.tasks[&phase].write_phase,
+        WritePhase::AfterEarlierWrite
+    );
+    assert!(adapter.tasks[&phase].attach_acknowledged);
+    assert!(adapter.discard_unwritten(&phase).is_err());
+    assert!(adapter.tasks.contains_key(&phase));
+    assert!(adapter.rpc.pending_method(&phase).is_some());
+    adapter.on_cancel("1");
+    let expired = adapter.expire(now + DEADLINE + Duration::from_secs(1));
+    let value = response(&expired);
+    assert_eq!(value["error"]["kind"], "outcome_unknown");
+    let token = value["error"]["details"]["custody"]["claim"]
+        .as_str()
+        .unwrap();
+    assert!(!adapter.claims[token].live);
+    assert_eq!(
+        adapter.claims[token].identity,
+        AttachmentIdentity::ReconciliationRequired
+    );
+}
+
+#[test]
+fn cancelled_session_name_keeps_the_matched_positive_ack_without_replay() {
+    let (mut adapter, context, now) = boot();
+    let request = frame(
+        &adapter
+            .written_semantic(
+                semantic("51", "nameSession", json!({"name":"actual title"})),
+                Some(&context),
+                now,
+            )
+            .expect("admitted session naming"),
+    );
+    assert_eq!(request["method"], "nameSession");
+    assert_eq!(request["params"]["session_id"], SID);
+    assert_eq!(request["params"]["turn_id"], "turn1");
+    adapter.on_cancel("51");
+    let actions = reply(&mut adapter, &request, Value::Null, now);
+    let value = response(&actions);
+    assert_eq!(value["error"]["kind"], "outcome_unknown");
+    assert_eq!(
+        value["error"]["details"]["acknowledgedResult"],
+        json!({"renamed":true}),
+        "matched native naming success must survive the cancellation fence"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, ExtensionWireAction::ExtensionFrame { .. })),
+        "late naming acknowledgement must not replay a native operation"
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(action, ExtensionWireAction::SemanticFinished { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn framed_original_inventory_preserves_title_and_group_before_broker_value_ipc() {
+    let (mut adapter, _, now) = boot();
+    let request = frame(
+        &adapter
+            .written_semantic(semantic("1", "inventory", json!({})), None, now)
+            .unwrap(),
+    );
+    let text = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":[{{"id":17,"title":"\ud800","tabGroup":"\udc00"}}]}}"#,
+        serde_json::to_string(request["id"].as_str().unwrap()).unwrap()
+    );
+    let mut wire = (text.len() as u32).to_ne_bytes().to_vec();
+    wire.extend_from_slice(text.as_bytes());
+    let bytes = super::super::extension_framing::read_frame(
+        &mut std::io::Cursor::new(wire),
+        super::super::extension_framing::Direction::ChromeToHost,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(serde_json::from_slice::<Value>(&bytes).is_err());
+    let raw: Box<RawValue> = serde_json::from_slice(&bytes).unwrap();
+    let actions = adapter.written_extension_json(&raw, now).unwrap();
+    let terminal = response(&actions);
+    assert_eq!(terminal["result"]["tabs"][0]["id"], 17);
+    assert_eq!(terminal["result"]["tabs"][0]["titleJson"], r#""\ud800""#);
+    assert_eq!(
+        terminal["result"]["tabs"][0]["groupTitleJson"],
+        r#""\udc00""#
+    );
+    let ipc = serde_json::to_vec(&terminal).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&ipc).unwrap(), terminal);
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, ExtensionWireAction::MatchedBrokerMessage { .. })));
+}
+
+#[test]
+fn original_debugger_claim_and_attached_event_preserve_preexisting_lone_title() {
+    let (mut adapter, context, now) = boot();
+    let claim_request = frame(
+        &adapter
+            .written_semantic(
+                semantic("1", "attach", json!({"tabId":7})),
+                Some(&context),
+                now,
+            )
+            .unwrap(),
+    );
+    assert_eq!(claim_request["method"], "claimUserTab");
+    let raw_reply = |request: &Value, body: &str| -> Box<RawValue> {
+        serde_json::from_str(&format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{body}}}"#,
+            serde_json::to_string(request["id"].as_str().unwrap()).unwrap()
+        ))
+        .unwrap()
+    };
+    let targets = frame(
+        &adapter
+            .written_extension_json(
+                &raw_reply(
+                    &claim_request,
+                    r#"{"id":7,"url":"about:blank","title":"\ud800"}"#,
+                ),
+                now,
+            )
+            .unwrap(),
+    );
+    assert_eq!(targets["params"]["method"], "Target.getTargets");
+    let attach = frame(&adapter.written_extension_json(&raw_reply(&targets, r#"{"targetInfos":[{"tabId":7,"type":"page","targetId":"target-7","attached":false,"title":"\ud800"}]}"#), now).unwrap());
+    assert_eq!(attach["method"], "attach");
+    let probe = frame(
+        &adapter
+            .written_extension_json(&raw_reply(&attach, "null"), now)
+            .unwrap(),
+    );
+    let targets = frame(
+        &adapter
+            .written_extension_json(&raw_reply(&probe, r#"{"result":{"value":0}}"#), now)
+            .unwrap(),
+    );
+    let terminal = response(&adapter.written_extension_json(&raw_reply(&targets, r#"{"targetInfos":[{"tabId":7,"type":"page","targetId":"target-7","attached":true,"title":"\ud800"}]}"#), now).unwrap());
+    let token = terminal["result"]["claim"].as_str().unwrap();
+    assert!(adapter.claims[token].live);
+    assert_eq!(adapter.claims[token].tab, 7);
+    assert_eq!(adapter.claims[token].target, "target-7");
+    let event: &RawValue = serde_json::from_str(r#"{"jsonrpc":"2.0","method":"onCDPEvent","params":{"source":{"tabId":7},"method":"Target.attachedToTarget","params":{"sessionId":"child-raw","targetInfo":{"targetId":"child-target","type":"iframe","title":"\udc00"}}}}"#).unwrap();
+    let actions = adapter.written_extension_json(event, now).unwrap();
+    assert_eq!(
+        adapter.children[&(7, "child-raw".to_owned())].state,
+        ChildState::Live
+    );
+    let forwarded = actions
+        .iter()
+        .find_map(|action| match action {
+            ExtensionWireAction::BrokerMessage(value) if value["kind"] == "event" => Some(value),
+            _ => None,
+        })
+        .unwrap();
+    assert!(forwarded.get("params").is_none());
+    assert_eq!(
+        forwarded["paramsJson"],
+        r#"{"sessionId":"child-raw","targetInfo":{"targetId":"child-target","type":"iframe","title":"\udc00"}}"#
+    );
+    assert_eq!(forwarded["claim"], token);
 }

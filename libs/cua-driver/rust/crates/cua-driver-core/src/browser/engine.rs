@@ -26,18 +26,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde_json::{Value, json};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::session::register_scoped_fallible_session_end_hook;
 
 use super::binding::{
-    BindingOutcome, CdpWindowCandidate, cardinality_exact_candidate, correlate,
-    selected_tab_target_id,
+    cardinality_exact_candidate, correlate, selected_tab_target_id, BindingOutcome,
+    CdpWindowCandidate,
 };
-use super::cdp_ws::{CdpConnection, CdpPool, SharedSocketRelease};
+use super::cdp_ws::{CdpConnection, CdpMetadataRead, CdpPool, SharedSocketRelease};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
 use super::mutation::{MutationGates, MutationKey};
 use super::platform::{
@@ -48,12 +48,13 @@ use super::prepare::ManagedBrowsers;
 use super::reconnect::{ReconnectGates, ReconnectKey};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
-    DEFAULT_SEMANTIC_NODE_BUDGET, OmissionCounts, SEMANTIC_COMPUTED_STYLES, SemanticDocument,
-    SemanticNode, build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
+    build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
+    OmissionCounts, SemanticDocument, SemanticNode, DEFAULT_SEMANTIC_NODE_BUDGET,
+    SEMANTIC_COMPUTED_STYLES,
 };
 use super::store::{
-    BrowserStore, BrowserVisibility, FrameIdentity, FrameKind, FrameRef, RefEntry,
-    SemanticContinuation, SnapshotRecord, TabRecord, TargetRecord, format_ref,
+    format_ref, BrowserStore, BrowserVisibility, FrameIdentity, FrameKind, FrameRef, RefEntry,
+    SemanticContinuation, SnapshotRecord, TabRecord, TargetRecord,
 };
 use super::types::{
     BindingQuality, BrowserClassification, BrowserEngineFamily, BrowserProcessRole,
@@ -87,6 +88,20 @@ pub struct BrowserEngine {
 
 fn refuse(code: BrowserRefusalCode, msg: impl Into<String>) -> BrowserRefusal {
     BrowserRefusal::new(code, msg)
+}
+
+fn native_candidate_title(info: &Value) -> Result<String, BrowserRefusal> {
+    let Some(value) = info.get("titleJson") else {
+        return Ok(String::new());
+    };
+    let title: super::JsonStringLiteral = serde_json::from_value(value.clone())
+        .map_err(|error| route_err("TargetInfo title is invalid", error))?;
+    title.strict_scalar().map_err(|_| {
+        refuse(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            "the current native-window proof cannot represent this CDP target's UTF-16 title",
+        )
+    })
 }
 
 fn authorize_live_browser_origin(
@@ -1112,10 +1127,14 @@ impl BrowserEngine {
         &self,
         conn: &CdpConnection,
     ) -> Result<Vec<CdpWindowCandidate>, BrowserRefusal> {
-        let targets = conn
-            .call(None, "Target.getTargets", json!({}))
+        let targets_json = conn
+            .call_metadata(None, CdpMetadataRead::GetTargets, json!({}))
             .await
             .map_err(|e| route_err("Target.getTargets failed", e))?;
+        let raw: &serde_json::value::RawValue = serde_json::from_str(&targets_json)
+            .map_err(|error| route_err("Target.getTargets returned invalid JSON", error))?;
+        let targets = super::js_string::normalize_cdp_targets(raw)
+            .map_err(|error| route_err("Target.getTargets metadata is invalid", error))?;
         let infos = targets
             .get("targetInfos")
             .and_then(Value::as_array)
@@ -1150,11 +1169,7 @@ impl BrowserEngine {
                         "Target.getTargets returned a page without targetId",
                     )
                 })?;
-            let title = info
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
+            let title = native_candidate_title(&info)?;
 
             let window_geometry = match conn
                 .call(
@@ -3280,5 +3295,30 @@ allow:
                 .unwrap_err();
         assert_eq!(refusal.code, BrowserRefusalCode::BrowserOriginOutsideScope);
         assert!(authorize_live_browser_origin(None, "https://app.example.com").is_err());
+    }
+}
+
+#[cfg(test)]
+mod utf16_native_title_tests {
+    use super::*;
+
+    #[test]
+    fn native_window_proof_refuses_unrepresentable_title_without_sanitizing_it() {
+        let raw: &serde_json::value::RawValue =
+            serde_json::from_str(r#"{"targetId":"actual","type":"page","title":"\ud800"}"#)
+                .unwrap();
+        let info = super::super::js_string::normalize_cdp_target_info(raw).unwrap();
+        let error = native_candidate_title(&info).unwrap_err();
+        assert_eq!(error.code, BrowserRefusalCode::BrowserRouteUnavailable);
+        assert_eq!(
+            error.message,
+            "the current native-window proof cannot represent this CDP target's UTF-16 title"
+        );
+        assert_eq!(info["titleJson"], r#""\ud800""#);
+        assert_eq!(
+            native_candidate_title(&json!({"titleJson":"\"Normal 😀 title\""})).unwrap(),
+            "Normal 😀 title"
+        );
+        assert_eq!(native_candidate_title(&json!({})).unwrap(), "");
     }
 }

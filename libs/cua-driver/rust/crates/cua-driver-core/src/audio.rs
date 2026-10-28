@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock, Weak,
+};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -40,6 +43,7 @@ struct InvalidAudioDuration;
 #[derive(Clone)]
 pub struct AudioCompletion {
     receiver: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+    output: Option<PathBuf>,
 }
 
 pub struct AudioCompletionSender {
@@ -49,7 +53,25 @@ pub struct AudioCompletionSender {
 impl AudioCompletion {
     pub fn channel() -> (Self, AudioCompletionSender) {
         let (sender, receiver) = tokio::sync::watch::channel(None);
-        (Self { receiver }, AudioCompletionSender { sender })
+        (
+            Self {
+                receiver,
+                output: None,
+            },
+            AudioCompletionSender { sender },
+        )
+    }
+
+    /// The actual manager-owned output, populated only by its bound snapshot.
+    /// This path is observation metadata; it grants no filesystem access.
+    pub fn output_path(&self) -> Option<&Path> {
+        self.output.as_deref()
+    }
+
+    /// Compare native completion observations without granting cleanup access.
+    /// The immutable bound manager/session still decides what it may discard.
+    pub fn same_capture(&self, other: &Self) -> bool {
+        self.receiver.same_channel(&other.receiver)
     }
 
     /// A duration deadline alone is not completion. The native owner reports
@@ -113,6 +135,7 @@ struct RetainedRecording {
     // file deletion, including through the directory's recursive destructor.
     _directory: tempfile::TempDir,
     file: Option<PathBuf>,
+    completion: Option<AudioCompletion>,
 }
 
 impl Drop for RetainedRecording {
@@ -128,8 +151,16 @@ impl Drop for RetainedRecording {
 
 #[derive(Default)]
 struct SessionAudio {
+    // One canonical Closed reservation on the existing manager entry. It can
+    // fence a queued start without waiting for an in-progress native startup.
+    closed: AtomicBool,
+    state: Mutex<SessionAudioState>,
+}
+#[derive(Default)]
+struct SessionAudioState {
     recording: RecordingState,
     completed: Vec<RetainedRecording>,
+    cleanup_failure: Option<String>,
 }
 
 #[derive(Default)]
@@ -137,14 +168,13 @@ enum RecordingState {
     #[default]
     Idle,
     Active(ActiveRecording),
-    Closed,
 }
 
 /// Constructed once per opted-in runtime, never stored in a process-global slot.
 pub struct AudioRecordings {
     factory: Arc<dyn AudioBackendFactory>,
     completed_lifetime: CompletedRecordingLifetime,
-    sessions: Mutex<HashMap<String, Arc<Mutex<SessionAudio>>>>,
+    sessions: Mutex<HashMap<String, Arc<SessionAudio>>>,
 }
 
 #[derive(Debug)]
@@ -162,7 +192,7 @@ impl AudioRecordings {
         }
     }
 
-    fn reserve_session(&self, session: &str) -> Arc<Mutex<SessionAudio>> {
+    fn reserve_session(&self, session: &str) -> Arc<SessionAudio> {
         self.sessions
             .lock()
             .unwrap()
@@ -178,16 +208,19 @@ impl AudioRecordings {
 
     fn start_reserved(
         &self,
-        owned: Arc<Mutex<SessionAudio>>,
+        owned: Arc<SessionAudio>,
         max_duration: Duration,
     ) -> anyhow::Result<()> {
         // This lock owns only this session's capture. Dispatch admission keeps
         // lifecycle cleanup after an accepted start; cleanup also takes this lock.
-        let mut owned = owned.lock().unwrap();
+        let entry = owned;
+        let mut owned = entry.state.lock().unwrap();
+        if entry.closed.load(Ordering::Acquire) {
+            bail!("computer audio session is closed");
+        }
         match owned.recording {
             RecordingState::Idle => {}
             RecordingState::Active(_) => bail!("computer audio recording is already active"),
-            RecordingState::Closed => bail!("computer audio session is closed"),
         }
         if self.completed_lifetime == CompletedRecordingLifetime::UntilNextStartAttempt {
             for previous in &mut owned.completed {
@@ -217,15 +250,19 @@ impl AudioRecordings {
             .get(session)
             .cloned()
             .context("computer audio recording is not active")?;
-        let mut owned = owned.lock().unwrap();
+        let entry = owned;
+        let mut owned = entry.state.lock().unwrap();
+        if entry.closed.load(Ordering::Acquire) {
+            bail!("computer audio session is closed");
+        }
         let active = match std::mem::take(&mut owned.recording) {
             RecordingState::Active(active) => active,
             RecordingState::Idle => bail!("computer audio recording is not active"),
-            RecordingState::Closed => {
-                owned.recording = RecordingState::Closed;
-                bail!("computer audio session is closed");
-            }
         };
+        let completion = active.backend.completion().ok().map(|mut completion| {
+            completion.output = Some(active.directory.path().join("recording.wav"));
+            completion
+        });
         active.backend.stop()?;
         let filepath = active.directory.path().join("recording.wav");
         let bytes = std::fs::read(&filepath).context("read finalized computer audio")?;
@@ -233,6 +270,7 @@ impl AudioRecordings {
         owned.completed.push(RetainedRecording {
             _directory: active.directory,
             file: Some(filepath.clone()),
+            completion,
         });
         Ok(RecordedAudio { filepath, bytes })
     }
@@ -248,12 +286,131 @@ impl AudioRecordings {
             .get(session)
             .cloned()
             .context("computer audio recording is not active")?;
-        let owned = owned.lock().unwrap();
-        match &owned.recording {
-            RecordingState::Active(active) => active.backend.completion(),
-            RecordingState::Idle => bail!("computer audio recording is not active"),
-            RecordingState::Closed => bail!("computer audio session is closed"),
+        let entry = owned;
+        let owned = entry.state.lock().unwrap();
+        if entry.closed.load(Ordering::Acquire) {
+            bail!("computer audio session is closed");
         }
+        match &owned.recording {
+            RecordingState::Active(active) => {
+                let mut completion = active.backend.completion()?;
+                completion.output = Some(active.directory.path().join("recording.wav"));
+                Ok(completion)
+            }
+            RecordingState::Idle => bail!("computer audio recording is not active"),
+        }
+    }
+
+    /// Resolve existing owned-resource metadata in this immutable session.
+    /// It never reads or deletes a caller-selected path. Final cleanup still
+    /// compares the original native watch under the same manager state lock.
+    pub fn completion_for_output(
+        &self,
+        session: &str,
+        output: &Path,
+    ) -> AudioResult<Option<AudioCompletion>> {
+        let owned = self.sessions.lock().unwrap().get(session).cloned();
+        let Some(owned) = owned else {
+            return Ok(None);
+        };
+        let state = owned.state.lock().unwrap();
+        if let Some(error) = &state.cleanup_failure {
+            bail!("{error}");
+        }
+        if let RecordingState::Active(active) = &state.recording {
+            if active.directory.path().join("recording.wav") == output {
+                let mut completion = active.backend.completion()?;
+                completion.output = Some(output.to_owned());
+                return Ok(Some(completion));
+            }
+        }
+        Ok(state
+            .completed
+            .iter()
+            .find(|record| record.file.as_deref() == Some(output))
+            .and_then(|record| record.completion.clone()))
+    }
+
+    /// Reserve Closed immediately on the existing entry, before native stop or
+    /// runtime write-drain can block. No new capture owner or grant is created.
+    pub fn reserve_close_session(self: &Arc<Self>, session: &str) -> AudioCloseReservation {
+        let owned = self.reserve_session(session);
+        owned.closed.store(true, Ordering::Release);
+        AudioCloseReservation {
+            manager: Arc::downgrade(self),
+            session: session.to_owned(),
+            owned,
+        }
+    }
+
+    /// Reserve the same Closed lifecycle only when this bound session still
+    /// owns the observed capture. An older observation cannot clear a later
+    /// recording or consume its retained files. It supplies no session authority.
+    pub fn reserve_close_completion(
+        self: &Arc<Self>,
+        session: &str,
+        expected: &AudioCompletion,
+    ) -> AudioResult<Option<AudioCloseReservation>> {
+        let owned = self.sessions.lock().unwrap().get(session).cloned();
+        let Some(owned) = owned else {
+            return Ok(None);
+        };
+        {
+            let mut state = owned.state.lock().unwrap();
+            if let Some(error) = &state.cleanup_failure {
+                bail!("{error}");
+            }
+            let mut index = 0;
+            while index < state.completed.len() {
+                let previous = &mut state.completed[index];
+                let matching = previous.file.is_some()
+                    && previous
+                        .completion
+                        .as_ref()
+                        .is_some_and(|capture| capture.same_capture(expected));
+                if !matching {
+                    index += 1;
+                    continue;
+                }
+                // Only this still-owned WAV and its empty wrapper are removed.
+                // A Windows next-Start-consumed slot (file=None) is not retried.
+                if let Some(file) = previous.file.as_ref() {
+                    match std::fs::remove_file(file) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).context("discard observed completed computer audio")
+                        }
+                    }
+                }
+                // The one owned file deletion settled. Never let a later
+                // empty-wrapper failure re-enable TempDir recursive deletion.
+                previous.file = None;
+                previous._directory.disable_cleanup(true);
+                match std::fs::remove_dir(previous._directory.path()) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).context("discard observed computer audio wrapper")
+                    }
+                }
+                state.completed.remove(index);
+            }
+            let RecordingState::Active(active) = &state.recording else {
+                return Ok(None);
+            };
+            if !active.backend.completion()?.same_capture(expected) {
+                return Ok(None);
+            }
+            // While this same state is locked no stop/new start can exchange
+            // the backend between identity comparison and the Closed fence.
+            owned.closed.store(true, Ordering::Release);
+        }
+        Ok(Some(AudioCloseReservation {
+            manager: Arc::downgrade(self),
+            session: session.to_owned(),
+            owned,
+        }))
     }
 
     pub fn close_session(&self, session: &str) -> anyhow::Result<()> {
@@ -264,11 +421,13 @@ impl AudioRecordings {
         // Keep this same ownership entry discoverable while native stop joins.
         // Concurrent runtime shutdown must wait on it, even when session close
         // started cleanup first on another blocking worker.
+        owned.closed.store(true, Ordering::Release);
         let result = close_owned(owned.clone());
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions
-            .get(session)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &owned))
+        if result.is_ok()
+            && sessions
+                .get(session)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &owned))
         {
             sessions.remove(session);
         }
@@ -291,14 +450,72 @@ impl AudioRecordings {
     }
 }
 
-fn close_owned(owned: Arc<Mutex<SessionAudio>>) -> anyhow::Result<()> {
-    let mut owned = owned.lock().unwrap();
-    let result = match std::mem::replace(&mut owned.recording, RecordingState::Closed) {
+fn close_owned(owned: Arc<SessionAudio>) -> anyhow::Result<()> {
+    owned.closed.store(true, Ordering::Release);
+    let mut state = owned.state.lock().unwrap();
+    if let Some(error) = &state.cleanup_failure {
+        bail!("{error}");
+    }
+    let result = match std::mem::take(&mut state.recording) {
         RecordingState::Active(active) => active.backend.stop(),
-        RecordingState::Idle | RecordingState::Closed => Ok(()),
+        RecordingState::Idle => Ok(()),
     };
-    owned.completed.clear();
+    state.completed.clear();
+    if let Err(error) = &result {
+        state.cleanup_failure = Some(format!("{error:#}"));
+    }
     result
+}
+
+/// Host-only custody of the same manager/session entry during audio revocation.
+/// It neither grants capture nor resets other native/browser/session state.
+#[must_use]
+pub struct AudioCloseReservation {
+    manager: Weak<AudioRecordings>,
+    session: String,
+    owned: Arc<SessionAudio>,
+}
+
+impl std::fmt::Debug for AudioCloseReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioCloseReservation")
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AudioCloseReservation {
+    /// Blocking real native stop/join, before waiting for unrelated SDK reads.
+    pub fn stop_native(&self) -> anyhow::Result<()> {
+        close_owned(self.owned.clone())
+    }
+    /// Release this exact successful Closed entry only after the embedding SDK
+    /// has drained its previously read-admitted calls. Failure keeps Closed.
+    pub fn finish_after_drain(self) -> anyhow::Result<()> {
+        let manager = self
+            .manager
+            .upgrade()
+            .context("audio manager retired before discard drain")?;
+        {
+            let owned = self.owned.state.lock().unwrap();
+            if let Some(error) = &owned.cleanup_failure {
+                bail!("{error}");
+            }
+            if !self.owned.closed.load(Ordering::Acquire)
+                || !matches!(owned.recording, RecordingState::Idle)
+            {
+                bail!("audio discard native stop is not settled");
+            }
+        }
+        let mut sessions = manager.sessions.lock().unwrap();
+        if sessions
+            .get(&self.session)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.owned))
+        {
+            sessions.remove(&self.session);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for AudioRecordings {
@@ -1313,5 +1530,92 @@ mod tests {
             "session_ended"
         );
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn host_audio_close_reservation_fences_reserved_and_late_starts_until_finish() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let recordings = Arc::new(AudioRecordings::new(Arc::new(Factory(active.clone()))));
+        recordings.start("target", Duration::from_secs(1)).unwrap();
+        recordings.start("foreign", Duration::from_secs(1)).unwrap();
+        let previously_reserved = recordings.reserve_session("target");
+        let closing = recordings.reserve_close_session("target");
+        closing.stop_native().unwrap();
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            1,
+            "only the exact target capture stops"
+        );
+        assert_eq!(
+            recordings
+                .start_reserved(previously_reserved, Duration::from_secs(1))
+                .unwrap_err()
+                .to_string(),
+            "computer audio session is closed"
+        );
+        assert_eq!(
+            recordings
+                .start("target", Duration::from_secs(1))
+                .unwrap_err()
+                .to_string(),
+            "computer audio session is closed"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        // The SDK owns the actual write-drain; this test isolates entry
+        // identity and the queued worker fence, not SDK admission itself.
+        closing.finish_after_drain().unwrap();
+        recordings.start("target", Duration::from_secs(1)).unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        recordings.close_all().unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    struct FailedStopFactory(Arc<AtomicUsize>);
+    struct FailedStop(Arc<AtomicUsize>);
+    impl AudioBackendFactory for FailedStopFactory {
+        fn start(&self, _: &Path, _: Duration) -> AudioResult<Box<dyn AudioBackend>> {
+            Ok(Box::new(FailedStop(self.0.clone())))
+        }
+    }
+    impl AudioBackend for FailedStop {
+        fn stop(self: Box<Self>) -> AudioResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("fixture native audio stop failed")
+        }
+    }
+    #[test]
+    fn failed_host_audio_stop_keeps_closed_and_its_original_error() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let recordings = Arc::new(AudioRecordings::new(Arc::new(FailedStopFactory(
+            stopped.clone(),
+        ))));
+        recordings.start("target", Duration::from_secs(1)).unwrap();
+        let closing = recordings.reserve_close_session("target");
+        assert_eq!(
+            closing.stop_native().unwrap_err().to_string(),
+            "fixture native audio stop failed"
+        );
+        assert_eq!(
+            closing.finish_after_drain().unwrap_err().to_string(),
+            "fixture native audio stop failed"
+        );
+        assert_eq!(
+            recordings
+                .start("target", Duration::from_secs(1))
+                .unwrap_err()
+                .to_string(),
+            "computer audio session is closed"
+        );
+        assert_eq!(
+            recordings.close_session("target").unwrap_err().to_string(),
+            "fixture native audio stop failed"
+        );
+        assert!(recordings.sessions.lock().unwrap().contains_key("target"));
+        assert_eq!(
+            stopped.load(Ordering::SeqCst),
+            1,
+            "the consumed backend is not stopped again or mistaken for success"
+        );
+        assert!(recordings.close_all().is_err());
     }
 }

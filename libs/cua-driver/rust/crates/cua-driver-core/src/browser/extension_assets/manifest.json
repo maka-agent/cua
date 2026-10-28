@@ -10,6 +10,7 @@
     "tabGroups",
     "declarativeNetRequestWithHostAccess",
     "downloads",
+    "history",
     "scripting",
     "webNavigation"
   ],

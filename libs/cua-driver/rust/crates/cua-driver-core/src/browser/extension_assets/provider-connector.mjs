@@ -1,5 +1,7 @@
 // Composition of maka Chrome transport leaves. Host retains its existing logical ledger and engine.
 import { ConnectorError } from './connector.mjs';
+import { readUserTab } from './user-tab-context.mjs';
+import { userHistory } from './user-history.mjs';
 import { ClaimPreparation } from './claim-preparation.mjs';
 import { validateExpandedHeaders } from './scoped-headers.mjs';
 import { ExtensionDownloads } from './extension-downloads.mjs';
@@ -13,6 +15,7 @@ import { FixedUi } from './fixed-ui.mjs';
 import {
   captureFixedSession,
   captureSessionScope,
+  captureSessionContext,
   sameSessionContext,
 } from './session-preparation.mjs';
 export class ExtensionBrowserConnector extends PreparedBrowserConnector {
@@ -98,11 +101,29 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
     result.capabilities.sessionTabResolution = true;
     result.capabilities.sessionTabInventory = true;
     result.capabilities.sessionCommittedUrl = true;
+    result.capabilities.userTabContextRead = !!this.chrome.scripting?.executeScript;
     result.capabilities.downloadNotifications = true;
+    result.capabilities.userHistory = typeof this.chrome.history?.search === 'function';
     result.capabilities.tabPreparation = true;
     result.capabilities.createdPresentation = true;
     return result;
   }
+  async readUserTabContext(owner, params, wireContext) {
+    if (typeof wireContext?.hostSessionId !== 'string' || !wireContext.hostSessionId
+        || typeof wireContext?.hostTurnId !== 'string' || !wireContext.hostTurnId)
+      throw new ConnectorError('context_required', 'user-tab reads require captured Host session and turn');
+    const generation = this.generation;
+    try {
+      const value = await readUserTab(this.chrome, params,
+        () => this.admittedTab(owner, params.tabId, generation));
+      return { value };
+    } catch (error) {
+      if (error?.message === 'The selected tab changed while being read')
+        throw new ConnectorError('tab_changed', error.message);
+      throw error;
+    }
+  }
+
   fixedSessionAvailable() {
     return this.headersInitialized && !this.headers.uncertain && !this.observer.failed
       && this.claimPreparation.available() && this.fixedUi.available();
@@ -749,6 +770,18 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
   async dispatch(owner, method, params, wireContext) {
     try {
       switch (method) {
+        case 'readUserTab':
+          return await this.readUserTabContext(owner, params, wireContext);
+        case 'userHistory': {
+          captureSessionContext(wireContext);
+          if (!this.accepting || !this.generation || this.closedOwners.has(owner))
+            throw new ConnectorError('owner_closed', 'history requires the current captured Host owner');
+          const generation = this.generation;
+          const items = await userHistory(this.chrome, params);
+          if (!this.accepting || this.generation !== generation || this.closedOwners.has(owner))
+            throw new ConnectorError('owner_closed', 'history owner ended before its response');
+          return { items };
+        }
         case 'prepareSessionTab':
           return await this.prepareFixedSession(owner, params, wireContext);
         case 'sessionUi':

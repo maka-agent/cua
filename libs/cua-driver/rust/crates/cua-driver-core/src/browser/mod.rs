@@ -52,8 +52,12 @@ mod extension_host;
 mod extension_install;
 pub mod extension_process;
 mod extension_provider;
+mod user_tab_context;
+pub use user_tab_context::{BrowserUserTabRead, BrowserWorkspaceExportFormat};
 mod extension_wire;
 mod grant;
+mod js_string;
+pub use js_string::JsonStringLiteral;
 mod keyed_gates;
 mod local_ipc;
 #[cfg(test)]

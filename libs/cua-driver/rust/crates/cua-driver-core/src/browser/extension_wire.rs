@@ -375,6 +375,7 @@ pub(crate) enum ExtensionWireAction {
         message: Value,
         semantic_id: Option<String>,
         trace: Option<ExtensionRpcTrace>,
+        phase: Option<super::chatgpt_rpc_v2::RequestId>,
     },
     BrokerMessage(Value),
     MatchedBrokerMessage {
@@ -428,7 +429,33 @@ pub(crate) trait ExtensionWireAdapter: Send {
         frame: Value,
         now: Instant,
     ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError>;
+    /// The original framed JSON remains opaque until this actor owns decoding.
+    fn on_extension_json(
+        &mut self,
+        frame: &serde_json::value::RawValue,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        let value = serde_json::from_str(frame.get())
+            .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+        self.on_extension(value, now)
+    }
     fn on_cancel(&mut self, semantic_id: &str) -> Vec<ExtensionWireAction>;
+    fn commit_write(
+        &mut self,
+        _phase: &super::chatgpt_rpc_v2::RequestId,
+    ) -> Result<(), ExtensionWireError> {
+        Err(ExtensionWireError::Protocol(
+            "adapter received an unsupported local write phase".to_owned(),
+        ))
+    }
+    fn discard_unwritten(
+        &mut self,
+        _phase: &super::chatgpt_rpc_v2::RequestId,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        Err(ExtensionWireError::Protocol(
+            "adapter received an unsupported unwritten local phase".to_owned(),
+        ))
+    }
     fn on_eof(&mut self, reason: &str) -> Vec<ExtensionWireAction>;
     fn expire(&mut self, now: Instant) -> Vec<ExtensionWireAction>;
 }
@@ -472,6 +499,7 @@ impl ExtensionWireAdapter for MakaWireAdapter {
                 message: envelope,
                 semantic_id: None,
                 trace: None,
+                phase: None,
             }]);
         }
         let semantic_id = envelope["id"]
@@ -498,6 +526,7 @@ impl ExtensionWireAdapter for MakaWireAdapter {
                 message: envelope,
                 semantic_id: Some(semantic_id.clone()),
                 trace: None,
+                phase: None,
             },
             ExtensionWireAction::SemanticPayloadReleased { semantic_id },
         ])
@@ -617,9 +646,9 @@ pub(crate) mod rpc_phase_test {
         sync::{Arc, Mutex},
     };
     use tracing::{
-        Event, Metadata, Subscriber,
         field::{Field, Visit},
         span::{Attributes, Id, Record},
+        Event, Metadata, Subscriber,
     };
 
     #[derive(Clone, Default)]

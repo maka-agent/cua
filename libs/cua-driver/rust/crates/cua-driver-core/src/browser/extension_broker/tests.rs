@@ -3820,3 +3820,30 @@ fn malformed_event_source_target_is_rejected_before_forwarding() {
     assert!(route.events.try_recv().is_err());
     reply(&mut broker, &command, json!({"result":null}));
 }
+
+#[test]
+fn raw_chrome_data_survives_generic_value_ipc_and_charges_encoded_wrapper_bytes() {
+    let original = r#"{"node":{"backendNodeId":17,"attributes":["title","\ud800"]}}"#;
+    let frame = chrome_result_json(42, original).unwrap();
+    assert!(serde_json::from_str::<Value>(&frame).is_err());
+    assert_eq!(super::super::cdp_ws::chrome_json_reply_id(&frame), Some(42));
+    let event = BrokerCdpEvent::ChromeJson(frame.clone());
+    let wire = serde_json::to_value(&event).unwrap();
+    let ipc = serde_json::to_vec(&wire).unwrap();
+    let outcome: super::super::extension_provider::ExtensionCdpCompletionOutcome =
+        serde_json::from_slice(&ipc).unwrap();
+    assert!(
+        matches!(outcome, super::super::extension_provider::ExtensionCdpCompletionOutcome::ChromeJson(ref text) if text == &frame)
+    );
+    let budget = ByteBudget::new();
+    let initial = budget.available_bytes();
+    let charge = budget.try_charge(&event).unwrap();
+    assert_eq!(charge.bytes(), serde_json::to_vec(&event).unwrap().len());
+    assert!(
+        charge.bytes() > frame.len(),
+        "ordinary String envelope overhead must be counted"
+    );
+    drop(charge);
+    assert_eq!(budget.available_bytes(), initial);
+    assert!(chrome_result_json(42, r#"{"bad":"\!"}"#).is_err());
+}

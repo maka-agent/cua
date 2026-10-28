@@ -14,14 +14,14 @@
 //! bridge; its local failures never become remote CDP rejections.
 
 use super::extension_wire::ExtensionWireContext;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
@@ -55,6 +55,8 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "DOM.scrollIntoViewIfNeeded",
     "DOM.setFileInputFiles",
     "DOMSnapshot.captureSnapshot",
+    "Emulation.clearDeviceMetricsOverride",
+    "Emulation.setDeviceMetricsOverride",
     "Emulation.setFocusEmulationEnabled",
     "Input.dispatchKeyEvent",
     "Input.dispatchMouseEvent",
@@ -64,10 +66,13 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Page.enable",
     "Page.getFrameTree",
     "Page.getLayoutMetrics",
+    "Page.getResourceContent",
+    "Page.getResourceTree",
     "Page.handleJavaScriptDialog",
     "Page.navigate",
     "Runtime.callFunctionOn",
     "Runtime.evaluate",
+    "Runtime.getProperties",
     "Target.activateTarget",
     "Target.attachToTarget",
     "Target.detachFromTarget",
@@ -117,6 +122,9 @@ pub struct CdpEvent {
     /// WebSocket events without this source metadata leave it unset.
     pub source_target_id: Option<String>,
     pub params: Value,
+    /// Original parameters for the closed target-attachment data projection.
+    /// The text remains encoded until a consumer explicitly reads its fields.
+    pub params_json: Option<String>,
 }
 
 /// Bounded state for one page-owned JavaScript dialog. Message text and URLs
@@ -128,9 +136,62 @@ pub struct CdpDialogState {
     pub session_id: String,
 }
 
+/// Closed metadata reads whose result may contain non-scalar JavaScript text.
+///
+/// This selects only the reply representation. The original method policy,
+/// authorization, writer, pending ID and observation lifetime still apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CdpMetadataRead {
+    /// The node identity and its opaque browser metadata.
+    DescribeNode,
+    /// Property handles and their opaque browser descriptions.
+    GetProperties,
+    /// Target identities and their lossless title metadata.
+    GetTargets,
+}
+
+impl CdpMetadataRead {
+    /// Return the exact protocol method for this metadata read.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DescribeNode => "DOM.describeNode",
+            Self::GetProperties => "Runtime.getProperties",
+            Self::GetTargets => "Target.getTargets",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyRepresentation {
+    Value,
+    MetadataJson,
+}
+
+enum ReplyPayload {
+    Value(Value),
+    MetadataJson(String),
+}
+
+impl ReplyPayload {
+    fn into_value(self) -> anyhow::Result<Value> {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::MetadataJson(_) => anyhow::bail!("CDP reply representation changed"),
+        }
+    }
+
+    fn into_metadata_json(self) -> anyhow::Result<String> {
+        match self {
+            Self::MetadataJson(json) => Ok(json),
+            Self::Value(_) => anyhow::bail!("CDP reply representation changed"),
+        }
+    }
+}
+
 /// What the reader routed back for one in-flight call.
 enum CallOutcome {
-    Result(Value),
+    Result(ReplyPayload),
     Error {
         code: Option<i64>,
         message: String,
@@ -259,9 +320,20 @@ impl std::fmt::Display for ExtensionCdpRefusal {
 
 impl std::error::Error for ExtensionCdpRefusal {}
 
+struct PendingReply {
+    sender: oneshot::Sender<CallOutcome>,
+    representation: ReplyRepresentation,
+}
+
+impl PendingReply {
+    fn send(self, outcome: CallOutcome) -> Result<(), CallOutcome> {
+        self.sender.send(outcome)
+    }
+}
+
 /// State shared between the caller side and the reader task.
 struct Demux {
-    pending: StdMutex<HashMap<u64, oneshot::Sender<CallOutcome>>>,
+    pending: StdMutex<HashMap<u64, PendingReply>>,
     subscribers: StdMutex<Vec<mpsc::UnboundedSender<CdpEvent>>>,
     session_targets: StdMutex<HashMap<String, String>>,
     dialogs: StdMutex<HashMap<String, CdpDialogState>>,
@@ -286,6 +358,14 @@ impl Demux {
             extension_close: StdMutex::new(extension_close),
             pending_slots,
         }
+    }
+
+    fn pending_representation(&self, id: u64) -> Option<ReplyRepresentation> {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|reply| reply.representation)
     }
 
     fn fail_transport(&self, message: String) {
@@ -325,8 +405,16 @@ fn route_json(v: Value, demux: &Demux) {
     route_json_with_disposition(v, demux, CdpFailureDisposition::ReplyFailure);
 }
 fn route_json_with_disposition(v: Value, demux: &Demux, disposition: CdpFailureDisposition) {
+    route_value_message(v, demux, disposition, None);
+}
+fn route_value_message(
+    v: Value,
+    demux: &Demux,
+    disposition: CdpFailureDisposition,
+    params_json: Option<String>,
+) {
     if let Some(id) = v.get("id").and_then(Value::as_u64) {
-        let Some(tx) = demux.pending.lock().unwrap().remove(&id) else {
+        let Some(reply) = demux.pending.lock().unwrap().remove(&id) else {
             return; // reply to a timed-out or unknown call
         };
         let outcome = match v.get("error") {
@@ -339,9 +427,16 @@ fn route_json_with_disposition(v: Value, demux: &Demux, disposition: CdpFailureD
                     .unwrap_or("unknown CDP error")
                     .to_owned(),
             },
-            None => CallOutcome::Result(v.get("result").cloned().unwrap_or(Value::Null)),
+            None => CallOutcome::Result(match reply.representation {
+                ReplyRepresentation::Value => {
+                    ReplyPayload::Value(v.get("result").cloned().unwrap_or(Value::Null))
+                }
+                ReplyRepresentation::MetadataJson => {
+                    ReplyPayload::MetadataJson(v.get("result").unwrap_or(&Value::Null).to_string())
+                }
+            }),
         };
-        let _ = tx.send(outcome);
+        let _ = reply.send(outcome);
     } else if let Some(method) = v.get("method").and_then(Value::as_str) {
         let event = CdpEvent {
             method: method.to_owned(),
@@ -354,6 +449,7 @@ fn route_json_with_disposition(v: Value, demux: &Demux, disposition: CdpFailureD
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             params: v.get("params").cloned().unwrap_or(Value::Null),
+            params_json,
         };
         if let Some(session_id) = event.session_id.as_deref() {
             let target_id = demux
@@ -399,6 +495,138 @@ fn route_json_with_disposition(v: Value, demux: &Demux, disposition: CdpFailureD
     }
 }
 
+/// Read only the Chrome reply ID without expanding its JavaScript data.
+/// This value is correlation data, never an effect or cleanup proof.
+pub(crate) fn chrome_json_reply_id(message_json: &str) -> Option<u64> {
+    let fields: BTreeMap<String, &RawValue> = serde_json::from_str(message_json).ok()?;
+    fields
+        .get("id")
+        .and_then(|id| serde_json::from_str(id.get()).ok())
+}
+
+/// Project only the source-consumed target attachment metadata. The caller
+/// retains the complete original parameters separately as ordinary JSON text.
+///
+/// # Errors
+/// Rejects malformed parameters or an ambiguous encoded target metadata field.
+pub(crate) fn chrome_json_attached_params(params_json: &str) -> Result<Value, serde_json::Error> {
+    let raw: &RawValue = serde_json::from_str(params_json)?;
+    if raw.get().as_bytes().first() != Some(&b'{') {
+        return serde_json::from_str(params_json);
+    }
+    let fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw.get())?;
+    let mut projected = serde_json::Map::new();
+    for (name, raw) in fields {
+        let value = if name == "targetInfo" && raw.get().as_bytes().first() == Some(&b'{') {
+            super::js_string::normalize_cdp_target_info(raw)?
+        } else {
+            serde_json::from_str(raw.get())?
+        };
+        projected.insert(name, value);
+    }
+    Ok(Value::Object(projected))
+}
+
+fn route_json_text(message_json: &str, demux: &Demux, disposition: CdpFailureDisposition) {
+    // The normal Value/event path keeps its existing single eager decode.
+    // Only a trusted metadata entry, the consumed attachment event, or an
+    // undecodable frame needs the raw-token pass below.
+    let decoded = match serde_json::from_str::<Value>(message_json) {
+        Ok(message) => {
+            let id = message.get("id").and_then(Value::as_u64);
+            let metadata = id.and_then(|id| demux.pending_representation(id))
+                == Some(ReplyRepresentation::MetadataJson);
+            let attachment = id.is_none()
+                && message.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget");
+            if attachment {
+                // Existing scalar events retain their exact public params
+                // shape, including targetInfo.title. Raw text is additive.
+                let params_json = serde_json::from_str::<BTreeMap<String, &RawValue>>(message_json)
+                    .ok()
+                    .map(|fields| {
+                        fields
+                            .get("params")
+                            .map_or_else(|| "null".to_owned(), |params| params.get().to_owned())
+                    });
+                route_value_message(message, demux, disposition, params_json);
+                return;
+            }
+            if !metadata {
+                route_json_with_disposition(message, demux, disposition);
+                return;
+            }
+            Some(message)
+        }
+        Err(_) => None,
+    };
+    let fields: BTreeMap<String, &RawValue> = match serde_json::from_str(message_json) {
+        Ok(fields) => fields,
+        Err(_) => return,
+    };
+    let id = fields
+        .get("id")
+        .and_then(|id| serde_json::from_str::<u64>(id.get()).ok());
+    if id.is_none()
+        && fields.get("method").is_some_and(|method| {
+            serde_json::from_str::<String>(method.get()).ok().as_deref()
+                == Some("Target.attachedToTarget")
+        })
+    {
+        let params_json = fields
+            .get("params")
+            .map_or_else(|| "null".to_owned(), |params| params.get().to_owned());
+        let Ok(params) = chrome_json_attached_params(&params_json) else {
+            return;
+        };
+        let mut projected = serde_json::Map::new();
+        for (name, raw) in fields {
+            if name == "params" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str(raw.get()) else {
+                return;
+            };
+            projected.insert(name, value);
+        }
+        projected.insert("params".to_owned(), params);
+        route_value_message(
+            Value::Object(projected),
+            demux,
+            disposition,
+            Some(params_json),
+        );
+        return;
+    }
+    let representation = id.and_then(|id| demux.pending_representation(id));
+    if representation != Some(ReplyRepresentation::MetadataJson) {
+        // Legacy Value reads keep the old invalid-frame behavior: no synthetic
+        // reply or early error replaces the original pending-call timeout.
+        if let Some(message) = decoded {
+            route_json_with_disposition(message, demux, disposition);
+        }
+        return;
+    }
+    let Some(id) = id else { return };
+    if let Some(error) = fields.get("error") {
+        // Preserve error presence, including explicit null. Error diagnostics
+        // retain their current Value contract; this seam changes metadata data.
+        if let Ok(error) = serde_json::from_str::<Value>(error.get()) {
+            route_json_with_disposition(
+                serde_json::json!({"id":id,"error":error}),
+                demux,
+                disposition,
+            );
+        }
+        return;
+    }
+    let json = fields
+        .get("result")
+        .map_or_else(|| "null".to_owned(), |result| result.get().to_owned());
+    if let Some(reply) = demux.pending.lock().unwrap().remove(&id) {
+        let _ = reply.send(CallOutcome::Result(ReplyPayload::MetadataJson(json)));
+    }
+}
+
 /// The WebSocket reader retains its existing parsing and close behavior.
 async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
     loop {
@@ -411,11 +639,7 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
             Message::Close(_) => break,
             _ => continue,
         };
-        let v: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        route_json(v, &demux);
+        route_json_text(&text, &demux, CdpFailureDisposition::ReplyFailure);
     }
     demux.close();
 }
@@ -427,6 +651,12 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
 /// internal boundary; this enum is not an external or model-facing wire API.
 pub(crate) enum ExtensionCdpInbound {
     ChromeMessage(Value),
+    /// Original Chrome JSON carried as ordinary text through the existing IPC.
+    /// The trusted bridge supplies disposition beside, never inside, that data.
+    ChromeJson {
+        message_json: String,
+        disposition: CdpFailureDisposition,
+    },
     /// Trusted client metadata travels beside raw JSON, never inside it.
     ClassifiedChromeMessage {
         message: Value,
@@ -486,6 +716,10 @@ async fn read_extension_loop(mut inbound: mpsc::Receiver<ExtensionCdpInbound>, d
     while let Some(message) = inbound.recv().await {
         match message {
             ExtensionCdpInbound::ChromeMessage(message) => route_json(message, &demux),
+            ExtensionCdpInbound::ChromeJson {
+                message_json,
+                disposition,
+            } => route_json_text(&message_json, &demux, disposition),
             ExtensionCdpInbound::ClassifiedChromeMessage {
                 message,
                 disposition,
@@ -749,8 +983,10 @@ impl CdpConnection {
             params,
             ReplyDisposition::Required,
             None,
+            ReplyRepresentation::Value,
         )
-        .await
+        .await?
+        .into_value()
     }
 
     /// Issue a known observation whose late reply can be discarded after its
@@ -768,8 +1004,10 @@ impl CdpConnection {
             params,
             ReplyDisposition::Observation,
             None,
+            ReplyRepresentation::Value,
         )
-        .await
+        .await?
+        .into_value()
     }
 
     /// Pass exact trusted session/turn metadata to a extension wire adapter.
@@ -788,8 +1026,10 @@ impl CdpConnection {
             params,
             ReplyDisposition::Required,
             Some(wire_context),
+            ReplyRepresentation::Value,
         )
-        .await
+        .await?
+        .into_value()
     }
 
     /// Observation counterpart with unchanged late-reply abandonment semantics.
@@ -806,8 +1046,81 @@ impl CdpConnection {
             params,
             ReplyDisposition::Observation,
             Some(wire_context),
+            ReplyRepresentation::Value,
         )
-        .await
+        .await?
+        .into_value()
+    }
+
+    /// Read a closed metadata result with the original required-reply lifetime.
+    /// Returns the original result JSON text without scalar-string decoding.
+    ///
+    /// # Errors
+    /// Preserves the policy, transport, timeout and matched-reply failures of
+    /// `call`, including its cancellation/retirement behavior.
+    pub async fn call_metadata(
+        &self,
+        session_id: Option<&str>,
+        read: CdpMetadataRead,
+        params: Value,
+    ) -> anyhow::Result<String> {
+        self.call_with_reply_disposition(
+            session_id,
+            read.as_str(),
+            params,
+            ReplyDisposition::Required,
+            None,
+            ReplyRepresentation::MetadataJson,
+        )
+        .await?
+        .into_metadata_json()
+    }
+
+    /// Read one of the closed metadata results without decoding JavaScript
+    /// strings into Rust scalar strings. Returns the original result JSON text.
+    ///
+    /// # Errors
+    /// Preserves the same policy, transport, timeout and matched-reply failures
+    /// as an ordinary observation. Callers must decode only their typed fields.
+    pub async fn call_metadata_observation(
+        &self,
+        session_id: Option<&str>,
+        read: CdpMetadataRead,
+        params: Value,
+    ) -> anyhow::Result<String> {
+        self.call_with_reply_disposition(
+            session_id,
+            read.as_str(),
+            params,
+            ReplyDisposition::Observation,
+            None,
+            ReplyRepresentation::MetadataJson,
+        )
+        .await?
+        .into_metadata_json()
+    }
+
+    /// Metadata observation with the same immutable trusted extension context.
+    ///
+    /// # Errors
+    /// Has the same failure and custody contract as `call_metadata_observation`.
+    pub async fn call_metadata_observation_with_extension_context(
+        &self,
+        wire_context: &ExtensionWireContext,
+        session_id: Option<&str>,
+        read: CdpMetadataRead,
+        params: Value,
+    ) -> anyhow::Result<String> {
+        self.call_with_reply_disposition(
+            session_id,
+            read.as_str(),
+            params,
+            ReplyDisposition::Observation,
+            Some(wire_context),
+            ReplyRepresentation::MetadataJson,
+        )
+        .await?
+        .into_metadata_json()
     }
 
     async fn call_with_reply_disposition(
@@ -817,7 +1130,8 @@ impl CdpConnection {
         params: Value,
         reply_disposition: ReplyDisposition,
         wire_context: Option<&ExtensionWireContext>,
-    ) -> anyhow::Result<Value> {
+        representation: ReplyRepresentation,
+    ) -> anyhow::Result<ReplyPayload> {
         let policy = self.method_policy();
         if !policy.allows(method) {
             anyhow::bail!(
@@ -838,7 +1152,13 @@ impl CdpConnection {
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.demux.pending.lock().unwrap().insert(id, tx);
+        self.demux.pending.lock().unwrap().insert(
+            id,
+            PendingReply {
+                sender: tx,
+                representation,
+            },
+        );
         let mut pending = PendingCall {
             connection: self,
             id,
@@ -1892,7 +2212,6 @@ mod tests {
             "Network.enable",
             "Fetch.enable",
             "Emulation.setUserAgentOverride",
-            "Emulation.setDeviceMetricsOverride",
             "Emulation.setTimezoneOverride",
         ] {
             let error = conn.call(None, method, json!({})).await.unwrap_err();
@@ -1910,6 +2229,40 @@ mod tests {
             .await
             .expect("reviewed method remains available");
         assert_eq!(&*seen.lock().unwrap(), &["Target.getTargets"]);
+        for (method, params) in [
+            (
+                "Emulation.setDeviceMetricsOverride",
+                json!({"width":320,"height":640,"deviceScaleFactor":1,"mobile":false}),
+            ),
+            ("Emulation.clearDeviceMetricsOverride", json!({})),
+            (
+                "Page.getResourceContent",
+                json!({"frameId":"main","url":"https://fixture.test/loaded.png"}),
+            ),
+            ("Page.getResourceTree", json!({})),
+        ] {
+            conn.call(None, method, params)
+                .await
+                .expect("effective viewport/pageAssets methods are reviewed");
+        }
+        conn.call_metadata_observation(
+            None,
+            CdpMetadataRead::GetProperties,
+            json!({"objectId":"fixed-utility-array","ownProperties":true}),
+        )
+        .await
+        .expect("admitted fixed utility metadata read remains available");
+        assert_eq!(
+            &*seen.lock().unwrap(),
+            &[
+                "Target.getTargets",
+                "Emulation.setDeviceMetricsOverride",
+                "Emulation.clearDeviceMetricsOverride",
+                "Page.getResourceContent",
+                "Page.getResourceTree",
+                "Runtime.getProperties"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2236,6 +2589,223 @@ mod tests {
         pool.release_existing(&url, 3, SharedSocketRelease::Close)
             .await;
         log("session C: ended; socket closed");
+    }
+
+    #[test]
+    fn chrome_json_id_uses_only_the_original_numeric_correlation_field() {
+        assert_eq!(
+            chrome_json_reply_id(r#"{"id":7,"result":{"description":"\ud800"}}"#),
+            Some(7)
+        );
+        assert_eq!(
+            chrome_json_reply_id(r#"{"id":1,"id":7,"result":null}"#),
+            Some(7)
+        );
+        for input in [
+            r#"{"id":"7"}"#,
+            r#"{"id":7.0}"#,
+            r#"{"id":-0}"#,
+            r#"{"id":null}"#,
+            r#"[7]"#,
+            r#"{"id":7,"result":"\ud800\!"}"#,
+        ] {
+            assert_eq!(chrome_json_reply_id(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn raw_metadata_result_does_not_settle_a_neighbor_or_accept_page_disposition() {
+        let demux = Demux::new(None);
+        let (sent, mut received) = oneshot::channel();
+        let (neighbor, mut waiting) = oneshot::channel();
+        demux.pending.lock().unwrap().insert(
+            1,
+            PendingReply {
+                sender: sent,
+                representation: ReplyRepresentation::MetadataJson,
+            },
+        );
+        demux.pending.lock().unwrap().insert(
+            2,
+            PendingReply {
+                sender: neighbor,
+                representation: ReplyRepresentation::Value,
+            },
+        );
+        route_json_text(
+            r#"{"id":1,"result":{"node":{"backendNodeId":17,"attributes":["title","\ud800"]}},"disposition":"not_dispatched"}"#,
+            &demux,
+            CdpFailureDisposition::ExtensionEffectUnknown,
+        );
+        let CallOutcome::Result(ReplyPayload::MetadataJson(json)) = received.try_recv().unwrap()
+        else {
+            panic!("the original metadata pending entry must receive its raw result");
+        };
+        assert_eq!(
+            json,
+            r#"{"node":{"backendNodeId":17,"attributes":["title","\ud800"]}}"#
+        );
+        assert!(serde_json::from_str::<Value>(&json).is_err());
+        assert!(matches!(
+            waiting.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(demux.pending.lock().unwrap().len(), 1);
+        assert!(!demux.closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn raw_metadata_error_presence_keeps_the_trusted_failure_disposition() {
+        let demux = Demux::new(None);
+        let (sent, mut received) = oneshot::channel();
+        demux.pending.lock().unwrap().insert(
+            1,
+            PendingReply {
+                sender: sent,
+                representation: ReplyRepresentation::MetadataJson,
+            },
+        );
+        route_json_text(
+            r#"{"id":1,"error":null,"result":null,"disposition":"not_dispatched"}"#,
+            &demux,
+            CdpFailureDisposition::ExtensionEffectUnknown,
+        );
+        let CallOutcome::Error {
+            code,
+            message,
+            disposition,
+        } = received.try_recv().unwrap()
+        else {
+            panic!("an explicitly present error is not a metadata success or local refusal");
+        };
+        assert_eq!(code, None);
+        assert_eq!(message, "unknown CDP error");
+        assert_eq!(disposition, CdpFailureDisposition::ExtensionEffectUnknown);
+        assert!(demux.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attached_target_raw_title_keeps_lifecycle_identity_and_event_order() {
+        let demux = Demux::new(None);
+        let (send, mut events) = mpsc::unbounded_channel();
+        demux.subscribers.lock().unwrap().push(send);
+        route_json_text(
+            r#"{"method":"Page.loadEventFired","params":{"timestamp":1}}"#,
+            &demux,
+            CdpFailureDisposition::ReplyFailure,
+        );
+        let scalar_params = r#"{"sessionId":"scalar-child","targetInfo":{"targetId":"scalar-target","type":"iframe","title":"Normal","url":"https://fixture.test/"}}"#;
+        route_json_text(
+            &format!(
+                r#"{{"method":"Target.attachedToTarget","sessionId":"parent-session","params":{scalar_params}}}"#
+            ),
+            &demux,
+            CdpFailureDisposition::ReplyFailure,
+        );
+        let params = r#"{"sessionId":"child-session","targetInfo":{"targetId":"child-target","type":"iframe","title":"\ud800","url":"https://fixture.test/"},"waitingForDebugger":false}"#;
+        let attached = format!(
+            r#"{{"method":"Target.attachedToTarget","sessionId":"parent-session","sourceTargetId":"actual-debuggee","params":{params}}}"#
+        );
+        route_json_text(&attached, &demux, CdpFailureDisposition::ReplyFailure);
+        route_json_text(
+            r#"{"method":"Target.detachedFromTarget","sessionId":"parent-session","params":{"sessionId":"child-session"}}"#,
+            &demux,
+            CdpFailureDisposition::ReplyFailure,
+        );
+        let before = events.try_recv().unwrap();
+        assert_eq!(before.method, "Page.loadEventFired");
+        assert_eq!(before.params_json, None);
+        let scalar = events.try_recv().unwrap();
+        assert_eq!(scalar.method, "Target.attachedToTarget");
+        assert_eq!(scalar.params["targetInfo"]["title"], "Normal");
+        assert!(scalar.params["targetInfo"].get("titleJson").is_none());
+        assert_eq!(scalar.params_json.as_deref(), Some(scalar_params));
+        let actual = events.try_recv().unwrap();
+        assert_eq!(actual.method, "Target.attachedToTarget");
+        assert_eq!(actual.session_id.as_deref(), Some("parent-session"));
+        assert_eq!(actual.source_target_id.as_deref(), Some("actual-debuggee"));
+        assert_eq!(actual.params["sessionId"], "child-session");
+        assert_eq!(actual.params["targetInfo"]["targetId"], "child-target");
+        assert_eq!(actual.params["targetInfo"]["type"], "iframe");
+        assert_eq!(actual.params["targetInfo"]["titleJson"], r#""\ud800""#);
+        assert_eq!(actual.params_json.as_deref(), Some(params));
+        assert!(serde_json::from_str::<Value>(actual.params_json.as_deref().unwrap()).is_err());
+        let after = events.try_recv().unwrap();
+        assert_eq!(after.method, "Target.detachedFromTarget");
+        assert_eq!(after.params["sessionId"], "child-session");
+        assert_eq!(after.params_json, None);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn real_reader_delivers_metadata_utf16_and_keeps_legacy_value_pending() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, released) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut ids = HashMap::new();
+            while ids.len() != 3 {
+                let Some(Ok(Message::Text(text))) = ws.next().await else {
+                    panic!("expected three actual requests")
+                };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                ids.insert(
+                    value["method"].as_str().unwrap().to_owned(),
+                    value["id"].as_u64().unwrap(),
+                );
+            }
+            let legacy = ids["Fixture.legacy"];
+            let metadata = ids["DOM.describeNode"];
+            let barrier = ids["Fixture.barrier"];
+            ws.send(Message::Text(format!(
+                r#"{{"id":{legacy},"result":{{"title":"\udc00"}}}}"#
+            )))
+            .await
+            .unwrap();
+            ws.send(Message::Text(format!(r#"{{"id":{metadata},"result":{{"node":{{"backendNodeId":17,"attributes":["title","\ud800"]}}}}}}"#))).await.unwrap();
+            ws.send(Message::Text(
+                json!({"id":barrier,"result":{"earlierFramesRead":true}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            released.await.unwrap();
+            ws.send(Message::Text(
+                json!({"id":legacy,"result":{"samePendingId":legacy}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        });
+        let connection =
+            CdpConnection::connect(&format!("ws://127.0.0.1:{port}/devtools/browser/utf16"))
+                .await
+                .unwrap();
+        let mut legacy = Box::pin(connection.call_observation(None, "Fixture.legacy", json!({})));
+        let completed = async {
+            tokio::join!(
+                connection.call_metadata_observation(
+                    None,
+                    CdpMetadataRead::DescribeNode,
+                    json!({"objectId":"same-element"})
+                ),
+                connection.call_observation(None, "Fixture.barrier", json!({})),
+            )
+        };
+        let (metadata, barrier) = tokio::select! { biased;
+            _=&mut legacy=>panic!("undecodable legacy Value reply must not become an early result or error"),
+            result=completed=>result,
+        };
+        assert_eq!(
+            metadata.unwrap(),
+            r#"{"node":{"backendNodeId":17,"attributes":["title","\ud800"]}}"#
+        );
+        assert_eq!(barrier.unwrap()["earlierFramesRead"], true);
+        assert_eq!(connection.demux.pending.lock().unwrap().len(), 1);
+        assert!(!connection.is_closed());
+        release.send(()).unwrap();
+        assert!(legacy.await.unwrap()["samePendingId"].as_u64().is_some());
+        server.await.unwrap();
     }
 }
 
@@ -2799,5 +3369,78 @@ mod extension_transport_tests {
             true
         );
         bounded(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_extension_reply_keeps_original_context_and_string_ipc_payload() {
+        let (connection, mut peer) = extension_connection(4);
+        let context = ExtensionWireContext::new("canonical-owner", "captured-turn").unwrap();
+        let original = connection.call_metadata_observation_with_extension_context(
+            &context,
+            Some("actual-child"),
+            CdpMetadataRead::GetProperties,
+            json!({"objectId":"same-array"}),
+        );
+        let remote = async {
+            let dispatch = bounded(peer.commands.recv())
+                .await
+                .unwrap()
+                .into_dispatch_if_live()
+                .expect("actual original command remains live");
+            assert_eq!(dispatch.wire_context.as_ref(), Some(&context));
+            assert!(matches!(
+                dispatch.reply_disposition,
+                ReplyDisposition::Observation
+            ));
+            assert_eq!(dispatch.message["method"], "Runtime.getProperties");
+            assert_eq!(dispatch.message["sessionId"], "actual-child");
+            assert_eq!(dispatch.message["params"]["objectId"], "same-array");
+            let id = dispatch.message["id"].as_u64().unwrap();
+            let raw = format!(
+                r#"{{"id":{id},"result":{{"result":[{{"name":"0","value":{{"objectId":"same-node","description":"\ud800"}}}}]}}}}"#
+            );
+            assert!(serde_json::from_str::<Value>(&raw).is_err());
+            let wire = serde_json::to_vec(&json!({"chromeJson":raw})).unwrap();
+            let delivered: Value = serde_json::from_slice(&wire).unwrap();
+            let raw = delivered["chromeJson"].as_str().unwrap().to_owned();
+            bounded(peer.inbound.send(ExtensionCdpInbound::ChromeJson {
+                message_json: raw,
+                disposition: CdpFailureDisposition::ReplyFailure,
+            }))
+            .await
+            .unwrap();
+        };
+        let (json, ()) = bounded(async { tokio::join!(original, remote) }).await;
+        assert_eq!(
+            json.unwrap(),
+            r#"{"result":[{"name":"0","value":{"objectId":"same-node","description":"\ud800"}}]}"#
+        );
+        assert!(connection.demux.pending.lock().unwrap().is_empty());
+        assert!(!connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn required_metadata_reply_keeps_the_original_cancel_close_rule() {
+        let (connection, mut peer) = extension_connection(2);
+        let mut original =
+            Box::pin(connection.call_metadata(None, CdpMetadataRead::GetTargets, json!({})));
+        let command = tokio::select! { biased;
+            _=&mut original=>panic!("required metadata call needs its actual peer reply"),
+            command=peer.commands.recv()=>command.expect("original metadata request reached its existing queue"),
+        };
+        let dispatch = command
+            .into_dispatch_if_live()
+            .expect("original command is live before cancellation");
+        assert_eq!(dispatch.message["method"], "Target.getTargets");
+        assert!(matches!(
+            dispatch.reply_disposition,
+            ReplyDisposition::Required
+        ));
+        drop(original);
+        assert!(connection.is_closed());
+        assert!(connection.demux.pending.lock().unwrap().is_empty());
+        bounded(peer.closed)
+            .await
+            .expect("required cancellation retains the real close signal");
     }
 }
