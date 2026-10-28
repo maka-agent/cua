@@ -16,8 +16,8 @@
 //! live frame tree before any mutation.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -51,7 +51,7 @@ impl BrowserActionKind {
     }
 }
 
-/// Browser-layout visibility. This is independent from native desktop
+/// Browser-layout visibility. This is independent from extension desktop
 /// foreground or occlusion state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,7 +146,7 @@ impl FrameRef {
 #[derive(Debug, Clone, Serialize)]
 pub struct RefEntry {
     /// CDP backendNodeId — internal only, never exposed to callers.
-    /// Valid in the tab's own session, or in the OOPIF child session
+    /// Valid in the tab's maka session, or in the OOPIF child session
     /// named by `frame.oopif_target_id`.
     #[serde(skip_serializing)]
     pub backend_node_id: i64,
@@ -195,7 +195,7 @@ pub struct TabRecord {
     pub cdp_target_id: String,
     pub title: String,
     pub url: String,
-    /// Native-window selection proof captured at bind time. `None` means the
+    /// Extension-window selection proof captured at bind time. `None` means the
     /// selected tab could not be proven without activating or foregrounding a
     /// page, so the public `active` field must be JSON null.
     pub active: Option<bool>,

@@ -9,12 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::action_record::{
-    effect_from_value_readback, ActionEffect, ActionEscalation, ActionEvidence,
-    ActionExecutionRecord, ActionTransport, ActualDelivery, EscalationKind, EvidenceKind,
-    RequestedDelivery,
+    ActionEffect, ActionEscalation, ActionEvidence, ActionExecutionRecord, ActionTransport,
+    ActualDelivery, EscalationKind, EvidenceKind, RequestedDelivery, effect_from_value_readback,
 };
 use crate::protocol::{Content, ToolResult};
 use crate::tool::{ProtectedResourceOwnership, Tool, ToolDef, ToolRegistry};
@@ -436,8 +435,8 @@ impl GetBrowserStateTool {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pid": { "type": "integer", "description": "Native browser process id (bind mode)." },
-                    "window_id": { "type": "integer", "description": "Native window id owned by pid (bind mode)." },
+                    "pid": { "type": "integer", "description": "Extension browser process id (bind mode)." },
+                    "window_id": { "type": "integer", "description": "Extension window id owned by pid (bind mode)." },
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
@@ -521,7 +520,7 @@ impl Tool for GetBrowserStateTool {
                         BrowserRefusalCode::BrowserTabRequired,
                         "snapshot mode requires a tab_id from a prior bind",
                     )
-                    .to_tool_result()
+                    .to_tool_result();
                 }
             };
             let snapshot_format = args
@@ -533,7 +532,7 @@ impl Tool for GetBrowserStateTool {
                 Some(_) => {
                     return ToolResult::error(
                         "Field include_screenshot has wrong type: expected boolean",
-                    )
+                    );
                 }
             };
             if snapshot_format != "dom_refs_v1" && snapshot_format != "semantic_v2" {
@@ -869,7 +868,7 @@ impl Tool for BrowserPrepareTool {
             Some(value) => match serde_json::from_value::<PrepareProfile>(value.clone()) {
                 Ok(profile) => Some(profile),
                 Err(error) => {
-                    return ToolResult::error(format!("invalid browser profile request: {error}"))
+                    return ToolResult::error(format!("invalid browser profile request: {error}"));
                 }
             },
         };
@@ -882,7 +881,7 @@ impl Tool for BrowserPrepareTool {
                         "invalid browser preparation strategy ({error}). Pass an object: \
                          \"strategy\": {{\"kind\": \"existing_profile\"}}, with pid and \
                          window_id from list_windows."
-                    ))
+                    ));
                 }
             },
         };
@@ -1360,7 +1359,7 @@ impl Tool for BrowserClickTool {
                         BrowserRefusalCode::BrowserRefStale,
                         "the ref's node no longer resolves in the live page",
                     )
-                    .to_tool_result()
+                    .to_tool_result();
                 }
             };
             let object_id = match resolved
@@ -1374,7 +1373,7 @@ impl Tool for BrowserClickTool {
                         BrowserRefusalCode::BrowserRefStale,
                         "the ref's node has no live object in the page",
                     )
-                    .to_tool_result()
+                    .to_tool_result();
                 }
             };
             // Cursor feedback is best-effort and visual-only. A missing box
@@ -1473,7 +1472,7 @@ impl Tool for BrowserClickTool {
                             BrowserRefusalCode::BrowserRefStale,
                             "the ref's node has no layout box — it left the DOM or is hidden",
                         )
-                        .to_tool_result()
+                        .to_tool_result();
                     }
                 };
                 match quad_center(&box_model) {
@@ -1483,7 +1482,7 @@ impl Tool for BrowserClickTool {
                             BrowserRefusalCode::BrowserRefStale,
                             "the ref's node returned an unusable layout box",
                         )
-                        .to_tool_result()
+                        .to_tool_result();
                     }
                 }
             }
@@ -1995,7 +1994,7 @@ impl Tool for BrowserTypeTool {
                     BrowserRefusalCode::BrowserRefStale,
                     "the ref's node no longer resolves in the live page",
                 )
-                .to_tool_result()
+                .to_tool_result();
             }
         };
         let editable = conn
@@ -2547,7 +2546,7 @@ impl Tool for BrowserSelectTool {
                     BrowserRefusalCode::BrowserRefStale,
                     "the ref's node no longer resolves in the live page",
                 )
-                .to_tool_result()
+                .to_tool_result();
             }
         };
         let outcome = match conn
@@ -2569,7 +2568,7 @@ impl Tool for BrowserSelectTool {
                     BrowserRefusalCode::BrowserActionUnavailable,
                     format!("the select script could not run on the ref: {error}"),
                 )
-                .to_tool_result()
+                .to_tool_result();
             }
         };
         if let Some(reason) = outcome["refused"].as_str() {
@@ -2969,7 +2968,7 @@ impl Tool for BrowserSetInputFilesTool {
                     BrowserRefusalCode::BrowserRefStale,
                     "the upload ref no longer resolves in the live page",
                 )
-                .to_tool_result()
+                .to_tool_result();
             }
         };
         let node = &described["node"];

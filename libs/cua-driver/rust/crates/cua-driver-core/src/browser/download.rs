@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::protocol::ToolResult;
 use crate::tool::{Tool, ToolDef};
@@ -234,12 +234,12 @@ async fn await_download(
                     Some("completed") => {
                         return DownloadEventOutcome::Completed {
                             guid: guid.to_owned(),
-                        }
+                        };
                     }
                     Some("canceled") => {
                         return DownloadEventOutcome::Canceled {
                             guid: guid.to_owned(),
-                        }
+                        };
                     }
                     _ => {}
                 }
@@ -360,7 +360,7 @@ impl Tool for BrowserDownloadTool {
                     BrowserRefusalCode::BrowserRouteUnavailable,
                     "the exact tab's main frame could not be proven",
                 )
-                .to_tool_result()
+                .to_tool_result();
             }
         };
         let Some(main_frame_id) = main_frame_id(&frame_tree).map(str::to_owned) else {
@@ -392,7 +392,7 @@ impl Tool for BrowserDownloadTool {
                     BrowserRefusalCode::BrowserRefStale,
                     "the download ref no longer resolves in the live page",
                 )
-                .to_tool_result()
+                .to_tool_result();
             }
         };
         let Some(object_id) = resolved

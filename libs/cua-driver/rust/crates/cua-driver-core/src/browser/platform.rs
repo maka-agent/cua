@@ -62,7 +62,7 @@ impl IsolatedBrowserProcess for Child {
 }
 
 /// Select the first installed, non-redirected candidate and return its
-/// canonical path. Native adapters must supply only trusted installation
+/// canonical path. Extension adapters must supply only trusted installation
 /// locations in public product-preference order. Rejecting redirects prevents
 /// a known browser path from becoming an arbitrary executable through a
 /// symlink or junction controlled outside the trusted installation.
@@ -341,7 +341,7 @@ pub struct PrepareSideEffects {
 pub trait BrowserPlatform: Send + Sync {
     /// Resolve a canonical installed Chromium-family executable for a
     /// driver-owned isolated launch that did not name an existing process.
-    /// Native adapters use deterministic product priority and fail closed when
+    /// Extension adapters use deterministic product priority and fail closed when
     /// no supported executable can be proven.
     fn isolated_browser_executable(&self) -> Result<String, BrowserRefusal> {
         Err(BrowserRefusal::new(

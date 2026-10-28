@@ -9,13 +9,13 @@
 //! reuse its charge for both copies; separately queued copies need separate
 //! charges. Keep the final wrapper alive until its socket write completes.
 
-use super::native_framing::{self, Direction, FrameError};
+use super::extension_framing::{self, Direction, FrameError};
 use serde::{Serialize, Serializer};
 use std::{fmt, sync::Arc, time::Duration};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-/// One native host's queued JSON budget; a single valid 64MiB message fits.
-const QUEUED_JSON_BYTES: usize = 128 * 1024 * 1024;
+/// One extension host's queued JSON budget; a single valid 64MiB message fits.
+pub(crate) const QUEUED_JSON_BYTES: usize = 128 * 1024 * 1024;
 
 /// Final local IPC egress budget, matching the existing client write budget.
 /// This limits shutdown drainage only; it never extends a command timeout or
@@ -56,7 +56,7 @@ impl ByteBudget {
 
     /// Charge one JSON payload before admitting it into a broker queue.
     ///
-    /// The counting serialization uses the existing 64MiB logical/native-input
+    /// The counting serialization uses the existing 64MiB logical/extension-input
     /// bound. Its temporary buffer is dropped before waiting for permits.
     /// Backpressure does not create cleanup authority or replay a command.
     ///
@@ -68,7 +68,7 @@ impl ByteBudget {
         value: &T,
     ) -> Result<Arc<ByteCharge>, DeliveryError> {
         let bytes = {
-            let encoded = native_framing::encode_json(value, Direction::ChromeToHost)?;
+            let encoded = extension_framing::encode_json(value, Direction::ChromeToHost)?;
             encoded.len()
         };
         let permits = u32::try_from(bytes).map_err(|_| DeliveryError::PermitRange)?;
@@ -79,7 +79,7 @@ impl ByteBudget {
         }))
     }
 
-    /// Charge a bounded actor-generated payload without awaiting its own queue.
+    /// Charge a bounded actor-generated payload without awaiting its maka queue.
     ///
     /// # Errors
     /// Rejects oversized serialization, a closed or saturated budget, and a
@@ -88,7 +88,7 @@ impl ByteBudget {
         &self,
         value: &T,
     ) -> Result<Arc<ByteCharge>, DeliveryError> {
-        let bytes = native_framing::encode_json(value, Direction::ChromeToHost)?.len();
+        let bytes = extension_framing::encode_json(value, Direction::ChromeToHost)?.len();
         let permits = u32::try_from(bytes).map_err(|_| DeliveryError::PermitRange)?;
         let permit = self.permits.clone().try_acquire_many_owned(permits)?;
         Ok(Arc::new(ByteCharge {
@@ -178,7 +178,7 @@ impl<T: Serialize> Serialize for Queued<T> {
 
 impl<T> fmt::Debug for Queued<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Native messages can contain endpoint capabilities and page content.
+        // Extension messages can contain endpoint capabilities and page content.
         formatter
             .debug_struct("Queued")
             .field("event_type", &std::any::type_name::<T>())

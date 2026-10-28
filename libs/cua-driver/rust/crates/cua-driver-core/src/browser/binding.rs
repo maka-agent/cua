@@ -1,4 +1,4 @@
-//! Native-window ↔ CDP-target correlation (pure, side-effect free).
+//! Extension-window ↔ CDP-target correlation (pure, side-effect free).
 //!
 //! The native entrypoint is `pid + window_id`. CDP exposes page targets
 //! (tabs), each mappable to a CDP window via `Browser.getWindowForTarget`
@@ -457,12 +457,14 @@ mod tests {
     fn cardinality_never_picks_between_multiple_cdp_windows() {
         let mut second = cand("t2", "Docs", B);
         second.cdp_window_id = Some(2);
-        assert!(cardinality_exact_candidate(
-            "Docs - Chrome",
-            &[cand("t1", "Docs", B), second],
-            Some(true)
-        )
-        .is_none());
+        assert!(
+            cardinality_exact_candidate(
+                "Docs - Chrome",
+                &[cand("t1", "Docs", B), second],
+                Some(true)
+            )
+            .is_none()
+        );
     }
 
     #[test]

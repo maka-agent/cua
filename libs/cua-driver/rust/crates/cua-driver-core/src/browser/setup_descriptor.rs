@@ -10,7 +10,7 @@ use super::types::BrowserProduct;
 pub const EXISTING_PROFILE_SETUP_READY_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Accessibility-visible anchors for a Chromium product's internal remote
-/// debugging page. Adapters still require an exact native window and exact
+/// debugging page. Adapters still require an exact extension window and exact
 /// control matches; these values only describe the product surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrowserSetupDescriptor {

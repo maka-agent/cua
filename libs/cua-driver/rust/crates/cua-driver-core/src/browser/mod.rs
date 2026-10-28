@@ -3,7 +3,7 @@
 //! Typed browser inspection, preparation, navigation, input, dialog, upload,
 //! and download tools over an exact-or-refused binding model:
 //!
-//! - The native entrypoint is `pid + window_id`. Browser target ids,
+//! - The extension entrypoint is `pid + window_id`. Browser target ids,
 //!   tab ids, and page refs (`p<snapshot>:<index>`) are opaque,
 //!   session-scoped capabilities minted by core.
 //! - Mutation is permitted only for **exact** bindings (unique
@@ -13,7 +13,7 @@
 //! - Core owns schemas, semantics, CDP target handling, the target/ref
 //!   store, lifecycle cleanup and correlation. Platform adapters
 //!   implement [`platform::BrowserPlatform`] for process identity,
-//!   endpoint ownership, native window metadata, classification and
+//!   endpoint ownership, extension window metadata, classification and
 //!   explicit setup — without depending on core internals.
 //!
 //! Wiring (per platform crate):
@@ -30,7 +30,7 @@
 //! v2 DOM-ref slice: snapshots compose shadow DOM (piercing, minus
 //! user-agent roots), same-process iframes (via `contentDocument`),
 //! and — only when the capability is proven live — OOPIF child targets
-//! auto-attached beneath the bound tab's own session. Every ref
+//! auto-attached beneath the bound tab's maka session. Every ref
 //! carries its frame's document identity (frame id + loader id), which
 //! is re-proven before any mutation; frames whose identity or
 //! capability cannot be proven are omitted or refused, never guessed.
@@ -40,27 +40,31 @@ pub mod binding;
 mod broker_delivery;
 pub mod cdp_ws;
 pub use cdp_ws::CdpFailureDisposition;
+mod browser_ui;
 pub mod download;
 pub mod engine;
+mod extension_adapter_factory;
+mod extension_adapter_process;
+mod extension_broker;
+mod extension_catalog;
+mod extension_framing;
+mod extension_host;
+mod extension_install;
+pub mod extension_process;
+mod extension_provider;
+mod extension_wire;
 mod grant;
 mod keyed_gates;
 mod local_ipc;
 #[cfg(test)]
 pub(crate) mod mock_cdp;
 mod mutation;
-mod native_adapter_factory;
-mod native_adapter_process;
-mod native_broker;
-mod native_framing;
-mod native_host;
-mod native_install;
-pub mod native_process;
-mod native_provider;
-mod native_wire;
-mod original_adapter;
-mod original_inventory;
-mod original_rpc_v2;
-mod original_tab_id;
+pub use browser_ui::FIXED_BROWSER_UI_SCRIPT;
+mod chatgpt_adapter;
+mod chatgpt_inventory;
+mod chatgpt_rpc_v2;
+mod chatgpt_tab_id;
+pub use chatgpt_tab_id::parse_browser_tab_id;
 pub mod platform;
 pub mod pointer;
 mod prepare;
@@ -75,7 +79,7 @@ pub mod types;
 mod v2_tests;
 
 pub use adapter_support::{
-    is_firefox, loopback_websocket_port, parse_devtools_active_port, BrowserCursorTracker,
+    BrowserCursorTracker, is_firefox, loopback_websocket_port, parse_devtools_active_port,
 };
 pub use engine::BrowserEngine;
 pub use platform::{
@@ -86,9 +90,9 @@ pub use platform::{
     PrepareStrategy,
 };
 pub use refusal::{BrowserRefusal, BrowserRefusalCode};
-pub use semantic::{semantic_ax_tree, SEMANTIC_COMPUTED_STYLES};
+pub use semantic::{SEMANTIC_COMPUTED_STYLES, semantic_ax_tree};
 pub use setup_descriptor::{
-    existing_profile_setup_descriptor, BrowserSetupDescriptor, EXISTING_PROFILE_SETUP_READY_TIMEOUT,
+    BrowserSetupDescriptor, EXISTING_PROFILE_SETUP_READY_TIMEOUT, existing_profile_setup_descriptor,
 };
 pub use tools::register_browser_tools;
 pub use types::{
@@ -114,34 +118,45 @@ pub(crate) fn required_session_schema() -> serde_json::Value {
     })
 }
 
-pub use local_ipc::{IpcError, NativeEndpointIdentity, ValidatedNativeEndpoint};
-pub use native_provider::{
-    discover_installed_native_endpoints, discover_registered, discover_registered_endpoints,
-    discover_registered_for, CleanupEvidence, CleanupProof, NativeAttachmentPreparation,
-    NativeBrowserOperation, NativeBrowserProvider, NativeCdpCompletionOutcome,
-    NativeClaimPreparationProof, NativeCommittedTabUrl, NativeCreatedTab, NativeCreationReceipt,
-    NativeCursorPresentationAck, NativeDownloadMetadata, NativeDownloadStatus, NativeEffectOwner,
-    NativeEndpointDiscovery, NativeEndpointRejection, NativeGroupColor, NativeGroupPresentation,
-    NativeGroupProof, NativeGroupReleaseEvidence, NativeGroupReleaseProof, NativeHeader,
-    NativeHeaderPolicyScope, NativeHeaderProof, NativeHeaderScope, NativeHostOperation,
-    NativeKnownCustody, NativeManagedGroupReceipt, NativeMetadataError, NativeMutationDiagnostic,
-    NativeOperation, NativeOperationCompletion, NativeOperationOutcome, NativePendingOperation,
-    NativePhysicalClaim, NativePopupRequest, NativePreparationDocument,
-    NativePreparationDocumentBinding, NativePreparationPolicy, NativePreparedTab,
-    NativeProviderCapabilities, NativeProviderError, NativeProviderEvent, NativeRecoveredOperation,
-    NativeSessionHeaderProof, NativeSessionPreparedTab, NativeTabInfo, NativeUserTabsOrder,
+pub use extension_provider::{
+    CleanupEvidence, CleanupProof, ExtensionAttachmentPreparation, ExtensionBrowserOperation,
+    ExtensionBrowserProvider, ExtensionCdpCompletionOutcome, ExtensionClaimPreparationProof,
+    ExtensionCommittedTabUrl, ExtensionCreatedTab, ExtensionCreationReceipt,
+    ExtensionCursorPresentationAck, ExtensionDownloadMetadata, ExtensionDownloadStatus,
+    ExtensionEffectOwner, ExtensionEndpointDiscovery, ExtensionEndpointRejection,
+    ExtensionFixedSessionCleanupProof, ExtensionFixedSessionPreparedTab,
+    ExtensionFixedSessionReceipt, ExtensionFixedUiAck, ExtensionFixedUiAction,
+    ExtensionFixedUiColor, ExtensionFixedUiCursor, ExtensionFixedUiIdentity,
+    ExtensionFixedUiOperation, ExtensionFixedUiProof, ExtensionFixedUiRenderState,
+    ExtensionFixedUiRenderStatus, ExtensionFixedUiRequest, ExtensionGroupColor,
+    ExtensionGroupPresentation, ExtensionGroupProof, ExtensionGroupReleaseEvidence,
+    ExtensionGroupReleaseProof, ExtensionHeader, ExtensionHeaderPolicyScope, ExtensionHeaderProof,
+    ExtensionHeaderScope, ExtensionHostOperation, ExtensionKnownCustody,
+    ExtensionManagedGroupReceipt, ExtensionMetadataError, ExtensionMutationDiagnostic,
+    ExtensionOperation, ExtensionOperationCompletion, ExtensionOperationOutcome,
+    ExtensionPendingOperation, ExtensionPhysicalClaim, ExtensionPopupRequest,
+    ExtensionPreparationDocument, ExtensionPreparationDocumentBinding, ExtensionPreparationPolicy,
+    ExtensionPreparedTab, ExtensionProviderCapabilities, ExtensionProviderError,
+    ExtensionProviderEvent, ExtensionRecoveredOperation, ExtensionSessionCleanupObservation,
+    ExtensionSessionHeaderProof, ExtensionSessionPopupRequest, ExtensionSessionPreparation,
+    ExtensionSessionPreparedTab, ExtensionTabInfo, ExtensionUserTabsOrder,
+    discover_installed_extension_endpoints, discover_registered, discover_registered_endpoints,
+    discover_registered_for,
+};
+pub use local_ipc::{ExtensionEndpointIdentity, IpcError, ValidatedExtensionEndpoint};
+
+pub use extension_provider::ExtensionTabAbsenceObservation;
+
+pub use extension_provider::{ExtensionKeepStatus, ExtensionKeepTab, ExtensionTurnFinishAck};
+
+pub use extension_wire::{ExtensionWireContext, ExtensionWireContextError};
+
+pub use extension_process::{
+    ExtensionAdapterMode, ExtensionAdapterSelection, ExtensionAdapterSelectionError,
 };
 
-pub use native_provider::NativeTabAbsenceObservation;
-
-pub use native_provider::{NativeKeepStatus, NativeKeepTab, NativeTurnFinishAck};
-
-pub use native_wire::{NativeWireContext, NativeWireContextError};
-
-pub use native_process::{NativeAdapterMode, NativeAdapterSelection, NativeAdapterSelectionError};
-
-pub use native_provider::{
-    NativeClaimCdpDrainProof, NativeClaimCdpSnapshot, NativePendingCdpRequest,
+pub use extension_provider::{
+    ExtensionClaimCdpDrainProof, ExtensionClaimCdpSnapshot, ExtensionPendingCdpRequest,
 };
 
 #[cfg(test)]

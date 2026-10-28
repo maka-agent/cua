@@ -26,16 +26,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::session::register_scoped_fallible_session_end_hook;
 
 use super::binding::{
-    cardinality_exact_candidate, correlate, selected_tab_target_id, BindingOutcome,
-    CdpWindowCandidate,
+    BindingOutcome, CdpWindowCandidate, cardinality_exact_candidate, correlate,
+    selected_tab_target_id,
 };
 use super::cdp_ws::{CdpConnection, CdpPool, SharedSocketRelease};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
@@ -48,13 +48,12 @@ use super::prepare::ManagedBrowsers;
 use super::reconnect::{ReconnectGates, ReconnectKey};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
-    build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
-    OmissionCounts, SemanticDocument, SemanticNode, DEFAULT_SEMANTIC_NODE_BUDGET,
-    SEMANTIC_COMPUTED_STYLES,
+    DEFAULT_SEMANTIC_NODE_BUDGET, OmissionCounts, SEMANTIC_COMPUTED_STYLES, SemanticDocument,
+    SemanticNode, build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
 };
 use super::store::{
-    format_ref, BrowserStore, BrowserVisibility, FrameIdentity, FrameKind, FrameRef, RefEntry,
-    SemanticContinuation, SnapshotRecord, TabRecord, TargetRecord,
+    BrowserStore, BrowserVisibility, FrameIdentity, FrameKind, FrameRef, RefEntry,
+    SemanticContinuation, SnapshotRecord, TabRecord, TargetRecord, format_ref,
 };
 use super::types::{
     BindingQuality, BrowserClassification, BrowserEngineFamily, BrowserProcessRole,
@@ -1557,7 +1556,7 @@ impl BrowserEngine {
             ));
         }
 
-        // 2. Native window still exists and is still owned by the pid.
+        // 2. Extension window still exists and is still owned by the pid.
         let native = self
             .native_window_checked(record.pid, record.window_id)
             .await?;
@@ -2229,7 +2228,7 @@ impl BrowserEngine {
                 }
                 Err(AttachError::Unsupported) => OopifStatus::Unsupported,
                 Err(AttachError::Failed(e)) => {
-                    return Err(route_err("Target.setAutoAttach failed", e))
+                    return Err(route_err("Target.setAutoAttach failed", e));
                 }
             }
         } else {
@@ -2402,7 +2401,10 @@ impl BrowserEngine {
                             last_size_error = error.to_string();
                         }
                         Err(error) => {
-                            return Err(route_err("bounded DOM.getDocument fallback failed", error))
+                            return Err(route_err(
+                                "bounded DOM.getDocument fallback failed",
+                                error,
+                            ));
                         }
                     }
                 }
@@ -2458,7 +2460,7 @@ impl BrowserEngine {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) if is_semantic_document_size_error(&error) => continue,
                 Ok(Err(error)) => {
-                    return Err(route_err("DOM.describeNode hydration failed", error))
+                    return Err(route_err("DOM.describeNode hydration failed", error));
                 }
             };
             let Some(node) = response.get("node") else {
@@ -2663,7 +2665,7 @@ impl BrowserEngine {
             Ok(tree) => Some(tree),
             Err(FrameTreeError::Unsupported) => None,
             Err(FrameTreeError::Failed(error)) => {
-                return Err(route_err("Page.getFrameTree failed", error))
+                return Err(route_err("Page.getFrameTree failed", error));
             }
         };
         let semantic_root_identity = local_tree.as_ref().map(LocalFrameTree::main_identity);
@@ -2747,7 +2749,7 @@ impl BrowserEngine {
                 }
                 Err(AttachError::Unsupported) => OopifStatus::Unsupported,
                 Err(AttachError::Failed(error)) => {
-                    return Err(route_err("Target.setAutoAttach failed", error))
+                    return Err(route_err("Target.setAutoAttach failed", error));
                 }
             }
         } else {

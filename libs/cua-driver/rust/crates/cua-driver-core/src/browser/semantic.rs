@@ -1470,10 +1470,11 @@ mod tests {
             node.name.as_deref() == Some("Custom action")
                 && node.actions == vec![BrowserActionKind::Click, BrowserActionKind::Pointer]
         }));
-        assert!(page
-            .selected
-            .iter()
-            .all(|node| node.name.as_deref() != Some("Static panel")));
+        assert!(
+            page.selected
+                .iter()
+                .all(|node| node.name.as_deref() != Some("Static panel"))
+        );
     }
 
     #[test]
@@ -1524,10 +1525,11 @@ mod tests {
             .find(|node| node.name.as_deref() == Some("Scrollable archive"))
             .expect("scrollable DOM supplement");
         assert_eq!(scrollable.actions, vec![BrowserActionKind::Scroll]);
-        assert!(page
-            .selected
-            .iter()
-            .all(|node| node.name.as_deref() != Some("Overflow-visible panel")));
+        assert!(
+            page.selected
+                .iter()
+                .all(|node| node.name.as_deref() != Some("Overflow-visible panel"))
+        );
     }
 
     #[test]
@@ -1606,10 +1608,11 @@ mod tests {
         ]});
         let document = compose_accessibility_tree(&ax, &dom, &layout, &viewport, frame());
         let page = document.page(0, 300, None, None);
-        assert!(page
-            .selected
-            .iter()
-            .all(|node| node.name.as_deref() != Some("Covered")));
+        assert!(
+            page.selected
+                .iter()
+                .all(|node| node.name.as_deref() != Some("Covered"))
+        );
         assert_eq!(page.omissions.page_occluded, 1);
     }
 

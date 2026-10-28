@@ -10,10 +10,10 @@
 //! the time that call returns.
 //!
 //! WebSocket constructors accept only loopback `ws://` URLs. The crate-private
-//! native channel seam receives only an already authenticated, claim-scoped
+//! extension channel seam receives only an already authenticated, claim-scoped
 //! bridge; its local failures never become remote CDP rejections.
 
-use super::native_wire::NativeWireContext;
+use super::extension_wire::ExtensionWireContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -23,7 +23,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -31,7 +31,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Native bridge calls remain bounded even after their outbound queue drains.
+/// Extension bridge calls remain bounded even after their outbound queue drains.
 const NATIVE_MAX_PENDING_CALLS: usize = 64;
 
 /// Connection-scoped command policy. Grant-owned personal-profile sockets
@@ -133,7 +133,7 @@ enum CallOutcome {
         message: String,
         disposition: CdpFailureDisposition,
     },
-    NativeFailure {
+    ExtensionFailure {
         message: String,
         disposition: CdpFailureDisposition,
     },
@@ -145,26 +145,26 @@ enum CallOutcome {
 }
 
 /// Trusted failure classification for the caller's existing effect ledger.
-/// These values are produced inside Rust; native/page JSON cannot choose them.
+/// These values are produced inside Rust; extension/page JSON cannot choose them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CdpFailureDisposition {
     /// An actual failed reply without locally retained unknown effect custody.
     ReplyFailure,
-    /// The native provider retained this exact request's unknown effect.
-    NativeEffectUnknown,
+    /// The extension provider retained this exact request's unknown effect.
+    ExtensionEffectUnknown,
     /// The connector proved that it did not dispatch this request.
     NotDispatched,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CdpFailureOrigin {
     Reply,
-    NativeTransport,
+    ExtensionTransport,
 }
 
-/// A request-matched failed reply or native invocation terminal.
+/// A request-matched failed reply or extension invocation terminal.
 ///
 /// Disposition separates a locally retained unknown effect from an ordinary
-/// failed reply. A native invocation terminal is not a Chrome rejection or an
+/// failed reply. A extension invocation terminal is not a Chrome rejection or an
 /// effect-settlement proof. Missing replies and whole-transport loss retain
 /// their existing generic unknown errors. Numeric codes are never invented.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +195,7 @@ impl CdpReplyError {
 
 impl std::fmt::Display for CdpReplyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.origin == CdpFailureOrigin::NativeTransport {
+        if self.origin == CdpFailureOrigin::ExtensionTransport {
             return write!(
                 formatter,
                 "CDP transport failed during {}: {}",
@@ -215,19 +215,19 @@ impl std::fmt::Display for CdpReplyError {
 
 impl std::error::Error for CdpReplyError {}
 
-/// A definite request-matched refusal from the local native connector.
+/// A definite request-matched refusal from the local extension connector.
 ///
 /// This is not a Chrome CDP error. The adapter may use it only when it knows
 /// this request was refused without dispatching its Chrome command; loss,
 /// revocation races and uncertain effects remain transport/unknown outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeCdpRefusal {
+pub struct ExtensionCdpRefusal {
     method: String,
     code: String,
     message: String,
 }
 
-impl NativeCdpRefusal {
+impl ExtensionCdpRefusal {
     pub fn disposition(&self) -> CdpFailureDisposition {
         CdpFailureDisposition::NotDispatched
     }
@@ -244,17 +244,17 @@ impl NativeCdpRefusal {
     }
 }
 
-impl std::fmt::Display for NativeCdpRefusal {
+impl std::fmt::Display for ExtensionCdpRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Native CDP {} refused ({}): {}",
+            "Extension CDP {} refused ({}): {}",
             self.method, self.code, self.message
         )
     }
 }
 
-impl std::error::Error for NativeCdpRefusal {}
+impl std::error::Error for ExtensionCdpRefusal {}
 
 /// State shared between the caller side and the reader task.
 struct Demux {
@@ -264,13 +264,13 @@ struct Demux {
     dialogs: StdMutex<HashMap<String, CdpDialogState>>,
     next_dialog_generation: AtomicU64,
     closed: AtomicBool,
-    native_close: StdMutex<Option<oneshot::Sender<()>>>,
+    extension_close: StdMutex<Option<oneshot::Sender<()>>>,
     pending_slots: Option<Semaphore>,
 }
 
 impl Demux {
-    fn new(native_close: Option<oneshot::Sender<()>>) -> Self {
-        let pending_slots = native_close
+    fn new(extension_close: Option<oneshot::Sender<()>>) -> Self {
+        let pending_slots = extension_close
             .as_ref()
             .map(|_| Semaphore::new(NATIVE_MAX_PENDING_CALLS));
         Self {
@@ -280,7 +280,7 @@ impl Demux {
             dialogs: StdMutex::new(HashMap::new()),
             next_dialog_generation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
-            native_close: StdMutex::new(native_close),
+            extension_close: StdMutex::new(extension_close),
             pending_slots,
         }
     }
@@ -298,7 +298,7 @@ impl Demux {
         if let Some(slots) = &self.pending_slots {
             slots.close();
         }
-        if let Some(signal) = self.native_close.lock().unwrap().take() {
+        if let Some(signal) = self.extension_close.lock().unwrap().take() {
             let _ = signal.send(());
         }
         let mut pending = self.pending.lock().unwrap();
@@ -413,12 +413,12 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
     demux.close();
 }
 
-/// A native bridge may forward only messages actually received from Chrome.
+/// A extension bridge may forward only messages actually received from Chrome.
 /// Definite pre-dispatch refusals use LocalRejected; uncertain broker/claim/
 /// lifetime failures use TransportFailure, never a fabricated ChromeMessage.
 /// The bridge validates generation, owner, claim and byte budget before this
 /// internal boundary; this enum is not an external or model-facing wire API.
-pub(crate) enum NativeCdpInbound {
+pub(crate) enum ExtensionCdpInbound {
     ChromeMessage(Value),
     /// Trusted client metadata travels beside raw JSON, never inside it.
     ClassifiedChromeMessage {
@@ -431,8 +431,8 @@ pub(crate) enum NativeCdpInbound {
         code: String,
         message: String,
     },
-    /// Fail only this exact native request. Neighboring requests retain their
-    /// own ordered write-phase facts and cannot be closed by this terminal.
+    /// Fail only this exact extension request. Neighboring requests retain their
+    /// maka ordered write-phase facts and cannot be closed by this terminal.
     RequestFailure {
         id: u64,
         reason: String,
@@ -445,28 +445,28 @@ pub(crate) enum NativeCdpInbound {
 /// The bridge must call `into_dispatch_if_live` immediately before dispatch.
 /// Once released to the bridge, Chrome execution can still race cancellation;
 /// that outcome is unknown and must never be retried automatically.
-pub(crate) struct NativeCdpCommand {
+pub(crate) struct ExtensionCdpCommand {
     message: Value,
-    wire_context: Option<NativeWireContext>,
+    wire_context: Option<ExtensionWireContext>,
     reply_disposition: ReplyDisposition,
     connection: Weak<Demux>,
 }
 
-/// An admitted native message retains exact immutable trusted call metadata.
+/// An admitted extension message retains exact immutable trusted call metadata.
 /// Context is carried beside CDP JSON and is never a Chrome CDP parameter.
-pub(crate) struct NativeCdpDispatch {
+pub(crate) struct ExtensionCdpDispatch {
     pub(crate) message: Value,
-    pub(crate) wire_context: Option<NativeWireContext>,
+    pub(crate) wire_context: Option<ExtensionWireContext>,
     pub(crate) reply_disposition: ReplyDisposition,
 }
 
-impl NativeCdpCommand {
-    pub(crate) fn into_dispatch_if_live(self) -> Option<NativeCdpDispatch> {
+impl ExtensionCdpCommand {
+    pub(crate) fn into_dispatch_if_live(self) -> Option<ExtensionCdpDispatch> {
         let connection = self.connection.upgrade()?;
         if connection.closed.load(Ordering::SeqCst) {
             None
         } else {
-            Some(NativeCdpDispatch {
+            Some(ExtensionCdpDispatch {
                 message: self.message,
                 wire_context: self.wire_context,
                 reply_disposition: self.reply_disposition,
@@ -475,32 +475,32 @@ impl NativeCdpCommand {
     }
 }
 
-async fn read_native_loop(mut inbound: mpsc::Receiver<NativeCdpInbound>, demux: Arc<Demux>) {
+async fn read_extension_loop(mut inbound: mpsc::Receiver<ExtensionCdpInbound>, demux: Arc<Demux>) {
     while let Some(message) = inbound.recv().await {
         match message {
-            NativeCdpInbound::ChromeMessage(message) => route_json(message, &demux),
-            NativeCdpInbound::ClassifiedChromeMessage {
+            ExtensionCdpInbound::ChromeMessage(message) => route_json(message, &demux),
+            ExtensionCdpInbound::ClassifiedChromeMessage {
                 message,
                 disposition,
             } => route_json_with_disposition(message, &demux, disposition),
-            NativeCdpInbound::LocalRejected { id, code, message } => {
+            ExtensionCdpInbound::LocalRejected { id, code, message } => {
                 if let Some(reply) = demux.pending.lock().unwrap().remove(&id) {
                     let _ = reply.send(CallOutcome::LocalRejected { code, message });
                 }
             }
-            NativeCdpInbound::RequestFailure {
+            ExtensionCdpInbound::RequestFailure {
                 id,
                 reason,
                 disposition,
             } => {
                 if let Some(reply) = demux.pending.lock().unwrap().remove(&id) {
-                    let _ = reply.send(CallOutcome::NativeFailure {
+                    let _ = reply.send(CallOutcome::ExtensionFailure {
                         message: reason,
                         disposition,
                     });
                 }
             }
-            NativeCdpInbound::TransportFailure(message) => {
+            ExtensionCdpInbound::TransportFailure(message) => {
                 demux.fail_transport(message);
                 return;
             }
@@ -511,7 +511,7 @@ async fn read_native_loop(mut inbound: mpsc::Receiver<NativeCdpInbound>, demux: 
 
 enum CdpWriter {
     WebSocket(SplitSink<WsStream, Message>),
-    Native(mpsc::Sender<NativeCdpCommand>),
+    Extension(mpsc::Sender<ExtensionCdpCommand>),
 }
 
 impl CdpWriter {
@@ -519,7 +519,7 @@ impl CdpWriter {
         &mut self,
         message: Value,
         demux: &Arc<Demux>,
-        wire_context: Option<&NativeWireContext>,
+        wire_context: Option<&ExtensionWireContext>,
         reply_disposition: ReplyDisposition,
     ) -> anyhow::Result<()> {
         match self {
@@ -527,15 +527,15 @@ impl CdpWriter {
                 .send(Message::Text(message.to_string()))
                 .await
                 .map_err(anyhow::Error::from),
-            Self::Native(writer) => writer
-                .send(NativeCdpCommand {
+            Self::Extension(writer) => writer
+                .send(ExtensionCdpCommand {
                     message,
                     wire_context: wire_context.cloned(),
                     reply_disposition,
                     connection: Arc::downgrade(demux),
                 })
                 .await
-                .map_err(|_| anyhow::anyhow!("native CDP bridge is closed")),
+                .map_err(|_| anyhow::anyhow!("extension CDP bridge is closed")),
         }
     }
 }
@@ -556,7 +556,7 @@ impl Drop for CdpConnection {
     }
 }
 
-// Trusted caller intent stays inside Rust; native peers cannot deserialize it.
+// Trusted caller intent stays inside Rust; extension peers cannot deserialize it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReplyDisposition {
     Required,
@@ -631,7 +631,7 @@ impl CdpConnection {
         })
     }
 
-    /// Bind the shared CDP state to an already validated native bridge.
+    /// Bind the shared CDP state to an already validated extension bridge.
     ///
     /// The bridge owns physical attachment, generation and claim validation.
     /// It must stop forwarding when `close` resolves, discard queued commands
@@ -642,16 +642,16 @@ impl CdpConnection {
     /// effects and route loss use `TransportFailure`. Inner CDP ids start at1
     /// per connection; the bridge must scope its outer-id mapping by this
     /// exact connection and claim, never treat these ids as globally unique.
-    /// Native pending calls are bounded independently of the outbound queue.
-    pub(crate) fn from_native_channels(
-        outbound: mpsc::Sender<NativeCdpCommand>,
-        inbound: mpsc::Receiver<NativeCdpInbound>,
+    /// Extension pending calls are bounded independently of the outbound queue.
+    pub(crate) fn from_extension_channels(
+        outbound: mpsc::Sender<ExtensionCdpCommand>,
+        inbound: mpsc::Receiver<ExtensionCdpInbound>,
         close: oneshot::Sender<()>,
     ) -> Self {
         let demux = Arc::new(Demux::new(Some(close)));
-        let reader = tokio::spawn(read_native_loop(inbound, demux.clone()));
+        let reader = tokio::spawn(read_extension_loop(inbound, demux.clone()));
         Self {
-            writer: Mutex::new(CdpWriter::Native(outbound)),
+            writer: Mutex::new(CdpWriter::Extension(outbound)),
             demux,
             next_id: AtomicU64::new(1),
             existing_profile_policy: AtomicBool::new(false),
@@ -765,12 +765,12 @@ impl CdpConnection {
         .await
     }
 
-    /// Pass exact trusted session/turn metadata to a native wire adapter.
+    /// Pass exact trusted session/turn metadata to a extension wire adapter.
     /// WebSocket calls keep their original CDP payload and ignore this metadata.
     /// Captured old context is never replaced with an ambient latest turn.
-    pub async fn call_with_native_context(
+    pub async fn call_with_extension_context(
         &self,
-        wire_context: &NativeWireContext,
+        wire_context: &ExtensionWireContext,
         session_id: Option<&str>,
         method: &str,
         params: Value,
@@ -786,9 +786,9 @@ impl CdpConnection {
     }
 
     /// Observation counterpart with unchanged late-reply abandonment semantics.
-    pub async fn call_observation_with_native_context(
+    pub async fn call_observation_with_extension_context(
         &self,
-        wire_context: &NativeWireContext,
+        wire_context: &ExtensionWireContext,
         session_id: Option<&str>,
         method: &str,
         params: Value,
@@ -809,7 +809,7 @@ impl CdpConnection {
         method: &str,
         params: Value,
         reply_disposition: ReplyDisposition,
-        wire_context: Option<&NativeWireContext>,
+        wire_context: Option<&ExtensionWireContext>,
     ) -> anyhow::Result<Value> {
         let policy = self.method_policy();
         if !policy.allows(method) {
@@ -872,13 +872,13 @@ impl CdpConnection {
             CallOutcome::TransportFailure(message) => {
                 anyhow::bail!("CDP transport failed during {method}: {message}")
             }
-            CallOutcome::LocalRejected { code, message } => Err(NativeCdpRefusal {
+            CallOutcome::LocalRejected { code, message } => Err(ExtensionCdpRefusal {
                 method: method.to_owned(),
                 code,
                 message,
             }
             .into()),
-            CallOutcome::NativeFailure {
+            CallOutcome::ExtensionFailure {
                 message,
                 disposition,
             } => Err(CdpReplyError {
@@ -886,7 +886,7 @@ impl CdpConnection {
                 code: None,
                 message,
                 disposition,
-                origin: CdpFailureOrigin::NativeTransport,
+                origin: CdpFailureOrigin::ExtensionTransport,
             }
             .into()),
             CallOutcome::Error {
@@ -986,7 +986,7 @@ fn loopback_port(url: &str) -> Option<u16> {
 }
 
 /// Whether an existing-profile grant owns the DevTools listener used by this
-/// URL. The legacy page route consults this before opening its own page socket.
+/// URL. The legacy page route consults this before opening its maka page socket.
 pub fn endpoint_port_is_grant_owned(url: &str) -> bool {
     loopback_port(url).is_some_and(|port| claimed_ports().lock().unwrap().contains_key(&port))
 }
@@ -1293,7 +1293,7 @@ impl CdpPool {
         let conn = Arc::new(CdpConnection::connect(ws_url).await?);
         conn.restrict_to_existing_profile();
         let mut conns = self.inner.conns.lock().await;
-        // Holders of the dead socket rebind through their own reconnect,
+        // Holders of the dead socket rebind through their maka reconnect,
         // which joins this socket without dialing.
         self.inner.insert_shared(
             &mut conns,
@@ -1515,9 +1515,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<CdpReplyError>().is_none());
-        assert!(error
-            .to_string()
-            .contains("existing-profile CDP policy refused"));
+        assert!(
+            error
+                .to_string()
+                .contains("existing-profile CDP policy refused")
+        );
         conn.call(None, "Page.getFrameTree", json!({}))
             .await
             .unwrap();
@@ -2181,24 +2183,24 @@ mod tests {
 }
 
 #[cfg(test)]
-mod native_transport_tests {
+mod extension_transport_tests {
     use super::*;
     use serde_json::json;
     use std::future::Future;
 
-    struct NativePeer {
-        commands: mpsc::Receiver<NativeCdpCommand>,
-        inbound: mpsc::Sender<NativeCdpInbound>,
+    struct ExtensionPeer {
+        commands: mpsc::Receiver<ExtensionCdpCommand>,
+        inbound: mpsc::Sender<ExtensionCdpInbound>,
         closed: oneshot::Receiver<()>,
     }
 
-    fn native_connection(capacity: usize) -> (CdpConnection, NativePeer) {
+    fn extension_connection(capacity: usize) -> (CdpConnection, ExtensionPeer) {
         let (outbound, commands) = mpsc::channel(capacity);
         let (inbound, incoming) = mpsc::channel(128);
         let (close, closed) = oneshot::channel();
         (
-            CdpConnection::from_native_channels(outbound, incoming, close),
-            NativePeer {
+            CdpConnection::from_extension_channels(outbound, incoming, close),
+            ExtensionPeer {
                 commands,
                 inbound,
                 closed,
@@ -2212,25 +2214,25 @@ mod native_transport_tests {
             .expect("hermetic channel operation must complete")
     }
 
-    async fn next_command(peer: &mut NativePeer) -> Value {
+    async fn next_command(peer: &mut ExtensionPeer) -> Value {
         bounded(peer.commands.recv())
             .await
-            .expect("native command")
+            .expect("extension command")
             .into_dispatch_if_live()
             .expect("live transport may dispatch queued command")
             .message
     }
 
-    async fn reply(peer: &NativePeer, message: Value) {
+    async fn reply(peer: &ExtensionPeer, message: Value) {
         peer.inbound
-            .send(NativeCdpInbound::ChromeMessage(message))
+            .send(ExtensionCdpInbound::ChromeMessage(message))
             .await
             .expect("live inbound bridge");
     }
 
     #[tokio::test]
     async fn raw_chrome_json_cannot_forge_failure_disposition() {
-        let (connection, mut peer) = native_connection(4);
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let call = {
             let connection = connection.clone();
@@ -2246,8 +2248,8 @@ mod native_transport_tests {
     }
 
     #[tokio::test]
-    async fn native_event_preceding_reply_is_queued_before_call_completes() {
-        let (connection, mut peer) = native_connection(4);
+    async fn extension_event_preceding_reply_is_queued_before_call_completes() {
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let mut events = connection.subscribe();
         let call = {
@@ -2281,8 +2283,8 @@ mod native_transport_tests {
     }
 
     #[tokio::test]
-    async fn native_out_of_order_replies_reuse_existing_id_routing() {
-        let (connection, mut peer) = native_connection(4);
+    async fn extension_out_of_order_replies_reuse_existing_id_routing() {
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let first = {
             let connection = connection.clone();
@@ -2303,7 +2305,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn matched_chrome_error_keeps_actual_reply_classification() {
-        let (connection, mut peer) = native_connection(4);
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let call = {
             let connection = connection.clone();
@@ -2327,7 +2329,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn broker_failure_is_not_a_chrome_rejection_and_closes_the_bridge() {
-        let (connection, mut peer) = native_connection(4);
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let call = {
             let connection = connection.clone();
@@ -2339,8 +2341,8 @@ mod native_transport_tests {
         };
         let _sent = next_command(&mut peer).await;
         peer.inbound
-            .send(NativeCdpInbound::TransportFailure(
-                "native generation ended".into(),
+            .send(ExtensionCdpInbound::TransportFailure(
+                "extension generation ended".into(),
             ))
             .await
             .unwrap();
@@ -2348,7 +2350,7 @@ mod native_transport_tests {
         assert!(error.downcast_ref::<CdpReplyError>().is_none());
         assert_eq!(
             error.to_string(),
-            "CDP transport failed during Input.insertText: native generation ended"
+            "CDP transport failed during Input.insertText: extension generation ended"
         );
         assert!(connection.is_closed());
         bounded(peer.closed)
@@ -2361,8 +2363,8 @@ mod native_transport_tests {
     }
 
     #[tokio::test]
-    async fn native_eof_fails_pending_call_without_retry_or_remote_error() {
-        let (connection, mut peer) = native_connection(4);
+    async fn extension_eof_fails_pending_call_without_retry_or_remote_error() {
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let call = {
             let connection = connection.clone();
@@ -2397,7 +2399,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn cancelled_mutation_fences_queued_unsent_command_and_signals_close() {
-        let (connection, mut peer) = native_connection(1);
+        let (connection, mut peer) = extension_connection(1);
         {
             let call = connection.call(None, "Input.insertText", json!({"text":"once"}));
             tokio::pin!(call);
@@ -2413,7 +2415,7 @@ mod native_transport_tests {
         );
         bounded(peer.closed)
             .await
-            .expect("mutation cancellation closes native claim route");
+            .expect("mutation cancellation closes extension claim route");
         assert!(matches!(
             peer.commands.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -2422,7 +2424,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn cancelled_sent_observation_drops_late_reply_and_keeps_connection_live() {
-        let (connection, mut peer) = native_connection(2);
+        let (connection, mut peer) = extension_connection(2);
         {
             let call = connection.call_observation(None, "Page.getLayoutMetrics", json!({}));
             tokio::pin!(call);
@@ -2451,7 +2453,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn cancelling_observation_while_its_send_is_blocked_fences_old_queue() {
-        let (connection, mut peer) = native_connection(1);
+        let (connection, mut peer) = extension_connection(1);
         {
             let first = connection.call_observation(None, "Page.getLayoutMetrics", json!({}));
             tokio::pin!(first);
@@ -2481,7 +2483,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn dropping_connection_invalidates_held_unsent_command() {
-        let (connection, mut peer) = native_connection(1);
+        let (connection, mut peer) = extension_connection(1);
         {
             let observation = connection.call_observation(None, "DOM.getDocument", json!({}));
             tokio::pin!(observation);
@@ -2494,8 +2496,8 @@ mod native_transport_tests {
     }
 
     #[tokio::test]
-    async fn native_pending_bound_survives_draining_the_outbound_queue() {
-        let (connection, mut peer) = native_connection(64);
+    async fn extension_pending_bound_survives_draining_the_outbound_queue() {
+        let (connection, mut peer) = extension_connection(64);
         let connection = Arc::new(connection);
         let mut calls = tokio::task::JoinSet::new();
         let mut sent = Vec::new();
@@ -2561,7 +2563,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn request_matched_local_refusal_keeps_unrelated_call_and_connection_live() {
-        let (connection, mut peer) = native_connection(4);
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
         let refused = {
             let connection = connection.clone();
@@ -2578,7 +2580,7 @@ mod native_transport_tests {
         };
         let healthy_sent = next_command(&mut peer).await;
         peer.inbound
-            .send(NativeCdpInbound::LocalRejected {
+            .send(ExtensionCdpInbound::LocalRejected {
                 id: 999,
                 code: "unsupported".into(),
                 message: "stale unmatched reply".into(),
@@ -2586,7 +2588,7 @@ mod native_transport_tests {
             .await
             .unwrap();
         peer.inbound
-            .send(NativeCdpInbound::LocalRejected {
+            .send(ExtensionCdpInbound::LocalRejected {
                 id: refused_sent["id"].as_u64().unwrap(),
                 code: "unsupported".into(),
                 message: "Browser domain is unavailable through chrome.debugger".into(),
@@ -2602,13 +2604,13 @@ mod native_transport_tests {
         assert!(error.downcast_ref::<CdpReplyError>().is_none());
         assert_eq!(
             error
-                .downcast_ref::<NativeCdpRefusal>()
+                .downcast_ref::<ExtensionCdpRefusal>()
                 .unwrap()
                 .disposition(),
             CdpFailureDisposition::NotDispatched
         );
         let refusal = error
-            .downcast_ref::<NativeCdpRefusal>()
+            .downcast_ref::<ExtensionCdpRefusal>()
             .expect("known local refusal retains separate provenance");
         assert_eq!(refusal.method(), "Browser.getWindowBounds");
         assert_eq!(refusal.code(), "unsupported");
@@ -2627,17 +2629,22 @@ mod native_transport_tests {
         ));
     }
     #[tokio::test]
-    async fn native_context_is_immutable_and_distinct_for_each_command() {
-        let (connection, mut peer) = native_connection(4);
+    async fn extension_context_is_immutable_and_distinct_for_each_command() {
+        let (connection, mut peer) = extension_connection(4);
         let connection = Arc::new(connection);
-        let first_context = NativeWireContext::new("canonical-owner", "turn-A").unwrap();
-        let second_context = NativeWireContext::new("canonical-owner", "turn-B").unwrap();
+        let first_context = ExtensionWireContext::new("canonical-owner", "turn-A").unwrap();
+        let second_context = ExtensionWireContext::new("canonical-owner", "turn-B").unwrap();
         let first = {
             let connection = connection.clone();
             let context = first_context.clone();
             tokio::spawn(async move {
                 connection
-                    .call_with_native_context(&context, None, "Runtime.first", json!({"value":1}))
+                    .call_with_extension_context(
+                        &context,
+                        None,
+                        "Runtime.first",
+                        json!({"value":1}),
+                    )
                     .await
             })
         };
@@ -2653,7 +2660,12 @@ mod native_transport_tests {
             let context = second_context.clone();
             tokio::spawn(async move {
                 connection
-                    .call_with_native_context(&context, None, "Runtime.second", json!({"value":2}))
+                    .call_with_extension_context(
+                        &context,
+                        None,
+                        "Runtime.second",
+                        json!({"value":2}),
+                    )
                     .await
             })
         };
@@ -2680,7 +2692,7 @@ mod native_transport_tests {
 
     #[tokio::test]
     async fn default_native_call_keeps_context_absent() {
-        let (connection, mut peer) = native_connection(2);
+        let (connection, mut peer) = extension_connection(2);
         let connection = Arc::new(connection);
         let call = {
             let connection = connection.clone();
@@ -2721,10 +2733,10 @@ mod native_transport_tests {
         let connection = CdpConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
-        let context = NativeWireContext::new("owner", "captured-turn").unwrap();
+        let context = ExtensionWireContext::new("owner", "captured-turn").unwrap();
         assert_eq!(
             connection
-                .call_with_native_context(&context, None, "Page.enable", json!({}))
+                .call_with_extension_context(&context, None, "Page.enable", json!({}))
                 .await
                 .unwrap()["enabled"],
             true

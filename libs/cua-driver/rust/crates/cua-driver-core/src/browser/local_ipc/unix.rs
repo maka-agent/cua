@@ -59,7 +59,7 @@ pub(super) fn validate_directory(path: &Path) -> Result<(), IpcError> {
         || metadata.permissions().mode() & 0o777 != 0o700
     {
         return Err(rejected(
-            "native IPC directory is not current-user private 0700",
+            "extension IPC directory is not current-user private 0700",
         ));
     }
     validate_acl(&file)?;
@@ -69,7 +69,7 @@ pub(super) fn validate_directory(path: &Path) -> Result<(), IpcError> {
 pub(super) fn ensure_directory(path: &Path) -> Result<(), IpcError> {
     let parent = path
         .parent()
-        .ok_or_else(|| rejected("native IPC directory has no parent"))?;
+        .ok_or_else(|| rejected("extension IPC directory has no parent"))?;
     validate_installation_parent(parent)?;
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => secure_new_directory(path)?,
@@ -147,7 +147,7 @@ pub(super) fn open_private_file(path: &Path) -> Result<File, IpcError> {
         || metadata.permissions().mode() & 0o777 != 0o600
     {
         return Err(rejected(
-            "native endpoint descriptor is not a current-user 0600 regular file",
+            "extension endpoint descriptor is not a current-user 0600 regular file",
         ));
     }
     validate_acl(&file)?;
@@ -260,7 +260,7 @@ mod mac_acl {
         }
         for index in 0..=128 {
             let mut entry = std::ptr::null_mut();
-            // SAFETY: the iterator and output refer to the retained native ACL.
+            // SAFETY: the iterator and output refer to the retained extension ACL.
             let result = unsafe {
                 acl_get_entry(
                     acl.0,
@@ -291,9 +291,17 @@ mod mac_acl {
                 return Err(io::Error::last_os_error().into());
             }
             match tag {
-                ACL_EXTENDED_DENY=>{},
-                ACL_EXTENDED_ALLOW=>return Err(rejected("macOS private IPC requires no extended-ACL allow entries on existing directories/files")),
-                _=>return Err(rejected("macOS extended ACL has an unrecognized entry type")),
+                ACL_EXTENDED_DENY => {}
+                ACL_EXTENDED_ALLOW => {
+                    return Err(rejected(
+                        "macOS private IPC requires no extended-ACL allow entries on existing directories/files",
+                    ));
+                }
+                _ => {
+                    return Err(rejected(
+                        "macOS extended ACL has an unrecognized entry type",
+                    ));
+                }
             }
         }
         Err(rejected("macOS extended ACL iteration did not settle"))
@@ -390,7 +398,7 @@ pub(super) async fn connect(
         || credentials.pid().and_then(|pid| u32::try_from(pid).ok()) != Some(host_pid)
     {
         return Err(rejected(
-            "Unix native host peer uid/pid disagrees with descriptor",
+            "Unix extension host peer uid/pid disagrees with descriptor",
         ));
     }
     Ok(stream)
@@ -415,7 +423,7 @@ impl LocalListener {
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
-            Ok(_) => return Err(rejected("native generation socket already exists")),
+            Ok(_) => return Err(rejected("extension generation socket already exists")),
         }
         let listener = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -472,7 +480,7 @@ impl LocalListener {
             fs::remove_file(self.path)?;
             Ok(())
         } else {
-            Err(rejected("refusing to remove a replaced native socket"))
+            Err(rejected("refusing to remove a replaced extension socket"))
         }
     }
 }

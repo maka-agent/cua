@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::BrowserEngine;
 use super::engine::unsupported_engine_refusal;
 use super::platform::{
     BrowserConsentAction, BrowserConsentOutcome, BrowserConsentRequest,
@@ -22,7 +23,6 @@ use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::types::{
     BrowserEngineFamily, EndpointOwnershipMethod, EndpointOwnershipProof, OwnedEndpoint,
 };
-use super::BrowserEngine;
 
 const PROFILE_MARKER: &str = ".cua-driver-owned-profile.json";
 const PROFILE_SCHEMA: &str = "cua-driver-browser-profile-v1";
@@ -826,7 +826,7 @@ impl BrowserEngine {
                     return Ok(outcome);
                 }
                 Err(error) if error.code != BrowserRefusalCode::BrowserRequiresSetup => {
-                    return Err(error)
+                    return Err(error);
                 }
                 Err(_) => {}
             }
@@ -1158,7 +1158,7 @@ impl BrowserEngine {
                         .as_mut()
                         .expect("setup guard exists while setup is pending")
                         .abort(with_setup_side_effects(error, &setup))
-                        .await)
+                        .await);
                 }
             };
             if current_fingerprint != fingerprint {
@@ -1184,7 +1184,7 @@ impl BrowserEngine {
                             .as_mut()
                             .expect("setup guard exists while setup is pending")
                             .abort(with_setup_side_effects(error, &setup))
-                            .await)
+                            .await);
                     }
                 };
             }
@@ -1192,10 +1192,13 @@ impl BrowserEngine {
         let endpoint = match endpoint {
             Some(endpoint) => endpoint,
             None => {
-                let error = with_setup_side_effects(BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRequiresSetup,
-                    "the approved browser still has no uniquely proven DevTools endpoint after bounded setup",
-                ), &setup);
+                let error = with_setup_side_effects(
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRequiresSetup,
+                        "the approved browser still has no uniquely proven DevTools endpoint after bounded setup",
+                    ),
+                    &setup,
+                );
                 if setup_pending {
                     return Err(setup_guard
                         .as_mut()

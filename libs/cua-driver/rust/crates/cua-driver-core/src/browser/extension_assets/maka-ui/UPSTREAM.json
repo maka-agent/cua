@@ -1,0 +1,18 @@
+{
+  "project": "https://github.com/apache/maka",
+  "sourcePath": "platform/computer-use/src/browser/cursor.js",
+  "sourceSha256": "d4c62a042b9221714fbe4b1da2a6cafeb0c029d635fe27dd0a3aba283f8b493d",
+  "sourceRevision": "466cc1168db3e2c7b3bdb43258b6b0201926f82c",
+  "sourceStatus": "Verified public Maka source revision; both source blobs were checked through GitHub Contents against their Git blob identity and recorded SHA-256.",
+  "license": "Apache-2.0; retained LICENSE and NOTICE apply; Cua MIT does not relicense this asset.",
+  "adaptations": [
+    "Existing fixed drawCursor renderer retained.",
+    "Static browser SVG artwork/color selection moved inside the canonical function using the existing Maka theme geometry rounded as f32; executable markup is no longer accepted as wire input.",
+    "The same canonical function source is used by direct CDP and the finite extension fixed-UI bridge; extension calls use one extension isolated realm per resource."
+  ],
+  "artworkSourcePath": "platform/computer-use/src/cursor/theme.rs",
+  "artworkSourceSha256": "ae4667bacde037319f705127dafc6bda318791e7f97724528e664ac97a1c9578",
+  "assetSha256": "e9f9b7fc246f65a19f326ed6e9684e8c9262dea423d739304ba994f11c4145b3",
+  "sourceUrl": "https://github.com/apache/maka/blob/466cc1168db3e2c7b3bdb43258b6b0201926f82c/platform/computer-use/src/browser/cursor.js",
+  "artworkSourceUrl": "https://github.com/apache/maka/blob/466cc1168db3e2c7b3bdb43258b6b0201926f82c/platform/computer-use/src/cursor/theme.rs"
+}

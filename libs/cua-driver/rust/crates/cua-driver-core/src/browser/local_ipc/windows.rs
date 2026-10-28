@@ -173,7 +173,7 @@ fn sid_text(sid: Handle) -> Result<String, IpcError> {
     }
     let owned = OwnedLocal(text.cast());
     // SAFETY: Windows returned a terminated SID string. The bounded scan avoids
-    // an unbounded walk if an unexpected native result violates that contract.
+    // an unbounded walk if an unexpected extension result violates that contract.
     let length = (0..256)
         .find(|index| unsafe { *text.add(*index) == 0 })
         .ok_or_else(|| rejected("Windows SID string exceeds bound"))?;
@@ -216,7 +216,7 @@ fn process_sid(process: Handle) -> Result<String, IpcError> {
     if bytes.len() < std::mem::size_of::<TokenUser>() {
         return Err(rejected("Windows TOKEN_USER header is truncated"));
     }
-    // SAFETY: native API filled this byte buffer; copying unaligned avoids a
+    // SAFETY: extension API filled this byte buffer; copying unaligned avoids a
     // reference with an alignment stronger than Vec<u8> guarantees.
     let user = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<TokenUser>()) };
     sid_text(user.user.sid)
@@ -341,7 +341,7 @@ fn validate_acl(path: &Path, policy: DirectoryPolicy) -> Result<(), IpcError> {
         if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
             return Err(io::Error::last_os_error().into());
         }
-        // SAFETY: GetAce returned a live ACE within the retained native ACL.
+        // SAFETY: GetAce returned a live ACE within the retained extension ACL.
         let header = unsafe { std::ptr::read_unaligned(ace.cast::<AceHeader>()) };
         if header.kind != 0 || header.size < 16 {
             return Err(rejected(
@@ -480,7 +480,7 @@ pub(super) struct FileIdentity {
 
 pub(super) fn file_identity(file: &File) -> Result<FileIdentity, IpcError> {
     let mut information = FileInformation::default();
-    // SAFETY: File owns a live handle and information is a writable native struct.
+    // SAFETY: File owns a live handle and information is a writable extension struct.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -646,7 +646,7 @@ pub(super) async fn connect(
         || !sid_for_pid(pid)?.eq_ignore_ascii_case(&current_sid()?)
     {
         return Err(rejected(
-            "Windows native host pipe peer differs from descriptor",
+            "Windows extension host pipe peer differs from descriptor",
         ));
     }
     Ok(LocalStream::Client(pipe))

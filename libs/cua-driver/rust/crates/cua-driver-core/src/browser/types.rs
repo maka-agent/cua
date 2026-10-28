@@ -126,7 +126,7 @@ pub struct NativeOwnershipProof {
     pub detail: Option<String>,
 }
 
-/// Native window metadata used for exact CDP-window correlation.
+/// Extension window metadata used for exact CDP-window correlation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeWindowInfo {
     pub pid: i64,
@@ -333,10 +333,12 @@ mod tests {
             serde_json::from_value(legacy).expect("deserialize legacy endpoint proof");
         assert_eq!(proof.owner_pid, 42);
         assert_eq!(proof.listener_pid, None);
-        assert!(serde_json::to_value(&proof)
-            .expect("serialize endpoint proof")
-            .get("listener_pid")
-            .is_none());
+        assert!(
+            serde_json::to_value(&proof)
+                .expect("serialize endpoint proof")
+                .get("listener_pid")
+                .is_none()
+        );
 
         let with_listener = EndpointOwnershipProof {
             listener_pid: Some(43),

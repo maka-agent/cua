@@ -4,7 +4,7 @@
 //! Every platform adapter reads Chromium's `DevToolsActivePort` file,
 //! re-proves that a discovered websocket stays on the attested loopback
 //! listener, recognizes Firefox, and keeps one visible browser cursor per
-//! native window. Those semantics are platform-independent, so they live here
+//! extension window. Those semantics are platform-independent, so they live here
 //! and the adapters stay thin.
 
 use std::collections::HashMap;
@@ -70,8 +70,8 @@ struct BrowserCursorBinding {
 
 /// Session-to-tab bindings for browser cursors.
 ///
-/// An active tab owns the sole visible browser cursor in its native window.
-/// An inactive tab hides only its own cursor and never disturbs the cursor for
+/// An active tab owns the sole visible browser cursor in its extension window.
+/// An inactive tab hides only its maka cursor and never disturbs the cursor for
 /// the selected tab.
 #[derive(Debug, Default)]
 pub struct BrowserCursorTracker {
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(
             other_window,
             vec![("session-green".to_owned(), true)],
-            "an active tab in another native window must not hide this window"
+            "an active tab in another extension window must not hide this window"
         );
     }
 }

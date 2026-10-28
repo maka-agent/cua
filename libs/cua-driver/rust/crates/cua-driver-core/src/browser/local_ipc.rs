@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-//! Private current-user IPC for the Chrome-owned native-host process.
+//! Private current-user IPC for the Chrome-owned extension-host process.
 //!
 //! Endpoint records are routing capabilities for this user account. They do not
 //! attest Chrome signatures or exclude arbitrary software running as that user.
 //! The runtime connects outward; this module does not start another daemon.
 
-use super::native_broker::{CheckedLocalPeer, LocalPrincipal};
-use super::native_framing::{self, Direction};
+use super::extension_broker::{CheckedLocalPeer, LocalPrincipal};
+use super::extension_framing::{self, Direction};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -30,10 +30,10 @@ const MAX_LOCAL_FRAME: usize = 64 * 1024 * 1024;
 const MAX_DESCRIPTOR: u64 = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Metadata supplied by the actual extension hello, plus the native host PID.
+/// Metadata supplied by the actual extension hello, plus the extension host PID.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NativeEndpointIdentity {
+pub struct ExtensionEndpointIdentity {
     pub adapter: String,
     pub extension_id: String,
     pub instance_id: String,
@@ -53,7 +53,7 @@ enum EndpointAddress {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Descriptor {
     protocol: u32,
-    identity: NativeEndpointIdentity,
+    identity: ExtensionEndpointIdentity,
     endpoint: EndpointAddress,
     capability: String,
 }
@@ -63,20 +63,20 @@ struct Descriptor {
 pub enum IpcError {
     #[error("private installation entry is absent after its parent was validated")]
     MissingInstallationFile,
-    #[error("private native IPC I/O failed: {0}")]
+    #[error("private extension IPC I/O failed: {0}")]
     Io(#[from] io::Error),
-    #[error("private native IPC JSON failed: {0}")]
+    #[error("private extension IPC JSON failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("private native IPC frame failed: {0}")]
+    #[error("private extension IPC frame failed: {0}")]
     Frame(String),
-    #[error("private native IPC rejected: {0}")]
+    #[error("private extension IPC rejected: {0}")]
     Rejected(String),
-    #[error("private native IPC handshake timed out")]
+    #[error("private extension IPC handshake timed out")]
     Timeout,
 }
 
-impl From<native_framing::FrameError> for IpcError {
-    fn from(error: native_framing::FrameError) -> Self {
+impl From<extension_framing::FrameError> for IpcError {
+    fn from(error: extension_framing::FrameError) -> Self {
         Self::Frame(error.to_string())
     }
 }
@@ -87,23 +87,23 @@ fn rejected(message: &str) -> IpcError {
 
 /// A descriptor loaded from a private directory and bound to its file identity.
 #[derive(Clone)]
-pub struct ValidatedNativeEndpoint {
+pub struct ValidatedExtensionEndpoint {
     descriptor: Descriptor,
     descriptor_path: PathBuf,
     file_identity: platform::FileIdentity,
 }
 
-impl std::fmt::Debug for ValidatedNativeEndpoint {
+impl std::fmt::Debug for ValidatedExtensionEndpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ValidatedNativeEndpoint")
+            .debug_struct("ValidatedExtensionEndpoint")
             .field("identity", &self.descriptor.identity)
             .field("descriptor_path", &self.descriptor_path)
             .finish_non_exhaustive()
     }
 }
 
-impl ValidatedNativeEndpoint {
+impl ValidatedExtensionEndpoint {
     /// Read only a current-user private, non-reparse descriptor for this adapter.
     ///
     /// # Errors
@@ -143,7 +143,7 @@ impl ValidatedNativeEndpoint {
         })
     }
 
-    pub fn identity(&self) -> &NativeEndpointIdentity {
+    pub fn identity(&self) -> &ExtensionEndpointIdentity {
         &self.descriptor.identity
     }
 
@@ -245,7 +245,7 @@ fn validate_descriptor(
     Ok(())
 }
 
-fn validate_identity(identity: &NativeEndpointIdentity) -> Result<(), IpcError> {
+fn validate_identity(identity: &ExtensionEndpointIdentity) -> Result<(), IpcError> {
     if !valid_namespace(&identity.adapter)
         || identity.extension_id.len() != 32
         || !identity
@@ -254,18 +254,18 @@ fn validate_identity(identity: &NativeEndpointIdentity) -> Result<(), IpcError> 
             .all(|byte| (b'a'..=b'p').contains(&byte))
     {
         return Err(rejected(
-            "native endpoint adapter or extension ID is invalid",
+            "extension endpoint adapter or extension ID is invalid",
         ));
     }
     let generation = uuid::Uuid::parse_str(&identity.generation)
-        .map_err(|_| rejected("native endpoint generation is invalid"))?;
+        .map_err(|_| rejected("extension endpoint generation is invalid"))?;
     if generation.to_string() != identity.generation
         || identity.instance_id.is_empty()
         || identity.instance_id.len() > 128
         || !identity.capabilities.is_object()
         || identity.host_pid == 0
     {
-        return Err(rejected("native endpoint identity is invalid"));
+        return Err(rejected("extension endpoint identity is invalid"));
     }
     Ok(())
 }
@@ -307,7 +307,7 @@ struct Welcome {
     kind: String,
     protocol: u32,
     generation: String,
-    identity: NativeEndpointIdentity,
+    identity: ExtensionEndpointIdentity,
 }
 
 /// Existing installation-selected private runtime directory, never public /tmp.
@@ -342,7 +342,7 @@ fn load_installation_file(path: &Path) -> Result<LoadedInstallationFile, IpcErro
     )?;
     let mut file = match platform::open_private_file(path) {
         Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(IpcError::MissingInstallationFile)
+            return Err(IpcError::MissingInstallationFile);
         }
         result => result?,
     };
@@ -373,6 +373,38 @@ pub(crate) fn ensure_private_state_directory(path: &Path) -> Result<(), IpcError
 }
 pub(crate) fn ensure_installation_directory(path: &Path) -> Result<(), IpcError> {
     platform::ensure_installation_directory(path)
+}
+
+/// Serializes cooperating installer mutations, without attesting a caller.
+/// The pathname remains after unlock so waiting writers use the same inode.
+#[derive(Debug)]
+pub(crate) struct InstallationMutationLock {
+    _file: std::fs::File,
+}
+
+pub(crate) fn lock_installation_directory(
+    directory: &Path,
+) -> Result<InstallationMutationLock, IpcError> {
+    platform::validate_directory(directory)?;
+    let path = directory.join(".mutation.lock");
+    match create_installation_file(&path, b"") {
+        Ok(_) => {}
+        Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let file = platform::open_private_file(&path)?;
+    let identity = platform::file_identity(&file)?;
+    if file.metadata()?.len() != 0 {
+        return Err(rejected(
+            "installation mutation lock is not an empty owned file",
+        ));
+    }
+    fs2::FileExt::lock_exclusive(&file)?;
+    platform::validate_directory(directory)?;
+    if platform::path_identity(&path)? != identity {
+        return Err(rejected("installation mutation lock changed while waiting"));
+    }
+    Ok(InstallationMutationLock { _file: file })
 }
 
 pub(crate) struct CreatedInstallationFile {
@@ -423,13 +455,53 @@ pub(crate) fn remove_exact_installation_file(
     load_installation_file(path)?.remove_exact(expected)
 }
 
+/// Copy a selected legacy entry, then remove that same loaded file identity.
+/// Caller holds the catalog mutation lock. This is not a filesystem CAS against
+/// a noncooperating same-user pathname replacer.
+pub(crate) fn migrate_exact_installation_file(
+    source: &Path,
+    destination: &Path,
+    expected_bytes: &[u8],
+) -> Result<bool, IpcError> {
+    let loaded = load_installation_file(source)?;
+    if loaded.bytes.as_slice() != expected_bytes {
+        return Err(rejected(
+            "legacy installation entry changed before migration",
+        ));
+    }
+    let expected: Value = serde_json::from_slice(expected_bytes)?;
+    let created = match create_installation_file(destination, expected_bytes) {
+        Ok(file) => Some(file),
+        Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let current = load_installation_file(destination)?;
+            if serde_json::from_slice::<Value>(&current.bytes)? != expected {
+                return Err(rejected("legacy migration destination differs"));
+            }
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let changed = created.is_some();
+    if let Err(error) = loaded.remove_exact(&expected) {
+        if let Some(created) = created {
+            if let Err(rollback) = created.rollback() {
+                return Err(rejected(&format!(
+                    "legacy migration failed: {error}; own-copy rollback unconfirmed: {rollback}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(changed)
+}
+
 pub(crate) fn current_user_principal() -> Result<LocalPrincipal, IpcError> {
     platform::current_principal()
 }
 
-/// Listener and descriptor belong to one Chrome native-port generation.
+/// Listener and descriptor belong to one Chrome extension-port generation.
 pub(crate) struct PublishedEndpoint {
-    pub(crate) identity: NativeEndpointIdentity,
+    pub(crate) identity: ExtensionEndpointIdentity,
     descriptor: Descriptor,
     descriptor_path: PathBuf,
     descriptor_identity: platform::FileIdentity,
@@ -439,7 +511,7 @@ pub(crate) struct PublishedEndpoint {
 impl PublishedEndpoint {
     pub(crate) async fn publish(
         directory: &Path,
-        identity: NativeEndpointIdentity,
+        identity: ExtensionEndpointIdentity,
     ) -> Result<Self, IpcError> {
         validate_identity(&identity)?;
         platform::ensure_directory(directory)?;
@@ -584,7 +656,7 @@ pub(crate) async fn write_json(
     writer: &mut (impl AsyncWrite + Unpin),
     value: &Value,
 ) -> Result<(), IpcError> {
-    let bytes = native_framing::encode_json(value, Direction::ChromeToHost)?;
+    let bytes = extension_framing::encode_json(value, Direction::ChromeToHost)?;
     let length =
         u32::try_from(bytes.len()).map_err(|_| rejected("IPC payload cannot fit its header"))?;
     writer.write_all(&length.to_ne_bytes()).await?;
@@ -600,7 +672,7 @@ mod tests {
     fn descriptor() -> Descriptor {
         Descriptor {
             protocol: 1,
-            identity: NativeEndpointIdentity {
+            identity: ExtensionEndpointIdentity {
                 adapter: "org.apache.maka.browser_connector".into(),
                 extension_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 instance_id: "actual-hello-fixture".into(),
@@ -621,12 +693,14 @@ mod tests {
             validate_descriptor(&path, "org.apache.maka.browser_connector", &descriptor).is_ok()
         );
         assert!(validate_descriptor(&path, "other.adapter", &descriptor).is_err());
-        assert!(validate_descriptor(
-            Path::new("/private/different.json"),
-            "org.apache.maka.browser_connector",
-            &descriptor
-        )
-        .is_err());
+        assert!(
+            validate_descriptor(
+                Path::new("/private/different.json"),
+                "org.apache.maka.browser_connector",
+                &descriptor
+            )
+            .is_err()
+        );
         let mut changed = descriptor;
         changed.identity.generation = changed.identity.generation.to_uppercase();
         assert!(validate_descriptor(&path, "org.apache.maka.browser_connector", &changed).is_err());

@@ -5,8 +5,8 @@
 //! grant, connection generation, and reconnect budget.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};

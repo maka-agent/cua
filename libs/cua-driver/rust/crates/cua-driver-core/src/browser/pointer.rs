@@ -2,7 +2,7 @@
 //!
 //! This module deliberately shares the exact-or-refused posture of the
 //! original browser click tool. Every mutation is serialized by the real CDP
-//! tab, then revalidates the native window, endpoint, tab, and (for refs) frame
+//! tab, then revalidates the extension window, endpoint, tab, and (for refs) frame
 //! identity before dispatch. It never activates a target or brings a page to
 //! the foreground.
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::protocol::ToolResult;
 use crate::tool::{ProtectedResourceOwnership, Tool, ToolDef};
@@ -113,7 +113,7 @@ struct PointerRequest {
     action: PointerAction,
     route: InputRoute,
     /// `delivery_mode="foreground"`: the caller accepts that trusted input
-    /// may activate the browser's own window (platforms whose trusted route
+    /// may activate the browser's maka window (platforms whose trusted route
     /// cannot stay in the background, such as Linux Chromium).
     foreground: bool,
     origin: Location,
@@ -930,25 +930,31 @@ mod tests {
 
     #[test]
     fn drag_requires_exactly_one_destination_shape() {
-        assert!(parse_request(&json!({ "action": "drag", "ref": "p1:0" }))
+        assert!(
+            parse_request(&json!({ "action": "drag", "ref": "p1:0" }))
+                .unwrap_err()
+                .contains("requires destination")
+        );
+        assert!(
+            parse_request(&json!({
+                "action": "drag",
+                "ref": "p1:0",
+                "destination_ref": "p1:1",
+                "to_x": 3,
+                "to_y": 4,
+            }))
             .unwrap_err()
-            .contains("requires destination"));
-        assert!(parse_request(&json!({
-            "action": "drag",
-            "ref": "p1:0",
-            "destination_ref": "p1:1",
-            "to_x": 3,
-            "to_y": 4,
-        }))
-        .unwrap_err()
-        .contains("not both"));
+            .contains("not both")
+        );
     }
 
     #[test]
     fn scroll_requires_a_nonzero_finite_delta() {
-        assert!(parse_request(&json!({ "action": "scroll", "ref": "p1:0" }))
-            .unwrap_err()
-            .contains("non-zero"));
+        assert!(
+            parse_request(&json!({ "action": "scroll", "ref": "p1:0" }))
+                .unwrap_err()
+                .contains("non-zero")
+        );
         let parsed = parse_request(&json!({
             "action": "scroll",
             "ref": "p1:0",

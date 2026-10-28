@@ -23,7 +23,7 @@ pub enum BrowserRefusalCode {
     /// The browser supports CDP but no owned endpoint is available —
     /// run `browser_prepare` explicitly.
     BrowserRequiresSetup,
-    /// More than one CDP candidate matched the native window and the
+    /// More than one CDP candidate matched the extension window and the
     /// title tie-break could not pick a unique one.
     BrowserBindingAmbiguous,
     /// A previously minted binding no longer identifies the same
@@ -31,7 +31,7 @@ pub enum BrowserRefusalCode {
     /// foreign-session target id).
     BrowserBindingStale,
     /// Revalidation could not prove the CDP target still corresponds to
-    /// the bound native window, or mutation was attempted on a
+    /// the bound extension window, or mutation was attempted on a
     /// non-exact binding.
     BrowserWrongTargetRefused,
     /// The operation needs an explicit `tab_id` and none was given.

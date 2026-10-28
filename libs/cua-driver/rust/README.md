@@ -124,3 +124,11 @@ deny:
 Rego policies must expose a boolean rule at `data.cua.policy.allow`. The input
 shape is `{ "server": "cua-driver", "tool": <name>, "arguments": <object> }`.
 Regorus evaluates policies inside the daemon; no OPA service is required.
+
+## Browser extension providers
+
+The browser extension transport uses `Extension*` types and the
+`browser::extension_process` startup hook. Its provider selectors are `maka`
+(the default) and `chatgpt`; display names are Maka and ChatGPT. See
+[Browser extension providers](../docs/browser-extension-providers.md) for setup,
+protocol boundaries, and the stock OpenCLI compatibility limit.
