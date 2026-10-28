@@ -65,7 +65,9 @@ pub use native::LoopbackAudioBackendFactory;
 mod native {
     use super::{PcmTimeline, FRAME_BYTES, HNS_PER_SECOND, SAMPLE_RATE};
     use anyhow::{anyhow, Context, Result};
-    use cua_driver_core::audio::{AudioBackend, AudioBackendFactory, AudioCompletion};
+    use cua_driver_core::audio::{
+        AudioBackend, AudioBackendFactory, AudioCompletion, CompletedRecordingLifetime,
+    };
     use std::{
         path::Path,
         sync::mpsc::{self, Receiver, Sender},
@@ -91,6 +93,10 @@ mod native {
     pub struct LoopbackAudioBackendFactory;
 
     impl AudioBackendFactory for LoopbackAudioBackendFactory {
+        fn completed_recording_lifetime(&self) -> CompletedRecordingLifetime {
+            CompletedRecordingLifetime::UntilNextStartAttempt
+        }
+
         fn start(
             &self,
             output_path: &Path,

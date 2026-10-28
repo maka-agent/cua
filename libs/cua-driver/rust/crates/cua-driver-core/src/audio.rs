@@ -22,6 +22,19 @@ pub const MAX_DURATION_MS: u64 = 300_000;
 /// The backend result type, available to hosts implementing this interface.
 pub type AudioResult<T> = anyhow::Result<T>;
 
+/// The native platform's retention boundary for a returned recording file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompletedRecordingLifetime {
+    #[default]
+    UntilSessionEnd,
+    UntilNextStartAttempt,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("max_duration_ms must be an integer from 100 through 300000")]
+struct InvalidAudioDuration;
+
 /// Observation of one native capture's finalization. It carries no authority
 /// to stop the capture, read its WAV, or select another session.
 #[derive(Clone)]
@@ -77,6 +90,11 @@ pub trait AudioBackend: Send {
 }
 
 pub trait AudioBackendFactory: Send + Sync {
+    /// An immutable backend policy, captured when the recorder is registered.
+    fn completed_recording_lifetime(&self) -> CompletedRecordingLifetime {
+        CompletedRecordingLifetime::UntilSessionEnd
+    }
+
     fn start(
         &self,
         output_path: &Path,
@@ -89,11 +107,17 @@ struct ActiveRecording {
     directory: tempfile::TempDir,
 }
 
+struct RetainedRecording {
+    // Directory custody continues until session cleanup, even after Windows
+    // consumes the returned file's retention at its next Start attempt.
+    _directory: tempfile::TempDir,
+    file: Option<PathBuf>,
+}
+
 #[derive(Default)]
 struct SessionAudio {
     recording: RecordingState,
-    // Returned local paths remain valid for the owning lifecycle episode.
-    completed: Vec<tempfile::TempDir>,
+    completed: Vec<RetainedRecording>,
 }
 
 #[derive(Default)]
@@ -107,6 +131,7 @@ enum RecordingState {
 /// Constructed once per opted-in runtime, never stored in a process-global slot.
 pub struct AudioRecordings {
     factory: Arc<dyn AudioBackendFactory>,
+    completed_lifetime: CompletedRecordingLifetime,
     sessions: Mutex<HashMap<String, Arc<Mutex<SessionAudio>>>>,
 }
 
@@ -119,6 +144,7 @@ pub struct RecordedAudio {
 impl AudioRecordings {
     fn new(factory: Arc<dyn AudioBackendFactory>) -> Self {
         Self {
+            completed_lifetime: factory.completed_recording_lifetime(),
             factory,
             sessions: Mutex::new(HashMap::new()),
         }
@@ -151,6 +177,18 @@ impl AudioRecordings {
             RecordingState::Active(_) => bail!("computer audio recording is already active"),
             RecordingState::Closed => bail!("computer audio session is closed"),
         }
+        if self.completed_lifetime == CompletedRecordingLifetime::UntilNextStartAttempt {
+            for previous in &mut owned.completed {
+                if let Some(file) = previous.file.take() {
+                    // This consumes only this recording's WAV path. A failed
+                    // unlink does not block validation or repeat on next Start.
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }
+        if !(100..=u128::from(MAX_DURATION_MS)).contains(&max_duration.as_millis()) {
+            return Err(InvalidAudioDuration.into());
+        }
         let directory = tempfile::Builder::new().prefix("cua-audio-").tempdir()?;
         let backend = self
             .factory
@@ -180,7 +218,10 @@ impl AudioRecordings {
         let filepath = active.directory.path().join("recording.wav");
         let bytes = std::fs::read(&filepath).context("read finalized computer audio")?;
         validate_wav(&bytes)?;
-        owned.completed.push(active.directory);
+        owned.completed.push(RetainedRecording {
+            _directory: active.directory,
+            file: Some(filepath.clone()),
+        });
         Ok(RecordedAudio { filepath, bytes })
     }
 
@@ -293,8 +334,8 @@ pub fn register_tools(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StartInput {
-    max_duration_ms: Option<u64>,
+struct StartInput<T> {
+    max_duration_ms: Option<T>,
     #[allow(dead_code)]
     session: Option<String>,
 }
@@ -345,20 +386,34 @@ impl Tool for StartAudio {
         })
     }
 
+    fn normalize_scalar_arguments(&self, args: &mut Value) {
+        if self.recordings.completed_lifetime != CompletedRecordingLifetime::UntilNextStartAttempt {
+            crate::tool::coerce_string_scalars(&self.def().input_schema, args);
+        }
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let session = match session(&args) {
             Ok(session) => session,
             Err(error) => return error,
         };
-        let input = match crate::tool_args::parse_typed_input::<StartInput>(
-            "start_audio_recording",
-            args,
-        ) {
-            Ok(input) => input,
+        let duration = if self.recordings.completed_lifetime
+            == CompletedRecordingLifetime::UntilNextStartAttempt
+        {
+            crate::tool_args::parse_typed_input::<StartInput<u32>>("start_audio_recording", args)
+                .map(|input| input.max_duration_ms.map(u64::from))
+        } else {
+            crate::tool_args::parse_typed_input::<StartInput<u64>>("start_audio_recording", args)
+                .map(|input| input.max_duration_ms)
+        };
+        let millis = match duration {
+            Ok(duration) => duration.unwrap_or(DEFAULT_DURATION_MS),
             Err(error) => return error,
         };
-        let millis = input.max_duration_ms.unwrap_or(DEFAULT_DURATION_MS);
-        if !(100..=MAX_DURATION_MS).contains(&millis) {
+        if !(100..=MAX_DURATION_MS).contains(&millis)
+            && self.recordings.completed_lifetime
+                != CompletedRecordingLifetime::UntilNextStartAttempt
+        {
             return refused(
                 "invalid_arguments",
                 "max_duration_ms must be an integer from 100 through 300000",
@@ -375,6 +430,9 @@ impl Tool for StartAudio {
         .await
         {
             Ok(Ok(())) => ToolResult::text("Computer audio recording started."),
+            Ok(Err(error)) if error.is::<InvalidAudioDuration>() => {
+                refused("invalid_arguments", error.to_string())
+            }
             Ok(Err(error)) => refused("audio_recording_unavailable", error.to_string()),
             Err(error) => refused("audio_recording_unavailable", error.to_string()),
         }
@@ -627,6 +685,326 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), 1);
         recordings.close_all().unwrap();
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    struct RetentionFactory {
+        active: Arc<AtomicUsize>,
+        lifetime: CompletedRecordingLifetime,
+    }
+
+    impl AudioBackendFactory for RetentionFactory {
+        fn completed_recording_lifetime(&self) -> CompletedRecordingLifetime {
+            self.lifetime
+        }
+
+        fn start(&self, path: &Path, duration: Duration) -> AudioResult<Box<dyn AudioBackend>> {
+            Factory(self.active.clone()).start(path, duration)
+        }
+    }
+
+    #[tokio::test]
+    async fn next_start_attempt_releases_only_its_sessions_wav_before_range_refusal() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let recordings = Arc::new(AudioRecordings::new(Arc::new(RetentionFactory {
+            active: active.clone(),
+            lifetime: CompletedRecordingLifetime::UntilNextStartAttempt,
+        })));
+        let tool = StartAudio {
+            recordings: recordings.clone(),
+        };
+        recordings.start("old", Duration::from_secs(1)).unwrap();
+        let old = recordings.stop("old").unwrap();
+        recordings.start("foreign", Duration::from_secs(1)).unwrap();
+        let foreign = recordings.stop("foreign").unwrap();
+        let result = tool
+            .invoke(json!({"_session_id":"old","max_duration_ms":99}))
+            .await;
+        let refusal = result.structured_content.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(refusal["refusal"]["code"], "invalid_arguments");
+        assert_eq!(
+            refusal["refusal"]["message"],
+            "max_duration_ms must be an integer from 100 through 300000"
+        );
+        assert!(
+            !old.filepath.exists(),
+            "old WAV must be unlinked before duration refusal"
+        );
+        assert!(
+            old.filepath.parent().unwrap().is_dir(),
+            "the session still owns its directory"
+        );
+        assert_eq!(std::fs::read(&foreign.filepath).unwrap(), foreign.bytes);
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "invalid range cannot open native capture"
+        );
+        recordings.close_all().unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_start_preserves_parse_error_and_active_refusal_before_file_release() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let recordings = Arc::new(AudioRecordings::new(Arc::new(RetentionFactory {
+            active: active.clone(),
+            lifetime: CompletedRecordingLifetime::UntilNextStartAttempt,
+        })));
+        let tool = StartAudio {
+            recordings: recordings.clone(),
+        };
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        let old = recordings.stop("owner").unwrap();
+        let parsed = tool
+            .invoke(json!({"_session_id":"owner","max_duration_ms":100.5}))
+            .await;
+        assert_eq!(parsed.is_error, Some(true));
+        assert_eq!(
+            parsed.structured_content.unwrap()["code"],
+            "invalid_arguments"
+        );
+        assert_eq!(std::fs::read(&old.filepath).unwrap(), old.bytes);
+        let unknown = tool
+            .invoke(json!({"_session_id":"owner","max_duration_ms":u64::from(u32::MAX)+1}))
+            .await;
+        assert_eq!(
+            unknown.structured_content.unwrap()["code"],
+            "invalid_arguments"
+        );
+        assert!(
+            old.filepath.exists(),
+            "values outside the native u32 parser must fail before file release"
+        );
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        assert!(!old.filepath.exists());
+        let active_refusal = tool
+            .invoke(json!({"_session_id":"owner","max_duration_ms":99}))
+            .await;
+        let refusal = active_refusal.structured_content.unwrap();
+        assert_eq!(refusal["refusal"]["code"], "audio_recording_unavailable");
+        assert_eq!(
+            refusal["refusal"]["message"],
+            "computer audio recording is already active"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        recordings.close_all().unwrap();
+    }
+
+    #[test]
+    fn failed_next_start_unlink_is_consumed_once_without_recursive_directory_removal() {
+        let recordings = AudioRecordings::new(Arc::new(RetentionFactory {
+            active: Arc::new(AtomicUsize::new(0)),
+            lifetime: CompletedRecordingLifetime::UntilNextStartAttempt,
+        }));
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        let old = recordings.stop("owner").unwrap();
+        std::fs::remove_file(&old.filepath).unwrap();
+        std::fs::create_dir(&old.filepath).unwrap();
+        let child = old.filepath.join("own-fixture.txt");
+        std::fs::write(
+            &child,
+            b"nonempty owned directory must not be removed recursively",
+        )
+        .unwrap();
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        assert!(
+            old.filepath.is_dir(),
+            "WAV unlink failure must not recursively remove a directory"
+        );
+        let next = recordings.stop("owner").unwrap();
+        std::fs::remove_file(child).unwrap();
+        std::fs::remove_dir(&old.filepath).unwrap();
+        std::fs::write(&old.filepath, b"own fixture after the one deletion attempt").unwrap();
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        assert!(
+            !next.filepath.exists(),
+            "only the latest retained result is released"
+        );
+        assert!(
+            old.filepath.exists(),
+            "a consumed deletion failure must not be retried"
+        );
+        recordings.close_all().unwrap();
+        assert!(
+            !old.filepath.parent().unwrap().exists(),
+            "terminal cleanup still owns all temp directories"
+        );
+    }
+
+    #[test]
+    fn session_lifetime_retains_earlier_results_across_later_captures() {
+        let recordings = AudioRecordings::new(Arc::new(Factory(Arc::new(AtomicUsize::new(0)))));
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        let old = recordings.stop("owner").unwrap();
+        recordings.start("owner", Duration::from_secs(1)).unwrap();
+        let next = recordings.stop("owner").unwrap();
+        assert_eq!(std::fs::read(&old.filepath).unwrap(), old.bytes);
+        assert_eq!(std::fs::read(&next.filepath).unwrap(), next.bytes);
+        recordings.close_all().unwrap();
+        assert!(!old.filepath.exists());
+        assert!(!next.filepath.exists());
+    }
+
+    #[tokio::test]
+    async fn windows_registry_preserves_original_duration_types_before_file_effects() {
+        use crate::authorization::PermissionMode;
+        use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        let recordings = register_tools(
+            &mut registry,
+            Arc::new(RetentionFactory {
+                active: active.clone(),
+                lifetime: CompletedRecordingLifetime::UntilNextStartAttempt,
+            }),
+        );
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+            .compatibility_context(PermissionMode::Standard, None)
+            .unwrap();
+        let invoke = |name: &'static str, duration: Option<Value>| {
+            let mut args = json!({"session":"windows-registry-duration"});
+            if let Some(duration) = duration {
+                args["max_duration_ms"] = duration;
+            }
+            registry.invoke_with_context(name, args, context.clone())
+        };
+        assert_ne!(
+            invoke("start_audio_recording", Some(json!(1000)))
+                .await
+                .is_error,
+            Some(true)
+        );
+        let stopped = invoke("stop_audio_recording", None).await;
+        assert_ne!(stopped.is_error, Some(true));
+        let old = PathBuf::from(
+            stopped.structured_content.unwrap()["filepath"]
+                .as_str()
+                .unwrap(),
+        );
+        for value in [
+            json!("99"),
+            json!("1000"),
+            json!(99.0),
+            json!(99.5),
+            json!(-1),
+            json!(u64::from(u32::MAX) + 1),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let refused = invoke("start_audio_recording", Some(value.clone())).await;
+            assert_eq!(refused.is_error, Some(true), "raw registry input {value}");
+            assert_eq!(
+                refused.structured_content.unwrap()["code"],
+                "invalid_arguments",
+                "raw registry input {value}"
+            );
+            assert!(
+                old.is_file(),
+                "type error {value} must precede file release"
+            );
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        }
+        let ranged = invoke("start_audio_recording", Some(json!(99))).await;
+        assert_eq!(
+            ranged.structured_content.unwrap()["refusal"]["code"],
+            "invalid_arguments"
+        );
+        assert!(
+            !old.exists(),
+            "parsed integer range refusal follows exact WAV release"
+        );
+        assert!(old.parent().unwrap().is_dir());
+        assert_ne!(
+            invoke("start_audio_recording", Some(Value::Null))
+                .await
+                .is_error,
+            Some(true)
+        );
+        let type_first = invoke("start_audio_recording", Some(json!("99"))).await;
+        assert_eq!(
+            type_first.structured_content.unwrap()["code"],
+            "invalid_arguments"
+        );
+        let active_first = invoke("start_audio_recording", Some(json!(99))).await;
+        let refusal = active_first.structured_content.unwrap();
+        assert_eq!(
+            refusal["refusal"]["message"],
+            "computer audio recording is already active"
+        );
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            1,
+            "refused starts leave the same capture running"
+        );
+        recordings.close_all().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_registry_keeps_numeric_string_normalization_and_earlier_files() {
+        use crate::authorization::PermissionMode;
+        use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        let recordings = register_tools(&mut registry, Arc::new(Factory(active.clone())));
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+            .compatibility_context(PermissionMode::Standard, None)
+            .unwrap();
+        let invoke = |name: &'static str, duration: Option<Value>| {
+            let mut args = json!({"session":"session-registry-duration"});
+            if let Some(duration) = duration {
+                args["max_duration_ms"] = duration;
+            }
+            registry.invoke_with_context(name, args, context.clone())
+        };
+        assert_ne!(
+            invoke("start_audio_recording", Some(json!(1000)))
+                .await
+                .is_error,
+            Some(true)
+        );
+        let stopped = invoke("stop_audio_recording", None).await;
+        assert_ne!(stopped.is_error, Some(true));
+        let old = PathBuf::from(
+            stopped.structured_content.unwrap()["filepath"]
+                .as_str()
+                .unwrap(),
+        );
+        let ranged = invoke("start_audio_recording", Some(json!("99"))).await;
+        assert_eq!(
+            ranged.structured_content.unwrap()["refusal"]["code"],
+            "invalid_arguments"
+        );
+        assert!(
+            old.is_file(),
+            "ordinary session retention remains before-range-checked"
+        );
+        assert_ne!(
+            invoke("start_audio_recording", Some(json!("1000")))
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert!(
+            old.is_file(),
+            "normal numeric-string coercion is preserved outside Windows policy"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        recordings.close_all().unwrap();
     }
 
     #[test]

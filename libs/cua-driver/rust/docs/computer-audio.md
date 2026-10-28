@@ -18,8 +18,13 @@ The path is local to the native worker and cannot be assumed readable by a
 remote caller. Bytes in the data URL are the exact finalized file bytes.
 
 Recordings belong to the authenticated runtime session, rather than a turn or
-a process-wide recorder. Returned temporary files remain readable until that
-session ends, including across subsequent recordings. Explicit session end
+a process-wide recorder. Linux and macOS retain returned temporary files until
+that session ends, including across subsequent recordings. Windows consumes the
+previous result's file retention at the next parsed Start attempt: after the
+active-recording check it attempts to unlink only that WAV, then validates the
+new supported duration. A deletion failure does not block validation or a new
+capture, and that consumed file is not retried by a later Start. Directory
+custody remains with the session for terminal cleanup. Explicit session end
 waits for native cleanup when no earlier action is in flight. If an accepted
 start is still running, session end closes admission and reports pending
 cleanup; completion of the accepted action triggers the same canonical cleanup
@@ -117,6 +122,20 @@ already be playing before short captures, because Pulse render latency can
 otherwise consume the short recording before the generated tone reaches its
 monitor. These observations do not justify changing native recording flags or
 claiming exact timing parity.
+
+The Windows next-Start file policy is based on static inspection of the
+selected native helper, SHA-256
+`9493af2cebd3c11e2e38ce692f6ccd8e00f4320bdbbcf14f242d036a9736635f`.
+The selected field parser accepts null or an unsigned 32-bit integer, rejects
+strings, floating-point values, negative values and larger integers before
+checking active capture or touching the previous file, and treats null or an
+absent field as the default. Windows audio retains those original JSON types
+at the shared scalar-normalization boundary; Linux and macOS retain their
+existing normalization and parser. This static parser evidence is recorded in
+REA `ev_0410e5c48da4d23de959f107c47883ff7ccf03bd266b228a0254c662fde1cecd`.
+Hermetic policy tests do not prove native deletion success,
+Windows playback/capture, or error equivalence. Terminal Cua cleanup continues
+to own temporary directories, including a WAV whose earlier unlink failed.
 
 Windows GNU cross-checks and pure timeline tests, and macOS API type checking
 and pure conversion/timeline tests, are structural evidence only. They do not

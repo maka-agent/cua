@@ -1071,6 +1071,12 @@ pub enum ProtectedResourceOwnership {
 pub trait Tool: Send + Sync {
     fn def(&self) -> &ToolDef;
 
+    /// Normalize optional scalar spellings before authorization and parsing.
+    /// Tools with a native type-sensitive field may retain its original type.
+    fn normalize_scalar_arguments(&self, args: &mut Value) {
+        coerce_string_scalars(&self.def().input_schema, args);
+    }
+
     /// Implementation-attested routing that cannot touch the primary input
     /// lane. The adapter must serialize its own lifecycle and fail closed if
     /// that independent route is unavailable; it must never fall back to
@@ -1909,7 +1915,7 @@ impl ToolRegistry {
 
         // Normalize deprecated public argument spellings before any policy,
         // consent, recording, or implementation layer interprets the call.
-        coerce_string_scalars(&tool.def().input_schema, &mut args);
+        tool.normalize_scalar_arguments(&mut args);
         normalize_delivery_mode_args(tool.def(), &mut args);
         if let Err(detail) = normalize_argument_aliases(resolved_name, &mut args) {
             return ToolResult::error(format!("{resolved_name}: {detail}")).with_structured(
