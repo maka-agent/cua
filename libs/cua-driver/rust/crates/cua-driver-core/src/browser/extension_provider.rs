@@ -3730,8 +3730,7 @@ impl ExtensionBrowserProvider {
         completion: &ExtensionOperationCompletion,
         details: Option<&Value>,
     ) -> Result<ExtensionKnownCustody, ExtensionProviderError> {
-        let mut custody = ExtensionKnownCustody::default();
-        custody.fixed_session = match &completion.operation {
+        let fixed_session = match &completion.operation {
             ExtensionOperation::PrepareFixedSessionTab { .. } => {
                 let context = completion.wire_context.as_ref().ok_or_else(|| {
                     protocol("unknown fixed preparation lost its captured context")
@@ -3750,6 +3749,10 @@ impl ExtensionBrowserProvider {
                 Some(retained)
             }
             _ => None,
+        };
+        let mut custody = ExtensionKnownCustody {
+            fixed_session,
+            ..ExtensionKnownCustody::default()
         };
         let Some(details) = details else {
             return Ok(custody);
