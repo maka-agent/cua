@@ -83,7 +83,7 @@ async fn fixed_session_service_and_actual_host_context_are_required_before_dispa
         if let Some(profile) = profile {
             capabilities["sessionPreparation"] = json!(profile);
         }
-        let (provider, mut server) = fixture_with_capabilities(capabilities);
+        let (provider, server) = fixture_with_capabilities(capabilities);
         let view = fixed_test_view(&provider, "turn-A");
         assert!(
             matches!(view.prepare_fixed_session_tab(11,&ExtensionPreparationPolicy::default(),&fixed_test_ui()).await,Err(ExtensionProviderError::Refused{kind,..}) if kind=="unsupported")
@@ -101,7 +101,7 @@ async fn fixed_session_service_and_actual_host_context_are_required_before_dispa
         );
         provider.close().await;
     }
-    let (provider, mut server) = fixture_with_capabilities(fixed_test_capabilities());
+    let (provider, server) = fixture_with_capabilities(fixed_test_capabilities());
     let wire_only =
         provider.with_wire_context(ExtensionWireContext::new("fixed-owner", "turn-A").unwrap());
     assert!(
@@ -338,7 +338,7 @@ async fn fixed_ui_requires_exact_scope_turn_except_new_epoch_configuration() {
 #[cfg(unix)]
 #[tokio::test]
 async fn fixed_ui_minimal_retained_identity_uses_existing_budget_before_wire_dispatch() {
-    let (provider, mut server) = fixture_with_capabilities_and_budget(
+    let (provider, server) = fixture_with_capabilities_and_budget(
         fixed_test_capabilities(),
         ByteBudget::test_with_capacity(1),
     );

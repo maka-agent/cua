@@ -9138,7 +9138,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn session_inventory_requires_its_captured_context_capability_and_valid_candidates() {
-        let (provider, mut server) = fixture_with_capabilities(maka_capabilities());
+        let (provider, server) = fixture_with_capabilities(maka_capabilities());
         assert!(matches!(provider.list_session_tabs(&[]).await,
             Err(ExtensionProviderError::Refused{kind,..}) if kind=="context_required"));
         let scoped = provider
@@ -9153,7 +9153,7 @@ mod tests {
         provider.close().await;
         let mut caps = maka_capabilities();
         caps["sessionTabInventory"] = json!(true);
-        let (provider, mut server) = fixture_with_capabilities(caps);
+        let (provider, server) = fixture_with_capabilities(caps);
         let scoped = provider
             .with_wire_context(ExtensionWireContext::new("inventory-owner", "turn-A").unwrap());
         for ids in [vec![0], vec![9_007_199_254_740_992], vec![2, 2]] {
