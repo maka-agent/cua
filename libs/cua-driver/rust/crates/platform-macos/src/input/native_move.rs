@@ -3,7 +3,7 @@
 use core_foundation::base::CFRetain;
 use core_graphics::{
     event::{CGEvent, CGEventFlags, EventField},
-    geometry::{CGPoint, CGRect},
+    geometry::{CGAffineTransform, CGPoint, CGRect, CGSize},
     sys::CGEventRef,
 };
 use foreign_types::ForeignType;
@@ -91,6 +91,21 @@ unsafe impl RefEncode for OpaqueCGEvent {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("__CGEvent", &[]));
 }
 
+fn retained_cg_event(native: &NSEvent) -> Option<CGEvent> {
+    // SAFETY: the getter's exact opaque-pointer encoding is supplied above;
+    // `native` is live for the getter and until the borrowed value is retained.
+    let raw: *mut OpaqueCGEvent = unsafe { objc2::msg_send![native, CGEvent] };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: raw is a nonnull borrowed CGEvent. Its +1 is owned by CGEvent's
+    // Drop, independently of this NSEvent and the current autorelease pool.
+    Some(unsafe {
+        CFRetain(raw.cast());
+        CGEvent::from_ptr(raw.cast::<std::ffi::c_void>() as CGEventRef)
+    })
+}
+
 #[must_use = "preparing a native move does not send it"]
 pub struct PreparedNativeMove {
     event: CGEvent,
@@ -154,18 +169,7 @@ pub fn prepare_native_move(
             None, event_number as isize, 1, 1.0,
         )
     }.ok_or(NativeMoveError::EventUnavailable)?;
-    // SAFETY: the getter's exact opaque-pointer encoding is supplied above;
-    // retain the borrowed autoreleased value before its NSEvent/pool expires.
-    let raw: *mut OpaqueCGEvent = unsafe { objc2::msg_send![&*native, CGEvent] };
-    if raw.is_null() {
-        return Err(NativeMoveError::CgEventUnavailable);
-    }
-    // SAFETY: raw is the nonnull borrowed CGEvent above. This +1 is owned by
-    // CGEvent's Drop, independently of the NSEvent and autorelease pool.
-    let event = unsafe {
-        CFRetain(raw.cast());
-        CGEvent::from_ptr(raw.cast::<std::ffi::c_void>() as CGEventRef)
-    };
+    let event = retained_cg_event(&native).ok_or(NativeMoveError::CgEventUnavailable)?;
     event.set_flags(CGEventFlags::empty());
     super::set_event_location(&event, point);
     event.set_integer_value_field(3, 0);
@@ -193,21 +197,188 @@ impl PreparedNativeMove {
     /// # Errors
     /// Returns before posting if boot uptime does not fit the native timestamp.
     pub fn post(self) -> Result<(), NativeMoveError> {
-        // SAFETY: this is the read-only mach boot clock; timebase was validated.
-        let ticks = unsafe { mach_absolute_time() };
-        let nanos =
-            u128::from(ticks) * u128::from(self.timebase.numer) / u128::from(self.timebase.denom);
-        let timestamp = u64::try_from(nanos).map_err(|_| NativeMoveError::UptimeOverflow)?;
-        // SAFETY: self still owns the retained event and timestamp has its ABI type.
-        unsafe { CGEventSetTimestamp(self.event.as_ptr(), timestamp) };
-        self.event.post_to_pid(self.pid);
+        timestamp_and_post(&self.event, self.pid, &self.timebase)
+            .map_err(|_| NativeMoveError::UptimeOverflow)?;
         std::thread::sleep(Duration::from_millis(10));
         Ok(())
     }
 }
 
+/// A native focus event could not be prepared or timestamped.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NativeEventError {
+    #[error("native focus boot uptime source is unavailable")]
+    UptimeUnavailable,
+    #[error("native focus event factory returned no event")]
+    EventUnavailable,
+    #[error("native focus event has no CGEvent")]
+    CgEventUnavailable,
+    #[error("native focus uptime timestamp cannot be represented")]
+    UptimeOverflow,
+    #[error("native focus window-location API is unavailable")]
+    WindowLocationUnavailable,
+}
+
+/// One retained native event; it carries no target authority or lifecycle lease.
+#[must_use = "preparing a native event does not send it"]
+pub struct PreparedNativeEvent {
+    event: CGEvent,
+    timebase: mach_timebase_info_data_t,
+}
+
+impl std::fmt::Debug for PreparedNativeEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeEvent")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Prepare one native-profile otherEvent with zero location, time and data words.
+///
+/// The focus caller selects the source event type (13 or 21), subtype and flags.
+/// Call and consume this on one native worker inside its autorelease pool.
+///
+/// # Errors
+/// Returns the failed native factory, CGEvent conversion or clock setup step.
+pub fn prepare_other_event(
+    event_type: u32,
+    subtype: u16,
+    flags: u64,
+    window_id: u32,
+) -> Result<PreparedNativeEvent, NativeEventError> {
+    let timebase =
+        super::page_scroll::uptime_timebase().map_err(|_| NativeEventError::UptimeUnavailable)?;
+    // The original subtype is a 16-bit word, including 0x8000; AppKit takes
+    // the same bits through its signed-short ABI.
+    let subtype = i16::from_ne_bytes(subtype.to_ne_bytes());
+    // SAFETY: these are the native otherEvent factory's argument types, with
+    // no graphics context. The NSEvent and conversion stay on this worker.
+    let native = unsafe {
+        NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType(event_type as usize), NSPoint::new(0.0, 0.0),
+            NSEventModifierFlags(flags as usize), 0.0,
+            window_id as isize, None, subtype, 0, 0,
+        )
+    }.ok_or(NativeEventError::EventUnavailable)?;
+    let event = retained_cg_event(&native).ok_or(NativeEventError::CgEventUnavailable)?;
+    Ok(PreparedNativeEvent { event, timebase })
+}
+
+impl PreparedNativeEvent {
+    /// Stamp fresh boot uptime and post once to `pid`, with no pause.
+    ///
+    /// This neither checks nor creates the caller's PID authority or lease.
+    /// Prepare and send a pulse's first event before preparing its second event.
+    ///
+    /// # Errors
+    /// Returns before posting if boot uptime does not fit the native timestamp.
+    pub fn timestamp_and_post(self, pid: i32) -> Result<(), NativeEventError> {
+        timestamp_and_post(&self.event, pid, &self.timebase)
+            .map_err(|_| NativeEventError::UptimeOverflow)
+    }
+}
+
+/// Retained window metadata; absence of the activation-point attribute differs
+/// from an attribute whose value is explicitly absent.
+#[derive(Clone, Copy, Debug)]
+pub struct FocusActivationWindow {
+    pub window_id: u32,
+    pub bounds: Option<[f64; 4]>,
+    pub activation_point: Option<Option<[f64; 2]>>,
+}
+
+/// Prepare the entire activation sequence before posting any event.
+///
+/// # Errors
+/// Returns a native factory, CGEvent, clock or window-location API failure.
+pub fn prepare_focus_activation(
+    window: Option<FocusActivationWindow>,
+) -> Result<Vec<PreparedNativeEvent>, NativeEventError> {
+    let Some(window) = window.filter(|window| window.activation_point.is_some()) else {
+        return Ok(vec![prepare_other_event(13, 1, 0, 0)?]);
+    };
+    let flags = if window.window_id == 0 { 0 } else { 0xc0000 };
+    let activation = prepare_other_event(13, 1, flags, window.window_id)?;
+    let (Some(bounds), Some(Some(point))) = (window.bounds, window.activation_point) else {
+        return Ok(vec![activation]);
+    };
+    if window.window_id == 0 {
+        return Ok(vec![activation]);
+    }
+    let down = prepare_activation_mouse(1, 1, window.window_id, bounds, point)?;
+    let up = prepare_activation_mouse(2, 2, window.window_id, bounds, point)?;
+    Ok(vec![activation, down, up])
+}
+
+fn prepare_activation_mouse(
+    event_type: u32,
+    event_number: isize,
+    window_id: u32,
+    bounds: [f64; 4],
+    point: [f64; 2],
+) -> Result<PreparedNativeEvent, NativeEventError> {
+    let timebase =
+        super::page_scroll::uptime_timebase().map_err(|_| NativeEventError::UptimeUnavailable)?;
+    // SAFETY: these are AppKit's native mouse factory arguments. No event or
+    // borrowed AppKit reference leaves this worker's autorelease pool.
+    let native = unsafe {
+        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            NSEventType(event_type as usize), NSPoint::new(point[0], point[1]),
+            NSEventModifierFlags::empty(), 0.0, window_id as isize,
+            None, event_number, 1, 1.0,
+        )
+    }.ok_or(NativeEventError::EventUnavailable)?;
+    let event = retained_cg_event(&native).ok_or(NativeEventError::CgEventUnavailable)?;
+    event.set_flags(CGEventFlags::empty());
+    super::set_event_location(&event, CGPoint::new(point[0], point[1]));
+    event.set_integer_value_field(3, 0);
+    event.set_integer_value_field(7, 3);
+    event.set_integer_value_field(91, i64::from(window_id));
+    event.set_integer_value_field(92, i64::from(window_id));
+    // Read the actual CG location after setting it, as the original builder
+    // does. CGRectGetMinX/Y also handle negative rectangle dimensions.
+    let actual = event.location();
+    let rectangle = CGRect::new(
+        &CGPoint::new(bounds[0], bounds[1]),
+        &CGSize::new(bounds[2], bounds[3]),
+    );
+    // SAFETY: these native by-value CoreGraphics structs have their declared
+    // ABI on both supported 64-bit macOS architectures.
+    let local = unsafe {
+        let min_x = CGRectGetMinX(rectangle);
+        let min_y = CGRectGetMinY(rectangle);
+        let transform = CGAffineTransformMakeTranslation(-min_x, -min_y);
+        CGPointApplyAffineTransform(actual, transform)
+    };
+    super::page_scroll::set_window_location(event.as_ptr(), local)
+        .map_err(|_| NativeEventError::WindowLocationUnavailable)?;
+    Ok(PreparedNativeEvent { event, timebase })
+}
+
+fn timestamp_and_post(
+    event: &CGEvent,
+    pid: i32,
+    timebase: &mach_timebase_info_data_t,
+) -> Result<(), std::num::TryFromIntError> {
+    // SAFETY: this is the read-only mach boot clock; both preparation paths
+    // validate their timebase before storing it in the prepared event.
+    let ticks = unsafe { mach_absolute_time() };
+    let nanos = u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom);
+    let timestamp = u64::try_from(nanos)?;
+    // SAFETY: the caller owns the retained event and timestamp has its ABI type.
+    unsafe { CGEventSetTimestamp(event.as_ptr(), timestamp) };
+    event.post_to_pid(pid);
+    Ok(())
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGRectGetMinX(rectangle: CGRect) -> f64;
+    fn CGRectGetMinY(rectangle: CGRect) -> f64;
+    fn CGAffineTransformMakeTranslation(x: f64, y: f64) -> CGAffineTransform;
+    fn CGPointApplyAffineTransform(point: CGPoint, transform: CGAffineTransform) -> CGPoint;
     fn CGEventSetTimestamp(event: CGEventRef, timestamp: u64);
 }
 

@@ -845,6 +845,146 @@ pub fn hw_capture_window(window_id: u32) -> Option<core_graphics::image::CGImage
     }
 }
 
+// ── Original-profile focus APIs ──────────────────────────────────────────────
+
+/// `OSStatus _CPSGetKeyFocusProcess(ProcessSerialNumber *psn, Boolean *secondary)`.
+type NativeGetKeyFocusProcessFn = unsafe extern "C" fn(*mut u32, *mut u8) -> i32;
+
+/// `OSStatus _CPSReleaseKeyFocusWithID(uint32_t theft_id)`.
+type NativeReleaseKeyFocusFn = unsafe extern "C" fn(u32) -> i32;
+
+/// `AXError _AXUIElementGetActualPid(AXUIElementRef element, pid_t *pid)`.
+type NativeActualPidFn = unsafe extern "C" fn(
+    crate::ax::bindings::AXUIElementRef,
+    *mut pid_t,
+) -> crate::ax::bindings::AXError;
+
+/// Raw key-focus observations before the native-profile policy interprets them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NativeFocusQuery {
+    /// Both initialized PSN words, including their values after a failed query.
+    pub process_serial_number: [u32; 2],
+    /// The secondary Boolean byte, preserved without normalization.
+    pub secondary: u8,
+    /// The status returned by `_CPSGetKeyFocusProcess`.
+    pub query_status: i32,
+    /// The status returned by the subsequent `GetProcessPID` call.
+    pub process_pid_status: i32,
+    /// The initialized PID out-parameter, without a positive-PID filter.
+    pub pid: pid_t,
+}
+
+/// Resolution or Accessibility failure from the native-profile focus bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum NativeFocusError {
+    /// A required exact symbol was absent; no SLPS substitute is selected.
+    #[error("native focus API {0} is unavailable")]
+    MissingApi(&'static str),
+    /// The actual-PID query returned a nonzero AX error.
+    #[error("native actual-pid query failed with AX status {0}")]
+    ActualPid(crate::ax::bindings::AXError),
+}
+
+/// Exact CPS and AX APIs used by the native focus profile.
+///
+/// These calls neither grant authority over observed PIDs nor own a monitor,
+/// event tap, or registration lifetime.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeFocusApis {
+    key_focus: NativeGetKeyFocusProcessFn,
+    process_pid: GetProcessPidFn,
+    release: NativeReleaseKeyFocusFn,
+    actual_pid: NativeActualPidFn,
+}
+
+impl NativeFocusApis {
+    /// Resolve the exact native-profile APIs once, without an SLPS fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeFocusError::MissingApi`] if a required symbol is absent.
+    pub fn resolve() -> Result<Self, NativeFocusError> {
+        static APIS: OnceLock<Result<NativeFocusApis, NativeFocusError>> = OnceLock::new();
+        *APIS.get_or_init(|| {
+            let key_focus = find_sym(b"_CPSGetKeyFocusProcess\0")
+                .ok_or(NativeFocusError::MissingApi("_CPSGetKeyFocusProcess"))?;
+            let process_pid =
+                get_process_pid_fn().ok_or(NativeFocusError::MissingApi("GetProcessPID"))?;
+            let release = find_sym(b"_CPSReleaseKeyFocusWithID\0")
+                .ok_or(NativeFocusError::MissingApi("_CPSReleaseKeyFocusWithID"))?;
+            let actual_pid = find_sym(b"_AXUIElementGetActualPid\0")
+                .ok_or(NativeFocusError::MissingApi("_AXUIElementGetActualPid"))?;
+            // SAFETY: Each exact symbol has the corresponding C ABI declared above;
+            // the existing resolver keeps the framework loaded for these pointers.
+            Ok(unsafe {
+                Self {
+                    key_focus: as_fn(key_focus),
+                    process_pid,
+                    release: as_fn(release),
+                    actual_pid: as_fn(actual_pid),
+                }
+            })
+        })
+    }
+
+    /// Query key focus, then convert its PSN even when the first status failed.
+    pub fn key_focus(&self) -> NativeFocusQuery {
+        let mut process_serial_number = [0_u32; 2];
+        let mut secondary = 0_u8;
+        let mut pid: pid_t = 0;
+        // SAFETY: The initialized, aligned PSN and Boolean storage have the exact
+        // sizes required by this resolved API and stay live for the call.
+        let query_status =
+            unsafe { (self.key_focus)(process_serial_number.as_mut_ptr(), &mut secondary) };
+        // SAFETY: Both PSN words remain initialized even if the first call failed;
+        // `pid` is a valid initialized out-parameter for the existing API.
+        let process_pid_status =
+            unsafe { (self.process_pid)(process_serial_number.as_ptr().cast(), &mut pid) };
+        NativeFocusQuery {
+            process_serial_number,
+            secondary,
+            query_status,
+            process_pid_status,
+            pid,
+        }
+    }
+
+    /// Release the event's native theft ID and preserve the raw OS status.
+    pub fn release_key_focus(&self, theft_id: u32) -> i32 {
+        // SAFETY: The resolved API accepts the complete u32 ID domain by value.
+        unsafe { (self.release)(theft_id) }
+    }
+
+    /// Read an AX element's actual service PID without granting it authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeFocusError::ActualPid`] for a nonzero AX status. A successful
+    /// PID is returned unchanged, including nonpositive values.
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a nonnull, valid AX element whose owning retained reference
+    /// remains alive throughout this call. The caller must uphold the element's
+    /// thread-access requirements; this method neither retains nor releases it.
+    pub unsafe fn actual_pid(
+        &self,
+        element: crate::ax::bindings::AXUIElementRef,
+    ) -> Result<pid_t, NativeFocusError> {
+        let mut pid: pid_t = -1;
+        // SAFETY: The caller guarantees a live retained AX element, and `pid` is
+        // initialized writable storage for the resolved API's out-parameter.
+        let status = unsafe { (self.actual_pid)(element, &mut pid) };
+        if status == 0 {
+            Ok(pid)
+        } else {
+            Err(NativeFocusError::ActualPid(status))
+        }
+    }
+}
+
 // ── Key-focus theft ───────────────────────────────────────────────────────────
 
 /// `CGError SLPSStealKeyFocusReturningID(uint32_t cid, uint32_t options, int32_t *theft_id)`
