@@ -529,13 +529,13 @@ impl UploadResources {
         let stage = self.owned_mut(id, owner)?;
         if stage.retained {
             return Err(UploadError::Refused(
-                "selected backing requires actual tab retirement",
+                "selected backing has no confirmed File lifetime end",
             ));
         }
         self.remove(id)
     }
-    /// Call only after an actual matching known tab-close acknowledgement. A
-    /// debugger detach, finishTurn ACK or event with unknown identity never calls it.
+    /// An exact tab-close acknowledgement ends this tab's unselected stages.
+    /// It cannot prove that another browser consumer no longer holds a File.
     pub(super) fn retire_tab(&mut self, owner: &UploadOwner) -> Result<(), UploadError> {
         let ids: Vec<_> = self
             .stages
@@ -544,6 +544,14 @@ impl UploadResources {
             .collect();
         let mut first_error = None;
         for id in ids {
+            if self.stages[&id].retained {
+                if first_error.is_none() {
+                    first_error = Some(UploadError::Refused(
+                        "retained upload backing has no confirmed File lifetime end",
+                    ));
+                }
+                continue;
+            }
             if let Err(error) = self.remove(id) {
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -556,8 +564,8 @@ impl UploadResources {
         }
     }
     /// The worker calls this only after actual placement revalidation at final
-    /// native-host shutdown. Selected backing still requires matching tab
-    /// retirement; ending this host cannot prove a browser File finished reading.
+    /// native-host shutdown. Ending a host or tab cannot prove that every
+    /// browser consumer finished reading selected backing.
     /// An unvalidated namespace change leaves cleanup unconfirmed as well.
     pub(super) fn cleanup_all(&mut self) -> Result<(), UploadError> {
         let ids: Vec<_> = self.stages.keys().copied().collect();
@@ -566,7 +574,7 @@ impl UploadResources {
             if self.stages[&id].retained {
                 if first_error.is_none() {
                     first_error = Some(UploadError::Refused(
-                        "retained upload backing awaits confirmed tab retirement",
+                        "retained upload backing has no confirmed File lifetime end",
                     ));
                 }
                 continue;
@@ -683,7 +691,16 @@ mod tests {
         };
         assert!(resources.retire_tab(&foreign).is_ok());
         assert!(paths[0].exists());
-        resources.retire_tab(&binding).unwrap();
+        assert!(matches!(
+            resources.retire_tab(&binding),
+            Err(UploadError::Refused(
+                "retained upload backing has no confirmed File lifetime end"
+            ))
+        ));
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+        // No browser received this test-owned fixture. Its local owner can
+        // remove it explicitly without inventing a production File-death proof.
+        resources.remove(id).unwrap();
         assert!(!paths[0].exists());
     }
 }
