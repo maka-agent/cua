@@ -16,7 +16,7 @@ thread_local! {
 use crate::{
     pip_hook,
     protocol::{Content, ToolResult},
-    recording::{RecordingSession, now_ms, screenshot_for},
+    recording::{now_ms, screenshot_for, RecordingSession},
     recording_tools::{
         GetRecordingStateTool, ReplayRegistrySlot, ReplayTrajectoryTool, StartRecordingTool,
         StopRecordingTool,
@@ -81,8 +81,8 @@ pub fn current_native_input_worker_lease() -> Option<NativeInputWorkerLease> {
 /// Resource adapters use this instead of consulting process-global
 /// compatibility configuration. The value exists only while the canonical
 /// registry chokepoint is executing a tool, including nested dispatch.
-pub(crate) fn current_dispatch_authorization_context()
--> Option<Arc<crate::session_authorization::EffectiveAuthorizationContext>> {
+pub(crate) fn current_dispatch_authorization_context(
+) -> Option<Arc<crate::session_authorization::EffectiveAuthorizationContext>> {
     DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok()
 }
 
@@ -143,7 +143,7 @@ fn try_admit_cursor_action(
     if read_only {
         return Ok(None);
     }
-    use cua_driver_contract::{CursorAction, classify_cursor_semantics};
+    use cua_driver_contract::{classify_cursor_semantics, CursorAction};
     let action = classify_cursor_semantics(name, args).map(|semantics| semantics.action);
     let mutates_cursor = matches!(
         action,
@@ -1142,6 +1142,65 @@ impl Drop for RuntimeCleanup {
     }
 }
 
+/// Physical window geometry observed by a trusted Rust host.
+///
+/// This is coordinate refinement, not authorization or proof of a live window.
+/// Native adapters must revalidate its exact target and rectangle before input.
+/// It is never extracted from public tool arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "NativeWindowFrameData", into = "NativeWindowFrameData")]
+pub struct NativeWindowFrame(NativeWindowFrameData);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeWindowFrameData {
+    pid: u32,
+    window_id: u64,
+    bounds: [i32; 4],
+}
+
+impl NativeWindowFrame {
+    pub fn try_new(pid: u32, window_id: u64, bounds: [i32; 4]) -> Result<Self, &'static str> {
+        let [x, y, width, height] = bounds;
+        if pid == 0
+            || window_id == 0
+            || width <= 0
+            || height <= 0
+            || x.checked_add(width).is_none()
+            || y.checked_add(height).is_none()
+        {
+            return Err(
+                "native window frame requires an exact target and positive representable rectangle",
+            );
+        }
+        Ok(Self(NativeWindowFrameData {
+            pid,
+            window_id,
+            bounds,
+        }))
+    }
+    pub fn pid(self) -> u32 {
+        self.0.pid
+    }
+    pub fn window_id(self) -> u64 {
+        self.0.window_id
+    }
+    pub fn bounds(self) -> [i32; 4] {
+        self.0.bounds
+    }
+}
+impl TryFrom<NativeWindowFrameData> for NativeWindowFrame {
+    type Error = &'static str;
+    fn try_from(value: NativeWindowFrameData) -> Result<Self, Self::Error> {
+        Self::try_new(value.pid, value.window_id, value.bounds)
+    }
+}
+impl From<NativeWindowFrame> for NativeWindowFrameData {
+    fn from(value: NativeWindowFrame) -> Self {
+        value.0
+    }
+}
+
 /// Transport evidence admitted only through a trusted protocol adapter.
 ///
 /// The values are extracted from the adapter's private argument envelope and
@@ -1161,6 +1220,8 @@ pub struct TrustedInvocationEvidence {
     /// [`ToolRegistry::invoke_with_native_window_pixels`]). Never read from
     /// arguments: only that in-process entry point sets it.
     native_window_pixels: bool,
+    native_window_frame: Option<NativeWindowFrame>,
+    raw_windows_observation: bool,
 }
 
 impl TrustedInvocationEvidence {
@@ -1170,6 +1231,27 @@ impl TrustedInvocationEvidence {
     pub fn native_window_pixels() -> Self {
         Self {
             native_window_pixels: true,
+            ..Self::default()
+        }
+    }
+
+    /// Only a trusted Rust invocation can attach this geometry. Public JSON
+    /// and protocol adapters never extract it as evidence.
+    #[doc(hidden)]
+    pub fn native_window_frame(frame: NativeWindowFrame) -> Self {
+        Self {
+            native_window_pixels: true,
+            native_window_frame: Some(frame),
+            ..Self::default()
+        }
+    }
+
+    /// Select the raw Windows observation lifetime from an admitted Rust
+    /// native producer. No public argument or protocol adapter extracts this.
+    #[doc(hidden)]
+    pub fn raw_windows_observation() -> Self {
+        Self {
+            raw_windows_observation: true,
             ..Self::default()
         }
     }
@@ -1244,6 +1326,17 @@ impl TrustedInvocationEvidence {
             arguments.insert(
                 crate::snapshot_store::NATIVE_WINDOW_PIXELS_ARG.to_owned(),
                 Value::Bool(true),
+            );
+        }
+        if self.raw_windows_observation {
+            arguments.insert("_raw_windows_observation".into(), Value::Bool(true));
+        }
+        if let Some(frame) = self.native_window_frame {
+            arguments.insert(
+                "_native_window_frame".into(),
+                serde_json::json!({
+                    "pid": frame.pid(), "window_id": frame.window_id(), "bounds": frame.bounds()
+                }),
             );
         }
     }
@@ -1703,6 +1796,8 @@ impl ToolRegistry {
                 .unwrap_or_default();
             // Only the outermost in-process call vouches for its pixels.
             evidence.native_window_pixels = native_window_pixels;
+            evidence.native_window_frame = None;
+            evidence.raw_windows_observation = false;
             crate::tool_args::sanitize_reserved_args(&mut args);
             if let Some(bound_session) = context.public_session() {
                 let Some(arguments) = args.as_object_mut() else {
@@ -1776,6 +1871,8 @@ impl ToolRegistry {
     ) -> ToolResult {
         let mut evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
         evidence.native_window_pixels = native_window_pixels;
+        evidence.native_window_frame = None;
+        evidence.raw_windows_observation = false;
         let context = match crate::session_authorization::configured_registry()
             .and_then(|registry| registry.legacy_context())
         {
@@ -3853,9 +3950,9 @@ fn restore_public_runtime_value(value: &mut Value, runtime_prefix: &str) -> bool
 #[cfg(test)]
 mod runtime_isolation_tests {
     use super::{
-        DISPATCH_RUNTIME_SCOPE, TrustedInvocationEvidence, canonical_proposed_path,
-        desktop_action_coordinator, namespace_runtime_args, publish_action_result,
-        restore_public_runtime_result, try_admit_text_input,
+        canonical_proposed_path, desktop_action_coordinator, namespace_runtime_args,
+        publish_action_result, restore_public_runtime_result, try_admit_text_input,
+        TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
     };
     use crate::{
         authorization::PermissionMode,
@@ -3865,8 +3962,8 @@ mod runtime_isolation_tests {
     };
     use std::io::Write;
     use std::sync::{
-        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
     };
     use std::time::Duration;
 
@@ -5161,7 +5258,7 @@ resources:
     /// platform. A public caller cannot claim that origin.
     #[tokio::test]
     async fn trusted_human_origin_suppresses_the_agent_cursor_and_is_not_forgeable() {
-        use crate::agent_cursor::{InputOrigin, input_origin, overlay_suppressed};
+        use crate::agent_cursor::{input_origin, overlay_suppressed, InputOrigin};
         let hits = Arc::new(AtomicUsize::new(0));
         let last_args = Arc::new(Mutex::new(None));
         let mut registry = super::ToolRegistry::new();
@@ -5284,15 +5381,38 @@ resources:
             args.as_ref().expect("arguments")[NATIVE_WINDOW_PIXELS_ARG]
                 == serde_json::Value::Bool(true)
         };
-        let forged = serde_json::json!({ NATIVE_WINDOW_PIXELS_ARG: true });
+        let forged = serde_json::json!({ NATIVE_WINDOW_PIXELS_ARG: true,
+            "_native_window_frame":{"pid":10,"window_id":20,"bounds":[0,0,122,153]},"_raw_windows_observation":true });
 
         // A public or adapter caller cannot assert native pixels.
         registry.invoke("click", forged.clone()).await;
         assert!(!marked(&last_args.lock().unwrap()));
+        assert!(last_args
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get("_native_window_frame")
+            .is_none());
         registry
             .invoke_from_trusted_adapter("click", forged.clone())
             .await;
         assert!(!marked(&last_args.lock().unwrap()));
+        assert!(last_args
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get("_native_window_frame")
+            .is_none());
+
+        assert!(last_args
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get("_raw_windows_observation")
+            .is_none());
 
         // The in-process entry points do.
         registry
@@ -5307,12 +5427,10 @@ resources:
             .await;
         let received = last_args.lock().unwrap().clone();
         assert!(marked(&received));
-        assert!(
-            received.unwrap()["_session_id"]
-                .as_str()
-                .unwrap()
-                .ends_with("native-pixels-viewer")
-        );
+        assert!(received.unwrap()["_session_id"]
+            .as_str()
+            .unwrap()
+            .ends_with("native-pixels-viewer"));
 
         // A nested call (replay) does not inherit the outer call's claim.
         // (The outer probe's result is not a list_windows payload; only the
@@ -5433,7 +5551,7 @@ resources:
     #[tokio::test]
     async fn dispatch_runs_the_action_under_its_post_action_wait() {
         use crate::post_action_wait::{
-            POST_ACTION_WAIT_ARG, POST_ACTION_WAIT_TOOLS, PostActionWait, SKIP_SUPPORTED, current,
+            current, PostActionWait, POST_ACTION_WAIT_ARG, POST_ACTION_WAIT_TOOLS, SKIP_SUPPORTED,
         };
         use serde_json::json;
         let schema = json!({"type": "object", "properties": {}, "additionalProperties": false});
@@ -5578,10 +5696,9 @@ resources:
                 .as_object_mut()
                 .and_then(|object| object.remove("hint"))
                 .expect("a desktop background refusal carries a hint");
-            assert!(
-                hint.as_str()
-                    .is_some_and(|hint| hint.contains("target {kind:\"window\""))
-            );
+            assert!(hint
+                .as_str()
+                .is_some_and(|hint| hint.contains("target {kind:\"window\"")));
             assert_eq!(
                 structured,
                 serde_json::json!({
@@ -6005,11 +6122,9 @@ resources:
             );
         }
         assert_eq!(hits.load(Ordering::SeqCst), 0);
-        assert!(
-            refusal_codes
-                .iter()
-                .all(|code| code.as_deref() == Some("foreign_process_termination_denied"))
-        );
+        assert!(refusal_codes
+            .iter()
+            .all(|code| code.as_deref() == Some("foreign_process_termination_denied")));
         assert_eq!(
             crate::session::list_session_snapshots_with_prefix(
                 &runtime_prefix,
@@ -6118,12 +6233,10 @@ resources:
         assert_eq!(result.is_error, Some(true));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
-        assert!(
-            result
-                .content
-                .iter()
-                .any(|item| format!("{item:?}").contains("live top-level origin"))
-        );
+        assert!(result
+            .content
+            .iter()
+            .any(|item| format!("{item:?}").contains("live top-level origin")));
     }
 
     #[tokio::test]
@@ -6163,12 +6276,11 @@ resources:
             "files": ["/does/not/matter"]
         });
         let evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
-        assert!(
-            args.as_object()
-                .unwrap()
-                .keys()
-                .all(|key| !key.starts_with('_'))
-        );
+        assert!(args
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with('_')));
 
         let result = registry
             .invoke_with_context_and_evidence(
@@ -6181,18 +6293,14 @@ resources:
         assert_ne!(result.is_error, Some(true));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let received = last_args.lock().unwrap().clone().unwrap();
-        assert!(
-            received
-                .get("_session_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.ends_with(":trusted-owner"))
-        );
-        assert!(
-            received
-                .get("_transport_session_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.ends_with(":transport-a"))
-        );
+        assert!(received
+            .get("_session_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.ends_with(":trusted-owner")));
+        assert!(received
+            .get("_transport_session_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.ends_with(":transport-a")));
         assert_eq!(
             received["_cua_browser_download_mcp_host_approved"],
             serde_json::Value::Bool(true)
@@ -6347,12 +6455,10 @@ resources:
             action.effect,
             crate::action_record::ActionEffect::Unverifiable
         );
-        assert!(
-            action
-                .debug_json()
-                .get("requested_delivery")
-                .is_some_and(|value| value == "background")
-        );
+        assert!(action
+            .debug_json()
+            .get("requested_delivery")
+            .is_some_and(|value| value == "background"));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         crate::session::fire_session_end(&runtime_session);
@@ -7236,11 +7342,9 @@ mod capability_tests {
             }),
         );
         assert_eq!(download["destination_root"], "[redacted]");
-        assert!(
-            download
-                .get("_cua_browser_download_mcp_host_approved")
-                .is_none()
-        );
+        assert!(download
+            .get("_cua_browser_download_mcp_host_approved")
+            .is_none());
 
         let serialized = serde_json::json!([dialog, upload, download]).to_string();
         for forbidden in [
@@ -7688,22 +7792,18 @@ mod capability_tests {
             }
         });
         let accepting_entry = accepting.to_list_entry();
-        assert!(
-            accepting_entry["capabilities"]
-                .as_array()
-                .expect("capabilities array")
-                .iter()
-                .any(|capability| capability == "input.delivery_mode")
-        );
+        assert!(accepting_entry["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .any(|capability| capability == "input.delivery_mode"));
 
         let rejecting_entry = dummy_def("press_key").to_list_entry();
-        assert!(
-            !rejecting_entry["capabilities"]
-                .as_array()
-                .expect("capabilities array")
-                .iter()
-                .any(|capability| capability == "input.delivery_mode")
-        );
+        assert!(!rejecting_entry["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .any(|capability| capability == "input.delivery_mode"));
     }
 
     #[test]
@@ -7930,15 +8030,13 @@ mod capability_tests {
         }
         .to_list_entry();
         // anyOf[0] is the success variant; anyOf[1] is the refusal envelope.
-        let z_index = &entry["outputSchema"]["anyOf"][0]["properties"]["windows"]["items"]["properties"]
-            ["z_index"];
+        let z_index = &entry["outputSchema"]["anyOf"][0]["properties"]["windows"]["items"]
+            ["properties"]["z_index"];
         assert_eq!(z_index["type"], serde_json::json!(["integer", "null"]));
-        assert!(
-            z_index["description"]
-                .as_str()
-                .expect("description")
-                .contains("Higher values are closer to the front")
-        );
+        assert!(z_index["description"]
+            .as_str()
+            .expect("description")
+            .contains("Higher values are closer to the front"));
     }
 
     #[test]
@@ -7990,24 +8088,21 @@ mod capability_tests {
             v["enforcement_adapters"].is_array(),
             "permission enforcement inventory must be available before tools register"
         );
-        assert!(
-            v["enforcement_adapters"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|adapter| {
-                    adapter["id"] == "browser_prepare.existing_profile"
-                        && adapter["state"] == "active"
-                })
-        );
+        assert!(v["enforcement_adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|adapter| {
+                adapter["id"] == "browser_prepare.existing_profile" && adapter["state"] == "active"
+            }));
     }
 }
 
 #[cfg(test)]
 mod argument_shape_tests {
     use super::{
-        ToolDef, coerce_string_scalars, normalize_argument_aliases, normalize_zoom_args,
-        unknown_argument,
+        coerce_string_scalars, normalize_argument_aliases, normalize_zoom_args, unknown_argument,
+        ToolDef,
     };
     use serde_json::json;
 

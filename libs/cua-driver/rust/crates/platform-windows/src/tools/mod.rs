@@ -14,6 +14,8 @@ pub(crate) mod page_bookmark;
 // Pure title parsing for `page_bookmark`; ungated so its tests run on any host.
 pub(crate) mod page_title_marker;
 mod scroll_coordinates;
+#[cfg(target_os = "windows")]
+mod window_coordinates;
 
 #[cfg(not(target_os = "windows"))]
 mod stubs;

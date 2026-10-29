@@ -1338,6 +1338,30 @@ impl Tool for GetWindowStateTool {
             window.width,
             window.height,
         ));
+        let raw_observation = args
+            .get("_raw_windows_observation")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let raw_frame = if raw_observation {
+            let frame = match cua_driver_core::tool::NativeWindowFrame::try_new(
+                pid,
+                hwnd,
+                [window.x, window.y, window.width, window.height],
+            ) {
+                Ok(frame) => frame,
+                Err(error) => return ToolResult::error(error),
+            };
+            let Some(bridge) = &self.state.capture_bridge else {
+                return ToolResult::error("raw Windows observation requires the capture service");
+            };
+            if let Err(error) = bridge.refresh_window_observation(&args, frame) {
+                return capture_admission_refusal(error);
+            }
+            Some(frame)
+        } else {
+            None
+        };
+
         let app_name = crate::input::owned::spawn_blocking(move || {
             crate::win32::list_processes()
                 .into_iter()
@@ -1548,6 +1572,15 @@ impl Tool for GetWindowStateTool {
 
         match result {
             Ok((tree_opt, screenshot_opt, screenshot_err)) => {
+                // Raw source observations commit their screenshot set only
+                // after construction succeeds. A failed newer image must not
+                // erase the previous ID/context solely due to this failure.
+                if raw_observation && do_shot && screenshot_opt.is_none() {
+                    return ToolResult::error(
+                        screenshot_err
+                            .unwrap_or_else(|| "raw Windows screenshot was not produced".into()),
+                    );
+                }
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": hwnd, "pid": pid });
                 let screenshot_scale = screenshot_opt
@@ -1729,6 +1762,23 @@ impl Tool for GetWindowStateTool {
                     structured["invalidated_snapshot_ids"] = json!(ids);
                 }
 
+                if raw_observation && !do_shot {
+                    if let Some(binding) =
+                        cua_driver_core::windows_interruption::current_windows_input_binding()
+                    {
+                        if let Err(error) = binding.check() {
+                            return ToolResult::error(error.to_string());
+                        }
+                    }
+                    let Some(bridge) = &state.capture_bridge else {
+                        return ToolResult::error(
+                            "raw Windows observation lost its capture service",
+                        );
+                    };
+                    if let Err(error) = bridge.retire_window_observations(&args) {
+                        return capture_admission_refusal(error);
+                    }
+                }
                 if let Some((b64_opt, file_path, w, h, native_w, native_h, png)) = screenshot_opt {
                     let capture_id = if !observation_only {
                         if let Some(bridge) = &state.capture_bridge {
@@ -1742,15 +1792,25 @@ impl Tool for GetWindowStateTool {
                                     ))
                                 }
                             };
-                            match bridge.publish(
-                                &args,
-                                png,
-                                crate::capture_admission::WindowsCaptureTarget::Window {
-                                    pid,
-                                    window_id: hwnd,
-                                },
-                                geometry,
-                            ) {
+                            // This is the actual publication boundary. The
+                            // native binding's precommit check does not claim
+                            // all observation effects were absent on cancel.
+                            if raw_observation {
+                                if let Some(binding)=cua_driver_core::windows_interruption::current_windows_input_binding() {
+                                    if let Err(error)=binding.check() {return ToolResult::error(error.to_string());}
+                                }
+                            }
+                            let target = crate::capture_admission::WindowsCaptureTarget::Window {
+                                pid,
+                                window_id: hwnd,
+                            };
+                            let publication = match raw_frame {
+                                Some(frame) => bridge.publish_window_observation(
+                                    &args, png, target, geometry, frame,
+                                ),
+                                None => bridge.publish(&args, png, target, geometry),
+                            };
+                            match publication {
                                 Ok(capture_id) => capture_id,
                                 Err(error) => {
                                     return ToolResult::error(format!(
@@ -3604,6 +3664,40 @@ impl Tool for ClickTool {
                 }
             }
         };
+        let native_frame = match super::window_coordinates::admit(&args, pid, hwnd) {
+            Ok(frame) => frame,
+            Err(error) => return error,
+        };
+        let capture_frame = if args.get("capture_id").is_some() {
+            let Some(bridge) = &self.state.capture_bridge else {
+                return capture_admission_refusal(anyhow::anyhow!(
+                    "capture service is unavailable"
+                ));
+            };
+            match bridge.action_frame(
+                &args,
+                crate::capture_admission::WindowsCaptureTarget::Window {
+                    pid,
+                    window_id: hwnd,
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(error) => return capture_admission_refusal(error),
+            }
+        } else {
+            None
+        };
+        if capture_frame.is_some() && delivery != DeliveryMode::Foreground {
+            return capture_admission_refusal(anyhow::anyhow!(
+                "raw window capture requires foreground coordinate delivery"
+            ));
+        }
+        let input_frame = native_frame.or(capture_frame);
+        if let (Some(frame), Some(bridge)) = (native_frame, self.state.capture_bridge.as_ref()) {
+            if let Err(error) = bridge.refresh_window_observation(&args, frame) {
+                return capture_admission_refusal(error);
+            }
+        }
         let capture_point = if args.get("capture_id").is_some() {
             if elem_idx.is_some()
                 || x.is_none()
@@ -4217,7 +4311,9 @@ impl Tool for ClickTool {
                 .get("from_zoom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Some((mapped_x, mapped_y)) = capture_point {
+            if native_frame.is_some() {
+                // Physical offsets already came from the trusted logical resolver.
+            } else if let Some((mapped_x, mapped_y)) = capture_point {
                 let (mapped_x, mapped_y) =
                     match crate::capture_admission::round_action_point(mapped_x, mapped_y) {
                         Ok(point) => point,
@@ -4244,7 +4340,13 @@ impl Tool for ClickTool {
             }
             // px/py are bitmap pixels — see `bitmap_to_screen` for the
             // mapping (DWM-frame top-left + 1-px inset, NOT ClientToScreen).
-            let (sx_i, sy_i) = bitmap_to_screen(hwnd, px as i32, py as i32);
+            let (sx_i, sy_i) = match native_frame {
+                Some(frame) => match super::window_coordinates::screen_point(frame, px, py) {
+                    Ok(point) => point,
+                    Err(error) => return error,
+                },
+                None => bitmap_to_screen(hwnd, px as i32, py as i32),
+            };
             let (sx, sy) = (sx_i as f64, sy_i as f64);
             pin_overlay_above(&cursor_key, hwnd);
             overlay_glide_to(&cursor_key, sx, sy).await;
@@ -4294,6 +4396,9 @@ impl Tool for ClickTool {
                     let admitted = admitted.clone();
                     move || {
                         let _admission = &admitted;
+                        if let Some(frame) = input_frame {
+                            super::window_coordinates::revalidate(frame)?;
+                        }
                         let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                         crate::input::send_click_synthesized_active_mods(
                             hwnd, sx as i32, sy as i32, count, &btn, &mod_refs,
@@ -4314,7 +4419,12 @@ impl Tool for ClickTool {
                         ))
                         .with_structured(json!({ "path": "pixel", "verified": false, "effect": "unverifiable" }))
                     }
-                    Ok(Err(e)) => ToolResult::error(e.to_string()),
+                    Ok(Err(e)) => {
+                        match e.downcast_ref::<super::window_coordinates::NativeFrameRefused>() {
+                            Some(refusal) => refusal.result(),
+                            None => ToolResult::error(e.to_string()),
+                        }
+                    }
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
                 };
             }
@@ -6573,11 +6683,25 @@ impl ScrollTool {
         if !crate::input::delivery::DeliveryMode::from_args(args).is_foreground() {
             return refused("scroll: native pixels require delivery_mode=\"foreground\"");
         }
-        let Some(pixels) = args.get("pixels").and_then(Value::as_f64) else {
-            return refused("scroll: pixels must be a finite number");
+        let deltas = if args.get("scroll_x").is_some() || args.get("scroll_y").is_some() {
+            if args.get("pixels").is_some() || args.get("direction").is_some() {
+                return refused("scroll: signed axes are exclusive with direction and pixels");
+            }
+            let (Some(x), Some(y)) = (
+                args.get("scroll_x").and_then(Value::as_f64),
+                args.get("scroll_y").and_then(Value::as_f64),
+            ) else {
+                return refused("scroll: signed axes require finite scroll_x and scroll_y");
+            };
+            crate::scroll_pixels::signed_deltas(x, y)
+        } else {
+            let Some(pixels) = args.get("pixels").and_then(Value::as_f64) else {
+                return refused("scroll: pixels must be a finite number");
+            };
+            let direction = args.get("direction").and_then(Value::as_str).unwrap_or("");
+            crate::scroll_pixels::directional_deltas(direction, pixels)
         };
-        let direction = args.get("direction").and_then(Value::as_str).unwrap_or("");
-        let (delta_x, delta_y) = match crate::scroll_pixels::directional_deltas(direction, pixels) {
+        let (delta_x, delta_y) = match deltas {
             Ok(deltas) => deltas,
             Err(message) => return refused(message),
         };
@@ -6594,6 +6718,9 @@ impl ScrollTool {
         let has_pid = args.get("pid").is_some_and(|value| !value.is_null());
         let has_window = args.get("window_id").is_some_and(|value| !value.is_null());
         let (x, y, window) = if !has_pid && !has_window {
+            if args.get("capture_id").is_some() {
+                return refused("scroll: capture_id requires an exact pid and window_id");
+            }
             if !is_windowless_desktop_action(args) {
                 return refused(
                     "scroll: coordinates without pid/window_id require scope=\"desktop\"",
@@ -6609,23 +6736,95 @@ impl ScrollTool {
                 Ok(hwnd) if hwnd > 0 => hwnd,
                 _ => return refused("scroll: native pixels require an exact window_id"),
             };
-            let (x, y) = match super::scroll_coordinates::window_bitmap_point(
-                &self.state.snapshots,
-                args,
-                pid,
-                hwnd,
-                f64::from(x),
-                f64::from(y),
-            ) {
-                Ok(point) => point,
-                Err(refusal) => return refusal,
+            let native_frame = match super::window_coordinates::admit(args, pid, hwnd) {
+                Ok(frame) => frame,
+                Err(error) => return error,
             };
-            (x, y, Some((pid, hwnd)))
+            let capture_frame = if args.get("capture_id").is_some() {
+                let Some(bridge) = &self.state.capture_bridge else {
+                    return capture_admission_refusal(anyhow::anyhow!(
+                        "capture service is unavailable"
+                    ));
+                };
+                match bridge.action_frame(
+                    args,
+                    crate::capture_admission::WindowsCaptureTarget::Window {
+                        pid,
+                        window_id: hwnd,
+                    },
+                ) {
+                    Ok(frame) => frame,
+                    Err(error) => return capture_admission_refusal(error),
+                }
+            } else {
+                None
+            };
+            let input_frame = native_frame.or(capture_frame);
+            if let (Some(frame), Some(bridge)) = (native_frame, self.state.capture_bridge.as_ref())
+            {
+                if let Err(error) = bridge.refresh_window_observation(args, frame) {
+                    return capture_admission_refusal(error);
+                }
+            }
+            let (x, y) = if native_frame.is_some() {
+                (x, y)
+            } else if args.get("capture_id").is_some() {
+                let Some(bridge) = &self.state.capture_bridge else {
+                    return capture_admission_refusal(anyhow::anyhow!(
+                        "capture service is unavailable"
+                    ));
+                };
+                match bridge.admit_click(
+                    args,
+                    crate::capture_admission::WindowsCaptureTarget::Window {
+                        pid,
+                        window_id: hwnd,
+                    },
+                    f64::from(x),
+                    f64::from(y),
+                ) {
+                    // The native raw resolver truncates the positive rational
+                    // screenshot-to-action mapping at its integer boundary.
+                    Ok(Some((x, y)))
+                        if (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&x.trunc())
+                            && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&y.trunc()) =>
+                    {
+                        (x as i32, y as i32)
+                    }
+                    Ok(Some(_)) => {
+                        return refused("scroll: capture point is outside the Windows pixel range")
+                    }
+                    Ok(None) => return refused("scroll: capture_id must be a string"),
+                    Err(error) => return capture_admission_refusal(error),
+                }
+            } else {
+                match super::scroll_coordinates::window_bitmap_point(
+                    &self.state.snapshots,
+                    args,
+                    pid,
+                    hwnd,
+                    f64::from(x),
+                    f64::from(y),
+                ) {
+                    Ok(point) => point,
+                    Err(refusal) => return refusal,
+                }
+            };
+            (x, y, Some((pid, hwnd, native_frame, input_frame)))
         };
         let result = crate::input::owned::spawn_blocking(move || {
-            let (sx, sy) = if let Some((pid, hwnd)) = window {
+            let (sx, sy) = if let Some((pid, hwnd, native_frame, input_frame)) = window {
                 exact_window_ownership_result(pid, hwnd, crate::win32::window_owner_pid(hwnd))?;
-                let point = bitmap_to_screen(hwnd, x, y);
+                if let Some(frame) = input_frame {
+                    super::window_coordinates::revalidate(frame)
+                        .map_err(|refusal| refusal.result())?;
+                }
+                let point = match native_frame {
+                    Some(frame) => {
+                        super::window_coordinates::screen_point(frame, f64::from(x), f64::from(y))?
+                    }
+                    None => bitmap_to_screen(hwnd, x, y),
+                };
                 exact_window_ownership_result(pid, hwnd, crate::win32::window_owner_pid(hwnd))?;
                 point
             } else {
@@ -6679,7 +6878,9 @@ impl Tool for ScrollTool {
                 An `element_token` selects the retained UIA scroll surface for line/page input. \
                 Native pixels require a coordinate point and reject element_token.".into(),
             input_schema: json!({
-                "type":"object","required":["direction"],"properties":{
+                "type":"object",
+                "anyOf":[{"required":["direction"]},{"required":["scroll_x","scroll_y"]}],
+                "properties":{
                     "session": cua_driver_core::tool_schema::session_schema(),
                     "pid":{"type":"integer","description":"Target process ID for window scope. Optional with element_token (the token carries the pid). Omit with scope=desktop for screen-absolute coordinates from get_desktop_state."},
                     "direction":{"type":"string","enum":["up","down","left","right"],"description":"Scroll direction."},
@@ -6687,6 +6888,9 @@ impl Tool for ScrollTool {
                     "amount":{"type":"integer","minimum":1,"maximum":50,
                         "description":"Number of scroll ticks. Default 3."},
                     "pixels":{"type":"number","description":"Native coordinate wheel distance, exclusive with by/amount. Requires x,y, foreground delivery and no element_token. Direction signs this finite value before rounding; each native axis is bounded to [-32768,32767]. OS/application displacement is not a pixel guarantee."},
+                    "scroll_x":{"type":"number","description":"Signed Windows raw wheel X, paired with scroll_y and exclusive with direction/pixels/by/amount. Both axes are submitted in one vertical-then-horizontal batch; no detent multiplier."},
+                    "scroll_y":{"type":"number","description":"Signed Windows raw wheel Y, positive downward before Win32 sign conversion. Requires scroll_x, x,y and foreground delivery. Rounded signed 32-bit values are supported; native packets clamp each axis to [-32768,32767]."},
+                    "capture_id":{"type":"string","description":"Exact current window capture for native coordinate wheel input. Requires pid/window_id and x,y; target, session, geometry and point are checked before input."},
                     "x":{"type":"number","description":"With pid/window_id: window-local screenshot X used to target a nested scroll surface in foreground mode. Without pid/window_id: screen-absolute X for desktop scope. Must be paired with y."},
                     "y":{"type":"number","description":"With pid/window_id: window-local screenshot Y used to target a nested scroll surface in foreground mode. Without pid/window_id: screen-absolute Y for desktop scope. Must be paired with x."},
                     "window_id":{"type":"integer","description":"Exact HWND of the target window. Omit when element_token supplies its retained window, or let pid-only target resolution select an eligible window."},
@@ -6700,8 +6904,17 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if args.get("pixels").is_some() {
+        if args.get("pixels").is_some()
+            || args.get("scroll_x").is_some()
+            || args.get("scroll_y").is_some()
+        {
             return self.invoke_pixels(&args).await;
+        }
+        if args.get("capture_id").is_some() {
+            return ToolResult::error(
+                "scroll: capture_id requires native coordinate wheel input, not line/page scrolling",
+            )
+            .with_structured(json!({"code":"invalid_arguments", "effect":"refused"}));
         }
         if args.get("by").and_then(Value::as_str) == Some("pixel") {
             return ToolResult::error(
@@ -8003,6 +8216,7 @@ impl Tool for DragTool {
                 "scope":{"type":"string","enum":["window","desktop"],"description":"Use desktop with no pid/window_id for screen-absolute coordinates."},
                 "pid":{"type":"integer","description":"Target process ID."},
                 "window_id":{"type":"integer","description":"Target window handle (HWND). Optional — driver picks frontmost window of pid when omitted."},
+                "capture_id":{"type":"string","minLength":1,"description":"Exact capture for both endpoints; consumed once only after both points pass admission."},
                 "from_x":{"type":"number","description":"Drag-start X in window-local screenshot pixels."},
                 "from_y":{"type":"number","description":"Drag-start Y in window-local screenshot pixels."},
                 "to_x":{"type":"number","description":"Drag-end X in window-local screenshot pixels."},
@@ -8029,10 +8243,44 @@ impl Tool for DragTool {
                 Ok(input) => input,
                 Err(error) => return error,
             };
-            let from_x = input.from_x as i32;
-            let from_y = input.from_y as i32;
-            let to_x = input.to_x as i32;
-            let to_y = input.to_y as i32;
+            let points = if args.get("capture_id").is_some() {
+                let Some(bridge) = &self.state.capture_bridge else {
+                    return capture_admission_refusal(anyhow::anyhow!(
+                        "capture service is unavailable"
+                    ));
+                };
+                match bridge.admit_drag(
+                    &args,
+                    crate::capture_admission::WindowsCaptureTarget::PrimaryDesktop,
+                    (input.from_x, input.from_y),
+                    (input.to_x, input.to_y),
+                ) {
+                    Ok(Some([from, to])) => {
+                        let from =
+                            match crate::capture_admission::round_action_point(from.0, from.1) {
+                                Ok(point) => point,
+                                Err(error) => return capture_admission_refusal(error),
+                            };
+                        let to = match crate::capture_admission::round_action_point(to.0, to.1) {
+                            Ok(point) => point,
+                            Err(error) => return capture_admission_refusal(error),
+                        };
+                        [from, to]
+                    }
+                    Ok(None) => {
+                        return capture_admission_refusal(anyhow::anyhow!(
+                            "capture_id must be a string"
+                        ))
+                    }
+                    Err(error) => return capture_admission_refusal(error),
+                }
+            } else {
+                [
+                    (input.from_x as i32, input.from_y as i32),
+                    (input.to_x as i32, input.to_y as i32),
+                ]
+            };
+            let [(from_x, from_y), (to_x, to_y)] = points;
             let duration_ms = input.duration_ms.unwrap_or(500);
             let steps = input.steps.unwrap_or(20) as usize;
             let button = input.button.unwrap_or(ClickButton::Left).as_str();
@@ -8106,29 +8354,6 @@ impl Tool for DragTool {
         let button = args.str_or("button", "left");
         let from_zoom = args.bool_or("from_zoom", false);
 
-        if from_zoom {
-            match self.state.zoom_context(&args, pid, hwnd_opt) {
-                Ok(ctx) => {
-                    let (wx, wy) = ctx.zoom_to_window(from_x, from_y);
-                    let (wx2, wy2) = ctx.zoom_to_window(to_x, to_y);
-                    from_x = wx;
-                    from_y = wy;
-                    to_x = wx2;
-                    to_y = wy2;
-                }
-                Err(refusal) => return refusal,
-            }
-        } else {
-            let ratio = match screenshot_scale(&self.state, &args, pid, hwnd_opt) {
-                Ok(ratio) => ratio,
-                Err(refusal) => return refusal,
-            };
-            from_x *= ratio;
-            from_y *= ratio;
-            to_x *= ratio;
-            to_y *= ratio;
-        }
-
         let hwnd = match hwnd_opt {
             Some(h) => h,
             None => {
@@ -8148,11 +8373,118 @@ impl Tool for DragTool {
             }
         };
 
-        // Compute screen-coord endpoints. Same correction as the click
-        // tools — bitmap pixels are anchored to the DWM-frame top-left,
-        // not the client area top-left (see `bitmap_to_screen` doc).
-        let (sx_from, sy_from) = bitmap_to_screen(hwnd, from_x as i32, from_y as i32);
-        let (sx_to, sy_to) = bitmap_to_screen(hwnd, to_x as i32, to_y as i32);
+        let native_frame = match super::window_coordinates::admit(&args, pid, hwnd) {
+            Ok(frame) => frame,
+            Err(error) => return error,
+        };
+        let capture_frame = if args.get("capture_id").is_some() {
+            let Some(bridge) = &self.state.capture_bridge else {
+                return capture_admission_refusal(anyhow::anyhow!(
+                    "capture service is unavailable"
+                ));
+            };
+            match bridge.action_frame(
+                &args,
+                crate::capture_admission::WindowsCaptureTarget::Window {
+                    pid,
+                    window_id: hwnd,
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(error) => return capture_admission_refusal(error),
+            }
+        } else {
+            None
+        };
+        if capture_frame.is_some() && delivery != DeliveryMode::Foreground {
+            return capture_admission_refusal(anyhow::anyhow!(
+                "raw window capture requires foreground coordinate delivery"
+            ));
+        }
+        let input_frame = native_frame.or(capture_frame);
+        if let (Some(frame), Some(bridge)) = (native_frame, self.state.capture_bridge.as_ref()) {
+            if let Err(error) = bridge.refresh_window_observation(&args, frame) {
+                return capture_admission_refusal(error);
+            }
+        }
+        let captured = if args.get("capture_id").is_some() {
+            if from_zoom || hwnd_opt.is_none() {
+                return capture_admission_refusal(anyhow::anyhow!(
+                    "capture_id requires an exact window_id without zoom"
+                ));
+            }
+            let Some(bridge) = &self.state.capture_bridge else {
+                return capture_admission_refusal(anyhow::anyhow!(
+                    "capture service is unavailable"
+                ));
+            };
+            match bridge.admit_drag(
+                &args,
+                crate::capture_admission::WindowsCaptureTarget::Window {
+                    pid,
+                    window_id: hwnd,
+                },
+                (from_x, from_y),
+                (to_x, to_y),
+            ) {
+                Ok(Some(points)) => Some(points),
+                Ok(None) => {
+                    return capture_admission_refusal(anyhow::anyhow!(
+                        "capture_id must be a string"
+                    ))
+                }
+                Err(error) => return capture_admission_refusal(error),
+            }
+        } else {
+            None
+        };
+        let ((sx_from, sy_from), (sx_to, sy_to)) = if let Some(frame) = native_frame {
+            let from = match super::window_coordinates::screen_point(frame, from_x, from_y) {
+                Ok(point) => point,
+                Err(error) => return error,
+            };
+            let to = match super::window_coordinates::screen_point(frame, to_x, to_y) {
+                Ok(point) => point,
+                Err(error) => return error,
+            };
+            (from, to)
+        } else {
+            if let Some([from, to]) = captured {
+                let from = match crate::capture_admission::round_action_point(from.0, from.1) {
+                    Ok(point) => point,
+                    Err(error) => return capture_admission_refusal(error),
+                };
+                let to = match crate::capture_admission::round_action_point(to.0, to.1) {
+                    Ok(point) => point,
+                    Err(error) => return capture_admission_refusal(error),
+                };
+                from_x = f64::from(from.0);
+                from_y = f64::from(from.1);
+                to_x = f64::from(to.0);
+                to_y = f64::from(to.1);
+            } else if from_zoom {
+                match self.state.zoom_context(&args, pid, hwnd_opt) {
+                    Ok(ctx) => {
+                        (from_x, from_y) = ctx.zoom_to_window(from_x, from_y);
+                        (to_x, to_y) = ctx.zoom_to_window(to_x, to_y);
+                    }
+                    Err(refusal) => return refusal,
+                }
+            } else {
+                let ratio = match screenshot_scale(&self.state, &args, pid, hwnd_opt) {
+                    Ok(ratio) => ratio,
+                    Err(refusal) => return refusal,
+                };
+                from_x *= ratio;
+                from_y *= ratio;
+                to_x *= ratio;
+                to_y *= ratio;
+            }
+            (
+                bitmap_to_screen(hwnd, from_x as i32, from_y as i32),
+                bitmap_to_screen(hwnd, to_x as i32, to_y as i32),
+            )
+        };
 
         // delivery_mode:"background" on WinUI3: a pointer drag can't both land and
         // hold the contract — the content island only consumes real
@@ -8234,6 +8566,9 @@ impl Tool for DragTool {
                 windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
             };
             let send_result = crate::input::owned::spawn_blocking(move || {
+                if let Some(frame) = input_frame {
+                    super::window_coordinates::revalidate(frame)?;
+                }
                 crate::input::mouse::send_drag_synthesized_active(
                     hwnd,
                     sx_from,
@@ -8266,6 +8601,11 @@ impl Tool for DragTool {
                      in {duration_ms}ms / {steps} steps (delivery_mode:foreground)."
                 )),
                 Ok(Err(e)) => {
+                    if let Some(refusal) =
+                        e.downcast_ref::<super::window_coordinates::NativeFrameRefused>()
+                    {
+                        return refusal.result();
+                    }
                     let message = e.to_string();
                     if message.starts_with("foreground_unavailable:") {
                         // Nothing was sent; give callers the structured code
@@ -10722,7 +11062,9 @@ pub fn build_registry_with_provider(
     r.register(Box::new(InvokeMenuTool));
     r.register(Box::new(DebugWindowInfoTool));
     r.register(pid_window_guarded(
-        NativeSecondaryActionTool { state: state.clone() },
+        NativeSecondaryActionTool {
+            state: state.clone(),
+        },
         &pid_window_candidates,
     ));
     r.register(pid_window_guarded(
@@ -10943,7 +11285,9 @@ impl Tool for NativeSecondaryActionTool {
                 return ToolResult::error(
                     "unsupported native secondary action; no input was attempted",
                 )
-                .with_structured(json!({"code":"secondary_action_unsupported","effect":"refused"}));
+                .with_structured(
+                    json!({"code":"secondary_action_unsupported","effect":"refused"}),
+                );
             }
         };
         let pid = match args.require_u32("pid") {
@@ -10977,11 +11321,11 @@ impl Tool for NativeSecondaryActionTool {
             // The AddRef'd snapshot element and actual worker lease survive
             // until the pattern call and foreground guard both finish.
             let _admission = &admitted;
+            use windows::core::Interface;
             use windows::Win32::UI::Accessibility::{
                 IUIAutomationElement, IUIAutomationExpandCollapsePattern,
                 UIA_ExpandCollapsePatternId,
             };
-            use windows::core::Interface;
             let element = std::mem::ManuallyDrop::new(unsafe {
                 IUIAutomationElement::from_raw(admitted.as_ptr() as *mut _)
             });

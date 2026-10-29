@@ -15,11 +15,17 @@
 //! required before a capture ID can authorize or drive any production action.
 //! Target-specific bounds and coordinate semantics must be revalidated there.
 //!
+//! Ordinary captures are consumed once and expire by TTL. Explicit window
+//! observations instead remain reusable until snapshot replacement, real frame
+//! invalidation, owner retirement or bounded storage eviction. They require a
+//! trusted current full window frame at every action admission.
+//!
 //! TTL cleanup is bounded and lazy: [`CaptureRegistry::prune_expired`] scans at
 //! most `max_captures` entries and drops expired image references. Registry size
 //! metrics call it automatically. An eventual runtime owner must call it from
 //! its maintenance/metrics path if no store or lookup traffic is occurring.
 
+use crate::tool::NativeWindowFrame;
 use image::{ImageDecoder, Limits};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -198,10 +204,12 @@ impl NativeActionDimensions {
     }
 }
 
-/// Continuous affine mapping from screenshot pixels to action coordinates.
+/// Mapping from screenshot pixels to action coordinates.
 ///
-/// For a screenshot point `(x, y)`, the action point is:
+/// [`Self::new`] preserves continuous affine behavior:
 /// `((m11*x) + (m12*y) + tx, (m21*x) + (m22*y) + ty)`.
+/// [`Self::from_dimensions`] additionally preserves its explicit integer
+/// rectangle mapping for integral points within the encoded image.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenshotToActionTransform {
     m11: f64,
@@ -210,6 +218,36 @@ pub struct ScreenshotToActionTransform {
     m22: f64,
     tx: f64,
     ty: f64,
+    rectangle: Option<RectangleRatio>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RectangleRatio {
+    encoded: EncodedScreenshotDimensions,
+    native: NativeActionDimensions,
+}
+
+impl RectangleRatio {
+    fn apply_integral(self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let bounded_integer = |value: f64, extent: u32| {
+            value.is_finite() && value.fract() == 0.0 && value >= 0.0 && value < f64::from(extent)
+        };
+        if !bounded_integer(x, self.encoded.width) || !bounded_integer(y, self.encoded.height) {
+            return None;
+        }
+        // Each factor fits u32, so the u64 product and resulting integer are
+        // exact. Checked operations keep that boundary explicit.
+        let scale = |point: f64, native: u32, encoded: u32| {
+            (point as u64)
+                .checked_mul(u64::from(native))?
+                .checked_div(u64::from(encoded))
+                .map(|mapped| mapped as f64)
+        };
+        Some((
+            scale(x, self.native.width, self.encoded.width)?,
+            scale(y, self.native.height, self.encoded.height)?,
+        ))
+    }
 }
 
 impl ScreenshotToActionTransform {
@@ -236,7 +274,31 @@ impl ScreenshotToActionTransform {
             m22,
             tx,
             ty,
+            rectangle: None,
         })
+    }
+
+    /// Construct a zero-origin rectangle mapping from actual image extents.
+    ///
+    /// Both dimension types already require nonzero extents. Integral points
+    /// inside the image use exact integer multiplication/division, truncated
+    /// toward zero. If either coordinate is fractional or outside the image,
+    /// `apply` retains the continuous ratio mapping; this constructor grants no
+    /// action admission. Arbitrary affine coefficients are never recognized as
+    /// rectangle provenance by inspection.
+    pub fn from_dimensions(
+        encoded: EncodedScreenshotDimensions,
+        native: NativeActionDimensions,
+    ) -> Self {
+        Self {
+            m11: f64::from(native.width) / f64::from(encoded.width),
+            m12: 0.0,
+            m21: 0.0,
+            m22: f64::from(native.height) / f64::from(encoded.height),
+            tx: 0.0,
+            ty: 0.0,
+            rectangle: Some(RectangleRatio { encoded, native }),
+        }
     }
 
     pub fn identity() -> Self {
@@ -247,10 +309,14 @@ impl ScreenshotToActionTransform {
             m22: 1.0,
             tx: 0.0,
             ty: 0.0,
+            rectangle: None,
         }
     }
 
     pub fn apply(self, x: f64, y: f64) -> (f64, f64) {
+        if let Some(mapped) = self.rectangle.and_then(|ratio| ratio.apply_integral(x, y)) {
+            return mapped;
+        }
         (
             self.m11.mul_add(x, self.m12.mul_add(y, self.tx)),
             self.m21.mul_add(x, self.m22.mul_add(y, self.ty)),
@@ -276,7 +342,11 @@ impl ScreenshotToActionTransform {
         Ok(())
     }
 
-    /// Compose two mappings, applying `self` first and `next` second.
+    /// Compose affine coefficients, applying `self` first and `next` second.
+    ///
+    /// The result is a continuous affine transform. Explicit rectangle
+    /// provenance and its native integer quantization are not inferred through
+    /// arbitrary affine composition.
     pub fn then(self, next: Self) -> Result<Self, CaptureStoreError> {
         Self::new(
             next.m11.mul_add(self.m11, next.m12 * self.m21),
@@ -444,6 +514,8 @@ pub enum CaptureLookupError {
     GenerationMismatch,
     #[error("capture belongs to another target")]
     TargetMismatch,
+    #[error("window observation requires the trusted current native window frame")]
+    WindowFrameRequired,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -494,6 +566,28 @@ pub struct CaptureActionAdmission {
     pub digest: ContentDigest,
 }
 
+/// Two endpoints admitted together against one immutable capture.
+///
+/// The `from` request supplies the shared capture, binding, target and live
+/// frame. Both screenshot points must pass before admission. Ordinary captures
+/// are consumed once; window observations remain reusable with an exact frame.
+pub struct CaptureDragRequest {
+    pub from: CaptureActionRequest,
+    pub to_x: f64,
+    pub to_y: f64,
+}
+
+#[derive(Debug)]
+pub struct CaptureDragAdmission {
+    pub from: CaptureActionAdmission,
+    /// Actual delivered-image extents from the same admitted capture.
+    /// Adapters with a proven axis-aligned rectangle mapping may use these
+    /// integer extents without inferring a rectangle from arbitrary affine data.
+    pub encoded_dimensions: EncodedScreenshotDimensions,
+    pub action_to_x: f64,
+    pub action_to_y: f64,
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum CaptureActionError {
     #[error(transparent)]
@@ -527,6 +621,7 @@ impl CaptureLookupError {
             Self::Expired => "capture_expired",
             Self::GenerationMismatch => "capture_generation_mismatch",
             Self::TargetMismatch => "capture_target_mismatch",
+            Self::WindowFrameRequired => "capture_frame_required",
         }
     }
 }
@@ -555,6 +650,18 @@ pub fn admission_error_code(error: &anyhow::Error) -> &'static str {
         .map_or(CAPTURE_ACTION_REFUSED_CODE, CaptureActionError::wire_code)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureLifetime {
+    OneShot,
+    WindowObservation(NativeWindowFrame),
+}
+
+impl CaptureLifetime {
+    fn is_window_observation(self) -> bool {
+        matches!(self, Self::WindowObservation(_))
+    }
+}
+
 #[derive(Clone)]
 struct StoredCapture {
     id: CaptureId,
@@ -566,8 +673,9 @@ struct StoredCapture {
     native_action_dimensions: NativeActionDimensions,
     screenshot_to_action: ScreenshotToActionTransform,
     binding: CaptureBinding,
+    lifetime: CaptureLifetime,
     created_at: Duration,
-    expires_at: Duration,
+    expires_at: Option<Duration>,
 }
 
 impl fmt::Debug for StoredCapture {
@@ -583,6 +691,7 @@ impl fmt::Debug for StoredCapture {
             .field("native_action_dimensions", &self.native_action_dimensions)
             .field("screenshot_to_action", &self.screenshot_to_action)
             .field("binding", &self.binding)
+            .field("lifetime", &self.lifetime)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
             .finish()
@@ -617,6 +726,15 @@ impl PerceptionCapture {
         self.0.encoded_dimensions
     }
 
+    /// Inert full-frame metadata of a retained window observation. This is not
+    /// an action admission or proof that the frame still describes a live window.
+    pub fn window_observation_frame(&self) -> Option<NativeWindowFrame> {
+        match self.0.lifetime {
+            CaptureLifetime::OneShot => None,
+            CaptureLifetime::WindowObservation(frame) => Some(frame),
+        }
+    }
+
     pub(crate) fn screenshot_to_action(&self) -> ScreenshotToActionTransform {
         self.0.screenshot_to_action
     }
@@ -625,7 +743,8 @@ impl PerceptionCapture {
         self.0.created_at
     }
 
-    pub fn expires_at(&self) -> Duration {
+    /// Ordinary captures have a TTL; window observations have no time expiry.
+    pub fn expires_at(&self) -> Option<Duration> {
         self.0.expires_at
     }
 }
@@ -677,7 +796,7 @@ impl ActionCapture {
         self.0.created_at
     }
 
-    pub fn expires_at(&self) -> Duration {
+    pub fn expires_at(&self) -> Option<Duration> {
         self.0.expires_at
     }
 }
@@ -725,6 +844,30 @@ impl CaptureRegistry {
     }
 
     pub fn store(&self, registration: CaptureRegistration) -> Result<CaptureId, CaptureStoreError> {
+        self.store_with_lifetime(registration, CaptureLifetime::OneShot)
+    }
+
+    fn store_window_observation(
+        &self,
+        registration: CaptureRegistration,
+        frame: NativeWindowFrame,
+    ) -> Result<CaptureId, CaptureStoreError> {
+        if registration.target
+            != (CaptureTarget::Window {
+                pid: frame.pid(),
+                window_id: frame.window_id(),
+            })
+        {
+            return Err(CaptureStoreError::InvalidTarget);
+        }
+        self.store_with_lifetime(registration, CaptureLifetime::WindowObservation(frame))
+    }
+
+    fn store_with_lifetime(
+        &self,
+        registration: CaptureRegistration,
+        lifetime: CaptureLifetime,
+    ) -> Result<CaptureId, CaptureStoreError> {
         registration.target.validate()?;
         if registration.encoded_bytes.len() > self.config.max_total_bytes {
             return Err(CaptureStoreError::CaptureTooLarge);
@@ -756,9 +899,14 @@ impl CaptureRegistry {
         let byte_len = encoded_bytes.len();
         let digest = ContentDigest(Sha256::digest(&encoded_bytes).into());
         let created_at = self.clock.now();
-        let expires_at = created_at
-            .checked_add(self.config.ttl)
-            .ok_or(CaptureStoreError::ExpiryOverflow)?;
+        let expires_at = match lifetime {
+            CaptureLifetime::OneShot => Some(
+                created_at
+                    .checked_add(self.config.ttl)
+                    .ok_or(CaptureStoreError::ExpiryOverflow)?,
+            ),
+            CaptureLifetime::WindowObservation(_) => None,
+        };
 
         let mut inner = self
             .inner
@@ -767,6 +915,13 @@ impl CaptureRegistry {
         self.prune_expired_locked(&mut inner, created_at);
         if inner.next_sequence == u64::MAX {
             return Err(CaptureStoreError::IdExhausted);
+        }
+        // All fallible image/target admission and ID allocation checks precede
+        // snapshot replacement. A failed publication retains the previous set.
+        if lifetime.is_window_observation() {
+            self.retire_matching_locked(&mut inner, |capture| {
+                capture.binding == registration.binding && capture.lifetime.is_window_observation()
+            });
         }
         while inner.captures.len() >= self.config.max_captures
             || inner.total_bytes.saturating_add(byte_len) > self.config.max_total_bytes
@@ -789,6 +944,7 @@ impl CaptureRegistry {
             native_action_dimensions: registration.native_action_dimensions,
             screenshot_to_action: registration.screenshot_to_action,
             binding: registration.binding,
+            lifetime,
             created_at,
             expires_at,
         };
@@ -822,7 +978,7 @@ impl CaptureRegistry {
         if inner
             .captures
             .get(&id)
-            .is_some_and(|capture| capture.expires_at <= now)
+            .is_some_and(|capture| capture.expires_at.is_some_and(|expiry| expiry <= now))
         {
             self.remove_capture(&mut inner, id);
             self.remember_expired(&mut inner, id);
@@ -845,6 +1001,46 @@ impl CaptureRegistry {
         &self,
         request: CaptureActionRequest,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.admit_action_in_frame(request, None)
+    }
+
+    fn admit_action_in_frame(
+        &self,
+        request: CaptureActionRequest,
+        current_frame: Option<NativeWindowFrame>,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        // A one-point action is the same transaction with coincident endpoints.
+        // Keep its public result and validation semantics unchanged.
+        let to_x = request.screenshot_x;
+        let to_y = request.screenshot_y;
+        self.admit_drag_in_frame(
+            CaptureDragRequest {
+                from: request,
+                to_x,
+                to_y,
+            },
+            current_frame,
+        )
+        .map(|admission| admission.from)
+    }
+
+    fn admit_drag(
+        &self,
+        drag: CaptureDragRequest,
+    ) -> Result<CaptureDragAdmission, CaptureActionError> {
+        self.admit_drag_in_frame(drag, None)
+    }
+
+    fn admit_drag_in_frame(
+        &self,
+        drag: CaptureDragRequest,
+        current_frame: Option<NativeWindowFrame>,
+    ) -> Result<CaptureDragAdmission, CaptureActionError> {
+        let CaptureDragRequest {
+            from: request,
+            to_x,
+            to_y,
+        } = drag;
         let now = self.clock.now();
         let mut inner = self
             .inner
@@ -853,7 +1049,7 @@ impl CaptureRegistry {
         if inner
             .captures
             .get(&request.capture_id)
-            .is_some_and(|capture| capture.expires_at <= now)
+            .is_some_and(|capture| capture.expires_at.is_some_and(|expiry| expiry <= now))
         {
             self.remove_capture(&mut inner, request.capture_id);
             self.remember_expired(&mut inner, request.capture_id);
@@ -872,35 +1068,56 @@ impl CaptureRegistry {
         if capture.target != request.target {
             return Err(CaptureLookupError::TargetMismatch.into());
         }
+        if let CaptureLifetime::WindowObservation(recorded_frame) = capture.lifetime {
+            let current_frame = current_frame.ok_or(CaptureLookupError::WindowFrameRequired)?;
+            if recorded_frame != current_frame {
+                return Err(CaptureActionError::NativeActionFrameMismatch);
+            }
+        }
+        if let Some(frame) = current_frame {
+            if capture.target
+                != (CaptureTarget::Window {
+                    pid: frame.pid(),
+                    window_id: frame.window_id(),
+                })
+            {
+                return Err(CaptureActionError::NativeActionFrameMismatch);
+            }
+        }
         if capture.native_action_dimensions != request.current_native_action_dimensions {
             return Err(CaptureActionError::NativeActionFrameMismatch);
         }
         let max_x = f64::from(capture.encoded_dimensions.width);
         let max_y = f64::from(capture.encoded_dimensions.height);
-        if !request.screenshot_x.is_finite()
-            || !request.screenshot_y.is_finite()
-            || request.screenshot_x < 0.0
-            || request.screenshot_y < 0.0
-            || request.screenshot_x >= max_x
-            || request.screenshot_y >= max_y
-        {
-            return Err(CaptureActionError::InvalidScreenshotPoint);
-        }
-        let (action_x, action_y) = capture
-            .screenshot_to_action
-            .apply(request.screenshot_x, request.screenshot_y);
-        if !action_x.is_finite() || !action_y.is_finite() {
-            return Err(CaptureActionError::InvalidMappedPoint);
-        }
-        let admission = CaptureActionAdmission {
-            capture_id: capture.id,
-            target: capture.target.clone(),
-            action_x,
-            action_y,
-            native_action_dimensions: capture.native_action_dimensions,
-            digest: capture.digest,
+        let map_point = |x: f64, y: f64| {
+            if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= max_x || y >= max_y {
+                return Err(CaptureActionError::InvalidScreenshotPoint);
+            }
+            let (action_x, action_y) = capture.screenshot_to_action.apply(x, y);
+            if !action_x.is_finite() || !action_y.is_finite() {
+                return Err(CaptureActionError::InvalidMappedPoint);
+            }
+            Ok((action_x, action_y))
         };
-        self.remove_capture(&mut inner, request.capture_id);
+        let (action_x, action_y) = map_point(request.screenshot_x, request.screenshot_y)?;
+        let (action_to_x, action_to_y) = map_point(to_x, to_y)?;
+        let admission = CaptureDragAdmission {
+            from: CaptureActionAdmission {
+                capture_id: capture.id,
+                target: capture.target.clone(),
+                action_x,
+                action_y,
+                native_action_dimensions: capture.native_action_dimensions,
+                digest: capture.digest,
+            },
+            encoded_dimensions: capture.encoded_dimensions,
+            action_to_x,
+            action_to_y,
+        };
+        // No endpoint can be admitted separately or consume on validation failure.
+        if capture.lifetime == CaptureLifetime::OneShot {
+            self.remove_capture(&mut inner, request.capture_id);
+        }
         Ok(admission)
     }
 
@@ -930,7 +1147,7 @@ impl CaptureRegistry {
         if inner
             .captures
             .get(&id)
-            .is_some_and(|capture| capture.expires_at <= now)
+            .is_some_and(|capture| capture.expires_at.is_some_and(|expiry| expiry <= now))
         {
             self.remove_capture(&mut inner, id);
             self.remember_expired(&mut inner, id);
@@ -948,6 +1165,9 @@ impl CaptureRegistry {
         }
         if capture.target != *target {
             return Err(CaptureLookupError::TargetMismatch);
+        }
+        if consume && capture.lifetime.is_window_observation() {
+            return Err(CaptureLookupError::WindowFrameRequired);
         }
         let capture = capture.clone();
         if consume {
@@ -969,7 +1189,7 @@ impl CaptureRegistry {
         if inner
             .captures
             .get(&id)
-            .is_some_and(|capture| capture.expires_at <= now)
+            .is_some_and(|capture| capture.expires_at.is_some_and(|expiry| expiry <= now))
         {
             self.remove_capture(&mut inner, id);
             self.remember_expired(&mut inner, id);
@@ -995,6 +1215,26 @@ impl CaptureRegistry {
 
     pub fn retire_runtime(&self, runtime_generation: u64) -> usize {
         self.retire_matching(|capture| capture.binding.runtime_generation == runtime_generation)
+    }
+
+    fn retire_window_observations(&self, binding: &CaptureBinding) -> usize {
+        self.retire_matching(|capture| {
+            capture.binding == *binding && capture.lifetime.is_window_observation()
+        })
+    }
+
+    fn refresh_window_observation(
+        &self,
+        binding: &CaptureBinding,
+        current_frame: NativeWindowFrame,
+    ) -> usize {
+        self.retire_matching(|capture| {
+            capture.binding == *binding
+                && matches!(
+                    capture.lifetime,
+                    CaptureLifetime::WindowObservation(recorded) if recorded != current_frame
+                )
+        })
     }
 
     /// Drop all registry-owned references whose TTL has elapsed.
@@ -1037,6 +1277,14 @@ impl CaptureRegistry {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.retire_matching_locked(&mut inner, matches)
+    }
+
+    fn retire_matching_locked(
+        &self,
+        inner: &mut RegistryInner,
+        matches: impl Fn(&StoredCapture) -> bool,
+    ) -> usize {
         let ids = inner
             .insertion_order
             .iter()
@@ -1044,7 +1292,7 @@ impl CaptureRegistry {
             .filter(|id| inner.captures.get(id).is_some_and(&matches))
             .collect::<Vec<_>>();
         for id in &ids {
-            self.remove_capture(&mut inner, *id);
+            self.remove_capture(inner, *id);
         }
         ids.len()
     }
@@ -1058,7 +1306,7 @@ impl CaptureRegistry {
                 inner
                     .captures
                     .get(id)
-                    .is_some_and(|capture| capture.expires_at <= now)
+                    .is_some_and(|capture| capture.expires_at.is_some_and(|expiry| expiry <= now))
             })
             .collect::<Vec<_>>();
         let mut outcome = PruneOutcome::default();
@@ -1107,7 +1355,7 @@ impl CaptureRegistry {
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Runtime-owned facade for immutable capture publication, perception reads,
-/// and one-shot action admission.
+/// and admission under each capture's explicit lifetime.
 pub struct CaptureService {
     runtime_generation: u64,
     registry: CaptureRegistry,
@@ -1192,6 +1440,39 @@ impl CaptureService {
         })
     }
 
+    /// Commit a reusable window observation, replacing prior window
+    /// observations of this exact runtime/session binding in one transaction.
+    /// Ordinary captures and other bindings retain their usual lifecycle and
+    /// all entries remain subject to the existing storage limits.
+    ///
+    /// The caller supplies an already-authorized image and a trusted native
+    /// frame from that observation. This method grants no Host permission and
+    /// does not infer full-window geometry from cropped action dimensions.
+    ///
+    /// # Errors
+    /// Rejects a target that differs from the supplied frame or any invalid
+    /// image, transform, binding or exhausted ID. Failure leaves prior window
+    /// observations in place.
+    pub fn publish_window_observation(
+        &self,
+        publication: CapturePublication,
+        frame: NativeWindowFrame,
+    ) -> Result<CaptureId, CaptureStoreError> {
+        let binding = self.binding(publication.session_id, publication.session_generation)?;
+        self.registry.store_window_observation(
+            CaptureRegistration {
+                encoded_bytes: publication.encoded_bytes,
+                codec: publication.codec,
+                target: publication.target,
+                encoded_dimensions: publication.encoded_dimensions,
+                native_action_dimensions: publication.native_action_dimensions,
+                screenshot_to_action: publication.screenshot_to_action,
+                binding,
+            },
+            frame,
+        )
+    }
+
     pub fn parse_capture_id(&self, value: &str) -> Result<CaptureId, CaptureIdParseError> {
         value.parse()
     }
@@ -1209,6 +1490,69 @@ impl CaptureService {
         request: CaptureActionRequest,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
         self.registry.admit_action(request)
+    }
+
+    /// Validate both drag endpoints and consume their capture in one transaction.
+    ///
+    /// # Errors
+    /// Rejects stale/foreign captures, a changed live frame, or either invalid
+    /// point. A point or frame refusal leaves a live capture unconsumed.
+    pub fn admit_drag(
+        &self,
+        request: CaptureDragRequest,
+    ) -> Result<CaptureDragAdmission, CaptureActionError> {
+        self.registry.admit_drag(request)
+    }
+
+    /// Admit a window action against an independently observed current frame.
+    /// Window observations remain reusable; ordinary captures consume once.
+    /// Native adapters must still revalidate the frame immediately before
+    /// input. This admission does not execute input or grant permission.
+    ///
+    /// # Errors
+    /// Rejects an unknown, expired or foreign capture, changed full window
+    /// frame or action dimensions, or an invalid screenshot point.
+    pub fn admit_window_action(
+        &self,
+        request: CaptureActionRequest,
+        current_frame: NativeWindowFrame,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.registry
+            .admit_action_in_frame(request, Some(current_frame))
+    }
+
+    /// Validate both endpoints together against one current full window frame.
+    /// Window observations remain reusable; ordinary captures consume once.
+    ///
+    /// # Errors
+    /// Rejects the same stale/foreign/frame conditions as
+    /// [`Self::admit_window_action`], or either invalid endpoint. Refusal never
+    /// consumes a live capture or admits either endpoint separately.
+    pub fn admit_window_drag(
+        &self,
+        request: CaptureDragRequest,
+        current_frame: NativeWindowFrame,
+    ) -> Result<CaptureDragAdmission, CaptureActionError> {
+        self.registry
+            .admit_drag_in_frame(request, Some(current_frame))
+    }
+
+    /// Retire only window observations of this exact binding, for example when
+    /// a state observation deliberately omits screenshots. No grant is changed.
+    pub fn retire_window_observations(&self, binding: &CaptureBinding) -> usize {
+        self.registry.retire_window_observations(binding)
+    }
+
+    /// Invalidate retained observations of this binding whose exact target or
+    /// full native rectangle differs from the supplied trusted current frame.
+    /// Matching observations, ordinary captures and other bindings are kept.
+    pub fn refresh_window_observation(
+        &self,
+        binding: &CaptureBinding,
+        current_frame: NativeWindowFrame,
+    ) -> usize {
+        self.registry
+            .refresh_window_observation(binding, current_frame)
     }
 
     /// Predict, without consuming anything, whether a capture-bound action
@@ -2005,6 +2349,157 @@ mod tests {
         }
     }
 
+    fn observation_frame() -> NativeWindowFrame {
+        NativeWindowFrame::try_new(7, 9, [-40, 12, 122, 70]).unwrap()
+    }
+
+    fn observation_publication(
+        binding: &CaptureBinding,
+        frame: NativeWindowFrame,
+        value: u8,
+    ) -> CapturePublication {
+        let encoded_dimensions = EncodedScreenshotDimensions::new(2, 2).unwrap();
+        // This deliberately represents a cropped action frame. A real full
+        // window is independent metadata, not guessed from these dimensions.
+        let native_action_dimensions = NativeActionDimensions::new(6, 4).unwrap();
+        CapturePublication {
+            encoded_bytes: png(2, 2, value),
+            codec: ScreenshotCodec::Png,
+            target: CaptureTarget::Window {
+                pid: frame.pid(),
+                window_id: frame.window_id(),
+            },
+            encoded_dimensions,
+            native_action_dimensions,
+            screenshot_to_action: ScreenshotToActionTransform::from_dimensions(
+                encoded_dimensions,
+                native_action_dimensions,
+            ),
+            session_id: Arc::from(binding.session_id()),
+            session_generation: binding.session_generation(),
+        }
+    }
+
+    fn observation_request(
+        id: CaptureId,
+        binding: &CaptureBinding,
+        frame: NativeWindowFrame,
+    ) -> CaptureActionRequest {
+        let mut request = action_request(
+            id,
+            binding.clone(),
+            CaptureTarget::Window {
+                pid: frame.pid(),
+                window_id: frame.window_id(),
+            },
+            (6, 4),
+        );
+        request.screenshot_x = 1.0;
+        request.screenshot_y = 1.0;
+        request
+    }
+
+    #[test]
+    fn window_observation_id_repeats_on_the_same_native_frame() {
+        let service = CaptureService::new(config(8, 100_000)).unwrap();
+        let owner = service.current_binding("raw-owner").unwrap();
+        let frame = observation_frame();
+        let id = service
+            .publish_window_observation(observation_publication(&owner, frame, 31), frame)
+            .unwrap();
+        for _ in 0..2 {
+            let admitted = service
+                .admit_window_action(observation_request(id, &owner, frame), frame)
+                .unwrap();
+            assert_eq!(admitted.capture_id, id);
+            assert_eq!((admitted.action_x, admitted.action_y), (3.0, 2.0));
+            let drag = service
+                .admit_window_drag(
+                    CaptureDragRequest {
+                        from: observation_request(id, &owner, frame),
+                        to_x: 0.0,
+                        to_y: 0.0,
+                    },
+                    frame,
+                )
+                .unwrap();
+            assert_eq!(drag.from.capture_id, id);
+            assert_eq!((drag.from.action_x, drag.from.action_y), (3.0, 2.0));
+            assert_eq!((drag.action_to_x, drag.action_to_y), (0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn window_observation_refuses_a_changed_native_frame_without_consuming_id() {
+        let service = CaptureService::new(config(8, 100_000)).unwrap();
+        let owner = service.current_binding("raw-owner").unwrap();
+        let frame = observation_frame();
+        let id = service
+            .publish_window_observation(observation_publication(&owner, frame, 32), frame)
+            .unwrap();
+        let moved = NativeWindowFrame::try_new(7, 9, [-39, 12, 122, 70]).unwrap();
+        assert_eq!(
+            service
+                .admit_window_action(observation_request(id, &owner, frame), moved)
+                .unwrap_err(),
+            CaptureActionError::NativeActionFrameMismatch
+        );
+        assert_eq!(
+            service
+                .admit_window_action(observation_request(id, &owner, frame), frame)
+                .unwrap()
+                .capture_id,
+            id
+        );
+    }
+
+    #[test]
+    fn drag_admits_both_endpoints_only_after_the_second_point_is_valid() {
+        let service = CaptureService::new(config(4, 100_000)).unwrap();
+        let target = CaptureTarget::Window {
+            pid: 42,
+            window_id: 7,
+        };
+        let owner = service.binding("drag-owner", 1).unwrap();
+        let id = service
+            .publish(CapturePublication {
+                encoded_bytes: png(2, 2, 5),
+                codec: ScreenshotCodec::Png,
+                target: target.clone(),
+                encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                native_action_dimensions: NativeActionDimensions::new(6, 4).unwrap(),
+                screenshot_to_action: ScreenshotToActionTransform::from_dimensions(
+                    EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                    NativeActionDimensions::new(6, 4).unwrap(),
+                ),
+                session_id: Arc::from("drag-owner"),
+                session_generation: 1,
+            })
+            .unwrap();
+        let request = || CaptureDragRequest {
+            from: action_request(id, owner.clone(), target.clone(), (6, 4)),
+            to_x: 2.0,
+            to_y: 0.0,
+        };
+        assert_eq!(
+            service.admit_drag(request()).unwrap_err(),
+            CaptureActionError::InvalidScreenshotPoint
+        );
+        let mut valid = request();
+        valid.to_x = 1.0;
+        valid.to_y = 1.0;
+        let admitted = service.admit_drag(valid).unwrap();
+        assert_eq!(admitted.from.capture_id, id);
+        assert_eq!((admitted.from.action_x, admitted.from.action_y), (1.5, 1.0));
+        assert_eq!((admitted.action_to_x, admitted.action_to_y), (3.0, 2.0));
+        assert_eq!(
+            service
+                .admit_action(action_request(id, owner, target, (6, 4)))
+                .unwrap_err(),
+            CaptureActionError::Lookup(CaptureLookupError::Unknown)
+        );
+    }
+
     #[test]
     fn service_owns_session_generation_and_advances_it_on_retirement() {
         let service = CaptureService::new(config(4, 10_000)).unwrap();
@@ -2080,6 +2575,10 @@ mod tests {
             (
                 CaptureActionError::Lookup(CaptureLookupError::TargetMismatch),
                 "capture_target_mismatch",
+            ),
+            (
+                CaptureActionError::Lookup(CaptureLookupError::WindowFrameRequired),
+                "capture_frame_required",
             ),
             (
                 CaptureActionError::InvalidScreenshotPoint,

@@ -110,6 +110,10 @@ impl RuntimeOptions {
 pub(crate) enum CoordinateFrame {
     Screenshot,
     NativeWindow,
+    #[cfg(target_os = "windows")]
+    NativeWindowFrame(cua_driver_core::tool::NativeWindowFrame),
+    #[cfg(target_os = "windows")]
+    RawWindowsObservation,
 }
 
 pub(crate) struct RuntimeSession {
@@ -344,6 +348,14 @@ impl RuntimeSession {
             }
             CoordinateFrame::NativeWindow => {
                 cua_driver_core::tool::TrustedInvocationEvidence::native_window_pixels()
+            }
+            #[cfg(target_os = "windows")]
+            CoordinateFrame::NativeWindowFrame(frame) => {
+                cua_driver_core::tool::TrustedInvocationEvidence::native_window_frame(frame)
+            }
+            #[cfg(target_os = "windows")]
+            CoordinateFrame::RawWindowsObservation => {
+                cua_driver_core::tool::TrustedInvocationEvidence::raw_windows_observation()
             }
         };
         let result = self

@@ -41,6 +41,16 @@ pub(crate) fn directional_deltas(direction: &str, pixels: f64) -> Result<(i32, i
     }
 }
 
+/// Preserve the Windows raw client's signed two-axis request in one wheel batch.
+/// Its Y coordinate convention is opposite to the Win32 vertical wheel sign.
+#[cfg(target_os = "windows")]
+pub(crate) fn signed_deltas(scroll_x: f64, scroll_y: f64) -> Result<(i32, i32), &'static str> {
+    Ok((
+        js_round_i32(scroll_x)?,
+        js_round_i32(scroll_y)?.wrapping_neg(),
+    ))
+}
+
 /// One native submission, with vertical before horizontal and no detent scale.
 pub(crate) fn wheel_packets(delta_x: i32, delta_y: i32) -> Vec<WheelPacket> {
     [(delta_y, false), (delta_x, true)]

@@ -541,6 +541,9 @@ fn map_capture_error(cause: CaptureLookupError) -> VisualParseError {
         }
         CaptureLookupError::Expired => VisualParseErrorCode::CaptureExpired,
         CaptureLookupError::GenerationMismatch => VisualParseErrorCode::CaptureGenerationMismatch,
+        // Read-only capture lookup does not produce this action-only error;
+        // keep the shared enum mapping honest if it crosses that boundary.
+        CaptureLookupError::WindowFrameRequired => VisualParseErrorCode::InvalidFrame,
     };
     error(code, cause.to_string(), false, None)
 }

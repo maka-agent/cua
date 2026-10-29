@@ -19,9 +19,11 @@ use cua_driver_contract::{
     ToolOutput, TypeTextInput, VerifyStateInput, VerifyStateOutput, WindowStateOutput,
 };
 use cua_driver_core::daemon::{
-    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin, is_daemon_listening,
-    request_daemon_metadata, send_request, socket_path_for_namespace,
+    is_daemon_listening, request_daemon_metadata, send_request, socket_path_for_namespace,
+    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin,
 };
+/// Physical coordinate refinement for trusted Rust Windows hosts.
+pub use cua_driver_core::tool::NativeWindowFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
@@ -50,8 +52,8 @@ pub use cursor_motion::*;
 pub use embedded::*;
 use remote::{DriverEnvelopeChannel, RemoteBoundSession, RemoteDriverClient};
 pub use remote_mcp::{
-    DriverServiceHeader, DriverServiceRequest, DriverServiceResponse, DriverServiceTransport,
-    DriverServiceTransportError, McpDriverChannel, open_mcp_driver_channel,
+    open_mcp_driver_channel, DriverServiceHeader, DriverServiceRequest, DriverServiceResponse,
+    DriverServiceTransport, DriverServiceTransportError, McpDriverChannel,
 };
 use runtime::RuntimeOptions;
 use service_session::ServiceSessionClient;
@@ -72,8 +74,8 @@ pub fn configure_perception_client_resolver(
     let _ = PERCEPTION_CLIENT_RESOLVER.set(resolver);
 }
 
-pub(crate) fn configured_perception_client()
--> cua_driver_core::perception_client::PerceptionClientHandle {
+pub(crate) fn configured_perception_client(
+) -> cua_driver_core::perception_client::PerceptionClientHandle {
     use cua_driver_core::perception_client::{PerceptionClient, PerceptionClientHandle};
     PERCEPTION_CLIENT_RESOLVER.get().map_or_else(
         || PerceptionClientHandle::fixed(PerceptionClient::unavailable()),
@@ -1818,6 +1820,46 @@ impl CuaDriverSession {
         )
         .await
     }
+    /// Refine native window pixels with the exact physical frame measured by
+    /// the trusted host. Absent from generated SDK/agent protocol surfaces.
+    pub async fn call_tool_with_native_window_frame_and_windows_interruption(
+        &self,
+        name: String,
+        arguments_json: String,
+        frame: cua_driver_core::tool::NativeWindowFrame,
+        binding: Arc<WindowsInterruptionBinding>,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = parse_arguments(&name, &arguments_json)?;
+        validate_native_window_pixel_call(&name, &arguments)?;
+        validate_native_window_frame_call(&name, &arguments, frame)?;
+        self.invoke_windows_interruption(
+            &name,
+            arguments,
+            binding,
+            runtime::CoordinateFrame::NativeWindowFrame(frame),
+        )
+        .await
+    }
+
+    /// Observe one raw native Windows target using its source-derived ID
+    /// lifetime. Geometry and capture IDs remain bound to this admitted native
+    /// producer. This is not available through generated SDK/Node APIs.
+    pub async fn observe_raw_window_with_windows_interruption(
+        &self,
+        arguments_json: String,
+        binding: Arc<WindowsInterruptionBinding>,
+    ) -> Result<ToolResult, DriverError> {
+        let arguments = parse_arguments("get_window_state", &arguments_json)?;
+        validate_raw_window_observation(&arguments)?;
+        self.invoke_windows_interruption(
+            "get_window_state",
+            arguments,
+            binding,
+            runtime::CoordinateFrame::RawWindowsObservation,
+        )
+        .await
+    }
+
     async fn invoke_windows_interruption(
         &self,
         name: &str,
@@ -2321,6 +2363,51 @@ impl CuaDriverSession {
         };
         normalize_result(name, raw)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn validate_raw_window_observation(args: &Value) -> Result<(), DriverError> {
+    let target = args.get("target").unwrap_or(args);
+    if target
+        .get("pid")
+        .and_then(Value::as_u64)
+        .is_none_or(|pid| pid == 0 || pid > u64::from(u32::MAX))
+        || target
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .is_none_or(|id| id == 0)
+        || target
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "window")
+        || args.get("scope").and_then(Value::as_str) == Some("desktop")
+        || args.get("display_only").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(DriverError::Protocol {
+            reason: "raw native observation requires an exact window target".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn validate_native_window_frame_call(
+    name: &str,
+    args: &Value,
+    frame: NativeWindowFrame,
+) -> Result<(), DriverError> {
+    validate_native_window_pixel_call(name, args)?;
+    let target = args.get("target").unwrap_or(args);
+    if target.get("pid").and_then(Value::as_u64) != Some(u64::from(frame.pid()))
+        || target.get("window_id").and_then(Value::as_u64) != Some(frame.window_id())
+        || args.get("delivery_mode").and_then(Value::as_str) != Some("foreground")
+    {
+        return Err(DriverError::Protocol {
+            reason: "native window frame requires the exact actual foreground coordinate call"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_native_window_pixel_call(name: &str, args: &Value) -> Result<(), DriverError> {
@@ -3596,11 +3683,9 @@ mod tests {
             authorization_host: None,
             activity_observer: None,
         });
-        assert!(
-            inventory["tools"]
-                .as_array()
-                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click"))
-        );
+        assert!(inventory["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click")));
 
         let driver = CuaDriver::create(None).unwrap();
         driver.shutdown().await.unwrap();
@@ -4840,11 +4925,9 @@ mod tests {
         let driver = CuaDriver::connect_remote(Arc::new(LegacyRemoteChannel)).unwrap();
         let error = driver.metadata().await.unwrap_err();
         assert!(matches!(error, DriverError::Protocol { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("does not support request cancellation")
-        );
+        assert!(error
+            .to_string()
+            .contains("does not support request cancellation"));
     }
 
     struct CancellableRemoteChannel {
@@ -4932,7 +5015,9 @@ mod native_desktop_boundary_tests {
         tool::{Tool, ToolDef, ToolRegistry},
     };
     use platform_linux::input::native_desktop::NativeDesktopRequest;
-    use platform_linux::input::native_window_action::{NativeWindowAction, NativeWindowActionRequest};
+    use platform_linux::input::native_window_action::{
+        NativeWindowAction, NativeWindowActionRequest,
+    };
 
     struct RefusingProbe {
         name: &'static str,
@@ -5092,25 +5177,66 @@ mod native_desktop_boundary_tests {
             }
         }
         for action in [
-            NativeWindowAction::Move { point: [-17, 31], key: Some("CTRL+SHIFT".into()) },
-            NativeWindowAction::Click { point: [i16::MIN, i16::MAX], button: cua_driver_contract::ClickButton::Middle,
-                count: 0, duration_ms: u64::MAX, key: Some("Alt++".into()) },
-            NativeWindowAction::Scroll { x: Some(-1), y: None,
-                direction: cua_driver_contract::ScrollDirection::Down, pixels: 0, key: None },
-            NativeWindowAction::PressKey { key: "F20".into(), duration_ms: 0 },
-            NativeWindowAction::Drag { path: vec![[0,0],[1,1],[-3,-1]], key: Some("Ctrl".into()) },
-            NativeWindowAction::TypeText { text: "window 世界 🦀\n\0__CUA_PROTOCOL_END__".into() },
-            NativeWindowAction::TypeTextElement { text: "element 世界 🦀\n\0__CUA_PROTOCOL_END__".into(), element_id: "fixture-opaque-native-id".into() },
-            NativeWindowAction::SecondaryAction { action: " Expanded ".into(), element_id: "fixture-opaque-native-id".into() },
-            NativeWindowAction::ScrollElement { element_id: "fixture-opaque-native-id".into(),
-                direction: cua_driver_contract::ScrollDirection::Right, pixels: 0, key: Some("CTRL+SHIFT".into()) },
+            NativeWindowAction::Move {
+                point: [-17, 31],
+                key: Some("CTRL+SHIFT".into()),
+            },
+            NativeWindowAction::Click {
+                point: [i16::MIN, i16::MAX],
+                button: cua_driver_contract::ClickButton::Middle,
+                count: 0,
+                duration_ms: u64::MAX,
+                key: Some("Alt++".into()),
+            },
+            NativeWindowAction::Scroll {
+                x: Some(-1),
+                y: None,
+                direction: cua_driver_contract::ScrollDirection::Down,
+                pixels: 0,
+                key: None,
+            },
+            NativeWindowAction::PressKey {
+                key: "F20".into(),
+                duration_ms: 0,
+            },
+            NativeWindowAction::Drag {
+                path: vec![[0, 0], [1, 1], [-3, -1]],
+                key: Some("Ctrl".into()),
+            },
+            NativeWindowAction::TypeText {
+                text: "window 世界 🦀\n\0__CUA_PROTOCOL_END__".into(),
+            },
+            NativeWindowAction::TypeTextElement {
+                text: "element 世界 🦀\n\0__CUA_PROTOCOL_END__".into(),
+                element_id: "fixture-opaque-native-id".into(),
+            },
+            NativeWindowAction::SecondaryAction {
+                action: " Expanded ".into(),
+                element_id: "fixture-opaque-native-id".into(),
+            },
+            NativeWindowAction::ScrollElement {
+                element_id: "fixture-opaque-native-id".into(),
+                direction: cua_driver_contract::ScrollDirection::Right,
+                pixels: 0,
+                key: Some("CTRL+SHIFT".into()),
+            },
         ] {
-            let request = NativeDesktopRequest::Window { request: NativeWindowActionRequest {
-                pid: 42, window_id: 7, action,
-            }};
+            let request = NativeDesktopRequest::Window {
+                request: NativeWindowActionRequest {
+                    pid: 42,
+                    window_id: 7,
+                    action,
+                },
+            };
             let expected = request.arguments();
-            assert!(expected.get("element_id").is_none(), "selector must not enter public tool arguments");
-            assert!(!request.recording_input().to_string().contains("fixture-opaque-native-id"));
+            assert!(
+                expected.get("element_id").is_none(),
+                "selector must not enter public tool arguments"
+            );
+            assert!(!request
+                .recording_input()
+                .to_string()
+                .contains("fixture-opaque-native-id"));
             if expected.get("action").is_some() {
                 assert_eq!(request.recording_input()["action"], "[redacted]");
             }
@@ -5119,20 +5245,35 @@ mod native_desktop_boundary_tests {
                 ("pid", serde_json::json!(43)),
                 ("window_id", serde_json::json!(8)),
                 ("delivery_mode", serde_json::json!("foreground")),
-                ("element_id", serde_json::json!("untrusted-selector-in-JSON")),
+                (
+                    "element_id",
+                    serde_json::json!("untrusted-selector-in-JSON"),
+                ),
                 ("action", serde_json::json!("changed secondary action")),
             ] {
-                let mut changed = expected.clone(); changed[field] = value;
-                assert!(matches!(binding.invoke_native_desktop(changed, owner.service.clone(), request.clone()).await,
-                    Err(DriverError::Protocol { reason }) if reason == "native desktop arguments changed"));
+                let mut changed = expected.clone();
+                changed[field] = value;
+                assert!(
+                    matches!(binding.invoke_native_desktop(changed, owner.service.clone(), request.clone()).await,
+                    Err(DriverError::Protocol { reason }) if reason == "native desktop arguments changed")
+                );
             }
-            assert!(matches!(other.input_native_desktop(&owner, request.clone()).await,
-                Err(DriverError::Protocol { reason }) if reason == "native desktop input owner belongs to another SDK binding"));
+            assert!(
+                matches!(other.input_native_desktop(&owner, request.clone()).await,
+                Err(DriverError::Protocol { reason }) if reason == "native desktop input owner belongs to another SDK binding")
+            );
             let result = first.input_native_desktop(&owner, request).await.unwrap();
-            assert!(result.is_error, "window probe must never claim native input or clipboard success");
+            assert!(
+                result.is_error,
+                "window probe must never claim native input or clipboard success"
+            );
             let received: Value = serde_json::from_str(&result.text).unwrap();
             for (field, value) in expected.as_object().unwrap() {
-                assert_eq!(received.get(field), Some(value), "native window field {field}");
+                assert_eq!(
+                    received.get(field),
+                    Some(value),
+                    "native window field {field}"
+                );
             }
             assert_eq!(received["scope"], "window");
             assert_eq!(received["delivery_mode"], "background");

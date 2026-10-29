@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use cua_driver_core::capture_runtime::{
-    CaptureActionRequest, CapturePublication, CaptureService, CaptureTarget,
-    EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotCodec,
-    ScreenshotToActionTransform,
+    CaptureActionError, CaptureActionRequest, CaptureDragRequest, CaptureLookupError,
+    CapturePublication, CaptureService, CaptureTarget, EncodedScreenshotDimensions,
+    NativeActionDimensions, ScreenshotCodec, ScreenshotToActionTransform,
 };
+use cua_driver_core::tool::NativeWindowFrame;
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,8 +29,6 @@ pub(crate) struct CaptureGeometry {
     pub encoded_height: u32,
     pub native_width: u32,
     pub native_height: u32,
-    pub scale_x: f64,
-    pub scale_y: f64,
 }
 
 impl CaptureGeometry {
@@ -48,8 +47,6 @@ impl CaptureGeometry {
             encoded_height,
             native_width,
             native_height,
-            scale_x: f64::from(native_width) / f64::from(encoded_width),
-            scale_y: f64::from(native_height) / f64::from(encoded_height),
         })
     }
 }
@@ -87,14 +84,10 @@ impl WindowsCaptureBridge {
             EncodedScreenshotDimensions::new(geometry.encoded_width, geometry.encoded_height)?;
         let native_action_dimensions =
             NativeActionDimensions::new(geometry.native_width, geometry.native_height)?;
-        let screenshot_to_action = ScreenshotToActionTransform::new(
-            geometry.scale_x,
-            0.0,
-            0.0,
-            geometry.scale_y,
-            0.0,
-            0.0,
-        )?;
+        let screenshot_to_action = ScreenshotToActionTransform::from_dimensions(
+            encoded_dimensions,
+            native_action_dimensions,
+        );
         let capture_id = self.service.publish(CapturePublication {
             encoded_bytes: png_bytes,
             codec: ScreenshotCodec::Png,
@@ -108,6 +101,92 @@ impl WindowsCaptureBridge {
         Ok(Some(capture_id.to_string()))
     }
 
+    /// Refresh only the raw observation records of this existing binding.
+    /// The caller supplies geometry obtained from the actual native window.
+    pub(crate) fn refresh_window_observation(
+        &self,
+        args: &Value,
+        frame: NativeWindowFrame,
+    ) -> anyhow::Result<()> {
+        let binding = self.service.binding_from_args(args)?;
+        self.service.refresh_window_observation(&binding, frame);
+        Ok(())
+    }
+
+    pub(crate) fn retire_window_observations(&self, args: &Value) -> anyhow::Result<()> {
+        let binding = self.service.binding_from_args(args)?;
+        self.service.retire_window_observations(&binding);
+        Ok(())
+    }
+
+    pub(crate) fn publish_window_observation(
+        &self,
+        args: &Value,
+        png: Vec<u8>,
+        target: WindowsCaptureTarget,
+        geometry: CaptureGeometry,
+        frame: NativeWindowFrame,
+    ) -> anyhow::Result<Option<String>> {
+        anyhow::ensure!(
+            live_window_frame(target)? == frame,
+            "window bounds changed during observation"
+        );
+        let binding = self.service.binding_from_args(args)?;
+        let encoded =
+            EncodedScreenshotDimensions::new(geometry.encoded_width, geometry.encoded_height)?;
+        let native = NativeActionDimensions::new(geometry.native_width, geometry.native_height)?;
+        let id = self.service.publish_window_observation(
+            CapturePublication {
+                encoded_bytes: png,
+                codec: ScreenshotCodec::Png,
+                target: target.core(),
+                encoded_dimensions: encoded,
+                native_action_dimensions: native,
+                screenshot_to_action: ScreenshotToActionTransform::from_dimensions(encoded, native),
+                session_id: binding.session_id().into(),
+                session_generation: binding.session_generation(),
+            },
+            frame,
+        )?;
+        Ok(Some(id.to_string()))
+    }
+
+    /// Inert expected-frame metadata for the same capture. Actual action
+    /// admission and the final owned-worker check remain mandatory.
+    pub(crate) fn action_frame(
+        &self,
+        args: &Value,
+        target: WindowsCaptureTarget,
+    ) -> anyhow::Result<Option<NativeWindowFrame>> {
+        let Some(id) = args.get("capture_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let binding = self.service.binding_from_args(args)?;
+        let id = id.parse()?;
+        let mut capture = self
+            .service
+            .read_for_perception(id, &binding)
+            .map_err(CaptureActionError::Lookup)?;
+        // The old one-shot surface has no full-window-record obligation.
+        // Only a real raw observation requires the stronger retained-frame
+        // probe; never impose its visible/titled lookup on ordinary captures.
+        if capture.window_observation_frame().is_some() {
+            let WindowsCaptureTarget::Window { .. } = target else {
+                return Err(CaptureActionError::Lookup(CaptureLookupError::TargetMismatch).into());
+            };
+            self.service
+                .refresh_window_observation(&binding, live_window_frame(target)?);
+            capture = self
+                .service
+                .read_for_perception(id, &binding)
+                .map_err(CaptureActionError::Lookup)?;
+        }
+        if capture.target() != &target.core() {
+            return Err(CaptureActionError::Lookup(CaptureLookupError::TargetMismatch).into());
+        }
+        Ok(capture.window_observation_frame())
+    }
+
     pub(crate) fn admit_click(
         &self,
         args: &Value,
@@ -119,22 +198,100 @@ impl WindowsCaptureBridge {
             return Ok(None);
         }
         let current_geometry = live_geometry(target)?;
-        self.admit_click_with_geometry(args, target, current_geometry, screenshot_x, screenshot_y)
+        let frame = self.action_frame(args, target)?;
+        self.admit_click_with_frame(
+            args,
+            target,
+            current_geometry,
+            screenshot_x,
+            screenshot_y,
+            frame,
+        )
     }
 
+    pub(crate) fn admit_drag(
+        &self,
+        args: &Value,
+        target: WindowsCaptureTarget,
+        from: (f64, f64),
+        to: (f64, f64),
+    ) -> anyhow::Result<Option<[(f64, f64); 2]>> {
+        if args.get("capture_id").and_then(Value::as_str).is_none() {
+            return Ok(None);
+        }
+        let current_geometry = live_geometry(target)?;
+        let frame = self.action_frame(args, target)?;
+        self.admit_drag_with_frame(args, target, current_geometry, from, to, frame)
+    }
+
+    fn admit_drag_with_frame(
+        &self,
+        args: &Value,
+        target: WindowsCaptureTarget,
+        current_geometry: CaptureGeometry,
+        from: (f64, f64),
+        to: (f64, f64),
+        frame: Option<NativeWindowFrame>,
+    ) -> anyhow::Result<Option<[(f64, f64); 2]>> {
+        let Some(capture_id) = args.get("capture_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let binding = self.service.binding_from_args(args)?;
+        let request = CaptureDragRequest {
+            from: CaptureActionRequest {
+                capture_id: capture_id.parse()?,
+                binding,
+                target: target.core(),
+                current_native_action_dimensions: NativeActionDimensions::new(
+                    current_geometry.native_width,
+                    current_geometry.native_height,
+                )?,
+                screenshot_x: from.0,
+                screenshot_y: from.1,
+            },
+            to_x: to.0,
+            to_y: to.1,
+        };
+        let admission = match frame {
+            Some(frame) => {
+                self.service
+                    .refresh_window_observation(&request.from.binding, frame);
+                self.service.admit_window_drag(request, frame)?
+            }
+            None => self.service.admit_drag(request)?,
+        };
+        Ok(Some([
+            (admission.from.action_x, admission.from.action_y),
+            (admission.action_to_x, admission.action_to_y),
+        ]))
+    }
+
+    #[cfg(test)]
     fn admit_click_with_geometry(
+        &self,
+        args: &Value,
+        target: WindowsCaptureTarget,
+        geometry: CaptureGeometry,
+        x: f64,
+        y: f64,
+    ) -> anyhow::Result<Option<(f64, f64)>> {
+        self.admit_click_with_frame(args, target, geometry, x, y, None)
+    }
+
+    fn admit_click_with_frame(
         &self,
         args: &Value,
         target: WindowsCaptureTarget,
         current_geometry: CaptureGeometry,
         screenshot_x: f64,
         screenshot_y: f64,
+        frame: Option<NativeWindowFrame>,
     ) -> anyhow::Result<Option<(f64, f64)>> {
         let Some(capture_id) = args.get("capture_id").and_then(Value::as_str) else {
             return Ok(None);
         };
         let binding = self.service.binding_from_args(args)?;
-        let admission = self.service.admit_action(CaptureActionRequest {
+        let request = CaptureActionRequest {
             capture_id: capture_id.parse()?,
             binding,
             target: target.core(),
@@ -144,9 +301,72 @@ impl WindowsCaptureBridge {
             )?,
             screenshot_x,
             screenshot_y,
-        })?;
+        };
+        let admission = match frame {
+            Some(frame) => {
+                self.service
+                    .refresh_window_observation(&request.binding, frame);
+                self.service.admit_window_action(request, frame)?
+            }
+            None => self.service.admit_action(request)?,
+        };
         Ok(Some((admission.action_x, admission.action_y)))
     }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn live_window_frame(target: WindowsCaptureTarget) -> anyhow::Result<NativeWindowFrame> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, GetWindowThreadProcessId, IsWindow,
+    };
+    let WindowsCaptureTarget::Window { pid, window_id } = target else {
+        anyhow::bail!("retained observation requires a native window");
+    };
+    let hwnd = HWND(window_id as usize as *mut std::ffi::c_void);
+    let mut rect = RECT::default();
+    // SAFETY: all pointers reference initialized local storage. The handle is
+    // observed only; no message, activation, capture or native input is sent.
+    unsafe {
+        anyhow::ensure!(
+            IsWindow(hwnd).as_bool(),
+            "native window is no longer available"
+        );
+        let mut before = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut before));
+        anyhow::ensure!(before == pid, "native window owner changed");
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut _ as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+        {
+            GetWindowRect(hwnd, &mut rect)?;
+        }
+        let mut after = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut after));
+        anyhow::ensure!(
+            after == pid && IsWindow(hwnd).as_bool(),
+            "native window owner changed while reading bounds"
+        );
+    }
+    let width = rect
+        .right
+        .checked_sub(rect.left)
+        .ok_or_else(|| anyhow::anyhow!("native window width overflows"))?;
+    let height = rect
+        .bottom
+        .checked_sub(rect.top)
+        .ok_or_else(|| anyhow::anyhow!("native window height overflows"))?;
+    NativeWindowFrame::try_new(pid, window_id, [rect.left, rect.top, width, height])
+        .map_err(anyhow::Error::msg)
+}
+#[cfg(not(target_os = "windows"))]
+fn live_window_frame(_target: WindowsCaptureTarget) -> anyhow::Result<NativeWindowFrame> {
+    anyhow::bail!("live Windows frame validation is unavailable on this platform")
 }
 
 #[cfg(target_os = "windows")]
@@ -186,7 +406,10 @@ mod tests {
     use cua_driver_core::capture_runtime::{admission_error_code, CaptureService};
     use serde_json::json;
 
-    use super::{round_action_point, CaptureGeometry, WindowsCaptureBridge, WindowsCaptureTarget};
+    use super::{
+        round_action_point, CaptureGeometry, EncodedScreenshotDimensions, NativeActionDimensions,
+        ScreenshotToActionTransform, WindowsCaptureBridge, WindowsCaptureTarget,
+    };
 
     fn png() -> Vec<u8> {
         cua_driver_core::image_utils::encode_rgba_to_png(&[10, 20, 30, 255], 1, 1).unwrap()
@@ -219,15 +442,23 @@ mod tests {
     #[test]
     fn resized_capture_maps_each_axis_into_native_window_pixels() {
         let geometry = CaptureGeometry::new(800, 450, 1600, 900).unwrap();
-        assert_eq!(geometry.scale_x, 2.0);
-        assert_eq!(geometry.scale_y, 2.0);
+        let transform = ScreenshotToActionTransform::from_dimensions(
+            EncodedScreenshotDimensions::new(geometry.encoded_width, geometry.encoded_height)
+                .unwrap(),
+            NativeActionDimensions::new(geometry.native_width, geometry.native_height).unwrap(),
+        );
+        assert_eq!(transform.apply(100.0, 50.0), (200.0, 100.0));
     }
 
     #[test]
     fn non_uniform_dimensions_preserve_full_affine_scale() {
         let geometry = CaptureGeometry::new(640, 360, 1280, 1080).unwrap();
-        assert_eq!(geometry.scale_x, 2.0);
-        assert_eq!(geometry.scale_y, 3.0);
+        let transform = ScreenshotToActionTransform::from_dimensions(
+            EncodedScreenshotDimensions::new(geometry.encoded_width, geometry.encoded_height)
+                .unwrap(),
+            NativeActionDimensions::new(geometry.native_width, geometry.native_height).unwrap(),
+        );
+        assert_eq!(transform.apply(100.0, 50.0), (200.0, 150.0));
     }
 
     #[test]
