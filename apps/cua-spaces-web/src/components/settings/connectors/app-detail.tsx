@@ -5,6 +5,7 @@ import { Link } from "@tanstack/react-router";
 import { CheckIcon, ChevronLeftIcon, Loader2Icon } from "lucide-react";
 
 import { HarnessMark } from "@/components/agents/harness-mark";
+import { useThisAndOthers } from "@/components/agents/other-machine-block";
 import { SettingsGroup, SettingsRow } from "@/components/settings-group";
 import { Snippet } from "@/components/settings/snippet";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,7 @@ import { cn } from "@/lib/utils";
  */
 export function ConnectorAppPage({ agent }: { agent: string }) {
   const c = useConnectors();
+  const { hereName } = useThisAndOthers();
   const d = c.detail(agent);
   const back = (
     <Link to="/settings/connectors" className="-ml-1 mb-4 inline-flex items-center gap-0.5 rounded-lg px-1 py-0.5 text-[13px] text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60" data-connector-back="">
@@ -34,7 +36,7 @@ export function ConnectorAppPage({ agent }: { agent: string }) {
     return (
       <div>
         {back}
-        <p className="text-[13px] text-muted-foreground">This app isn't on this computer.</p>
+        <p className="text-[13px] text-muted-foreground">This app isn't on this machine.</p>
       </div>
     );
   }
@@ -53,6 +55,10 @@ export function ConnectorAppPage({ agent }: { agent: string }) {
             {busy ? <Loader2Icon className="size-3.5 animate-spin" /> : d.connected ? <CheckIcon className="size-3.5 text-success" /> : null}
             {d.status}
           </p>
+          {/* Connect edits the apps of this machine only: the page says which. */}
+          <p className="text-xs text-muted-foreground" data-connector-on="">
+            On {hereName}
+          </p>
           {failure ? <p className="text-[13px] text-destructive">{failure}</p> : null}
         </div>
         {d.connect ? (
@@ -62,6 +68,7 @@ export function ConnectorAppPage({ agent }: { agent: string }) {
         ) : null}
       </header>
 
+      {d.toggles.length ? (
       <SettingsGroup title={d.toolsTitle}>
         {d.toggles.map((t) => (
           <SettingsRow
@@ -73,6 +80,7 @@ export function ConnectorAppPage({ agent }: { agent: string }) {
           />
         ))}
       </SettingsGroup>
+      ) : null}
 
       <SettingsGroup title={d.signInTitle} footer={d.signIn?.way}>
         {d.signIn ? (

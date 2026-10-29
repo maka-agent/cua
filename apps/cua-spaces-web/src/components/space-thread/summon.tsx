@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 /**
- * @mentioning agents in a Space (redesign): the composer's picker offers the
+ * @mentioning agents in a Space: the composer's picker offers the
  * agents in the Space and those that can start in it; sending posts the
  * message, adds an @mentioned agent that isn't in the Space yet (asleep, so
  * the message wakes it), and, when one can't be woken, shows why under the
@@ -175,7 +175,7 @@ export function useSummon({ spaceId, thread, roster, canAdd }: { spaceId: string
   const connectors = useConnectors();
   const input: SummonInput = useMemo(
     () => ({
-      members: thread.members.map((m) => ({ handle: m.name, harness: m.harness, label: roster.agents.find((a) => a.name === m.name)?.label ?? m.name })),
+      members: thread.members.map((m) => ({ handle: m.handle ?? m.name, harness: m.harness, label: roster.agents.find((a) => a.name === m.name)?.label ?? m.name })),
       people: roster.people.map((p) => p.label.toLowerCase().replace(/\s+/g, "")),
       canAdd: canAdd && !!data && threadOpAvailable(data.mode, "thread.agentAdd"),
       connectors: connectors.input,
@@ -197,9 +197,9 @@ export function useSummon({ spaceId, thread, roster, canAdd }: { spaceId: string
   const handles = useMemo(() => new Set([...roster.handles, ...extra.map((c) => c.handle.toLowerCase())]), [roster.handles, extra]);
 
   const send = useCallback(
-    async (text: string, view: PostView | null) => {
+    async (text: string, view: PostView | null, replyTo?: number | null) => {
       if (!data) return;
-      await sendWithSummon({ core, data, spaceId, input, text, post: (t) => thread.post(t, view) });
+      await sendWithSummon({ core, data, spaceId, input, text, post: (t) => thread.post(t, view, replyTo) });
     },
     [core, data, spaceId, input, thread],
   );

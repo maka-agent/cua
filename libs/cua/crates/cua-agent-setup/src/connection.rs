@@ -184,7 +184,7 @@ pub struct ImportedSignIn {
     pub source: String,
     /// The variable a run in a Space gets it as.
     pub env: String,
-    /// "Codex · ChatGPT sign-in".
+    /// "ChatGPT sign-in for Codex".
     pub label: String,
     /// When it stops working (Unix ms), when known.
     pub expires_ms: Option<u64>,
@@ -199,6 +199,11 @@ pub struct SignInCopy {
     pub label: String,
     pub value: String,
     pub expires_ms: Option<u64>,
+    /// How it was made: `claude-login-keychain` or `claude-login-file` (read
+    /// from Claude Code's own sign-in), `device-code` (Codex), `token` (a
+    /// pasted `claude setup-token`). Fixed words; the telemetry and the
+    /// freshness check at run start read it.
+    pub origin: Option<String>,
 }
 
 impl std::fmt::Debug for SignInCopy {
@@ -209,6 +214,7 @@ impl std::fmt::Debug for SignInCopy {
             .field("label", &self.label)
             .field("value", &"<redacted>")
             .field("expires_ms", &self.expires_ms)
+            .field("origin", &self.origin)
             .finish()
     }
 }
@@ -826,9 +832,9 @@ impl AgentSetup {
         r.connected_at = crate::state::now();
     }
 
-    /// Copies `agent`'s sign-in into `vault` (Claude Code waits up to
-    /// `wait` for its one browser approval). The agent's own sign-in is
-    /// never changed.
+    /// Copies `agent`'s sign-in into `vault` (Claude Code's is the sign-in it
+    /// already has; `wait` is how long Claude Code may take to refresh it).
+    /// The agent's own sign-in is never changed.
     pub fn import_sign_in(
         &self,
         agent: &str,
@@ -848,9 +854,9 @@ impl AgentSetup {
         copy: &SignInCopy,
         vault: &dyn SignInVault,
     ) -> std::result::Result<ImportedSignIn, signin::CopyRefusal> {
-        let saved = vault.save(copy).map_err(|e| {
-            signin::CopyRefusal::Failed(format!("Connected. Sign-in not copied: {e}"))
-        })?;
+        let saved = vault
+            .save(copy)
+            .map_err(|e| signin::CopyRefusal::Failed(format!("Couldn't save the sign-in: {e}")))?;
         if let Ok(mut state) = State::load(&self.state_path) {
             let r = state.connections.entry(agent.to_string()).or_default();
             r.sign_in = Some(crate::state::SignInRecord {
@@ -976,9 +982,7 @@ impl AgentSetup {
                 None => SignInResult {
                     imported: None,
                     refused: Some("failed".into()),
-                    line: Some(
-                        "Connected. Sign-in not copied: Keyvault isn't available here.".into(),
-                    ),
+                    line: Some("Couldn't save the sign-in: Keyvault isn't available here.".into()),
                 },
                 Some(v) => match match show.as_deref_mut() {
                     Some(show) if signin::signs_in_with_a_code(a.id) => {

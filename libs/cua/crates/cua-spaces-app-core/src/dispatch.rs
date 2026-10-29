@@ -199,6 +199,7 @@ pub const METHODS: &[&str] = &[
     "connectors.view",
     "connectors.connectPlan",
     "connectors.providerSheet",
+    "connectors.importSheet",
     "connectors.appDetail",
     "connectors.setupCard",
     "summon.candidates",
@@ -266,6 +267,7 @@ pub const METHODS: &[&str] = &[
     "machines.merge",
     "machines.pageRows",
     "machines.view",
+    "machines.account",
     "devices.activityText",
     "devices.labels",
     "devices.platformName",
@@ -1002,6 +1004,11 @@ pub fn call_value(method: &str, args: Value) -> Result<Value, CoreError> {
             &a.get::<String>("provider")?,
             a.get::<Option<SpaceOs>>("hostOs")?
                 .unwrap_or(SpaceOs::Macos),
+            a.get::<Option<String>>("forApp")?.as_deref(),
+        )),
+        "connectors.importSheet" => out(connectors::import_sheet_on(
+            a.get::<Option<SpaceOs>>("hostOs")?
+                .unwrap_or(SpaceOs::Macos),
         )),
         "connectors.appDetail" => out(connectors::app_detail(
             &a.get("input")?,
@@ -1166,6 +1173,12 @@ pub fn call_value(method: &str, args: Value) -> Result<Value, CoreError> {
         "machines.view" => out(crate::machines_view::view(
             &a.get::<Option<crate::machines_view::MachinesViewInput>>("input")?
                 .unwrap_or_default(),
+        )),
+        "machines.account" => out(crate::machines_account::view(
+            &a.get::<Option<devices::DevicesInput>>("input")?
+                .unwrap_or_default(),
+            a.get::<Option<u64>>("now")?.unwrap_or(0),
+            a.get::<Option<String>>("readError")?.as_deref(),
         )),
         "devices.view" => out(devices::devices_view(
             &a.get::<Option<devices::DevicesInput>>("input")?
@@ -1724,7 +1737,7 @@ mod tests {
                 .contains("on this PC in Windows Credential Manager,")
         );
         let linux = intro(json!({ "input": input, "hostOs": "linux" }));
-        assert!(linux.contains("on this computer,") && !linux.contains("Keychain"));
+        assert!(linux.contains("on this machine,") && !linux.contains("Keychain"));
         let help = |os: Value| {
             call_value(
                 "agentKeys.form",
@@ -1742,7 +1755,7 @@ mod tests {
         assert!(help(json!("windows")).contains("in Windows Credential Manager on this PC"));
         assert_eq!(
             help(json!("linux")),
-            "It's saved on this computer and won't be shown again."
+            "It's saved on this machine and won't be shown again."
         );
     }
 

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 /**
- * Settings → Connectors (redesign) and summoning agents in a Space: the
+ * Settings → Connectors and summoning agents in a Space: the
  * app core's `connectors.*` and `summon.*` (`connectors.rs`, `summon.rs`)
  * over what the host already answers (`agents.setup`, `agentKeys.list`).
  * Every word, state and rule is the core's; this file only shapes inputs
@@ -69,6 +69,8 @@ export interface ConnectorsView {
   appsTitle: string;
   apps: ConnectorAppRow[];
   appsEmpty: string | null;
+  /** Apps that are not on this machine and cannot run as agents (under Show all, with where to get them). */
+  more: { agent: string; name: string }[];
   autoLabel: string;
   autoHelp: string;
   auto: boolean;
@@ -83,6 +85,21 @@ export interface ConnectorsView {
   addedLabel: string;
 }
 
+/** The words around importing Claude Code's sign-in (`connectors.importSheet`). */
+export interface ImportSheetView {
+  title: string;
+  lede: string;
+  /** What is read, what is kept, where it goes. */
+  points: string[];
+  confirmLabel: string;
+  cancelLabel: string;
+  readingLabel: string;
+  notFoundTitle: string;
+  notFoundLede: string;
+  /** In order: sign in with Claude Code, paste a token, use an API key. */
+  options: { id: "login" | "token" | "key"; label: string; help: string; command: string | null; button: string }[];
+}
+
 export interface ConnectPlan {
   tools: boolean;
   appToken: boolean;
@@ -92,7 +109,7 @@ export interface ConnectPlan {
 }
 
 export interface ProviderWay {
-  id: "app-token" | "app-device" | "key" | "shell";
+  id: "app-token" | "app-device" | "token" | "key" | "shell";
   label: string;
   help: string;
   button: string;
@@ -109,9 +126,15 @@ export interface ProviderSheetView {
   keyLabel: string;
   keyPlaceholder: string;
   keyHelp: string;
+  /** The field when the person picks Paste a Claude token. */
+  tokenLabel: string;
+  tokenPlaceholder: string;
   saveLabel: string;
   keyProvider: "anthropic" | "openai" | "other";
   keyEnv: string | null;
+  /** "Or choose another provider", when opened for an app that signs in with more than one. */
+  othersLabel: string | null;
+  others: { provider: string; label: string }[];
 }
 
 export interface ConnectorToggle {
@@ -181,8 +204,11 @@ export const connectorsView = (core: CoreClient, input: ConnectorsInput, os: Hos
 export const connectPlan = (core: CoreClient, input: ConnectorsInput, agent: string): ConnectPlan | null =>
   core.tryCall<ConnectPlan>("connectors.connectPlan", { input: input as unknown as Json, agent }) ?? null;
 
-export const providerSheet = (core: CoreClient, input: ConnectorsInput, provider: string, os: HostOs = hostOs()): ProviderSheetView | null =>
-  core.tryCall<ProviderSheetView | null>("connectors.providerSheet", { input: input as unknown as Json, provider, hostOs: os }) ?? null;
+export const providerSheet = (core: CoreClient, input: ConnectorsInput, provider: string, os: HostOs = hostOs(), forApp: string | null = null): ProviderSheetView | null =>
+  core.tryCall<ProviderSheetView | null>("connectors.providerSheet", { input: input as unknown as Json, provider, hostOs: os, forApp }) ?? null;
+
+export const importSheet = (core: CoreClient, os: HostOs = hostOs()): ImportSheetView | null =>
+  core.tryCall<ImportSheetView>("connectors.importSheet", { hostOs: os }) ?? null;
 
 export const appDetail = (core: CoreClient, input: ConnectorsInput, agent: string): AppDetailView | null =>
   core.tryCall<AppDetailView | null>("connectors.appDetail", { input: input as unknown as Json, agent }) ?? null;

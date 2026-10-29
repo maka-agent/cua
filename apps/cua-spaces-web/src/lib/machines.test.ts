@@ -22,9 +22,9 @@ const machine = (over: Partial<Machine>): Machine => ({
 });
 
 describe("machines", () => {
-  it("counts computers in the Computers header in the singular too", () => {
-    expect(machinesSummary(1, 1)).toBe("1 computer, 1 online");
-    expect(machinesSummary(3, 2)).toBe("3 computers, 2 online");
+  it("counts machines in the Machines header in the singular too", () => {
+    expect(machinesSummary(1, 1)).toBe("1 machine, 1 online");
+    expect(machinesSummary(3, 2)).toBe("3 machines, 2 online");
   });
 
   it("reads the OS the host reported", () => {
@@ -37,13 +37,13 @@ describe("machines", () => {
     expect(connectionLabel(machine({}))).toBe("Cua relay");
     expect(connectionLabel(machine({ connection: "direct" }))).toBe("Direct");
     expect(connectionLabel(machine({ connection: null, current: true }))).toBe("Not set up for access");
-    expect(machineSubtitle(machine({ model: "Mac mini" }))).toBe("Mac mini · Cua relay");
-    expect(machineSubtitle(machine({ os: "windows", connection: "direct" }))).toBe("Windows · Direct");
+    expect(machineSubtitle(machine({ model: "Mac mini" }))).toBe("Mac mini, Cua relay");
+    expect(machineSubtitle(machine({ os: "windows", connection: "direct" }))).toBe("Windows, Direct");
   });
 
-  it("labels a signed-in device apart from a machine's connection", () => {
-    expect(connectionLabel(machine({ connection: null, device: true }))).toBe("Signed-in device, not shared");
-    expect(machineSubtitle(machine({ os: "windows", connection: null, device: true }))).toBe("Windows · Signed-in device, not shared");
+  it("labels a signed-in machine apart from a machine's connection", () => {
+    expect(connectionLabel(machine({ connection: null, device: true }))).toBe("Signed in, not sharing");
+    expect(machineSubtitle(machine({ os: "windows", connection: null, device: true }))).toBe("Windows, Signed in, not sharing");
     expect(connectionLabel(machine({ connection: "relay", device: true }))).toBe("Cua relay");
     expect(connectionLabel(machine({ connection: null, current: true }))).toBe("Not set up for access");
     expect(connectionLabel(machine({ connection: null, current: false }))).toBe("Unknown");
@@ -80,7 +80,7 @@ describe("machines", () => {
 
   it("counts a shared desktop in the words (machines::desktop_spaces_label)", () => {
     expect(spacesLabel(machine({}), 0, true)).toBe("Desktop shared");
-    expect(spacesLabel(machine({}), 2, true)).toBe("Desktop · 2 Spaces");
+    expect(spacesLabel(machine({}), 2, true)).toBe("Desktop and 2 Spaces");
     // A label the core sent still wins.
     expect(spacesLabel(machine({ spacesLabel: "No Spaces" }), 0, true)).toBe("No Spaces");
     expect(spacesLabel(machine({ device: true, spacesLabel: "" }), 0, true)).toBe("");

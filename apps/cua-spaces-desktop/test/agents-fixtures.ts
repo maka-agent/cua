@@ -91,6 +91,7 @@ export class FakeAgentKeysTools {
     this.calls.push([tool, args]);
     switch (tool) {
       case "agent_keys.list":
+      case "agent_keys.check":
         break;
       case "agent_keys.set": {
         const provider = String(args.provider ?? "");
@@ -230,5 +231,5 @@ export const AGENT_METHODS = [
   "agents.detail", "agents.readFile", "agents.restoreFile", "agents.addRoutine", "agents.setRoutine", "agents.removeRoutine",
   "agents.allowComputer", "agents.revokeComputer",
   "agents.status", "agents.connect", "agents.disconnect", "agents.signInStart", "agents.signInWait",
-  "agentKeys.list", "agentKeys.set", "agentKeys.remove", "agentKeys.shell", "agentKeys.fromShell",
+  "agentKeys.list", "agentKeys.check", "agentKeys.set", "agentKeys.remove", "agentKeys.shell", "agentKeys.fromShell",
 ];

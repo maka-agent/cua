@@ -27,10 +27,10 @@ export const CONNECTION_LABEL: Record<"relay" | "direct", string> = {
   direct: "Direct",
 };
 
-/** A row that is only a signed-in device (`machines_view::DEVICE_LINE`). */
-export const DEVICE_LINE = "Signed-in device, not shared";
+/** A row that is only a signed-in machine (`machines_view::DEVICE_LINE`). */
+export const DEVICE_LINE = "Signed in, not sharing";
 
-/** How other devices reach it, in words. */
+/** How other machines reach it, in words. */
 export function connectionLabel(m: Pick<Machine, "connection" | "current"> & Pick<Partial<Machine>, "device">): string {
   if (m.connection) return CONNECTION_LABEL[m.connection];
   if (m.device) return DEVICE_LINE;
@@ -39,7 +39,7 @@ export function connectionLabel(m: Pick<Machine, "connection" | "current"> & Pic
 
 /** The list row's second line: OS, then how it is reached. */
 export function machineSubtitle(m: Pick<Machine, "os" | "connection" | "current" | "model"> & Pick<Partial<Machine>, "device">): string {
-  return [m.model ?? osName(m), connectionLabel(m)].join(" · ");
+  return [m.model ?? osName(m), connectionLabel(m)].join(", ");
 }
 
 /** The core's word for a machine its owner stopped sharing
@@ -74,7 +74,7 @@ export function spaceCount(n: number): string {
 /** The row's Spaces count: the core's (`machines::spaces_label`, the same
  * the SwiftUI Machines list shows), else `n` counted here. Empty for a
  * device of its own (it runs no Spaces). `desktop`: the machine shares its
- * own desktop ("Desktop shared", "Desktop · 2 Spaces"). */
+ * own desktop ("Desktop shared", "Desktop and 2 Spaces"). */
 export function spacesLabel(m: Pick<Machine, "spacesLabel">, n: number, desktop = false): string {
   return m.spacesLabel ?? machineSpacesLabel(desktop, n);
 }
@@ -86,5 +86,5 @@ export function selectedMachine<T extends Pick<Machine, "id">>(machines: readonl
 
 /** The Machines header: "1 machine, 1 online", "3 machines, 2 online". */
 export function machinesSummary(total: number, online: number): string {
-  return `${plural(total, "computer")}, ${online} online`;
+  return `${plural(total, "machine")}, ${online} online`;
 }
