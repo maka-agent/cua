@@ -233,6 +233,45 @@ pub fn walk_tree_budgeted(
     walk_tree_with_web_content(pid, window_id, query, max_depth, budget, true)
 }
 
+/// Walk one already-retained AX root, including its expanded menu descendants.
+///
+/// Call on the owning CF run-loop thread while `root` remains live. This does
+/// not discover applications or windows, and it does not consume the root's
+/// reference. Addressable nodes retain the same snapshot ownership as a normal
+/// tree walk. A null root produces an empty, unscoped result.
+pub fn walk_retained_root(
+    root: &super::snapshot::RetainedElement,
+    query: Option<&str>,
+    max_depth: usize,
+    mut budget: WalkBudget,
+) -> TreeWalkResult {
+    with_menus_collapsed(false, || {
+        let mut nodes = Vec::new();
+        let mut lines = Vec::new();
+        let mut index_counter = 0usize;
+        if root.as_ptr() != 0 {
+            // SAFETY: the borrowed owner retains this AX root for the entire
+            // walk; descendants and addressable-node retains use the existing
+            // walker ownership rules.
+            unsafe {
+                walk_element(
+                    root.as_ptr() as AXUIElementRef,
+                    0,
+                    None,
+                    false,
+                    &mut nodes,
+                    &mut lines,
+                    &mut index_counter,
+                    &mut budget,
+                    max_depth,
+                    true,
+                );
+            }
+        }
+        finish_tree_walk(nodes, lines, query, budget, None)
+    })
+}
+
 fn walk_tree_with_web_content(
     pid: i32,
     window_id: Option<u32>,
@@ -336,6 +375,16 @@ fn walk_tree_with_web_content(
         CFRelease(app_elem as CFTypeRef);
     }
 
+    finish_tree_walk(nodes, lines, query, budget, window_scope)
+}
+
+fn finish_tree_walk(
+    nodes: Vec<AXNode>,
+    mut lines: Vec<(usize, String)>,
+    query: Option<&str>,
+    budget: WalkBudget,
+    window_scope: Option<WindowScope>,
+) -> TreeWalkResult {
     let walk = budget.outcome();
     prune_echo_text_rows(&mut lines);
     let raw_markdown = render_lines(&lines);
