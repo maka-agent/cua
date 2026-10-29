@@ -2,8 +2,8 @@
 
 //! Visible-cell sampling shared by native observation and element lookup.
 
-use super::{accessible_for, call, raw_child_count, raw_children, RawObjectRef};
-use anyhow::{anyhow, bail, Result};
+use super::{RawObjectRef, accessible_for, call, raw_child_count, raw_children};
+use anyhow::{Result, anyhow, bail};
 use atspi::proxy::component::ComponentProxy;
 use atspi::{CoordType, State};
 use atspi_connection::AccessibilityConnection;
@@ -56,24 +56,53 @@ async fn component<'a>(
     .await
 }
 
+fn rect((x, y, width, height): (i32, i32, i32, i32)) -> Rect {
+    Rect {
+        left: i64::from(x),
+        top: i64::from(y),
+        right: i64::from(x) + i64::from(width),
+        bottom: i64::from(y) + i64::from(height),
+    }
+}
+
 pub(super) async fn bounds(
     conn: &AccessibilityConnection,
     object: &RawObjectRef,
     session_id: Option<&str>,
 ) -> Result<Rect> {
+    if super::super::native_observation::current().is_some() {
+        return native_bounds(conn, object, session_id).await;
+    }
     let proxy = component(conn, object, session_id).await?;
-    let (x, y, width, height) = request(
+    // Preserve the generated-proxy behavior for the existing generic lane.
+    let values = request(
         session_id,
         "Component.GetExtents",
         proxy.get_extents(CoordType::Screen),
     )
     .await?;
-    Ok(Rect {
-        left: i64::from(x),
-        top: i64::from(y),
-        right: i64::from(x) + i64::from(width),
-        bottom: i64::from(y) + i64::from(height),
-    })
+    Ok(rect(values))
+}
+
+/// Explicit original-profile route for an owned blocking input worker.
+/// Its caller already owns the trusted native target; no task-local marker
+/// or caller JSON flag is needed to choose the reply decoder.
+pub(super) async fn native_bounds(
+    conn: &AccessibilityConnection,
+    object: &RawObjectRef,
+    session_id: Option<&str>,
+) -> Result<Rect> {
+    let proxy = component(conn, object, session_id).await?;
+    super::element::check(session_id)?;
+    let reply = call(super::reply::call_method(
+        proxy.inner(),
+        "GetExtents",
+        &(CoordType::Screen,),
+    ))
+    .await;
+    super::element::check(session_id)?;
+    let reply = reply.ok_or_else(|| anyhow!("Component.GetExtents did not answer in time"))??;
+    Ok(rect(super::reply::rectangle(&reply)?))
 }
 
 pub(super) async fn children(

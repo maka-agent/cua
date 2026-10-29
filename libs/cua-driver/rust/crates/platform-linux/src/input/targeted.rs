@@ -1039,6 +1039,18 @@ fn keyboard_foreground(
     })
 }
 
+// This is the existing XTest engine with the protocol's relative detail bit.
+pub(crate) fn fake_relative_motion(
+    conn: &RustConnection,
+    root: Window,
+    dx: i16,
+    dy: i16,
+) -> Result<(), TargetedInputError> {
+    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 1, 0, root, dx, dy, 0)
+        .map_err(failed)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

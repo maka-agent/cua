@@ -97,6 +97,14 @@ fn runtime_with_tool(
     factory: Arc<dyn AudioBackendFactory>,
     extra: Option<Box<dyn cua_driver_core::tool::Tool>>,
 ) -> Arc<DriverRuntime> {
+    runtime_with_native(factory, extra, None)
+}
+
+fn runtime_with_native(
+    factory: Arc<dyn AudioBackendFactory>,
+    extra: Option<Box<dyn cua_driver_core::tool::Tool>>,
+    native: Option<Arc<dyn cua_driver_core::windows_interruption::WindowsInterruptionBackend>>,
+) -> Arc<DriverRuntime> {
     let ceiling = SessionModeCeiling::for_trusted_sessions(
         [PermissionMode::Standard],
         false,
@@ -113,6 +121,11 @@ fn runtime_with_tool(
     if let Some(tool) = extra {
         registry.register(tool);
     }
+    if let Some(native) = native {
+        registry
+            .retain_windows_interruption_backend(native)
+            .unwrap();
+    }
     let audio = cua_driver_core::audio::register_tools(&mut registry, factory);
     let registry = Arc::new(registry);
     registry.init_self_weak();
@@ -123,7 +136,7 @@ fn runtime_with_tool(
         compatibility_context,
         shutdown: AtomicBool::new(false),
         last_activity: AtomicU64::new(now_unix_secs()),
-        lifecycle: tokio::sync::RwLock::new(()),
+        lifecycle: Arc::new(tokio::sync::RwLock::new(())),
         lifecycle_maintenance: Mutex::new(None),
         activity_observer: None,
     })
@@ -777,4 +790,186 @@ async fn observed_completed_wav_cleanup_does_not_gain_recursive_directory_deleti
     runtime.shutdown().await.unwrap();
     std::fs::remove_file(sentinel).unwrap();
     std::fs::remove_dir(wrapper).unwrap();
+}
+
+struct ShutdownPanic {
+    identity: Arc<()>,
+    dropped: Arc<AtomicBool>,
+}
+impl Drop for ShutdownPanic {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+struct ShutdownNative {
+    panic: Mutex<Option<ShutdownPanic>>,
+    calls: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl cua_driver_core::windows_interruption::WindowsInterruptionBackend for ShutdownNative {
+    async fn invoke(
+        &self,
+        tool: &dyn cua_driver_core::tool::Tool,
+        _name: &str,
+        args: Value,
+    ) -> cua_driver_core::protocol::ToolResult {
+        tool.invoke(args).await
+    }
+    fn close_turn(&self, _owner: &str, _turn: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn close_binding(
+        &self,
+        _binding: &Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn release_binding_inputs(
+        &self,
+        _binding: &Arc<cua_driver_core::windows_interruption::WindowsInputBinding>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn close_session(&self, _owner: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn close_all(&self) -> Result<(), String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let panic = self.panic.lock().unwrap().take();
+        if let Some(panic) = panic {
+            std::panic::panic_any(panic);
+        }
+        Err("fixture native shutdown remains unconfirmed".into())
+    }
+}
+
+fn session_end_witness(
+    internal: &str,
+) -> (
+    Arc<AtomicBool>,
+    cua_driver_core::session::SessionEndHookRegistration,
+) {
+    let ended = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&ended);
+    let internal = internal.to_owned();
+    let registration =
+        cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
+            if session_id == internal.as_str() {
+                observed.store(true, Ordering::SeqCst);
+            }
+        });
+    (ended, registration)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_resumes_native_panic_after_same_owned_cleanup() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let (stopping, mut reached, release) = gate();
+    let factory = Arc::new(Factory {
+        stopping: Some(stopping),
+        ..Default::default()
+    });
+    let identity = Arc::new(());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let native = Arc::new(ShutdownNative {
+        panic: Mutex::new(Some(ShutdownPanic {
+            identity: identity.clone(),
+            dropped: dropped.clone(),
+        })),
+        calls: AtomicUsize::new(0),
+    });
+    let retained: Arc<dyn cua_driver_core::windows_interruption::WindowsInterruptionBackend> =
+        native.clone();
+    let runtime = runtime_with_native(factory.clone(), None, Some(retained.clone()));
+    let target = session(&runtime, "shutdown-native-panic").await;
+    let internal = target.context.runtime_session_key(&target.public_session);
+    let (ended, _end_registration) = session_end_witness(&internal);
+    invoke(&target, "start_audio_recording").await;
+    let closing = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("shutdown must attempt remaining audio cleanup after the native panic")
+        .unwrap();
+    assert_eq!(native.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    assert!(!closing.is_finished());
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert!(runtime.lifecycle.try_write().is_err());
+    release.send(()).unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(5), closing)
+        .await
+        .unwrap()
+        .expect_err("native panic must not become a shutdown Result error");
+    assert!(failure.is_panic());
+    let original = failure.into_panic().downcast::<ShutdownPanic>().unwrap();
+    assert!(Arc::ptr_eq(&original.identity, &identity));
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    assert!(
+        ended.load(Ordering::SeqCst),
+        "shutdown must run the exact canonical session-end callback"
+    );
+    assert!(!factory.paths.lock().unwrap()[0].parent().unwrap().exists());
+    assert!(Arc::ptr_eq(
+        &runtime.registry.windows_interruption_backend().unwrap(),
+        &retained
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_shutdown_observer_retains_panic_cleanup_and_admission() {
+    let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+    let (stopping, mut reached, release) = gate();
+    let factory = Arc::new(Factory {
+        stopping: Some(stopping),
+        ..Default::default()
+    });
+    let dropped = Arc::new(AtomicBool::new(false));
+    let native = Arc::new(ShutdownNative {
+        panic: Mutex::new(Some(ShutdownPanic {
+            identity: Arc::new(()),
+            dropped: dropped.clone(),
+        })),
+        calls: AtomicUsize::new(0),
+    });
+    let runtime = runtime_with_native(factory.clone(), None, Some(native.clone()));
+    let target = session(&runtime, "shutdown-observer-drop").await;
+    let internal = target.context.runtime_session_key(&target.public_session);
+    let (ended, _end_registration) = session_end_witness(&internal);
+    invoke(&target, "start_audio_recording").await;
+    let closing = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.shutdown().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("shutdown must attempt remaining audio cleanup after the native panic")
+        .unwrap();
+    closing.abort();
+    assert!(closing.await.unwrap_err().is_cancelled());
+    assert_eq!(native.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.active.load(Ordering::SeqCst), 1);
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert!(runtime.lifecycle.try_write().is_err());
+    release.send(()).unwrap();
+    let drained = tokio::time::timeout(Duration::from_secs(5), runtime.lifecycle.write())
+        .await
+        .expect("the same cleanup worker must release its owned write guard");
+    drop(drained);
+    assert_eq!(factory.active.load(Ordering::SeqCst), 0);
+    assert!(
+        ended.load(Ordering::SeqCst),
+        "shutdown must run the exact canonical session-end callback"
+    );
+    assert!(!factory.paths.lock().unwrap()[0].parent().unwrap().exists());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("payload may be dropped only after owned cleanup and original unwind");
 }

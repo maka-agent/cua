@@ -386,7 +386,7 @@ pub(crate) struct DriverRuntime {
     /// Calls hold a read guard; shutdown takes the write guard after closing
     /// admission. Therefore shutdown is idempotent and does not return while a
     /// previously admitted operation is still executing.
-    lifecycle: tokio::sync::RwLock<()>,
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
     lifecycle_maintenance: Mutex<Option<LifecycleMaintenance>>,
     activity_observer: Option<Arc<dyn DriverActivityObserver>>,
 }
@@ -394,6 +394,56 @@ pub(crate) struct DriverRuntime {
 struct LifecycleMaintenance {
     shutdown: std::sync::mpsc::Sender<()>,
     thread: std::thread::JoinHandle<()>,
+}
+
+// One shutdown worker attempts the independent cleanup phases before
+// resuming its original panic. This never converts a panic to a native error.
+#[derive(Default)]
+struct ShutdownCleanup {
+    errors: Vec<String>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+impl ShutdownCleanup {
+    fn record(&mut self, result: std::thread::Result<Result<(), String>>) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.errors.push(error),
+            Err(payload) => {
+                if self.panic.is_none() {
+                    self.panic = Some(payload);
+                } else {
+                    // A secondary payload may itself panic when dropped. The
+                    // original payload must survive the remaining cleanup.
+                    std::mem::forget(payload);
+                }
+            }
+        }
+    }
+    fn attempt(&mut self, cleanup: impl FnOnce() -> Result<(), String>) {
+        self.record(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            cleanup,
+        )));
+    }
+    fn finish(self) -> Result<(), String> {
+        if let Some(payload) = self.panic {
+            std::panic::resume_unwind(payload);
+        }
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors.join("; "))
+        }
+    }
+}
+
+fn shutdown_task_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(format!("runtime shutdown worker was cancelled: {error}")),
+    }
 }
 
 impl DriverRuntime {
@@ -433,7 +483,7 @@ impl DriverRuntime {
             compatibility_context,
             shutdown: AtomicBool::new(false),
             last_activity: AtomicU64::new(now_unix_secs()),
-            lifecycle: tokio::sync::RwLock::new(()),
+            lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             lifecycle_maintenance: Mutex::new(None),
             activity_observer: options.activity_observer.clone(),
         });
@@ -450,59 +500,71 @@ impl DriverRuntime {
         self.compatibility_context.runtime_scope_key()
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+    pub(crate) async fn shutdown(self: &Arc<Self>) -> Result<(), String> {
         self.shutdown.store(true, Ordering::Release);
-        let _drained = self.lifecycle.write().await;
-        let mut failures = Vec::new();
+        let runtime = Arc::clone(self);
+        let settlement = tokio::spawn(async move {
+            let drained = Arc::clone(&runtime.lifecycle).write_owned().await;
+            // The same worker owns the drained admission and every cleanup,
+            // including a captured panic, even if its observer is dropped.
+            shutdown_task_result(
+                tokio::task::spawn_blocking(move || {
+                    let _drained = drained;
+                    runtime.shutdown_resources()
+                })
+                .await,
+            )
+        });
+        shutdown_task_result(settlement.await)
+    }
+
+    fn shutdown_resources(&self) -> Result<(), String> {
+        let mut cleanup = ShutdownCleanup::default();
         if let Some(maintenance) = self.stop_lifecycle_maintenance() {
-            match tokio::task::spawn_blocking(move || maintenance.join()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => failures.push("runtime maintenance thread panicked".into()),
-                Err(error) => failures.push(format!("runtime maintenance join failed: {error}")),
-            }
+            cleanup.record(maintenance.join().map(|()| Ok(())));
         }
         if let Some(native) = self.registry.windows_interruption_backend() {
-            match tokio::task::spawn_blocking(move || native.close_all()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => failures.push(error),
-                Err(error) => failures.push(format!(
-                    "Windows native interruption shutdown worker failed: {error}"
-                )),
-            }
+            cleanup.attempt(|| native.close_all());
         }
         if let Some(audio) = self.audio.clone() {
-            match tokio::task::spawn_blocking(move || audio.close_all()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => failures.push(error.to_string()),
-                Err(error) => {
-                    failures.push(format!("computer audio shutdown worker failed: {error}"))
-                }
-            }
+            cleanup.attempt(|| audio.close_all().map_err(|error| error.to_string()));
         }
-        self.authorization_registry.revoke_all();
+        cleanup.attempt(|| {
+            self.authorization_registry.revoke_all();
+            Ok(())
+        });
         let runtime_prefix = format!(
             "__cua_runtime_{}:",
             self.compatibility_context.runtime_scope_key()
         );
-        cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_suspended_runtime_scope(
-            &self.compatibility_context.runtime_scope_key(),
-        );
-        cua_driver_core::snapshot_store::retire_runtime_scope(
-            &self.compatibility_context.runtime_scope_key(),
-        );
-        let recording = self.registry.recording.clone();
-        match tokio::task::spawn_blocking(move || recording.stop_owner(None)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => failures.push(error.to_string()),
-            Err(error) => failures.push(format!("recording shutdown worker failed: {error}")),
-        }
-        if failures.is_empty() {
+        cleanup.attempt(|| {
+            cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
             Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        });
+        cleanup.attempt(|| {
+            cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
+            Ok(())
+        });
+        cleanup.attempt(|| {
+            cua_driver_core::session::forget_suspended_runtime_scope(
+                &self.compatibility_context.runtime_scope_key(),
+            );
+            Ok(())
+        });
+        cleanup.attempt(|| {
+            cua_driver_core::snapshot_store::retire_runtime_scope(
+                &self.compatibility_context.runtime_scope_key(),
+            );
+            Ok(())
+        });
+        cleanup.attempt(|| {
+            self.registry
+                .recording
+                .stop_owner(None)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+        cleanup.finish()
     }
 
     fn stop_lifecycle_maintenance(&self) -> Option<std::thread::JoinHandle<()>> {

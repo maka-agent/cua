@@ -164,7 +164,7 @@ fn exact_window_from_probe(
 }
 
 /// Return the native owner of one exact HWND without enumerating Win32 or UIA.
-pub(crate) fn window_owner_pid(hwnd: u64) -> Option<u32> {
+pub fn window_owner_pid(hwnd: u64) -> Option<u32> {
     let hwnd = HWND(hwnd as *mut _);
     if hwnd.0.is_null() || !unsafe { IsWindow(hwnd) }.as_bool() {
         return None;

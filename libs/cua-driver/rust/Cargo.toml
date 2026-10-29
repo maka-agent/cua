@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["third-party/nom"]
+exclude = ["third-party/nom", "vendor/clipboard-rs"]
 members = [
     "crates/cua-driver",
     "crates/cua-driver-contract",

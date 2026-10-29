@@ -917,6 +917,11 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 enum NativeRequest {
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    Desktop {
+        owner: Arc<platform_linux::input::native_desktop::NativeDesktop>,
+        request: platform_linux::input::native_desktop::NativeDesktopRequest,
+    },
     #[cfg(target_os = "macos")]
     WindowCapture(platform_macos::capture::FrozenWindowCapture),
     #[cfg(target_os = "macos")]
@@ -957,6 +962,14 @@ impl NativeRequest {
     /// this diagnostic; it cannot supply native replay authority.
     fn recording_input(&self) -> (&'static str, Value) {
         match self {
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            Self::Desktop { request, .. } => (
+                if matches!(request, platform_linux::input::native_desktop::NativeDesktopRequest::Window { .. }) {
+                    "linux_native_window"
+                } else {
+                    "linux_native_desktop"
+                }, request.recording_input()
+            ),
             #[cfg(target_os = "macos")]
             Self::WindowCapture(prepared) => {
                 let geometry = prepared.geometry();
@@ -1195,6 +1208,10 @@ unsafe fn session_invoke_in_frame(
                         let (profile, original_input) = request.recording_input();
                         let invocation = async move {
                             match request {
+                                #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+                                NativeRequest::Desktop { owner, request } => {
+                                    platform_linux::input::native_desktop::with_native_desktop(owner, request, invocation).await
+                                }
                                 #[cfg(target_os = "macos")]
                                 NativeRequest::WindowCapture(prepared) => {
                                     platform_macos::capture::with_frozen_window_capture(
@@ -2312,6 +2329,26 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
         RuntimeCreateError::AlreadyExists => DriverError::RuntimeAlreadyExists,
         RuntimeCreateError::Authorization(reason) => DriverError::Configuration { reason },
         RuntimeCreateError::Unavailable(reason) => DriverError::Protocol { reason },
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl NativeAbiSession {
+    pub(crate) async fn invoke_native_desktop(
+        &self, arguments: Value,
+        owner: Arc<platform_linux::input::native_desktop::NativeDesktop>,
+        request: platform_linux::input::native_desktop::NativeDesktopRequest,
+    ) -> Result<Value, DriverError> {
+        if arguments != request.arguments() {
+            return Err(DriverError::Protocol { reason: "native desktop arguments changed".into() });
+        }
+        let frame = if matches!(request, platform_linux::input::native_desktop::NativeDesktopRequest::Window { .. }) {
+            crate::runtime::CoordinateFrame::NativeWindow
+        } else {
+            crate::runtime::CoordinateFrame::Screenshot
+        };
+        self.invoke_in_frame(request.tool_name(), arguments, frame,
+            Some(NativeRequest::Desktop { owner, request })).await
     }
 }
 

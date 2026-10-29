@@ -99,10 +99,27 @@ impl std::fmt::Debug for NativeInputReceipt {
 }
 impl Drop for NativeInputReceipt {
     fn drop(&mut self) {
-        if self.release.release().is_ok() {
-            if let Some(binding) = self.binding.upgrade() {
-                binding.remove_release(&self.release);
+        let cleanup = || {
+            if self.release.release().is_ok() {
+                if let Some(binding) = self.binding.upgrade() {
+                    binding.remove_release(&self.release);
+                }
             }
+        };
+        if std::thread::panicking() {
+            // Preserve the in-flight original panic and retained resource if a
+            // destructor encounters the same violated invariant again.
+            // During an original unwind retain even a physically closed
+            // resource until explicit owner retirement rechecks and prunes it.
+            if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = self.release.release();
+            })) {
+                // The original unwind must not be replaced by Drop on another
+                // panic payload while this same resource remains retained.
+                std::mem::forget(secondary);
+            }
+        } else {
+            cleanup();
         }
     }
 }
@@ -210,12 +227,22 @@ impl WindowsInputBinding {
     /// wait for an unrelated provider or claim its action outcome is known.
     pub fn release_owned_inputs(&self) -> Result<(), String> {
         let mut failures = Vec::new();
+        let mut panic = None;
         for phase in [
             NativeReleasePhase::ResumeTarget,
             NativeReleasePhase::ReleaseInput,
             NativeReleasePhase::RestoreContext,
         ] {
-            failures.extend(self.release_owned_inputs_in_phase(phase).err());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.release_owned_inputs_in_phase(phase)
+            })) {
+                Ok(result) => failures.extend(result.err()),
+                Err(payload) if panic.is_none() => panic = Some(payload),
+                Err(secondary) => std::mem::forget(secondary),
+            }
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
         if failures.is_empty() {
             Ok(())
@@ -230,14 +257,23 @@ impl WindowsInputBinding {
             .expect("native input release custody lock poisoned")
             .clone();
         let mut failures = Vec::new();
+        let mut panic = None;
         for release in held {
-            if release.resource.phase() != phase {
-                continue;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if release.resource.phase() == phase {
+                    match release.release() {
+                        Ok(()) => self.remove_release(&release),
+                        Err(error) => failures.push(error),
+                    }
+                }
+            })) {
+                Ok(()) => {}
+                Err(payload) if panic.is_none() => panic = Some(payload),
+                Err(secondary) => std::mem::forget(secondary),
             }
-            match release.release() {
-                Ok(()) => self.remove_release(&release),
-                Err(error) => failures.push(error),
-            }
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
         if failures.is_empty() {
             Ok(())
@@ -601,5 +637,119 @@ mod tests {
         .is_err());
         // Returning an ordinary Err must fail this should_panic keeper.
         let _ = binding.failed_input_releases();
+    }
+    #[test]
+    fn panic_cleanup_attempts_remaining_same_phase_and_later_phases_without_forgetting_owner() {
+        struct Release {
+            phase: NativeReleasePhase,
+            id: u8,
+            trace: Arc<Mutex<Vec<u8>>>,
+            panics: std::sync::atomic::AtomicBool,
+        }
+        impl NativeInputRelease for Release {
+            fn phase(&self) -> NativeReleasePhase {
+                self.phase
+            }
+            fn release(&self) -> Result<(), String> {
+                self.trace.lock().unwrap().push(self.id);
+                if self.panics.swap(false, Ordering::SeqCst) {
+                    std::panic::panic_any(41_u64);
+                }
+                Ok(())
+            }
+        }
+        let binding = WindowsInputBinding::new(
+            "owner".into(),
+            "turn".into(),
+            Arc::new(Sink {
+                events: Mutex::new(Vec::new()),
+                fail: false,
+            }),
+        )
+        .unwrap();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut receipts = Vec::new();
+        for (phase, id, panics) in [
+            (NativeReleasePhase::ResumeTarget, 1, true),
+            (NativeReleasePhase::ResumeTarget, 2, false),
+            (NativeReleasePhase::ReleaseInput, 3, false),
+            (NativeReleasePhase::RestoreContext, 4, false),
+        ] {
+            receipts.push(
+                binding
+                    .retain_input_release(Arc::new(Release {
+                        phase,
+                        id,
+                        trace: trace.clone(),
+                        panics: std::sync::atomic::AtomicBool::new(panics),
+                    }))
+                    .unwrap(),
+            );
+        }
+        let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            binding.release_owned_inputs()
+        }))
+        .unwrap_err();
+        assert_eq!(original.downcast_ref::<u64>(), Some(&41));
+        assert_eq!(*trace.lock().unwrap(), [1, 2, 3, 4]);
+        assert_eq!(binding.releases.lock().unwrap().len(), 1);
+        // The fixture panic is one-shot so ordinary fixture destruction can
+        // attempt cleanup without manufacturing a success for the failed pass.
+        drop(receipts);
+    }
+    #[test]
+    fn receipt_drop_during_original_unwind_retains_panicking_resource() {
+        struct Panics;
+        impl NativeInputRelease for Panics {
+            fn release(&self) -> Result<(), String> {
+                std::panic::panic_any(202_u64)
+            }
+        }
+        let binding = WindowsInputBinding::new(
+            "owner".into(),
+            "turn".into(),
+            Arc::new(Sink {
+                events: Mutex::new(Vec::new()),
+                fail: false,
+            }),
+        )
+        .unwrap();
+        let receipt = binding.retain_input_release(Arc::new(Panics)).unwrap();
+        let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _receipt = receipt;
+            std::panic::panic_any(101_u64);
+        }))
+        .unwrap_err();
+        assert_eq!(original.downcast_ref::<u64>(), Some(&101));
+        assert_eq!(binding.releases.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn successful_receipt_drop_during_unwind_waits_for_actual_owner_retirement_to_prune() {
+        struct Released;
+        impl NativeInputRelease for Released {
+            fn release(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let binding = WindowsInputBinding::new(
+            "owner".into(),
+            "turn".into(),
+            Arc::new(Sink {
+                events: Mutex::new(Vec::new()),
+                fail: false,
+            }),
+        )
+        .unwrap();
+        let receipt = binding.retain_input_release(Arc::new(Released)).unwrap();
+        let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _receipt = receipt;
+            std::panic::panic_any(101_u64);
+        }))
+        .unwrap_err();
+        assert_eq!(original.downcast_ref::<u64>(), Some(&101));
+        assert_eq!(binding.releases.lock().unwrap().len(), 1);
+        binding.retire();
+        binding.release_owned_inputs().unwrap();
+        assert!(binding.releases.lock().unwrap().is_empty());
     }
 }

@@ -215,6 +215,26 @@ jobs:
           xvfb-run -a cargo test -p platform-linux --lib \
             clipboard::tests::native_clipboard_round_trips_text_on_x11 \
             --locked -- --ignored --exact --nocapture
+      - name: Run native X11 exact selection bytes regression
+        working-directory: libs/cua-driver/rust
+        run: |
+          xvfb-run -a cargo test -p platform-linux --lib \
+            clipboard::tests::native_x11_preserves_exact_selection_bytes \
+            --locked -- --ignored --exact --nocapture --test-threads=1
+      - name: Run owned native X11 window Stop cleanup regression
+        working-directory: libs/cua-driver/rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 640x480x24 -noreset -nolisten tcp" \
+            cargo test -p platform-linux --lib \
+            input::native_desktop::owned_window_live_tests::native_owned_window_stop_releases_real_key_before_original_future_settles \
+            --locked -- --ignored --exact --nocapture --test-threads=1
+      - name: Run owned native X11 child cleanup regression
+        working-directory: libs/cua-driver/rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 640x480x24 -noreset -nolisten tcp" \
+            cargo test -p platform-linux --lib \
+            input::native_window::tests::native_owned_cleanup_uses_the_exact_held_child_destruction_witness \
+            --locked -- --ignored --exact --nocapture --test-threads=1
       - name: Run X11 MIT-SHM capture correctness and performance regression
         working-directory: libs/cua-driver/rust
         run: |

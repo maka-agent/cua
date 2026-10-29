@@ -8,12 +8,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
+use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::rust_connection::RustConnection;
 
 pub use cua_driver_contract::{
@@ -24,6 +25,8 @@ pub use cua_driver_contract::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NativeWindowInput {
+    /// One virtual window pointer move with no button edges.
+    Move { point: [i16; 2] },
     /// A click train, including the meaningful zero-count virtual move.
     Click {
         point: [i16; 2],
@@ -88,6 +91,7 @@ impl NativeWindowInputRequest {
     #[doc(hidden)]
     pub fn tool_name(&self) -> &'static str {
         match self.input {
+            NativeWindowInput::Move { .. } => "native_window_move",
             NativeWindowInput::Click { .. } => "click",
             NativeWindowInput::Scroll { .. } => "scroll",
         }
@@ -101,6 +105,10 @@ impl NativeWindowInputRequest {
             "scope":"window","delivery_mode":"background",
         });
         match self.input {
+            NativeWindowInput::Move { point } => {
+                args["x"] = point[0].into();
+                args["y"] = point[1].into();
+            }
             NativeWindowInput::Click {
                 point,
                 button,
@@ -132,6 +140,7 @@ impl NativeWindowInputRequest {
 
     pub(crate) fn pairs(&self) -> u32 {
         match self.input {
+            NativeWindowInput::Move { .. } => 0,
             NativeWindowInput::Click { count, .. } => count,
             NativeWindowInput::Scroll { pixels, .. } => scroll_detents(pixels),
         }
@@ -139,6 +148,7 @@ impl NativeWindowInputRequest {
 
     fn point(&self) -> Result<Option<[i16; 2]>, NativeWindowError> {
         match self.input {
+            NativeWindowInput::Move { point } => Ok(Some(point)),
             NativeWindowInput::Click { point, .. } => Ok(Some(point)),
             NativeWindowInput::Scroll {
                 x: Some(x),
@@ -192,6 +202,10 @@ pub(crate) struct NativeWindowCancellation {
 }
 
 impl NativeWindowCancellation {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub(crate) fn invocation(session_id: String) -> (CancelOnDrop, Self) {
         let cancelled = Arc::new(AtomicBool::new(false));
         (
@@ -283,6 +297,11 @@ pub(crate) struct NativeWindowContext {
     cached_target: Cell<Option<super::EventTarget>>,
     root_point: Cell<Option<[i16; 2]>>,
     pointer: Cell<PointerOperation>,
+    owner: Option<std::sync::Weak<super::native_desktop::NativeDesktop>>,
+    modifier_masks: [u16; 256],
+    key_state: Cell<u16>,
+    held_keys: RefCell<Vec<u8>>,
+    held_button_target: Cell<Option<super::EventTarget>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,6 +312,10 @@ enum PointerOperation {
 }
 
 impl NativeWindowContext {
+    pub(crate) fn session_id(&self) -> &str {
+        self.cancellation.session_id()
+    }
+
     pub(super) fn root(&self) -> Window {
         self.root
     }
@@ -308,27 +331,48 @@ impl NativeWindowContext {
     }
 
     pub(crate) fn check(&self) -> Result<(), NativeWindowError> {
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.upgrade().is_none_or(|owner| owner.is_closed()))
+        {
+            return Err(NativeWindowError::Cancelled);
+        }
         self.cancellation.check()
+    }
+
+    pub(crate) fn pause(&self, duration: std::time::Duration) -> anyhow::Result<()> {
+        if let Some(owner) = &self.owner {
+            let owner = owner.upgrade().ok_or(NativeWindowError::Cancelled)?;
+            owner
+                .pause(duration, &self.cancellation)
+                .map_err(anyhow::Error::from)
+        } else {
+            std::thread::sleep(duration);
+            Ok(())
+        }
     }
 
     pub(super) fn refreshes_target_per_pair(&self) -> bool {
         self.pointer.get() == PointerOperation::Click
     }
 
-    pub(super) fn mark_attempted(&self) {
+    pub(crate) fn mark_attempted(&self) {
         self.attempted.set(true);
     }
 
-    pub(super) fn mark_completed(&self) {
+    pub(crate) fn mark_completed(&self) {
         self.completed.set(self.completed.get() + 1);
     }
 
     pub(super) fn mark_pressed(&self, button: u8) {
         self.held_button.set(Some(button));
+        self.held_button_target.set(self.cached_target.get());
     }
 
     pub(super) fn mark_released(&self) {
         self.held_button.set(None);
+        self.held_button_target.set(None);
     }
 
     fn send_focus(&self, conn: &RustConnection, focused: bool) -> anyhow::Result<()> {
@@ -354,7 +398,24 @@ impl NativeWindowContext {
             .root_point
             .get()
             .ok_or_else(|| anyhow::anyhow!("native window input has no translated root point"))?;
-        let target = resolve_event_target(conn, self.root, self.target.window_id, point)?;
+        let held = self.held_button_target.get();
+        let target = if let Some(held) = held {
+            let translated = conn
+                .translate_coordinates(self.root, held.window, point[0], point[1])?
+                .reply()?;
+            if !translated.same_screen {
+                anyhow::bail!("native held pointer is on a different X11 screen");
+            }
+            super::EventTarget {
+                window: held.window,
+                root_x: point[0],
+                root_y: point[1],
+                local_x: translated.dst_x,
+                local_y: translated.dst_y,
+            }
+        } else {
+            resolve_event_target(conn, self.root, self.target.window_id, point)?
+        };
         // Resolver roundtrips may outlive the caller. Stop before new input.
         self.check()?;
         let root = self.root;
@@ -370,13 +431,16 @@ impl NativeWindowContext {
             root_y: target.root_y,
             event_x: target.local_x,
             event_y: target.local_y,
-            state: KeyButMask::from(0u16),
+            state: self.pointer_state(),
             mode: NotifyMode::NORMAL,
             same_screen_focus: 2,
         };
-        self.mark_attempted();
-        conn.send_event(false, target.window, EventMask::NO_EVENT, enter)?
-            .check()?;
+        if held.is_none() {
+            self.check()?;
+            self.mark_attempted();
+            conn.send_event(false, target.window, EventMask::NO_EVENT, enter)?
+                .check()?;
+        }
         let motion = MotionNotifyEvent {
             response_type: MOTION_NOTIFY_EVENT,
             detail: Motion::NORMAL,
@@ -389,9 +453,11 @@ impl NativeWindowContext {
             root_y: target.root_y,
             event_x: target.local_x,
             event_y: target.local_y,
-            state: KeyButMask::from(0u16),
+            state: self.pointer_state(),
             same_screen: true,
         };
+        self.check()?;
+        self.mark_attempted();
         conn.send_event(false, target.window, EventMask::NO_EVENT, motion)?
             .check()?;
         self.cached_target.set(Some(target));
@@ -402,6 +468,175 @@ impl NativeWindowContext {
         self.cached_target
             .get()
             .ok_or_else(|| anyhow::anyhow!("native window input has no prepared pointer target"))
+    }
+
+    fn pointer_state(&self) -> KeyButMask {
+        KeyButMask::from(
+            self.key_state.get()
+                | self
+                    .held_button
+                    .get()
+                    .map(super::button_state_mask)
+                    .map(u16::from)
+                    .unwrap_or(0),
+        )
+    }
+
+    /// Fixed key release uses the selected keyboard destination and current
+    /// acknowledged modifier state; it never checks producer cancellation.
+    fn key_edge(&self, conn: &RustConnection, code: u8, down: bool) -> anyhow::Result<()> {
+        let event = KeyPressEvent {
+            response_type: if down {
+                KEY_PRESS_EVENT
+            } else {
+                KEY_RELEASE_EVENT
+            },
+            detail: code,
+            sequence: 0,
+            time: self.timestamp(),
+            root: self.root,
+            event: self.target.window_id,
+            child: x11rb::NONE,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: self.pointer_state(),
+            same_screen: true,
+        };
+        self.mark_attempted();
+        conn.send_event(false, self.target.window_id, EventMask::NO_EVENT, event)?
+            .check()?;
+        let mask = self.modifier_masks[usize::from(code)];
+        self.key_state.set(if down {
+            self.key_state.get() | mask
+        } else {
+            self.key_state.get() & !mask
+        });
+        Ok(())
+    }
+
+    pub(crate) fn key_chord<T>(
+        &self,
+        conn: &RustConnection,
+        key: Option<&str>,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.check()?;
+        let mut keys = super::native_keys::NativeKeys::new(key)?;
+        let mut attempted = Vec::new();
+        let pressed = (|| -> anyhow::Result<()> {
+            while let Some(code) = keys.next_code()? {
+                self.check()?;
+                self.held_keys.borrow_mut().push(code);
+                attempted.push(code);
+                self.key_edge(conn, code, true)?;
+                self.pause(std::time::Duration::from_millis(33))?;
+            }
+            Ok(())
+        })();
+        let result = pressed.and_then(|()| {
+            self.check()?;
+            action()
+        });
+        let mut failures = Vec::new();
+        for code in attempted.into_iter().rev() {
+            match self.key_edge(conn, code, false) {
+                Ok(()) => {
+                    let mut held = self.held_keys.borrow_mut();
+                    if let Some(index) = held.iter().rposition(|held| *held == code) {
+                        held.remove(index);
+                    }
+                }
+                Err(error) => failures.push(error.to_string()),
+            }
+            native_key_release_pause();
+        }
+        if failures.is_empty() {
+            result
+        } else {
+            let mut failure = failures.join("; ");
+            if let Err(error) = result {
+                failure = format!("{error}; {failure}");
+            }
+            anyhow::bail!(failure)
+        }
+    }
+
+    pub(crate) fn owned_move_to_root(
+        &self,
+        conn: &RustConnection,
+        point: [i16; 2],
+        wheel: bool,
+    ) -> anyhow::Result<()> {
+        self.pointer.set(if wheel {
+            PointerOperation::Wheel
+        } else {
+            PointerOperation::Click
+        });
+        self.root_point.set(Some(point));
+        self.move_to(conn).map(|_| ())
+    }
+
+    pub(crate) fn local_to_root(
+        &self,
+        conn: &RustConnection,
+        point: [i16; 2],
+    ) -> anyhow::Result<[i16; 2]> {
+        let point = conn
+            .translate_coordinates(self.target.window_id, self.root, point[0], point[1])?
+            .reply()?;
+        if !point.same_screen {
+            anyhow::bail!("native window input point is on a different X11 screen");
+        }
+        Ok([point.dst_x, point.dst_y])
+    }
+
+    pub(crate) fn client_center(&self, conn: &RustConnection) -> anyhow::Result<[i16; 2]> {
+        let geometry = conn.get_geometry(self.target.window_id)?.reply()?;
+        Ok([(geometry.width / 2) as i16, (geometry.height / 2) as i16])
+    }
+
+    pub(crate) fn button_edge_owned(
+        &self,
+        conn: &RustConnection,
+        button: u8,
+        down: bool,
+    ) -> anyhow::Result<()> {
+        if down {
+            self.check()?;
+        }
+        let target = self.cached_target()?;
+        let state = self.pointer_state();
+        if down {
+            self.mark_pressed(button);
+        }
+        let event = ButtonPressEvent {
+            response_type: if down {
+                BUTTON_PRESS_EVENT
+            } else {
+                BUTTON_RELEASE_EVENT
+            },
+            detail: button,
+            sequence: 0,
+            time: self.timestamp(),
+            root: self.root,
+            event: target.window,
+            child: x11rb::NONE,
+            root_x: target.root_x,
+            root_y: target.root_y,
+            event_x: target.local_x,
+            event_y: target.local_y,
+            state,
+            same_screen: true,
+        };
+        self.mark_attempted();
+        conn.send_event(false, target.window, EventMask::NO_EVENT, event)?
+            .check()?;
+        if !down {
+            self.mark_released();
+        }
+        Ok(())
     }
 
     fn finish(&self, conn: &RustConnection) {
@@ -458,7 +693,9 @@ impl NativeWindowContext {
         input: NativeWindowInput,
     ) -> anyhow::Result<()> {
         self.pointer.set(match input {
-            NativeWindowInput::Click { .. } => PointerOperation::Click,
+            NativeWindowInput::Move { .. } | NativeWindowInput::Click { .. } => {
+                PointerOperation::Click
+            }
             NativeWindowInput::Scroll { .. } => PointerOperation::Wheel,
         });
         self.root_point.set(Some(point));
@@ -532,13 +769,264 @@ impl NativeWindowContext {
     }
 }
 
-struct NativeWindowLifetime {
+pub(crate) struct NativeWindowLifetime {
     conn: RustConnection,
     context: NativeWindowContext,
     finished: bool,
+    // This is the original connection's existing Composite resource custody,
+    // including an attempted redirect whose acknowledgement was lost.
+    buffer_retained: bool,
 }
 
 impl NativeWindowLifetime {
+    pub(crate) fn open(
+        target: NativeWindowTarget,
+        cancellation: NativeWindowCancellation,
+    ) -> Result<Self, NativeWindowSetupFailure> {
+        let setup_error = NativeWindowSetupFailure::no_input;
+        cancellation
+            .check()
+            .map_err(|error| setup_error(error.into()))?;
+        validate_live_owner(target).map_err(|error| setup_error(error.into()))?;
+        let (conn, screen) = super::connect_x11_for_input().map_err(setup_error)?;
+        let root = conn.setup().roots[screen].root;
+        let clock = super::native_window_clock(Some(root)).map_err(setup_error)?;
+        Ok(Self {
+            conn,
+            context: NativeWindowContext {
+                target,
+                cancellation,
+                root,
+                clock,
+                virtual_focus: Cell::new(false),
+                attempted: Cell::new(false),
+                completed: Cell::new(0),
+                held_button: Cell::new(None),
+                cached_target: Cell::new(None),
+                root_point: Cell::new(None),
+                pointer: Cell::new(PointerOperation::FocusOnly),
+                owner: None,
+                modifier_masks: [0; 256],
+                key_state: Cell::new(0),
+                held_keys: RefCell::new(Vec::new()),
+                held_button_target: Cell::new(None),
+            },
+            finished: false,
+            buffer_retained: false,
+        })
+    }
+
+    pub(crate) fn attach_owner(
+        &mut self,
+        owner: &Arc<super::native_desktop::NativeDesktop>,
+    ) -> anyhow::Result<()> {
+        self.context.owner = Some(Arc::downgrade(owner));
+        let mapping = self.conn.get_modifier_mapping()?.reply()?;
+        let width = mapping.keycodes.len() / 8;
+        if width > 0 {
+            for (index, codes) in mapping.keycodes.chunks(width).enumerate() {
+                for code in codes.iter().copied().filter(|code| *code != 0) {
+                    self.context.modifier_masks[usize::from(code)] |= 1u16 << index;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_window_buffer(&mut self) -> anyhow::Result<()> {
+        let attributes = self.conn.get_window_attributes(self.context.target.window_id)?.reply()?;
+        if attributes.map_state != MapState::VIEWABLE {
+            anyhow::bail!("window {} is not mapped; restore it before using background input or taking a screenshot", self.context.target.window_id);
+        }
+        self.conn.composite_query_version(0, 4)
+            .map_err(anyhow::Error::from)
+            .and_then(|cookie| cookie.reply().map_err(anyhow::Error::from))
+            .map_err(|error| error.context("background window rendering requires the X Composite extension"))?;
+        self.context.check()?;
+        // Retain before the server roundtrip so an ambiguous connection error
+        // cannot discard ownership of a redirect that may have been accepted.
+        self.buffer_retained = true;
+        let result = self.conn.composite_redirect_window(self.context.target.window_id, Redirect::AUTOMATIC)
+            .map_err(anyhow::Error::from)
+            .and_then(|cookie| match cookie.check() {
+                Ok(()) => Ok(()),
+                Err(x11rb::errors::ReplyError::X11Error(error)) => {
+                    self.buffer_retained = false;
+                    Err(anyhow::Error::from(x11rb::errors::ReplyError::X11Error(error)))
+                }
+                Err(error) => Err(error.into()),
+            });
+        result.map_err(|error| error.context("failed to retain the target window's rendering buffer"))?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        self.context.check()?;
+        Ok(())
+    }
+
+    pub(crate) fn start(&mut self) -> anyhow::Result<()> {
+        self.context.check()?;
+        let focused =
+            focus_is_within(&self.conn, self.context.root, self.context.target.window_id)?;
+        self.context.check()?;
+        if self.context.owner.is_some() {
+            self.retain_window_buffer()?;
+        }
+        if !focused {
+            self.context.virtual_focus.set(true);
+            self.context.send_focus(&self.conn, true)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn parts(&self) -> (&RustConnection, &NativeWindowContext) {
+        (&self.conn, &self.context)
+    }
+    pub(crate) fn phase(&self) -> NativeWindowPhase {
+        self.context.phase()
+    }
+
+    /// Release only actual retained key/button resources, without caller checks.
+    pub(crate) fn release_owned_input(&mut self) -> anyhow::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        // The selected keyboard/focus/buffer destination and a hit-tested
+        // button child are distinct resources. A child may be reparented out
+        // before the selected window disappears.
+        let selected_destroyed = match self.conn
+            .get_window_attributes(self.context.target.window_id)?.reply() {
+            Err(x11rb::errors::ReplyError::X11Error(error))
+                if error.error_kind == x11rb::protocol::ErrorKind::Window => true,
+            Err(error) => return Err(error.into()),
+            Ok(_) => false,
+        };
+        let mut failures = Vec::new();
+        if selected_destroyed {
+            self.context.held_keys.borrow_mut().clear();
+            self.context.virtual_focus.set(false);
+            self.buffer_retained = false;
+        } else {
+            let mut retained = Vec::new();
+            for code in self.context.held_keys.borrow().iter().rev().copied() {
+                if let Err(error) = self.context.key_edge(&self.conn, code, false) {
+                    retained.push(code);
+                    failures.push(error.to_string());
+                }
+                native_key_release_pause();
+            }
+            retained.reverse();
+            self.context.held_keys.replace(retained);
+        }
+        if let (Some(button), Some(target)) = (
+            self.context.held_button.get(),
+            self.context.held_button_target.get(),
+        ) {
+            let release = ButtonReleaseEvent {
+                response_type: BUTTON_RELEASE_EVENT,
+                detail: button,
+                sequence: 0,
+                time: self.context.timestamp(),
+                root: self.context.root,
+                event: target.window,
+                child: x11rb::NONE,
+                root_x: target.root_x,
+                root_y: target.root_y,
+                event_x: target.local_x,
+                event_y: target.local_y,
+                state: self.context.pointer_state(),
+                same_screen: true,
+            };
+            match self
+                .conn
+                .send_event(false, target.window, EventMask::NO_EVENT, release)
+                .map_err(anyhow::Error::from)
+                .and_then(|cookie| match cookie.check() {
+                    Ok(()) => Ok(()),
+                    // Only this exact held destination can witness that its
+                    // old button resource was destroyed; never re-hit-test.
+                    Err(x11rb::errors::ReplyError::X11Error(error))
+                        if error.error_kind == x11rb::protocol::ErrorKind::Window => Ok(()),
+                    Err(error) => Err(error.into()),
+                })
+            {
+                Ok(()) => self.context.mark_released(),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(failures.join("; "))
+        }
+    }
+
+    /// Finish the original virtual-focus lifetime after fixed input/clipboard cleanup.
+    pub(crate) fn finish_owned_context(&mut self) -> anyhow::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        // The original delay also occurs after the target was destroyed.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if self.context.virtual_focus.get() {
+            match focus_is_within(&self.conn, self.context.root, self.context.target.window_id) {
+                Ok(true) => self.context.virtual_focus.set(false),
+                Ok(false) => match self.context.send_focus(&self.conn, false) {
+                    Ok(()) => self.context.virtual_focus.set(false),
+                    Err(error) => failures.push(error.to_string()),
+                },
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        // The original BackgroundWindow destructor sends FocusOut before
+        // dropping WindowBuffer, which unredirects this exact same client.
+        if self.buffer_retained {
+            match self.conn.composite_unredirect_window(self.context.target.window_id, Redirect::AUTOMATIC)
+                .map_err(anyhow::Error::from)
+                .and_then(|cookie| match cookie.check() {
+                    Ok(()) => Ok(()),
+                    Err(x11rb::errors::ReplyError::X11Error(error))
+                        if error.error_kind == x11rb::protocol::ErrorKind::Window => Ok(()),
+                    Err(error) => Err(error.into()),
+                }) {
+                Ok(()) => self.buffer_retained = false,
+                Err(error) => failures.push(format!("native window buffer release is unconfirmed: {error}")),
+            }
+        }
+        if let Err(error) = self
+            .conn
+            .get_input_focus()
+            .map_err(anyhow::Error::from)
+            .and_then(|cookie| cookie.reply().map_err(anyhow::Error::from))
+        {
+            failures.push(error.to_string());
+        }
+        if !self.context.held_keys.borrow().is_empty() || self.context.held_button.get().is_some() {
+            failures.push("native input release remains unconfirmed".into());
+        }
+        if failures.is_empty() {
+            self.finished = true;
+            Ok(())
+        } else {
+            anyhow::bail!(failures.join("; "))
+        }
+    }
+
+    pub(crate) fn finish_owned(&mut self) -> anyhow::Result<()> {
+        let release = self.release_owned_input();
+        let finish = self.finish_owned_context();
+        match (release, finish) {
+            (Ok(()), Ok(())) => Ok(()),
+            (release, finish) => {
+                let failures = [release.err(), finish.err()]
+                    .into_iter()
+                    .flatten()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>();
+                anyhow::bail!(failures.join("; "))
+            }
+        }
+    }
+
     fn finish(&mut self) -> NativeWindowPhase {
         if !self.finished {
             self.finished = true;
@@ -550,7 +1038,11 @@ impl NativeWindowLifetime {
 
 impl Drop for NativeWindowLifetime {
     fn drop(&mut self) {
-        let _ = self.finish();
+        if self.context.owner.is_some() {
+            let _ = self.finish_owned();
+        } else {
+            let _ = self.finish();
+        }
     }
 }
 
@@ -561,41 +1053,8 @@ pub(crate) fn with_native_window_focus<T, E>(
     cancellation: NativeWindowCancellation,
     operation: impl FnOnce(&RustConnection, &NativeWindowContext) -> Result<T, E>,
 ) -> Result<NativeWindowOutcome<T, E>, NativeWindowSetupFailure> {
-    let setup_error = NativeWindowSetupFailure::no_input;
-    cancellation
-        .check()
-        .map_err(|error| setup_error(error.into()))?;
-    validate_live_owner(target).map_err(|error| setup_error(error.into()))?;
-    let (conn, screen) = super::connect_x11_for_input().map_err(setup_error)?;
-    let root = conn.setup().roots[screen].root;
-    let clock = super::native_window_clock(Some(root)).map_err(setup_error)?;
-    let mut lifetime = NativeWindowLifetime {
-        conn,
-        context: NativeWindowContext {
-            target,
-            cancellation,
-            root,
-            clock,
-            virtual_focus: Cell::new(false),
-            attempted: Cell::new(false),
-            completed: Cell::new(0),
-            held_button: Cell::new(None),
-            cached_target: Cell::new(None),
-            root_point: Cell::new(None),
-            pointer: Cell::new(PointerOperation::FocusOnly),
-        },
-        finished: false,
-    };
-    let setup = (|| -> anyhow::Result<()> {
-        lifetime.context.check()?;
-        let focused = focus_is_within(&lifetime.conn, root, target.window_id)?;
-        lifetime.context.check()?;
-        if !focused {
-            lifetime.context.virtual_focus.set(true);
-            lifetime.context.send_focus(&lifetime.conn, true)?;
-        }
-        Ok(())
-    })();
+    let mut lifetime = NativeWindowLifetime::open(target, cancellation)?;
+    let setup = lifetime.start();
     if let Err(error) = setup {
         return Err(NativeWindowSetupFailure {
             error,
@@ -723,6 +1182,7 @@ pub(crate) fn execute(
                 request.input,
             )?;
             let (button, hold_ms) = match request.input {
+                NativeWindowInput::Move { .. } => return Ok(()),
                 NativeWindowInput::Click { button, .. } => (
                     match button {
                         NativeClickButton::Left => 1,
@@ -790,14 +1250,104 @@ pub(crate) enum NativeWindowError {
     },
 }
 
+/// Original KeyPresser Drop waits after every UP, including stopped cleanup.
+/// Only producer duration/down waits may be woken by the owner fence.
+pub(super) fn native_key_release_pause() {
+    std::thread::sleep(std::time::Duration::from_millis(33));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Actual leaf cleanup, only on a disposable task-owned X11 server.
+    #[test]
+    #[ignore = "requires an isolated X11 display with Composite; never a personal desktop"]
+    fn native_owned_cleanup_uses_the_exact_held_child_destruction_witness() -> anyhow::Result<()> {
+        use x11rb::protocol::Event;
+        use x11rb::wrapper::ConnectionExt as _;
+
+        let (observer, screen) = x11rb::connect(None)?;
+        let root = observer.setup().roots[screen].root;
+        let pid_atom = observer.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+        for reparent_child in [true, false] {
+            let selected = observer.generate_id()?;
+            let child = observer.generate_id()?;
+            for (window, parent, width) in [(selected, root, 100), (child, selected, 50)] {
+                observer.create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT, window, parent,
+                    if window == selected {20} else {0}, if window == selected {20} else {0},
+                    width, width, 0, WindowClass::INPUT_OUTPUT, 0,
+                    &CreateWindowAux::new().override_redirect(1)
+                        .event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::FOCUS_CHANGE),
+                )?.check()?;
+                observer.change_property32(PropMode::REPLACE, window, pid_atom,
+                    AtomEnum::CARDINAL, &[std::process::id()])?.check()?;
+                observer.map_window(window)?.check()?;
+            }
+            observer.set_input_focus(InputFocus::POINTER_ROOT, root, x11rb::CURRENT_TIME)?.check()?;
+            let owner = Arc::new(super::super::native_desktop::NativeDesktop::default());
+            let (_cancel, cancellation) = NativeWindowCancellation::invocation(String::new());
+            let mut lifetime = NativeWindowLifetime::open(
+                NativeWindowTarget {pid:std::process::id(), window_id:selected}, cancellation,
+            ).map_err(|error| error.error)?;
+            lifetime.attach_owner(&owner)?;
+            lifetime.start()?;
+            {
+                let (connection, context) = lifetime.parts();
+                let point = context.local_to_root(connection, [5, 5])?;
+                context.owned_move_to_root(connection, point, false)?;
+                context.button_edge_owned(connection, 1, true)?;
+                assert_eq!(context.held_button_target.get().map(|target| target.window), Some(child));
+            }
+            observer.get_input_focus()?.reply()?;
+            let mut downs = 0;
+            while let Some(event) = observer.poll_for_event()? {
+                if let Event::ButtonPress(event) = event {
+                    assert_eq!(event.event, child);
+                    downs += 1;
+                }
+            }
+            assert_eq!(downs, 1, "fixture must retain an actual acknowledged child DOWN");
+            if reparent_child {
+                observer.reparent_window(child, root, 200, 20)?.check()?;
+                observer.map_window(child)?.check()?;
+                observer.destroy_window(selected)?.check()?;
+                assert_eq!(observer.get_window_attributes(child)?.reply()?.map_state, MapState::VIEWABLE);
+            } else {
+                observer.destroy_window(child)?.check()?;
+                let (connection, context) = lifetime.parts();
+                let error = context.button_edge_owned(connection, 1, false)
+                    .expect_err("the actual UP destination was destroyed");
+                assert!(matches!(error.downcast_ref::<x11rb::errors::ReplyError>(),
+                    Some(x11rb::errors::ReplyError::X11Error(error))
+                        if error.error_kind == x11rb::protocol::ErrorKind::Window));
+            }
+            owner.seal();
+            lifetime.release_owned_input()?;
+            assert!(lifetime.context.held_button.get().is_none());
+            assert!(lifetime.context.held_button_target.get().is_none());
+            lifetime.finish_owned_context()?;
+            assert!(lifetime.finished);
+            observer.get_input_focus()?.reply()?;
+            let mut ups = 0;
+            while let Some(event) = observer.poll_for_event()? {
+                if let Event::ButtonRelease(event) = event {
+                    assert_eq!(event.event, child, "cleanup must not retarget the held child");
+                    ups += 1;
+                }
+            }
+            assert_eq!(ups, usize::from(reparent_child),
+                "live reparented child needs its actual UP; destroyed child needs its own typed witness");
+            observer.destroy_window(if reparent_child {child} else {selected})?.check()?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn retained_observation_cancellation_works_outside_its_task_local_scope() {
-        use crate::atspi::native_observation::{with_native_observation, NativeObservationRequest};
+        use crate::atspi::native_observation::{NativeObservationRequest, with_native_observation};
 
         let observation = with_native_observation(
             NativeObservationRequest {

@@ -16,7 +16,7 @@ thread_local! {
 use crate::{
     pip_hook,
     protocol::{Content, ToolResult},
-    recording::{now_ms, screenshot_for, RecordingSession},
+    recording::{RecordingSession, now_ms, screenshot_for},
     recording_tools::{
         GetRecordingStateTool, ReplayRegistrySlot, ReplayTrajectoryTool, StartRecordingTool,
         StopRecordingTool,
@@ -81,8 +81,8 @@ pub fn current_native_input_worker_lease() -> Option<NativeInputWorkerLease> {
 /// Resource adapters use this instead of consulting process-global
 /// compatibility configuration. The value exists only while the canonical
 /// registry chokepoint is executing a tool, including nested dispatch.
-pub(crate) fn current_dispatch_authorization_context(
-) -> Option<Arc<crate::session_authorization::EffectiveAuthorizationContext>> {
+pub(crate) fn current_dispatch_authorization_context()
+-> Option<Arc<crate::session_authorization::EffectiveAuthorizationContext>> {
     DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok()
 }
 
@@ -143,7 +143,7 @@ fn try_admit_cursor_action(
     if read_only {
         return Ok(None);
     }
-    use cua_driver_contract::{classify_cursor_semantics, CursorAction};
+    use cua_driver_contract::{CursorAction, classify_cursor_semantics};
     let action = classify_cursor_semantics(name, args).map(|semantics| semantics.action);
     let mutates_cursor = matches!(
         action,
@@ -637,7 +637,7 @@ fn normalize_scroll_args(tool_name: &str, args: &mut Value) -> Result<(), String
             return Err(format!(
                 "scroll moves along one axis per call, got dx={dx} and dy={dy}. Pass only dx or \
                  dy (or direction and amount), or use two scroll steps in run_steps."
-            ))
+            ));
         }
         (false, false) => {
             return Err(
@@ -645,7 +645,7 @@ fn normalize_scroll_args(tool_name: &str, args: &mut Value) -> Result<(), String
                  (up, down, left or right) and amount (wheel notches). To hover without \
                  scrolling, use move_cursor."
                     .to_owned(),
-            )
+            );
         }
         (false, true) => (if dy > 0.0 { "down" } else { "up" }, dy),
         (true, false) => (if dx > 0.0 { "right" } else { "left" }, dx),
@@ -766,7 +766,9 @@ pub fn renamed_tool(name: &str) -> Option<&'static str> {
 }
 
 fn deprecated_name_note(old: &str, new: &str) -> String {
-    format!("Note: `{old}` is deprecated and will be removed in a future release; call `{new}` instead.")
+    format!(
+        "Note: `{old}` is deprecated and will be removed in a future release; call `{new}` instead."
+    )
 }
 
 /// Centralised tool name → capability tokens map. Lookup is by name so
@@ -863,7 +865,9 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // so we deliberately do NOT claim `terminal_safe` here — the
         // contract is intentionally narrower than `type_text`'s. It
         // still accepts `element_token`, hence the tokens claim.
+        "native_paste_text" => &["input.keyboard.hotkey", "clipboard.read", "clipboard.write"],
         "type_text_chars" => &["input.keyboard.type", "accessibility.element_tokens"],
+        "native_secondary_action" => &["accessibility.element_tokens"],
         "set_value" => &[
             // Bulk-set an editable field's value — semantically a
             // typing surface, even though the implementation skips
@@ -903,10 +907,10 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "parse_visual_regions" => &["screen.perception.visual_regions"],
 
         // ── apps / windows ───────────────────────────────────────────
-        "launch_app" => &["app.launch"],
-        "list_apps" => &["app.list"],
+        "launch_app" | "native_launch_app" => &["app.launch"],
+        "list_apps" | "native_list_apps" => &["app.list"],
         "kill_app" => &["app.kill"],
-        "list_windows" => &["window.list"],
+        "list_windows" | "native_list_windows" => &["window.list"],
         "bring_to_front" => &["window.activate"],
         "set_window_frame" => &["window.frame.set"],
         "debug_window_info" => &["window.debug_info"],
@@ -1732,7 +1736,7 @@ impl ToolRegistry {
             Err(error) => {
                 return permission_denied_result(format!(
                     "authorization configuration is invalid: {error}"
-                ))
+                ));
             }
         };
         let evidence = TrustedInvocationEvidence {
@@ -1779,7 +1783,7 @@ impl ToolRegistry {
             Err(error) => {
                 return permission_denied_result(format!(
                     "authorization configuration is invalid: {error}"
-                ))
+                ));
             }
         };
         self.invoke_with_context_and_evidence(name, args, context, evidence)
@@ -1906,7 +1910,9 @@ impl ToolRegistry {
         // never appears in tools/list.
         let resolved_name: &str = match name {
             "type_text_chars" => {
-                eprintln!("[cua-driver-rs] deprecated tool name 'type_text_chars' — use 'type_text' instead.");
+                eprintln!(
+                    "[cua-driver-rs] deprecated tool name 'type_text_chars' — use 'type_text' instead."
+                );
                 "type_text"
             }
             other => renamed_tool(other).unwrap_or(other),
@@ -2174,7 +2180,22 @@ impl ToolRegistry {
             }
         }
         if has_adapter("clipboard") {
-            if let Err(error) = self
+            if resolved_name == "native_paste_text" {
+                // The same canonical context must admit both the native old-
+                // selection read and replacement/owned restoration. This
+                // preserves existing Standard/Bounded/manifest behavior.
+                for (operation, input) in [
+                    ("clipboard_read", serde_json::json!({"include_text":true})),
+                    ("clipboard_write", public_args.clone()),
+                ] {
+                    if let Err(error) = self
+                        .authorize_clipboard(operation, &input, context, runtime_session.as_deref())
+                        .await
+                    {
+                        return protected_consent_refusal(error);
+                    }
+                }
+            } else if let Err(error) = self
                 .authorize_clipboard(
                     resolved_name,
                     &public_args,
@@ -2436,7 +2457,7 @@ impl ToolRegistry {
         evidence.record_input_origin(&args);
 
         // Capture start time for recording timestamps only after validation.
-        let launch_snapshot = if resolved_name == "launch_app" {
+        let launch_snapshot = if matches!(resolved_name, "launch_app" | "native_launch_app") {
             self.snapshot_running_pids().await
         } else {
             None
@@ -2575,7 +2596,9 @@ impl ToolRegistry {
                 );
             }
         }
-        if resolved_name == "launch_app" && result.is_error != Some(true) {
+        if matches!(resolved_name, "launch_app" | "native_launch_app")
+            && result.is_error != Some(true)
+        {
             if let (Some(before), Some(pid)) = (
                 launch_snapshot.as_ref(),
                 result
@@ -2907,21 +2930,21 @@ impl ToolRegistry {
         {
             let pid = args.get("pid").and_then(Value::as_i64);
             (
-                    serde_json::json!({
-                        "kind": "window_input",
-                        "pid": pid,
-                        "window_id": window_id,
-                        "delivery_mode_ceiling": delivery_mode,
-                    }),
-                    match pid {
-                        Some(pid) => format!(
-                            "Allow Cua to control window {window_id} of process {pid} in {delivery_mode} mode"
-                        ),
-                        None => format!(
-                            "Allow Cua to control window {window_id} in {delivery_mode} mode"
-                        ),
-                    },
-                )
+                serde_json::json!({
+                    "kind": "window_input",
+                    "pid": pid,
+                    "window_id": window_id,
+                    "delivery_mode_ceiling": delivery_mode,
+                }),
+                match pid {
+                    Some(pid) => format!(
+                        "Allow Cua to control window {window_id} of process {pid} in {delivery_mode} mode"
+                    ),
+                    None => {
+                        format!("Allow Cua to control window {window_id} in {delivery_mode} mode")
+                    }
+                },
+            )
         } else if let Some(pid) = args.get("pid").and_then(Value::as_i64) {
             (
                 serde_json::json!({
@@ -3194,7 +3217,7 @@ impl ToolRegistry {
             _ => {
                 return Err(protected_scope_refusal(
                     "the file-transfer operation has no reviewed exact scope",
-                ))
+                ));
             }
         };
 
@@ -3531,23 +3554,23 @@ fn canonical_proposed_path(raw: &str) -> Result<String, ToolResult> {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(protected_scope_refusal(
                     "the output path contains a broken symbolic link",
-                ))
+                ));
             }
             Ok(_) => {
                 return Err(protected_scope_refusal(
                     "the output path contains an unavailable filesystem entry",
-                ))
+                ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
                 return Err(protected_scope_refusal(
                     "an ancestor of the output path is not a directory",
-                ))
+                ));
             }
             Err(_) => {
                 return Err(protected_scope_refusal(
                     "the output path could not be inspected safely",
-                ))
+                ));
             }
         }
         let name = existing
@@ -3596,12 +3619,16 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "mouse_drag"
             | "parallel_mouse_drag"
             | "move_cursor"
+            | "native_desktop_input"
+            | "native_paste_text"
+            | "native_window_move"
             | "mouse_button_down"
             | "mouse_button_up"
             | "type_text"
             | "press_key"
             | "hotkey"
             | "set_value"
+            | "native_secondary_action"
             | "bring_to_front"
             | "set_window_frame"
     )
@@ -3826,9 +3853,9 @@ fn restore_public_runtime_value(value: &mut Value, runtime_prefix: &str) -> bool
 #[cfg(test)]
 mod runtime_isolation_tests {
     use super::{
-        canonical_proposed_path, desktop_action_coordinator, namespace_runtime_args,
-        publish_action_result, restore_public_runtime_result, try_admit_text_input,
-        TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
+        DISPATCH_RUNTIME_SCOPE, TrustedInvocationEvidence, canonical_proposed_path,
+        desktop_action_coordinator, namespace_runtime_args, publish_action_result,
+        restore_public_runtime_result, try_admit_text_input,
     };
     use crate::{
         authorization::PermissionMode,
@@ -3838,8 +3865,8 @@ mod runtime_isolation_tests {
     };
     use std::io::Write;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -4923,6 +4950,145 @@ resources:
     }
 
     #[tokio::test]
+    async fn native_desktop_capture_scope_refuses_before_native_or_clipboard_probe() {
+        use crate::capture_scope::{self, CaptureScopePolicy};
+
+        struct NativeScopeProbe {
+            hits: Arc<AtomicUsize>,
+            def: super::ToolDef,
+        }
+        #[async_trait::async_trait]
+        impl super::Tool for NativeScopeProbe {
+            fn def(&self) -> &super::ToolDef {
+                &self.def
+            }
+            async fn invoke(&self, _args: serde_json::Value) -> ToolResult {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                ToolResult::error("native scope probe reached; no platform action runs")
+                    .with_structured(serde_json::json!({"code": "native_scope_probe"}))
+            }
+        }
+
+        for tool_name in ["native_desktop_input", "native_paste_text"] {
+            for policy in [
+                Some(CaptureScopePolicy::Window),
+                Some(CaptureScopePolicy::Auto),
+                Some(CaptureScopePolicy::Desktop),
+                None,
+            ] {
+                let context = standard_context();
+                let hits = Arc::new(AtomicUsize::new(0));
+                let mut registry = super::ToolRegistry::new();
+                registry.register(Box::new(NativeScopeProbe {
+                    hits: hits.clone(),
+                    def: super::ToolDef {
+                        name: tool_name.into(),
+                        description: "test-only native scope admission boundary".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                        read_only: false,
+                        destructive: true,
+                        idempotent: false,
+                        open_world: false,
+                    },
+                }));
+                let public = serde_json::json!({
+                    "session": "native-scope-owner", "scope": "desktop",
+                    "operation": if tool_name == "native_paste_text" { "type_text" } else { "move" },
+                    "text": "private fixture text", "x": 1, "y": 2,
+                });
+                let mut internal = public.clone();
+                namespace_runtime_args(
+                    &mut internal,
+                    context.as_ref(),
+                    &TrustedInvocationEvidence::default(),
+                );
+                let session = internal["session"].as_str().unwrap();
+                if let Some(policy) = policy {
+                    capture_scope::bind_session(session, Some(policy)).unwrap();
+                }
+                let expected = match policy {
+                    Some(CaptureScopePolicy::Window) => "desktop_scope_disabled",
+                    Some(CaptureScopePolicy::Auto) => "desktop_escalation_required",
+                    Some(CaptureScopePolicy::Desktop) | None => "native_scope_probe",
+                };
+                let result = registry
+                    .invoke_with_context(tool_name, public, context)
+                    .await;
+                assert_eq!(result.is_error, Some(true));
+                assert_eq!(
+                    result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|value| value.get("code"))
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected),
+                    "{tool_name} with {policy:?}"
+                );
+                assert_eq!(
+                    hits.load(Ordering::SeqCst),
+                    usize::from(expected == "native_scope_probe"),
+                    "scope refusal must precede native input and every clipboard constructor/read/write"
+                );
+                capture_scope::clear_session(session);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_paste_manifest_refusal_precedes_native_adapter() {
+        for constrained in [false, true] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let mut registry = super::ToolRegistry::new();
+            registry.register(Box::new(ObservationProbe {
+                hits: hits.clone(),
+                def: super::ToolDef {
+                    name: "native_paste_text".into(),
+                    description: "test-only native invocation boundary probe".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    read_only: false,
+                    destructive: true,
+                    idempotent: false,
+                    open_world: false,
+                },
+            }));
+            let context = if constrained {
+                manifest_context(
+                    PermissionMode::Standard,
+                    r#"
+version: 3
+allow:
+  tools: [native_paste_text]
+resources:
+  desktop:
+    display: true
+"#,
+                )
+            } else {
+                standard_context()
+            };
+            let result=registry.invoke_with_context("native_paste_text",serde_json::json!({
+                "scope":"desktop","operation":"type_text","text":"private paste","session":"paste-owner"
+            }),context).await;
+            assert_eq!(result.is_error == Some(true), constrained);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                usize::from(!constrained),
+                "a clipboard authority refusal must never enter native code or its read-error fallback"
+            );
+            if constrained {
+                assert_eq!(
+                    result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|v| v.pointer("/refusal/code"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("bounded_resource_outside_manifest")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn background_input_rechecks_manifest_before_every_adapter_dispatch() {
         // The adapter may retain a native connection after a successful call.
         // Reusing its public session label must not reuse resource authority.
@@ -4995,7 +5161,7 @@ resources:
     /// platform. A public caller cannot claim that origin.
     #[tokio::test]
     async fn trusted_human_origin_suppresses_the_agent_cursor_and_is_not_forgeable() {
-        use crate::agent_cursor::{input_origin, overlay_suppressed, InputOrigin};
+        use crate::agent_cursor::{InputOrigin, input_origin, overlay_suppressed};
         let hits = Arc::new(AtomicUsize::new(0));
         let last_args = Arc::new(Mutex::new(None));
         let mut registry = super::ToolRegistry::new();
@@ -5141,10 +5307,12 @@ resources:
             .await;
         let received = last_args.lock().unwrap().clone();
         assert!(marked(&received));
-        assert!(received.unwrap()["_session_id"]
-            .as_str()
-            .unwrap()
-            .ends_with("native-pixels-viewer"));
+        assert!(
+            received.unwrap()["_session_id"]
+                .as_str()
+                .unwrap()
+                .ends_with("native-pixels-viewer")
+        );
 
         // A nested call (replay) does not inherit the outer call's claim.
         // (The outer probe's result is not a list_windows payload; only the
@@ -5265,7 +5433,7 @@ resources:
     #[tokio::test]
     async fn dispatch_runs_the_action_under_its_post_action_wait() {
         use crate::post_action_wait::{
-            current, PostActionWait, POST_ACTION_WAIT_ARG, POST_ACTION_WAIT_TOOLS, SKIP_SUPPORTED,
+            POST_ACTION_WAIT_ARG, POST_ACTION_WAIT_TOOLS, PostActionWait, SKIP_SUPPORTED, current,
         };
         use serde_json::json;
         let schema = json!({"type": "object", "properties": {}, "additionalProperties": false});
@@ -5410,9 +5578,10 @@ resources:
                 .as_object_mut()
                 .and_then(|object| object.remove("hint"))
                 .expect("a desktop background refusal carries a hint");
-            assert!(hint
-                .as_str()
-                .is_some_and(|hint| hint.contains("target {kind:\"window\"")));
+            assert!(
+                hint.as_str()
+                    .is_some_and(|hint| hint.contains("target {kind:\"window\""))
+            );
             assert_eq!(
                 structured,
                 serde_json::json!({
@@ -5836,9 +6005,11 @@ resources:
             );
         }
         assert_eq!(hits.load(Ordering::SeqCst), 0);
-        assert!(refusal_codes
-            .iter()
-            .all(|code| code.as_deref() == Some("foreign_process_termination_denied")));
+        assert!(
+            refusal_codes
+                .iter()
+                .all(|code| code.as_deref() == Some("foreign_process_termination_denied"))
+        );
         assert_eq!(
             crate::session::list_session_snapshots_with_prefix(
                 &runtime_prefix,
@@ -5947,10 +6118,12 @@ resources:
         assert_eq!(result.is_error, Some(true));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
-        assert!(result
-            .content
-            .iter()
-            .any(|item| format!("{item:?}").contains("live top-level origin")));
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|item| format!("{item:?}").contains("live top-level origin"))
+        );
     }
 
     #[tokio::test]
@@ -5990,11 +6163,12 @@ resources:
             "files": ["/does/not/matter"]
         });
         let evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
-        assert!(args
-            .as_object()
-            .unwrap()
-            .keys()
-            .all(|key| !key.starts_with('_')));
+        assert!(
+            args.as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with('_'))
+        );
 
         let result = registry
             .invoke_with_context_and_evidence(
@@ -6007,14 +6181,18 @@ resources:
         assert_ne!(result.is_error, Some(true));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let received = last_args.lock().unwrap().clone().unwrap();
-        assert!(received
-            .get("_session_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| value.ends_with(":trusted-owner")));
-        assert!(received
-            .get("_transport_session_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| value.ends_with(":transport-a")));
+        assert!(
+            received
+                .get("_session_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.ends_with(":trusted-owner"))
+        );
+        assert!(
+            received
+                .get("_transport_session_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.ends_with(":transport-a"))
+        );
         assert_eq!(
             received["_cua_browser_download_mcp_host_approved"],
             serde_json::Value::Bool(true)
@@ -6169,10 +6347,12 @@ resources:
             action.effect,
             crate::action_record::ActionEffect::Unverifiable
         );
-        assert!(action
-            .debug_json()
-            .get("requested_delivery")
-            .is_some_and(|value| value == "background"));
+        assert!(
+            action
+                .debug_json()
+                .get("requested_delivery")
+                .is_some_and(|value| value == "background")
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         crate::session::fire_session_end(&runtime_session);
@@ -6912,7 +7092,7 @@ fn recording_args_for(tool_name: &str, args: &Value) -> Value {
                     );
                 }
             }
-            "clipboard_write" => {
+            "clipboard_write" | "native_paste_text" => {
                 for field in ["text", "image_path", "file_path"] {
                     if arguments.contains_key(field) {
                         arguments.insert(field.to_owned(), Value::String("[redacted]".to_owned()));
@@ -6935,6 +7115,13 @@ fn recording_args_for(tool_name: &str, args: &Value) -> Value {
                         "destination_root".to_owned(),
                         Value::String("[redacted]".to_owned()),
                     );
+                }
+            }
+            "native_desktop_input" => {
+                for field in ["action", "key", "handle"] {
+                    if arguments.get(field).is_some_and(|value| !value.is_null()) {
+                        arguments.insert(field.to_owned(), Value::String("[redacted]".to_owned()));
+                    }
                 }
             }
             "browser_pointer" => {}
@@ -7049,9 +7236,11 @@ mod capability_tests {
             }),
         );
         assert_eq!(download["destination_root"], "[redacted]");
-        assert!(download
-            .get("_cua_browser_download_mcp_host_approved")
-            .is_none());
+        assert!(
+            download
+                .get("_cua_browser_download_mcp_host_approved")
+                .is_none()
+        );
 
         let serialized = serde_json::json!([dialog, upload, download]).to_string();
         for forbidden in [
@@ -7090,6 +7279,20 @@ mod capability_tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn native_paste_recording_keeps_no_clipboard_text() {
+        let recorded = recording_args_for(
+            "native_paste_text",
+            &serde_json::json!({
+                "scope":"desktop","operation":"type_text","text":"private Unicode 世界\n__CUA_PROTOCOL_END__"
+            }),
+        );
+        assert_eq!(recorded["text"], "[redacted]");
+        assert_eq!(recorded["scope"], "desktop");
+        assert_eq!(recorded["operation"], "type_text");
+        assert!(!recorded.to_string().contains("private Unicode"));
     }
 
     #[test]
@@ -7141,8 +7344,11 @@ mod capability_tests {
         "get_accessibility_tree",
         "get_window_state",
         // app / window
+        "native_paste_text",
         "launch_app",
+        "native_launch_app",
         "list_apps",
+        "native_list_apps",
         "kill_app",
         "list_windows",
         "bring_to_front",
@@ -7283,6 +7489,9 @@ mod capability_tests {
         "driver.update_check",
         "driver.guide",
         "driver.probe",
+        // existing clipboard contract tokens used by the native paste tool
+        "clipboard.read",
+        "clipboard.write",
         // encrypted local history
         "history.status",
         "history.query",
@@ -7479,18 +7688,22 @@ mod capability_tests {
             }
         });
         let accepting_entry = accepting.to_list_entry();
-        assert!(accepting_entry["capabilities"]
-            .as_array()
-            .expect("capabilities array")
-            .iter()
-            .any(|capability| capability == "input.delivery_mode"));
+        assert!(
+            accepting_entry["capabilities"]
+                .as_array()
+                .expect("capabilities array")
+                .iter()
+                .any(|capability| capability == "input.delivery_mode")
+        );
 
         let rejecting_entry = dummy_def("press_key").to_list_entry();
-        assert!(!rejecting_entry["capabilities"]
-            .as_array()
-            .expect("capabilities array")
-            .iter()
-            .any(|capability| capability == "input.delivery_mode"));
+        assert!(
+            !rejecting_entry["capabilities"]
+                .as_array()
+                .expect("capabilities array")
+                .iter()
+                .any(|capability| capability == "input.delivery_mode")
+        );
     }
 
     #[test]
@@ -7717,13 +7930,15 @@ mod capability_tests {
         }
         .to_list_entry();
         // anyOf[0] is the success variant; anyOf[1] is the refusal envelope.
-        let z_index = &entry["outputSchema"]["anyOf"][0]["properties"]["windows"]["items"]
-            ["properties"]["z_index"];
+        let z_index = &entry["outputSchema"]["anyOf"][0]["properties"]["windows"]["items"]["properties"]
+            ["z_index"];
         assert_eq!(z_index["type"], serde_json::json!(["integer", "null"]));
-        assert!(z_index["description"]
-            .as_str()
-            .expect("description")
-            .contains("Higher values are closer to the front"));
+        assert!(
+            z_index["description"]
+                .as_str()
+                .expect("description")
+                .contains("Higher values are closer to the front")
+        );
     }
 
     #[test]
@@ -7775,21 +7990,24 @@ mod capability_tests {
             v["enforcement_adapters"].is_array(),
             "permission enforcement inventory must be available before tools register"
         );
-        assert!(v["enforcement_adapters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|adapter| {
-                adapter["id"] == "browser_prepare.existing_profile" && adapter["state"] == "active"
-            }));
+        assert!(
+            v["enforcement_adapters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|adapter| {
+                    adapter["id"] == "browser_prepare.existing_profile"
+                        && adapter["state"] == "active"
+                })
+        );
     }
 }
 
 #[cfg(test)]
 mod argument_shape_tests {
     use super::{
-        coerce_string_scalars, normalize_argument_aliases, normalize_zoom_args, unknown_argument,
-        ToolDef,
+        ToolDef, coerce_string_scalars, normalize_argument_aliases, normalize_zoom_args,
+        unknown_argument,
     };
     use serde_json::json;
 

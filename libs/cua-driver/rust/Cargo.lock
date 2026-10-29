@@ -958,6 +958,21 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "clipboard-rs"
 version = "0.3.5"
+dependencies = [
+ "clipboard-win",
+ "image",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-ui-kit",
+ "windows 0.59.0",
+ "wl-clipboard-rs",
+ "x11rb",
+]
+
+[[package]]
+name = "clipboard-rs"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1c988a897ea030e32f0668c90b0192800e0c561b3d941fc366f9ad5a1bf26ba"
 dependencies = [
@@ -968,7 +983,6 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-ui-kit",
  "windows 0.59.0",
- "wl-clipboard-rs",
  "x11rb",
 ]
 
@@ -3536,7 +3550,7 @@ dependencies = [
  "base64",
  "bitflags 2.11.1",
  "calloop",
- "clipboard-rs",
+ "clipboard-rs 0.3.5",
  "crossbeam-channel",
  "cua-driver-contract",
  "cua-driver-core",
@@ -3587,7 +3601,7 @@ dependencies = [
  "async-trait",
  "base64",
  "block2 0.5.1",
- "clipboard-rs",
+ "clipboard-rs 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "core-foundation",
  "core-graphics",
  "cua-cursor-motion",
@@ -3627,7 +3641,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
- "clipboard-rs",
+ "clipboard-rs 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "cua-driver-contract",
  "cua-driver-core",
  "cursor-overlay",

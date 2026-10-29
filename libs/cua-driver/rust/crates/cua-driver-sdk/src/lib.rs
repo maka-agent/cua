@@ -19,8 +19,8 @@ use cua_driver_contract::{
     ToolOutput, TypeTextInput, VerifyStateInput, VerifyStateOutput, WindowStateOutput,
 };
 use cua_driver_core::daemon::{
-    is_daemon_listening, request_daemon_metadata, send_request, socket_path_for_namespace,
-    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin,
+    DaemonClientKind, DaemonMetadata, DaemonRequest, ToolObservationOrigin, is_daemon_listening,
+    request_daemon_metadata, send_request, socket_path_for_namespace,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,8 +50,8 @@ pub use cursor_motion::*;
 pub use embedded::*;
 use remote::{DriverEnvelopeChannel, RemoteBoundSession, RemoteDriverClient};
 pub use remote_mcp::{
-    open_mcp_driver_channel, DriverServiceHeader, DriverServiceRequest, DriverServiceResponse,
-    DriverServiceTransport, DriverServiceTransportError, McpDriverChannel,
+    DriverServiceHeader, DriverServiceRequest, DriverServiceResponse, DriverServiceTransport,
+    DriverServiceTransportError, McpDriverChannel, open_mcp_driver_channel,
 };
 use runtime::RuntimeOptions;
 use service_session::ServiceSessionClient;
@@ -72,8 +72,8 @@ pub fn configure_perception_client_resolver(
     let _ = PERCEPTION_CLIENT_RESOLVER.set(resolver);
 }
 
-pub(crate) fn configured_perception_client(
-) -> cua_driver_core::perception_client::PerceptionClientHandle {
+pub(crate) fn configured_perception_client()
+-> cua_driver_core::perception_client::PerceptionClientHandle {
     use cua_driver_core::perception_client::{PerceptionClient, PerceptionClientHandle};
     PERCEPTION_CLIENT_RESOLVER.get().map_or_else(
         || PerceptionClientHandle::fixed(PerceptionClient::unavailable()),
@@ -2679,6 +2679,89 @@ fn normalize_result(tool: &str, raw: Value) -> Result<ToolResult, DriverError> {
 
 uniffi::setup_scaffolding!("cua_driver_sdk");
 
+// Add in cua-driver-sdk/src/lib.rs. Only the Embedded Rust host can create
+// or supply this owner. It retains no old invocation/approval context.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+pub struct NativeDesktopOwner {
+    binding: std::sync::Weak<NativeAbiSession>,
+    service: std::sync::Arc<platform_linux::input::native_desktop::NativeDesktop>,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl std::fmt::Debug for NativeDesktopOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeDesktopOwner")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl NativeDesktopOwner {
+    /// Close producer admission without waiting for a blocked native worker.
+    pub fn seal(&self) {
+        self.service.seal();
+    }
+
+    /// Close producer admission first; only confirmed release closes resources.
+    /// The embedding Host retains this owner after any unconfirmed result.
+    pub async fn close(&self) -> Result<(), DriverError> {
+        self.service
+            .clone()
+            .close()
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl CuaDriverSession {
+    /// Create a passive input owner for one Host turn. Construction opens no
+    /// display connection and conveys no input authority.
+    pub fn native_desktop_owner(&self) -> Result<std::sync::Arc<NativeDesktopOwner>, DriverError> {
+        match &self.backend {
+            SessionBackend::Embedded(binding) => Ok(std::sync::Arc::new(NativeDesktopOwner {
+                binding: std::sync::Arc::downgrade(binding),
+                service: std::sync::Arc::new(Default::default()),
+            })),
+            _ => Err(DriverError::Protocol {
+                reason: "native desktop input requires an embedded trusted session".into(),
+            }),
+        }
+    }
+
+    /// Preserve the same immutable binding and ordinary Core tool admission.
+    /// A service from another SDK binding is refused before native dispatch.
+    pub async fn input_native_desktop(
+        &self,
+        owner: &std::sync::Arc<NativeDesktopOwner>,
+        request: platform_linux::input::native_desktop::NativeDesktopRequest,
+    ) -> Result<ToolResult, DriverError> {
+        let SessionBackend::Embedded(binding) = &self.backend else {
+            return Err(DriverError::Protocol {
+                reason: "native desktop input requires an embedded trusted session".into(),
+            });
+        };
+        if !owner
+            .binding
+            .upgrade()
+            .is_some_and(|expected| std::sync::Arc::ptr_eq(&expected, binding))
+        {
+            return Err(DriverError::Protocol {
+                reason: "native desktop input owner belongs to another SDK binding".into(),
+            });
+        }
+        let name = request.tool_name();
+        let arguments = request.arguments();
+        normalize_result(
+            name,
+            binding
+                .invoke_native_desktop(arguments, owner.service.clone(), request)
+                .await?,
+        )
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/snapshot_lifecycle.rs"]
 mod snapshot_lifecycle_tests;
@@ -3513,9 +3596,11 @@ mod tests {
             authorization_host: None,
             activity_observer: None,
         });
-        assert!(inventory["tools"]
-            .as_array()
-            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click")));
+        assert!(
+            inventory["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "click"))
+        );
 
         let driver = CuaDriver::create(None).unwrap();
         driver.shutdown().await.unwrap();
@@ -4755,9 +4840,11 @@ mod tests {
         let driver = CuaDriver::connect_remote(Arc::new(LegacyRemoteChannel)).unwrap();
         let error = driver.metadata().await.unwrap_err();
         assert!(matches!(error, DriverError::Protocol { .. }));
-        assert!(error
-            .to_string()
-            .contains("does not support request cancellation"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not support request cancellation")
+        );
     }
 
     struct CancellableRemoteChannel {
@@ -4831,5 +4918,228 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("remote request cancellation was not forwarded");
+    }
+}
+
+// Append to cua-driver-sdk/src/lib.rs. These exercise the actual Embedded ABI,
+// canonical request checks and Core policy/recording with an always-refusing
+// actuator probe. They never open an X11 connection or claim native delivery.
+#[cfg(all(test, target_os = "linux", not(target_env = "musl")))]
+mod native_desktop_boundary_tests {
+    use super::*;
+    use cua_driver_core::{
+        protocol::ToolResult as CoreResult,
+        tool::{Tool, ToolDef, ToolRegistry},
+    };
+    use platform_linux::input::native_desktop::NativeDesktopRequest;
+    use platform_linux::input::native_window_action::{NativeWindowAction, NativeWindowActionRequest};
+
+    struct RefusingProbe {
+        name: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl Tool for RefusingProbe {
+        fn def(&self) -> &ToolDef {
+            static INPUT: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+            static PASTE: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+            let definition = if self.name == "native_paste_text" {
+                &PASTE
+            } else {
+                &INPUT
+            };
+            definition.get_or_init(||ToolDef {name:self.name.into(),description:"test-only refusing native desktop boundary probe".into(),
+                input_schema:serde_json::json!({"type":"object","additionalProperties":false,"properties":{
+                    "operation":{"type":"string"},"scope":{"type":"string"},"point":{"type":["array","null"]},
+                    "delta":{"type":"array"},"key":{"type":["string","null"]},"handle":{"type":"string"},
+                    "button":{"type":"string"},"count":{"type":"integer"},"duration_ms":{"type":"integer"},
+                    "pixels":{"type":"integer"},"direction":{"type":"string"},"path":{"type":"array"},"text":{"type":"string"},
+                    "pid":{"type":"integer"},"window_id":{"type":"integer"},"delivery_mode":{"type":"string"},
+                    "x":{"type":["integer","null"]},"y":{"type":["integer","null"]},"action":{"type":"string"}
+                }}),read_only:false,destructive:true,idempotent:false,open_world:false})
+        }
+        async fn invoke(&self, args: Value) -> CoreResult {
+            CoreResult::error(args.to_string())
+        }
+    }
+    fn register(registry: &mut ToolRegistry) {
+        registry.register(Box::new(RefusingProbe {
+            name: "native_desktop_input",
+        }));
+        registry.register(Box::new(RefusingProbe {
+            name: "native_paste_text",
+        }));
+    }
+
+    #[tokio::test]
+    async fn native_desktop_same_binding_and_canonical_data_are_checked_before_dispatch() {
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
+        let driver = CuaDriver::try_create_configured_for_host(
+            ConfiguredDriverOptions {
+                audio_enabled: false,
+                claude_code_compatibility: false,
+                authorization: RuntimeAuthorizationOptions {
+                    allowed_modes: vec![SessionPermissionMode::Standard],
+                    compatibility_mode: SessionPermissionMode::Standard,
+                    compatibility_capability_manifest_path: None,
+                    compatibility_bounded_manifest_path: None,
+                    unrestricted_acknowledged: false,
+                    max_session_ttl_seconds: 60,
+                    max_idle_ttl_seconds: 30,
+                },
+            },
+            DriverHostOptions {
+                cursor: cursor_overlay::CursorConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                host_owns_permission_ux: false,
+                host_bundle_id: None,
+                claude_code_compatibility: false,
+                prepare_desktop_environment: false,
+                register_host_tools: Some(register),
+                authorization_host: None,
+                activity_observer: None,
+            },
+        )
+        .unwrap();
+        let make = |name: &str| {
+            driver
+                .create_trusted_session(TrustedSessionOptions {
+                    public_session: name.into(),
+                    mode: SessionPermissionMode::Standard,
+                    ttl_seconds: 60,
+                    idle_ttl_seconds: 30,
+                    capability_manifest_path: None,
+                    bounded_manifest_path: None,
+                })
+                .unwrap()
+        };
+        let first = make("native-desktop-first");
+        let other = make("native-desktop-other");
+        let owner = first.native_desktop_owner().unwrap();
+        let request = NativeDesktopRequest::MoveRelative {
+            delta: [i16::MIN, i16::MAX],
+            key: None,
+        };
+        assert!(
+            matches!(other.input_native_desktop(&owner,request.clone()).await,
+            Err(DriverError::Protocol {reason}) if reason=="native desktop input owner belongs to another SDK binding")
+        );
+        let SessionBackend::Embedded(binding) = &first.backend else {
+            panic!("Embedded fixture required")
+        };
+        for (field, value) in [
+            ("scope", serde_json::json!("window")),
+            ("delta", serde_json::json!([1, 2])),
+            ("key", serde_json::json!("Ctrl")),
+            ("pid", serde_json::json!(42)),
+        ] {
+            let mut changed = request.arguments();
+            changed[field] = value;
+            assert!(
+                matches!(binding.invoke_native_desktop(changed,owner.service.clone(),request.clone()).await,
+                Err(DriverError::Protocol {reason}) if reason=="native desktop arguments changed")
+            );
+        }
+        let result = first
+            .input_native_desktop(&owner, request.clone())
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "the probe must never claim desktop input succeeded"
+        );
+        let received: Value = serde_json::from_str(&result.text).unwrap();
+        assert_eq!(received["operation"], "move_relative");
+        assert_eq!(received["delta"], serde_json::json!([i16::MIN, i16::MAX]));
+        assert_eq!(received["scope"], "desktop");
+        assert!(received["key"].is_null());
+        for request in [
+            NativeDesktopRequest::TypeText {
+                text: "Unicode 世界 🦀\n\0__CUA_PROTOCOL_END__".into(),
+            },
+            NativeDesktopRequest::Scroll {
+                point: None,
+                direction: cua_driver_contract::ScrollDirection::Left,
+                pixels: 0,
+                key: None,
+            },
+            NativeDesktopRequest::Drag {
+                path: vec![[-3, -1], [0, 0], [1, 2]],
+                key: Some("shift".into()),
+            },
+            NativeDesktopRequest::Click {
+                point: [-17, 1],
+                button: cua_driver_contract::ClickButton::Right,
+                count: 0,
+                duration_ms: u64::MAX,
+                key: Some("Ctrl++".into()),
+            },
+            NativeDesktopRequest::PressKey {
+                key: "XK_Return".into(),
+                duration_ms: 33,
+            },
+        ] {
+            let expected = request.arguments();
+            let result = first.input_native_desktop(&owner, request).await.unwrap();
+            assert!(
+                result.is_error,
+                "the refusing probe cannot claim input delivery"
+            );
+            let received: Value = serde_json::from_str(&result.text).unwrap();
+            for (field, value) in expected.as_object().unwrap() {
+                assert_eq!(received.get(field), Some(value));
+            }
+        }
+        for action in [
+            NativeWindowAction::Move { point: [-17, 31], key: Some("CTRL+SHIFT".into()) },
+            NativeWindowAction::Click { point: [i16::MIN, i16::MAX], button: cua_driver_contract::ClickButton::Middle,
+                count: 0, duration_ms: u64::MAX, key: Some("Alt++".into()) },
+            NativeWindowAction::Scroll { x: Some(-1), y: None,
+                direction: cua_driver_contract::ScrollDirection::Down, pixels: 0, key: None },
+            NativeWindowAction::PressKey { key: "F20".into(), duration_ms: 0 },
+            NativeWindowAction::Drag { path: vec![[0,0],[1,1],[-3,-1]], key: Some("Ctrl".into()) },
+            NativeWindowAction::TypeText { text: "window 世界 🦀\n\0__CUA_PROTOCOL_END__".into() },
+            NativeWindowAction::TypeTextElement { text: "element 世界 🦀\n\0__CUA_PROTOCOL_END__".into(), element_id: "fixture-opaque-native-id".into() },
+            NativeWindowAction::SecondaryAction { action: " Expanded ".into(), element_id: "fixture-opaque-native-id".into() },
+            NativeWindowAction::ScrollElement { element_id: "fixture-opaque-native-id".into(),
+                direction: cua_driver_contract::ScrollDirection::Right, pixels: 0, key: Some("CTRL+SHIFT".into()) },
+        ] {
+            let request = NativeDesktopRequest::Window { request: NativeWindowActionRequest {
+                pid: 42, window_id: 7, action,
+            }};
+            let expected = request.arguments();
+            assert!(expected.get("element_id").is_none(), "selector must not enter public tool arguments");
+            assert!(!request.recording_input().to_string().contains("fixture-opaque-native-id"));
+            if expected.get("action").is_some() {
+                assert_eq!(request.recording_input()["action"], "[redacted]");
+            }
+            for (field, value) in [
+                ("scope", serde_json::json!("desktop")),
+                ("pid", serde_json::json!(43)),
+                ("window_id", serde_json::json!(8)),
+                ("delivery_mode", serde_json::json!("foreground")),
+                ("element_id", serde_json::json!("untrusted-selector-in-JSON")),
+                ("action", serde_json::json!("changed secondary action")),
+            ] {
+                let mut changed = expected.clone(); changed[field] = value;
+                assert!(matches!(binding.invoke_native_desktop(changed, owner.service.clone(), request.clone()).await,
+                    Err(DriverError::Protocol { reason }) if reason == "native desktop arguments changed"));
+            }
+            assert!(matches!(other.input_native_desktop(&owner, request.clone()).await,
+                Err(DriverError::Protocol { reason }) if reason == "native desktop input owner belongs to another SDK binding"));
+            let result = first.input_native_desktop(&owner, request).await.unwrap();
+            assert!(result.is_error, "window probe must never claim native input or clipboard success");
+            let received: Value = serde_json::from_str(&result.text).unwrap();
+            for (field, value) in expected.as_object().unwrap() {
+                assert_eq!(received.get(field), Some(value), "native window field {field}");
+            }
+            assert_eq!(received["scope"], "window");
+            assert_eq!(received["delivery_mode"], "background");
+        }
+        owner.close().await.unwrap(); // Passive owner, no OS resource opened.
+        first.close();
+        other.close();
+        driver.shutdown().await.unwrap();
     }
 }

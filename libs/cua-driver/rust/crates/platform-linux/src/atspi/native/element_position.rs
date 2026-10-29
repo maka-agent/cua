@@ -2,12 +2,12 @@
 
 //! Live screen geometry for native element pointer preparation.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use atspi::State;
 use atspi_connection::AccessibilityConnection;
 
-use super::visible_table::{bounds, Rect};
-use super::{accessible_for, call, RawObjectRef};
+use super::visible_table::{Rect, bounds};
+use super::{RawObjectRef, accessible_for, call};
 use crate::x11::WindowInfo;
 
 fn intersect(left: Rect, right: Rect) -> Rect {
@@ -93,6 +93,14 @@ async fn live_window_clip(
 ) -> Result<Rect> {
     super::element::check(Some(session_id))?;
     let target_bounds = bounds(conn, target, Some(session_id)).await?;
+    clip_to_live_window(target_bounds, window_id, session_id).await
+}
+
+async fn clip_to_live_window(
+    target_bounds: Rect,
+    window_id: u32,
+    session_id: &str,
+) -> Result<Rect> {
     super::element::check(Some(session_id))?;
     let window = super::bounded_blocking(move || crate::x11::window_info(u64::from(window_id)))
         .await
@@ -111,6 +119,19 @@ pub(super) async fn scroll_position(
     session_id: &str,
 ) -> Result<[i16; 2]> {
     center(live_window_clip(conn, target, window_id, session_id).await?)
+}
+
+/// The typed Raw action selects this route explicitly after its window owner
+/// is prepared. spawn_blocking does not inherit the native task-local scope.
+pub(super) async fn native_scroll_position(
+    conn: &AccessibilityConnection,
+    target: &RawObjectRef,
+    window_id: u32,
+    session_id: &str,
+) -> Result<[i16; 2]> {
+    super::element::check(Some(session_id))?;
+    let target_bounds = super::visible_table::native_bounds(conn, target, Some(session_id)).await?;
+    center(clip_to_live_window(target_bounds, window_id, session_id).await?)
 }
 
 #[cfg(test)]

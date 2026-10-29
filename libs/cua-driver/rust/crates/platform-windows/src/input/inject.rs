@@ -85,10 +85,10 @@ impl NativeInputRelease for ForegroundLease {
         let mut own = self
             .state
             .lock()
-            .map_err(|_| "native foreground lock guard mutex poisoned")?;
+            .expect("native foreground lock guard mutex poisoned");
         let mut global = FOREGROUND_LOCK_STATE
             .lock()
-            .map_err(|_| "native foreground lock state mutex poisoned")?;
+            .expect("native foreground lock state mutex poisoned");
         if matches!(*own, ForegroundLeaseState::Holding) {
             global.holders = global
                 .holders
@@ -117,7 +117,9 @@ impl NativeInputRelease for ForegroundLease {
 }
 impl Drop for ForegroundLease {
     fn drop(&mut self) {
-        let _ = self.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.release();
+        });
     }
 }
 pub struct ForegroundLockGuard {
@@ -146,10 +148,10 @@ impl ForegroundLockGuard {
             let mut own = lease
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .expect("native foreground lock guard mutex poisoned");
             let mut state = FOREGROUND_LOCK_STATE
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .expect("native foreground lock state mutex poisoned");
             if matches!(*own, ForegroundLeaseState::Prepared) {
                 if state.holders == 0 {
                     state.locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) }.is_ok();
@@ -171,14 +173,16 @@ impl ForegroundLockGuard {
                 .lease
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner()),
+                .expect("native foreground lock guard mutex poisoned"),
             ForegroundLeaseState::Holding
         )
     }
 }
 impl Drop for ForegroundLockGuard {
     fn drop(&mut self) {
-        let _ = self.lease.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.lease.release();
+        });
     }
 }
 
@@ -263,7 +267,7 @@ impl NativeInputRelease for NoActivateState {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "native no-activate guard mutex poisoned")?;
+            .expect("native no-activate guard mutex poisoned");
         state.1 = true;
         if state.0 {
             let Some(root) = self.root.resolve()? else {
@@ -287,7 +291,9 @@ impl NativeInputRelease for NoActivateState {
 }
 impl Drop for NoActivateState {
     fn drop(&mut self) {
-        let _ = self.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.release();
+        });
     }
 }
 pub struct NoActivateGuard {
@@ -327,7 +333,7 @@ impl NoActivateGuard {
             let mut state = guard
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .expect("native no-activate guard mutex poisoned");
             if !state.1 {
                 unsafe {
                     let previous = GetWindowLongPtrW(root, GWL_EXSTYLE);
@@ -347,7 +353,9 @@ impl NoActivateGuard {
 }
 impl Drop for NoActivateGuard {
     fn drop(&mut self) {
-        let _ = self.guard.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.guard.release();
+        });
     }
 }
 
@@ -718,6 +726,12 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
 /// and promote it to mouse INTERNALLY, without the OS moving the system cursor.
 static TOUCH_DEV: Mutex<isize> = Mutex::new(0);
 
+fn touch_device_guard(device: &Mutex<isize>) -> std::sync::MutexGuard<'_, isize> {
+    device
+        .lock()
+        .expect("persistent touch device lock poisoned")
+}
+
 /// One **touch** press-drag-release from screen `(sx0,sy0)` to `(sx1,sy1)` with
 /// `steps` interpolated in-contact moves, via the persistent [`TOUCH_DEV`].
 /// Unlike a pen (an absolute *cursor* device — injecting one drags the user's
@@ -725,7 +739,7 @@ static TOUCH_DEV: Mutex<isize> = Mutex::new(0);
 /// as touch/stylus and does NOT move the user's cursor. Serialized on the
 /// single shared device (one stroke at a time across all sessions).
 fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()> {
-    let mut dev_guard = TOUCH_DEV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dev_guard = touch_device_guard(&TOUCH_DEV);
     unsafe {
         // A non-pointer-aware window (WPF) makes the OS promote the PRIMARY touch
         // contact to a mouse event, which drags the system cursor to the contact
@@ -908,3 +922,26 @@ pub fn inject_drag_screen(
 // WPF/terminal text) is now reported as `background_unavailable`; the agent
 // escalates to `delivery_mode:"foreground"`, which uses the explicit
 // SetForegroundWindow path (send_key_synthesized / send_text_synthesized).
+
+#[cfg(test)]
+mod touch_device_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_touch_device_refuses_handle_reuse_before_any_native_write() {
+        let device = Mutex::new(17_isize);
+        let poisoned = std::panic::catch_unwind(|| {
+            let _device = device.lock().unwrap();
+            panic!("fixture touch stroke panicked");
+        });
+        assert!(poisoned.is_err());
+        let entered = std::sync::atomic::AtomicBool::new(false);
+        let refused = std::panic::catch_unwind(|| {
+            let mut device = touch_device_guard(&device);
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            *device = 23;
+        });
+        assert!(refused.is_err());
+        assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}

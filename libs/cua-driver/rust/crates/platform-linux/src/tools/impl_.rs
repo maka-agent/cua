@@ -122,6 +122,259 @@ fn pid_fallback_window_resolver() -> cua_driver_core::window_target::PidFallback
     })
 }
 
+pub struct NativeDesktopInputTool;
+pub struct NativeWindowMoveTool;
+static NATIVE_DESKTOP_INPUT_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+#[async_trait]
+impl Tool for NativeDesktopInputTool {
+    fn def(&self) -> &ToolDef {
+        NATIVE_DESKTOP_INPUT_DEF.get_or_init(|| ToolDef {
+            name: "native_desktop_input".into(),
+            description: "Trusted Embedded native window/desktop input: click, key, scroll, ordered drag, pointer motion, named accessibility actions, and owned desktop drag lifecycle. Requires the matching Rust SDK sidecar; direct JSON alone conveys no native authority.".into(),
+            input_schema: json!({
+                "type":"object", "required":["scope","operation"],
+                "properties":{
+                    "scope":{"enum":["desktop","window"]},
+                    "pid":{"type":"integer","minimum":1,"maximum":u32::MAX},
+                    "window_id":{"type":"integer","minimum":1,"maximum":u32::MAX},
+                    "delivery_mode":{"const":"background"},
+                    "x":{"type":["integer","null"],"minimum":i16::MIN,"maximum":i16::MAX},
+                    "y":{"type":["integer","null"],"minimum":i16::MIN,"maximum":i16::MAX},
+                    "operation":{"enum":["scroll","drag","press_key","click","move","move_relative","drag_start","drag_move","drag_end","secondary_action"]},
+                    "point":{"type":["array","null"],"items":{"type":"integer","minimum":-32768,"maximum":32767},"minItems":2,"maxItems":2},
+                    "delta":{"type":"array","items":{"type":"integer","minimum":-32768,"maximum":32767},"minItems":2,"maxItems":2},
+                    "key":{"type":["string","null"]},
+                    "button":{"enum":["left","middle","right"]},
+                    "count":{"type":"integer","minimum":0,"maximum":u32::MAX},
+                    "duration_ms":{"type":"integer","minimum":0,"maximum":u64::MAX},
+                    "handle":{"type":"string"},
+                    "action":{"type":"string"},
+                    "direction":{"enum":["up","down","left","right"]},
+                    "pixels":{"type":"integer","minimum":0,"maximum":u16::MAX},
+                    "path":{"type":"array","items":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"integer","minimum":i16::MIN,"maximum":i16::MAX}}}
+                },
+                "oneOf":[
+                    {"properties":{"operation":{"const":"scroll"}},"required":["direction","pixels","key"],
+                        "oneOf":[{"required":["point"]},{"required":["x","y"]}]},
+                    {"properties":{"operation":{"const":"drag"}},"required":["path","key"]},
+                    {"properties":{"operation":{"const":"press_key"},"key":{"type":"string"}},"required":["key","duration_ms"]},
+                    {"properties":{"operation":{"const":"click"}},"required":["point","button","count","duration_ms","key"]},
+                    {"properties":{"operation":{"const":"move"}},"required":["point","key"]},
+                    {"properties":{"operation":{"const":"move_relative"}},"required":["delta","key"]},
+                    {"properties":{"operation":{"const":"drag_start"}},"required":["handle","point"]},
+                    {"properties":{"operation":{"const":"drag_move"}},"required":["handle","point"]},
+                    {"properties":{"operation":{"const":"drag_end"}},"required":["handle"]},
+                    {"properties":{"operation":{"const":"secondary_action"},"scope":{"const":"window"}},"required":["action"]}
+                ],
+                "allOf":[
+                    {"if":{"properties":{"scope":{"const":"window"}}},"then":{"required":["pid","window_id","delivery_mode"]}},
+                    {"if":{"properties":{"scope":{"const":"desktop"}}},"then":{"not":{"anyOf":[{"required":["pid"]},{"required":["window_id"]}]}}}
+                ],
+                "additionalProperties":false
+            }),
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: false,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        match crate::input::native_desktop::invoke_if_native("native_desktop_input", &args).await {
+            Some(result) => result,
+            None => ToolResult::error(
+                "native desktop input requires the matching trusted SDK sidecar",
+            )
+            .with_structured(
+                json!({"code":"native_desktop_refused","effect":"refused","input_attempted":false}),
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NativeWindowMoveTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+        DEF.get_or_init(||ToolDef {name:"native_window_move".into(),description:"Move one selected X11 client's virtual pointer without button edges or desktop activation; requires its trusted SDK sidecar.".into(),
+            input_schema:json!({"type":"object","additionalProperties":false,"required":["pid","window_id","scope","delivery_mode","x","y"],"properties":{
+                "pid":{"type":"integer","minimum":1,"maximum":u32::MAX},"window_id":{"type":"integer","minimum":1,"maximum":u32::MAX},
+                "scope":{"const":"window"},"delivery_mode":{"const":"background"},
+                "x":{"type":"integer","minimum":i16::MIN,"maximum":i16::MAX},"y":{"type":"integer","minimum":i16::MIN,"maximum":i16::MAX}}}),
+            read_only:false,destructive:true,idempotent:false,open_world:false})
+    }
+    async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(request) = crate::input::native_window::take_native_window_input() {
+            return native_window::invoke("native_window_move", args, request).await;
+        }
+        ToolResult::error("native window move requires its matching trusted SDK sidecar")
+            .with_structured(json!({"code":"native_window_refused","effect":"refused"}))
+    }
+}
+
+// Register beside ListWindowsTool. Ordinary inventory stays unchanged.
+pub struct NativeListWindowsTool;
+static NATIVE_LIST_WINDOWS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+#[async_trait]
+impl Tool for NativeListWindowsTool {
+    fn def(&self) -> &ToolDef {
+        NATIVE_LIST_WINDOWS_DEF.get_or_init(|| ToolDef {
+            name: "native_list_windows".into(),
+            description:
+                "Read source-profile mapped-window metadata from this selected X11 desktop.".into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        })
+    }
+    async fn invoke(&self, _args: Value) -> ToolResult {
+        let lease = cua_driver_core::tool::current_native_input_worker_lease();
+        match tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            crate::x11::native_inventory::list()
+        })
+        .await
+        {
+            Ok(Ok(windows)) => ToolResult::text("Read native mapped window metadata.")
+                .with_structured(json!({"windows":windows})),
+            Ok(Err(error)) => ToolResult::error(error.to_string()),
+            Err(error) => ToolResult::error(format!("native window read failed: {error}")),
+        }
+    }
+}
+
+// Register beside ListAppsTool/LaunchAppTool. These source-profile tools still
+// enter the same Core app.list/app.launch admission and launcher custody.
+pub struct NativeListAppsTool;
+#[async_trait]
+impl Tool for NativeListAppsTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+        DEF.get_or_init(||ToolDef {
+            name:"native_list_apps".into(),description:"Read original-profile launchable Linux desktop applications and their mapped windows.".into(),
+            input_schema:json!({"type":"object","properties":{},"additionalProperties":false}),
+            read_only:true,destructive:false,idempotent:true,open_world:false,
+        })
+    }
+    async fn invoke(&self, _args: Value) -> ToolResult {
+        let lease = cua_driver_core::tool::current_native_input_worker_lease();
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+            let _lease = lease;
+            // Original Client has one mapped-window snapshot before scanning
+            // launchers. An error reading this display cannot become [] apps.
+            let windows = crate::x11::native_inventory::list()?;
+            let entries = crate::installed_apps::native_profile::entries();
+            Ok(entries
+                .into_iter()
+                .map(|entry| {
+                    let owned = windows
+                        .iter()
+                        .filter(|window| {
+                            entry.owns_window_class(window["app"].as_str().unwrap_or_default())
+                        })
+                        .collect::<Vec<_>>();
+                    json!({"id":entry.id,"name":entry.name,"windows":owned})
+                })
+                .collect())
+        })
+        .await
+        {
+            Ok(Ok(apps)) => ToolResult::text("Read native desktop applications.")
+                .with_structured(json!({"apps":apps})),
+            Ok(Err(error)) => ToolResult::error(error.to_string()),
+            Err(error) => ToolResult::error(format!("native application read failed: {error}")),
+        }
+    }
+}
+
+pub struct NativeLaunchAppTool;
+#[async_trait]
+impl Tool for NativeLaunchAppTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+        DEF.get_or_init(||ToolDef {
+            name:"native_launch_app".into(),description:"Launch one exact original-profile Linux desktop application ID or display name.".into(),
+            input_schema:json!({"type":"object","additionalProperties":false,"required":["app"],"properties":{"app":{"type":"string"}}}),
+            read_only:false,destructive:false,idempotent:false,open_world:false,
+        })
+    }
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let Some(query) = args.get("app").and_then(Value::as_str) else {
+            return ToolResult::error("app must be a string");
+        };
+        let query = query.trim().to_owned();
+        if query.is_empty() {
+            return ToolResult::error("app must be a non-empty string");
+        }
+        let lease = cua_driver_core::tool::current_native_input_worker_lease();
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
+            let _lease = lease;
+            let entry = crate::installed_apps::native_profile::entries()
+                .into_iter()
+                .find(|entry| entry.matches_query(&query))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no launchable desktop application matches {query:?}")
+                })?;
+            let argv = entry.argv().map_err(anyhow::Error::msg)?;
+            // Reuse the existing Host restriction after actual expansion;
+            // caller text and desktop files cannot add a debugger endpoint.
+            if argv
+                .iter()
+                .any(|value| cua_driver_core::launch_guard::contains_remote_debugging_flag(value))
+            {
+                anyhow::bail!(cua_driver_core::launch_guard::REMOTE_DEBUGGING_LAUNCH_REFUSAL);
+            }
+            // Same process spawn/reaper and transport stdio isolation; native
+            // argv is already parsed and must not be split or reinterpreted.
+            Ok(spawn_launch_argv(&argv[0], &argv[1..], false)?)
+        })
+        .await
+        {
+            Ok(Ok(pid)) => ToolResult::text("Native application launcher process started.")
+                .with_structured(json!({"pid":pid,"launcher_pid":pid})),
+            Ok(Err(error)) => ToolResult::error(error.to_string()),
+            Err(error) => ToolResult::error(format!(
+                "native application launch outcome is unknown: {error}"
+            ))
+            .with_structured(
+                json!({"effect":"unverifiable","code":"native_launch_outcome_unknown"}),
+            ),
+        }
+    }
+}
+
+// Linux only. Construct with the same backend Arc passed to the existing
+// clipboard tools. Core composes desktop_input + clipboard authority first.
+pub struct NativePasteTextTool {
+    clipboard: Arc<crate::clipboard::LinuxClipboard>,
+}
+#[async_trait]
+impl Tool for NativePasteTextTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+        DEF.get_or_init(||ToolDef {
+            name:"native_paste_text".into(),
+            description:"Trusted Embedded original-profile text paste using the existing X11 clipboard backend and owned key lifetime. Requires matching Rust SDK sidecar.".into(),
+            input_schema:json!({"type":"object","additionalProperties":false,"required":["scope","operation","text"],"properties":{
+                "scope":{"enum":["desktop","window"]},"operation":{"const":"type_text"},"text":{"type":"string"},
+                "pid":{"type":"integer","minimum":1,"maximum":u32::MAX},
+                "window_id":{"type":"integer","minimum":1,"maximum":u32::MAX},
+                "delivery_mode":{"const":"background"}
+            }}),
+            read_only:false,destructive:true,idempotent:false,open_world:true,
+        })
+    }
+    async fn invoke(&self, args: Value) -> ToolResult {
+        crate::input::native_desktop::invoke_if_native_with_clipboard("native_paste_text",&args,Some(self.clipboard.clone()))
+            .await.unwrap_or_else(||ToolResult::error("native paste requires its matching trusted SDK sidecar")
+                .with_structured(json!({"code":"native_desktop_refused","effect":"refused","input_attempted":false})))
+    }
+}
+
 #[cfg(test)]
 mod pid_window_resolver_tests;
 
@@ -2022,22 +2275,34 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     let prog = parts.next().unwrap_or(cmd);
     let mut rest: Vec<String> = parts.map(str::to_owned).collect();
     rest.extend(additional_arguments.iter().cloned());
+    spawn_launch_argv(prog, &rest, true)
+}
+
+fn spawn_launch_argv(
+    prog: &str,
+    rest: &[String],
+    enable_accessibility: bool,
+) -> std::io::Result<u32> {
     let mut launch = std::process::Command::new(prog);
     launch
-        .args(&rest)
+        .args(rest)
         // The child must not inherit the driver's stdio: in private-worker mode
         // stdout is the JSON-RPC stream to the SDK, and a chatty app (Chromium's
         // zygote logs, GTK warnings) writing there corrupts a response and shuts
         // the worker down.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if enable_accessibility {
         // Enable accessibility for this child without toggling GNOME's global
         // ScreenReaderEnabled setting (which can launch Orca). Native
         // toolkits ignore these when they do not need them.
-        .env("ACCESSIBILITY_ENABLED", "1")
-        .env("NO_AT_BRIDGE", "0");
-    if chromium_family_program(prog)
+        launch
+            .env("ACCESSIBILITY_ENABLED", "1")
+            .env("NO_AT_BRIDGE", "0");
+    }
+    if enable_accessibility
+        && chromium_family_program(prog)
         && !rest
             .iter()
             .any(|arg| arg == "--force-renderer-accessibility")
@@ -15016,7 +15281,10 @@ pub fn build_registry_with_provider(
         });
     }
     r.register(Box::new(ListAppsTool));
+    r.register(Box::new(NativeListAppsTool));
+    r.register(Box::new(NativeLaunchAppTool));
     r.register(Box::new(ListWindowsTool));
+    r.register(Box::new(NativeListWindowsTool));
     r.register(Box::new(GetWindowStateTool {
         state: state.clone(),
     }));
@@ -15117,10 +15385,9 @@ pub fn build_registry_with_provider(
         },
         &pid_window_candidates,
     ));
-    cua_driver_core::clipboard::register_clipboard_tools(
-        &mut r,
-        Arc::new(crate::clipboard::LinuxClipboard::new()),
-    );
+    let clipboard = Arc::new(crate::clipboard::LinuxClipboard::new());
+    cua_driver_core::clipboard::register_clipboard_tools(&mut r, clipboard.clone());
+    r.register(Box::new(NativePasteTextTool { clipboard }));
     // `screenshot` removed - see the matching comment in
     // platform-windows/src/tools/impl_.rs::build_registry. Canonical
     // screenshot path is `get_window_state` (it always returns a screenshot now).
@@ -15130,6 +15397,8 @@ pub fn build_registry_with_provider(
         state: state.clone(),
     }));
     r.register(Box::new(GetCursorPositionTool));
+    r.register(Box::new(NativeDesktopInputTool));
+    r.register(Box::new(NativeWindowMoveTool));
     r.register(Box::new(MoveCursorTool {
         state: state.clone(),
     }));
@@ -15243,3 +15512,9 @@ mod cursor_hook_emission_tests {
         assert!(seen[1].pressed);
     }
 }
+
+// Add module input::native_desktop in platform-linux/src/input/mod.rs.
+// Register NativeDesktopInputTool in the existing Linux tool registry.
+// Add "native_desktop_input" to Core DESKTOP_INPUT_OPERATIONS and the
+// local reversible-control classification beside mouse_button_down/up.
+// The same Core execution path must mint current_native_input_worker_lease.

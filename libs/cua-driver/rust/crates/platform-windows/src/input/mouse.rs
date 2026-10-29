@@ -59,7 +59,7 @@ impl NativeInputRelease for ThreadPause {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "owned suspended-thread mutex poisoned")?;
+            .expect("owned suspended-thread mutex poisoned");
         state.1 = true;
         if state.0 {
             // SAFETY: the standard OwnedHandle keeps this exact opened thread
@@ -77,7 +77,9 @@ impl NativeInputRelease for ThreadPause {
 }
 impl Drop for ThreadPause {
     fn drop(&mut self) {
-        let _ = self.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.release();
+        });
     }
 }
 struct SuspendedThread {
@@ -113,12 +115,7 @@ impl SuspendedThread {
             None => None,
         };
         {
-            let mut state = pause.state.lock().map_err(|_| {
-                Error::new(
-                    windows::core::HRESULT(0x80004005_u32 as i32),
-                    "owned suspension mutex poisoned",
-                )
-            })?;
+            let mut state = pause.state.lock().expect("owned suspension mutex poisoned");
             if state.1 {
                 return Err(Error::new(
                     windows::core::HRESULT(0x80004004_u32 as i32),
@@ -165,7 +162,9 @@ impl SuspendedThread {
 }
 impl Drop for SuspendedThread {
     fn drop(&mut self) {
-        let _ = self.pause.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.pause.release();
+        });
     }
 }
 

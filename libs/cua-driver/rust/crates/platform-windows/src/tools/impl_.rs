@@ -10722,6 +10722,10 @@ pub fn build_registry_with_provider(
     r.register(Box::new(InvokeMenuTool));
     r.register(Box::new(DebugWindowInfoTool));
     r.register(pid_window_guarded(
+        NativeSecondaryActionTool { state: state.clone() },
+        &pid_window_candidates,
+    ));
+    r.register(pid_window_guarded(
         ClickTool {
             state: state.clone(),
         },
@@ -10891,3 +10895,162 @@ mod pid_window_target_tests;
 mod display_only_tests;
 #[cfg(test)]
 mod value_write_readback_tests;
+
+// Append to platform-windows/src/tools/impl_.rs; register with the exact same
+// pid_window_guarded(...,&pid_window_candidates) wrapper as ClickTool.
+
+pub struct NativeSecondaryActionTool {
+    state: Arc<ToolState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativePatternAction {
+    Expand,
+    Collapse,
+}
+
+impl NativePatternAction {
+    fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("expand") {
+            Some(Self::Expand)
+        } else if value.eq_ignore_ascii_case("collapse") {
+            Some(Self::Collapse)
+        } else {
+            None
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NativeSecondaryActionTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+        DEF.get_or_init(||ToolDef {name:"native_secondary_action".into(),description:"Perform an explicit supported UIA secondary action on one retained element; never fall back to clicking.".into(),
+            input_schema:json!({"type":"object","additionalProperties":false,"required":["pid","window_id","element_token","action"],"properties":{
+                "pid":{"type":"integer","minimum":1,"maximum":u32::MAX},"window_id":{"type":"integer","minimum":1},
+                "element_token":{"type":"string"},"action":{"type":"string"}}}),
+            read_only:false,destructive:true,idempotent:false,open_world:false})
+    }
+    async fn invoke(&self, args: Value) -> ToolResult {
+        use cua_driver_core::tool_args::ArgsExt;
+        let action = match args
+            .get("action")
+            .and_then(Value::as_str)
+            .and_then(NativePatternAction::parse)
+        {
+            Some(action) => action,
+            None => {
+                return ToolResult::error(
+                    "unsupported native secondary action; no input was attempted",
+                )
+                .with_structured(json!({"code":"secondary_action_unsupported","effect":"refused"}));
+            }
+        };
+        let pid = match args.require_u32("pid") {
+            Ok(pid) => pid,
+            Err(error) => return error,
+        };
+        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let (index, hwnd, admitted) = resolved.into_parts(args.opt_u64("window_id"));
+        let (Some(index), Some(hwnd), Some(admitted)) = (index, hwnd, admitted) else {
+            return ToolResult::error(
+                "secondary action requires a retained element from this window",
+            )
+            .with_structured(json!({"code":"stale_element","effect":"refused"}));
+        };
+        if !admitted.is_uia() {
+            return ToolResult::error("secondary action requires a UIA element").with_structured(
+                json!({"code":"secondary_action_unsupported","effect":"refused"}),
+            );
+        }
+        let Some(lease) = cua_driver_core::tool::current_native_input_worker_lease() else {
+            return ToolResult::error("secondary action requires the current admitted Core worker")
+                .with_structured(json!({"code":"native_worker_required","effect":"refused"}));
+        };
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_attempted = attempted.clone();
+        let result = crate::input::owned::spawn_blocking(move || -> anyhow::Result<()> {
+            let _lease = lease;
+            // The AddRef'd snapshot element and actual worker lease survive
+            // until the pattern call and foreground guard both finish.
+            let _admission = &admitted;
+            use windows::Win32::UI::Accessibility::{
+                IUIAutomationElement, IUIAutomationExpandCollapsePattern,
+                UIA_ExpandCollapsePatternId,
+            };
+            use windows::core::Interface;
+            let element = std::mem::ManuallyDrop::new(unsafe {
+                IUIAutomationElement::from_raw(admitted.as_ptr() as *mut _)
+            });
+            let pattern = unsafe {
+                element
+                    .GetCurrentPattern(UIA_ExpandCollapsePatternId)
+                    .and_then(|value| value.cast::<IUIAutomationExpandCollapsePattern>())
+            }
+            .map_err(|error| {
+                anyhow::anyhow!("ExpandCollapsePattern unavailable for element [{index}]: {error}")
+            })?;
+            if crate::win32::window_owner_pid(hwnd) != Some(pid) {
+                anyhow::bail!("native window owner changed before secondary action");
+            }
+            worker_attempted.store(true, std::sync::atomic::Ordering::Release);
+            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                match action {
+                    NativePatternAction::Expand => pattern.Expand(),
+                    NativePatternAction::Collapse => pattern.Collapse(),
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("ExpandCollapse pattern action failed: {error}"))
+        })
+        .await;
+        use cua_driver_core::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        match result {
+            Ok(Ok(()))=>{
+                let record=ActionExecutionRecord::builder(ActionEffect::Unverifiable,ActionTransport::WindowsUiaExpandCollapse,
+                    RequestedDelivery::Background).actual_delivery(ActualDelivery::Background).build();
+                match record {
+                    Ok(record)=>ToolResult::text("UIA secondary action returned successfully; verify its semantic effect from fresh state.")
+                        .with_structured(json!({"path":"uia_expand_collapse","verified":false,"effect":"unverifiable"})).with_action_record(record),
+                    Err(error)=>ToolResult::error(format!("secondary action receipt unavailable: {error:?}"))
+                        .with_structured(json!({"code":"input_outcome_unknown","effect":"unverifiable"})),
+                }
+            }
+            Ok(Err(error)) if !attempted.load(std::sync::atomic::Ordering::Acquire)=>ToolResult::error(error.to_string())
+                .with_structured(json!({"code":"secondary_action_unavailable","effect":"refused","input_attempted":false})),
+            Ok(Err(error))=>ToolResult::error(error.to_string()).with_structured(json!({"code":"input_outcome_unknown","effect":"unverifiable"})),
+            Err(error)=>ToolResult::error(format!("secondary action worker outcome is unknown: {error}"))
+                .with_structured(json!({"code":"input_outcome_unknown","effect":"unverifiable"})),
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_secondary_action_tests {
+    use super::*;
+    #[test]
+    fn supported_pattern_labels_never_alias_unknown_actions_to_click() {
+        assert_eq!(
+            NativePatternAction::parse("Expand"),
+            Some(NativePatternAction::Expand)
+        );
+        assert_eq!(
+            NativePatternAction::parse("cOlLaPsE"),
+            Some(NativePatternAction::Collapse)
+        );
+        for label in [
+            "Raise",
+            "Scroll Down",
+            "Invoke",
+            " expand ",
+            "",
+            "CollapseAndInvoke",
+        ] {
+            assert_eq!(NativePatternAction::parse(label), None, "{label}");
+        }
+    }
+}

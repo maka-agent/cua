@@ -26,16 +26,22 @@ use atspi_connection::AccessibilityConnection;
 
 use super::{AtspiIdentity, AtspiNode};
 
+mod actions;
 mod element;
 mod element_position;
 pub mod hit;
 pub(crate) mod hit_test;
+mod reply;
 mod scroll;
+mod secondary;
 mod traversal;
+mod typing;
 mod visible_table;
 
 pub(crate) use element::click_native_element;
-pub(crate) use scroll::scroll_native_element;
+pub(crate) use scroll::{prepare_native_scroll, scroll_native_element};
+pub(crate) use secondary::prepare_native_secondary;
+pub(crate) use typing::prepare_native_typing;
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
@@ -4025,29 +4031,7 @@ async fn native_action_names(
     ap: &atspi::proxy::action::ActionProxy<'_>,
     session_id: Option<&str>,
 ) -> Result<Vec<String>> {
-    element::check(session_id)?;
-    let count = call(ap.n_actions()).await;
-    element::check(session_id)?;
-    let count = match count {
-        Some(Ok(count)) => count,
-        Some(Err(error)) => return Err(anyhow!("{error}")),
-        None => anyhow::bail!("AT-SPI element lookup did not answer in time"),
-    };
-    if count < 0 {
-        anyhow::bail!("AT-SPI NActions returned a negative count");
-    }
-    let mut names = Vec::new();
-    for index in 0..count {
-        element::check(session_id)?;
-        let name = call(ap.get_name(index)).await;
-        element::check(session_id)?;
-        match name {
-            Some(Ok(name)) => names.push(name),
-            Some(Err(error)) => return Err(anyhow!("{error}")),
-            None => anyhow::bail!("AT-SPI element lookup did not answer in time"),
-        }
-    }
-    Ok(names)
+    actions::names(ap, session_id).await
 }
 
 /// Current action names of an Action proxy, index-aligned with `do_action`.

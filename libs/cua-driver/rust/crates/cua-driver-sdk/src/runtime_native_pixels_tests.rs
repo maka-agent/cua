@@ -95,7 +95,7 @@ fn runtime() -> (Arc<DriverRuntime>, Arc<Mutex<Vec<Value>>>) {
             compatibility_context,
             shutdown: AtomicBool::new(false),
             last_activity: AtomicU64::new(now_unix_secs()),
-            lifecycle: tokio::sync::RwLock::new(()),
+            lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             lifecycle_maintenance: Mutex::new(None),
             activity_observer: None,
         }),

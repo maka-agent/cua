@@ -8,7 +8,7 @@
 //! typed inputs/results and versioned declarations used by the live runtime
 //! and to generate experimental client SDKs.
 
-use schemars::{generate::SchemaSettings, transform::RecursiveTransform, Schema};
+use schemars::{Schema, generate::SchemaSettings, transform::RecursiveTransform};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,44 +46,44 @@ fn drop_schemars_numeric_format(schema: &mut Schema) {
 
 pub use cursor::CursorEffectSetting;
 pub use cursor::{
-    classify_cursor_semantics, CursorAction, CursorDelivery, CursorMotionEffects,
-    CursorMotionEffectsOutput, CursorMotionStyle, CursorMotionTiming, CursorPlayback,
-    CursorReducedMotion, CursorSemantics, CursorTarget, CursorThemeSelection,
+    CursorAction, CursorDelivery, CursorMotionEffects, CursorMotionEffectsOutput,
+    CursorMotionStyle, CursorMotionTiming, CursorPlayback, CursorReducedMotion, CursorSemantics,
+    CursorTarget, CursorThemeSelection, classify_cursor_semantics,
 };
 pub use inputs::{
     ActionTarget, CaptureScope, ClickButton, ClickInput, ClickPosition, ClipboardReadInput,
     ClipboardWriteInput, CursorMotionSelection, DesktopScope, DragInput, EndSessionInput,
     EscalateSessionInput, EscalationReason, GetAgentCursorStateInput, GetCursorPositionInput,
     GetDesktopStateInput, GetScreenSizeInput, GetSessionInput, GetSessionStateInput, HotkeyInput,
-    InputDeliveryMode, InvokeMenuInput, LegacyClickInput, ListSessionsInput, MoveCursorInput,
-    PressKeyInput, ScrollBy, ScrollDirection, ScrollInput, SetAgentCursorEnabledInput,
-    SetAgentCursorMotionInput, SetAgentCursorThemeInput, SetWindowFrameInput, StartSessionInput,
-    ToolInput, TypeTextInput, MULTI_CALL_SESSION_DESCRIPTION,
+    InputDeliveryMode, InvokeMenuInput, LegacyClickInput, ListSessionsInput,
+    MULTI_CALL_SESSION_DESCRIPTION, MoveCursorInput, PressKeyInput, ScrollBy, ScrollDirection,
+    ScrollInput, SetAgentCursorEnabledInput, SetAgentCursorMotionInput, SetAgentCursorThemeInput,
+    SetWindowFrameInput, StartSessionInput, ToolInput, TypeTextInput,
 };
 pub use outputs::{
-    advertised_output_schema, conforming_error_envelope, is_refusal_envelope,
-    refusal_envelope_schema, ActionDelivery, ActionDeliveryMode, ActionEffect, ActionError,
-    ActionEscalation, ActionEscalationReason, ActionEscalationTarget, ActionEvidence,
-    ActionEvidenceKind, ActionNextCall, ActionResult, ActionResultValidationError, ActionRoute,
-    AgentOverlayCapture, AgentOverlayCaptureStatus, ClipboardReadOutput, ClipboardWriteOutput,
-    CursorMotionOutput, CursorPointOutput, CursorPositionOutput, CursorThemeOutput,
-    CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
-    GetAgentCursorStateOutput, ListSessionsOutput, ScreenSizeOutput, SessionClientKindOutput,
-    SessionLifecycleState, SessionOutput, SessionStateOutput, SessionTransportOutput,
-    SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput, SetAgentCursorThemeOutput,
-    StartSessionOutput, ToolOutput, TOOL_INVOCATION_FAILED_CODE,
+    ActionDelivery, ActionDeliveryMode, ActionEffect, ActionError, ActionEscalation,
+    ActionEscalationReason, ActionEscalationTarget, ActionEvidence, ActionEvidenceKind,
+    ActionNextCall, ActionResult, ActionResultValidationError, ActionRoute, AgentOverlayCapture,
+    AgentOverlayCaptureStatus, ClipboardReadOutput, ClipboardWriteOutput, CursorMotionOutput,
+    CursorPointOutput, CursorPositionOutput, CursorThemeOutput, CursorVisualOutput,
+    DesktopStateOutput, EffectiveScope, EndSessionOutput, GetAgentCursorStateOutput,
+    ListSessionsOutput, ScreenSizeOutput, SessionClientKindOutput, SessionLifecycleState,
+    SessionOutput, SessionStateOutput, SessionTransportOutput, SetAgentCursorEnabledOutput,
+    SetAgentCursorMotionOutput, SetAgentCursorThemeOutput, StartSessionOutput,
+    TOOL_INVOCATION_FAILED_CODE, ToolOutput, advertised_output_schema, conforming_error_envelope,
+    is_refusal_envelope, refusal_envelope_schema,
 };
 pub use verification::{
     BoundsExpectation, ElementPredicate, ElementSelector, PredicateOutcome, StatePredicate,
-    UnknownReason, VerificationStatus, VerifyStateInput, VerifyStateOutput, WindowPredicate,
-    VERIFY_STATE_DEFAULT_TIMEOUT_MS,
+    UnknownReason, VERIFY_STATE_DEFAULT_TIMEOUT_MS, VerificationStatus, VerifyStateInput,
+    VerifyStateOutput, WindowPredicate,
 };
 pub use visual::{
     ParseVisualRegionsInput, ParseVisualRegionsOptions, ParseVisualRegionsOutput,
-    VisualActionCoordinateSpace, VisualCaptureProvenance, VisualCaptureSource,
-    VisualContractValidationError, VisualParseError, VisualParseErrorCode, VisualParseTiming,
-    VisualParseWarning, VisualParserMetadata, VisualRegion, VisualRegionBounds, VisualRegionKind,
-    VisualScreenshotReference, VISUAL_REGIONS_SCHEMA,
+    VISUAL_REGIONS_SCHEMA, VisualActionCoordinateSpace, VisualCaptureProvenance,
+    VisualCaptureSource, VisualContractValidationError, VisualParseError, VisualParseErrorCode,
+    VisualParseTiming, VisualParseWarning, VisualParserMetadata, VisualRegion, VisualRegionBounds,
+    VisualRegionKind, VisualScreenshotReference,
 };
 
 /// Shape version for the MCP `tools/list` result emitted by cua-driver.
@@ -113,6 +113,10 @@ pub const ACTION_RESULT_TOOLS: &[&str] = &[
     "mouse_drag",
     "parallel_mouse_drag",
     "move_cursor",
+    "native_desktop_input",
+    "native_paste_text",
+    "native_window_move",
+    "native_secondary_action",
     "mouse_button_down",
     "mouse_button_up",
     "type_text",
@@ -517,17 +521,19 @@ mod tests {
         assert_eq!(contract.schema_mode, SchemaMode::PortableSubset);
         assert!(contract.annotations.read_only);
         assert!(!contract.annotations.destructive);
-        assert!(contract
-            .capabilities
-            .iter()
-            .any(|capability| capability == "state.verify"));
+        assert!(
+            contract
+                .capabilities
+                .iter()
+                .any(|capability| capability == "state.verify")
+        );
         assert_eq!(
             contract.input_schema["required"],
             serde_json::json!(["pid", "window_id", "expect"])
         );
         assert_eq!(
-            contract.input_schema["properties"]["expect"]["items"]["properties"]["element"]
-                ["properties"]["exists"]["type"],
+            contract.input_schema["properties"]["expect"]["items"]["properties"]["element"]["properties"]
+                ["exists"]["type"],
             serde_json::json!("boolean")
         );
         assert!(
@@ -706,11 +712,13 @@ mod tests {
             ),
             Ok(true)
         );
-        assert!(validate_success_output(
-            "list_windows",
-            serde_json::json!({"windows": [{"z_index": "unknown"}]}),
-        )
-        .is_err());
+        assert!(
+            validate_success_output(
+                "list_windows",
+                serde_json::json!({"windows": [{"z_index": "unknown"}]}),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -779,20 +787,24 @@ mod tests {
             ),
             Ok(true)
         );
-        assert!(validate_success_output(
-            "get_screen_size",
-            serde_json::json!({
-                "width": "1512",
-                "height": 982,
-                "scale_factor": 2
-            }),
-        )
-        .is_err());
-        assert!(validate_success_output(
-            "end_session",
-            serde_json::json!({"session": "run", "active": true}),
-        )
-        .is_err());
+        assert!(
+            validate_success_output(
+                "get_screen_size",
+                serde_json::json!({
+                    "width": "1512",
+                    "height": 982,
+                    "scale_factor": 2
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_success_output(
+                "end_session",
+                serde_json::json!({"session": "run", "active": true}),
+            )
+            .is_err()
+        );
     }
 
     #[test]

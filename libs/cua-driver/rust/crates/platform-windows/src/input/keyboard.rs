@@ -710,7 +710,7 @@ impl cua_driver_core::windows_interruption::NativeInputRelease for QueueAttachme
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "native input-queue attachment mutex poisoned")?;
+            .expect("native input-queue attachment mutex poisoned");
         state.1 = true;
         if state.0 {
             // SAFETY: only detach the exact pair whose successful attachment
@@ -736,7 +736,9 @@ impl cua_driver_core::windows_interruption::NativeInputRelease for QueueAttachme
 }
 impl Drop for QueueAttachment {
     fn drop(&mut self) {
-        let _ = cua_driver_core::windows_interruption::NativeInputRelease::release(self);
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = cua_driver_core::windows_interruption::NativeInputRelease::release(self);
+        });
     }
 }
 pub(crate) struct InputQueueAttachment {
@@ -768,7 +770,7 @@ impl InputQueueAttachment {
             let mut state = attachment
                 .state
                 .lock()
-                .map_err(|_| anyhow::anyhow!("native input attachment mutex poisoned"))?;
+                .expect("native input attachment mutex poisoned");
             if state.1 {
                 bail!("native input-queue attachment owner retired");
             }
@@ -838,9 +840,11 @@ impl InputQueueAttachment {
 
 impl Drop for InputQueueAttachment {
     fn drop(&mut self) {
-        let _ = cua_driver_core::windows_interruption::NativeInputRelease::release(
-            self.attachment.as_ref(),
-        );
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = cua_driver_core::windows_interruption::NativeInputRelease::release(
+                self.attachment.as_ref(),
+            );
+        });
     }
 }
 

@@ -365,3 +365,5 @@ Exec=/opt/demo/bin/demo %U
         assert_eq!(desktop_file_id(root, other), "");
     }
 }
+
+pub(crate) mod native_profile;

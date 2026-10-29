@@ -227,17 +227,8 @@ async fn action_proxy<'conn>(
     object: &RawObjectRef,
     session_id: &str,
 ) -> Result<ActionProxy<'conn>> {
-    let accessible = checked(session_id, accessible_via_bus(conn, object)).await?;
-    // Read the interface names verbatim: a provider may advertise interfaces
-    // unknown to the atspi crate alongside the standard Action interface.
-    let interfaces: Vec<String> =
-        checked(session_id, accessible.inner().call("GetInterfaces", &())).await?;
-    if !interfaces
-        .iter()
-        .any(|name| name == "org.a11y.atspi.Action")
-    {
-        bail!("AT-SPI element does not implement Action");
-    }
+    // Both callers immediately run native_action_names, which performs the
+    // original GetInterfaces -> NActions -> GetName sequence exactly once.
     checked(
         session_id,
         ActionProxy::builder(conn.connection())
@@ -252,7 +243,7 @@ async fn action_proxy<'conn>(
 /// Native tool results render `Display`, so preserve the action reader's
 /// public cause-chain text here without flattening away its typed source.
 #[derive(Debug)]
-struct ActionReadError(anyhow::Error);
+pub(super) struct ActionReadError(pub(super) anyhow::Error);
 
 impl std::fmt::Display for ActionReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -294,21 +285,34 @@ async fn dispatch_action(
         .map_err(|error| failure(error, false, transport))?;
     let index = i32::try_from(index).map_err(|error| failure(error.into(), false, transport))?;
     check(Some(session_id)).map_err(|error| failure(error, false, transport))?;
-    // Once the RPC is tried, cancellation/timeout cannot justify another route.
-    match call(proxy.do_action(index)).await {
-        Some(Ok(true)) => Ok(NativeElementDelivery::Accessibility {
-            unacknowledged: false,
-        }),
-        Some(Ok(false)) => Err(failure(
-            anyhow!("AT-SPI element refused action {index}; refresh get_window_state() to check its state"),
-            true,
-            transport,
-        )),
-        Some(Err(error)) => Err(failure(error.into(), true, transport)),
-        None => Ok(NativeElementDelivery::Accessibility {
-            unacknowledged: true,
-        }),
+    // Once issued, this same mutation remains owned through its actual reply.
+    // Read budgets and producer Stop cannot drop it or select another route.
+    settle_action(
+        super::reply::call_method(proxy.inner(), "DoAction", &(index,)),
+        index,
+    )
+    .await
+}
+
+async fn settle_action(
+    reply: impl std::future::Future<Output = Result<atspi::zbus::Message>>,
+    index: i32,
+) -> std::result::Result<NativeElementDelivery, NativeElementClickFailure> {
+    let transport = NativeElementTransport::Accessibility;
+    let acknowledged = async {
+        let reply = reply.await?;
+        if super::reply::boolean(&reply)? == Some(true) {
+            Ok(())
+        } else {
+            bail!("AT-SPI element refused action {index}; refresh get_window_state() to check its state")
+        }
     }
+    .await;
+    acknowledged
+        .map(|()| NativeElementDelivery::Accessibility {
+            unacknowledged: false,
+        })
+        .map_err(|error| failure(error, true, transport))
 }
 
 async fn verify_owner(request: &NativeElementClickRequest, session_id: &str) -> Result<()> {
@@ -585,6 +589,156 @@ pub(crate) fn click_native_element(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn action_reply<T: serde::Serialize + atspi::zbus::zvariant::DynamicType>(
+        body: &T,
+    ) -> atspi::zbus::Message {
+        let call = atspi::zbus::Message::method_call("/org/cua/Fixture", "DoAction")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        atspi::zbus::Message::method_return(&call.header())
+            .unwrap()
+            .build(body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accepted_primary_action_keeps_its_same_future_after_the_observation_stops() {
+        use crate::atspi::native_observation::{
+            NativeObservationRequest, current, with_native_observation,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::task::Poll;
+        use tokio::sync::oneshot;
+
+        struct Ended(Arc<AtomicUsize>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (context_tx, context_rx) = oneshot::channel();
+        let mut invocation = Box::pin(with_native_observation(
+            NativeObservationRequest {
+                pid: 73,
+                window_id: 11,
+                deadline: None,
+            },
+            async move {
+                context_tx.send(current().unwrap()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        let observation = tokio::select! {
+            _ = invocation.as_mut() => panic!("test invocation must remain pending"),
+            context = context_rx => context.unwrap(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicUsize::new(0));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let actual_calls = calls.clone();
+        let actual_ended = ended.clone();
+        let transport = async move {
+            let _ended = Ended(actual_ended);
+            actual_calls.fetch_add(1, Ordering::SeqCst);
+            reply_rx.await.map_err(anyhow::Error::from)
+        };
+        let mut owned = Box::pin(observation.scope(settle_action(transport, 0)));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(
+                std::future::Future::poll(owned.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
+        drop(invocation);
+        assert_eq!(observation.stop_reason(), Some("cancelled"));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(
+                std::future::Future::poll(owned.as_mut(), cx).is_pending()
+            ))
+            .await,
+            "producer Stop cannot terminate the accepted method future"
+        );
+        assert_eq!(
+            ended.load(Ordering::SeqCst),
+            0,
+            "transport future is still retained"
+        );
+        reply_tx.send(action_reply(&(true, 7_u32))).unwrap();
+        assert_eq!(
+            owned.await.unwrap(),
+            NativeElementDelivery::Accessibility {
+                unacknowledged: false
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no replay occurred");
+        assert_eq!(
+            ended.load(Ordering::SeqCst),
+            1,
+            "the original future actually settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_primary_action_accepts_every_nonzero_boolean_word() {
+        for word in [1, 2, u32::MAX] {
+            let reply = action_reply(&super::super::reply::BooleanWord(word));
+            let delivery = settle_action(std::future::ready(Ok(reply)), 2)
+                .await
+                .unwrap();
+            assert!(matches!(
+                delivery,
+                NativeElementDelivery::Accessibility {
+                    unacknowledged: false
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_primary_action_retains_unknown_delivery_for_errors_or_wrong_reply_shapes() {
+        for reply in [
+            action_reply(&false),
+            action_reply(&(false, true)),
+            action_reply(&()),
+            action_reply(&((true,),)),
+            action_reply(&7_i32),
+        ] {
+            let failure = settle_action(std::future::ready(Ok(reply)), 2)
+                .await
+                .unwrap_err();
+            assert!(failure.dispatched);
+            assert_eq!(failure.transport, NativeElementTransport::Accessibility);
+            assert_eq!(
+                failure.error.to_string(),
+                "AT-SPI element refused action 2; refresh get_window_state() to check its state"
+            );
+        }
+        let cause = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "accepted transport disconnected",
+        );
+        let failure = settle_action(std::future::ready(Err(cause.into())), 2)
+            .await
+            .unwrap_err();
+        assert!(failure.dispatched);
+        assert_eq!(failure.transport, NativeElementTransport::Accessibility);
+        assert_eq!(
+            failure
+                .error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+    }
 
     #[test]
     fn window_input_phase_preserves_primary_failures_and_marks_pre_primary_input() {

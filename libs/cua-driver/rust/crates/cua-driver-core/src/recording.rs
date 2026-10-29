@@ -1460,10 +1460,25 @@ fn write_turn_with_after(
     {
         before.state = StateCapture::unavailable(STATE_SKIPPED_PREDICTION_MISSED);
     }
+    // Native input's private diagnostic omits chord/text/handle/action bytes.
+    // Its provider can echo those bytes in an error, so persist only status;
+    // keep the actual ToolResult and typed action truth outside this copy.
+    let result_summary = if matches!(
+        tool_name.as_str(),
+        "native_desktop_input" | "native_paste_text"
+    ) {
+        if result_is_error {
+            "native call failed"
+        } else {
+            "native call succeeded"
+        }
+    } else {
+        result_text
+    };
     let mut payload = serde_json::json!({
         "tool": tool_name,
         "arguments": args,
-        "result_summary": result_text,
+        "result_summary": result_summary,
         "result_error": result_is_error,
         "timestamp": iso8601_utc_from_unix_ms(now),
         "t_ms_from_session_start": now.saturating_sub(session_start_ms),
@@ -1630,6 +1645,214 @@ fn validate_video_metadata(meta: VideoMetadata) -> anyhow::Result<VideoMetadata>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NativeRecordingProbe {
+        def: crate::tool::ToolDef,
+        received: Arc<Mutex<Option<Value>>>,
+        echo: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for NativeRecordingProbe {
+        fn def(&self) -> &crate::tool::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> crate::protocol::ToolResult {
+            self.received.lock().unwrap().replace(args);
+            // This recorder fixture has no actuator. Deliberately echo the
+            // caller bytes so the real writer must suppress that third path.
+            crate::protocol::ToolResult::error(self.echo.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_recording_masks_both_input_channels_and_result_echo_without_mutating_dispatch()
+    {
+        use crate::authorization::PermissionMode;
+        use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+
+        let forbidden = [
+            "fixture-private-action",
+            "fixture-private-key",
+            "fixture-private-handle",
+            "fixture-private-text",
+        ];
+        let echo = format!("fixture refuses {}", forbidden.join(" | "));
+        let cases = [
+            (
+                "native_desktop_input",
+                serde_json::json!({
+                    "operation":"secondary_action","scope":"window","pid":1,"window_id":2,
+                    "delivery_mode":"background","action":forbidden[0]
+                }),
+                serde_json::json!({"operation":"secondary_action","action":"[redacted]","has_element":true}),
+            ),
+            (
+                "native_desktop_input",
+                serde_json::json!({
+                    "operation":"press_key","scope":"desktop","key":forbidden[1],"duration_ms":33
+                }),
+                serde_json::json!({"operation":"press_key","duration_ms":33}),
+            ),
+            (
+                "native_desktop_input",
+                serde_json::json!({
+                    "operation":"drag_end","scope":"desktop","handle":forbidden[2]
+                }),
+                serde_json::json!({"operation":"drag_end"}),
+            ),
+            (
+                "native_paste_text",
+                serde_json::json!({
+                    "operation":"type_text","scope":"desktop","text":forbidden[3]
+                }),
+                serde_json::json!({"operation":"type_text","text":"[redacted]","clipboard":"temporary_utf8"}),
+            ),
+            (
+                "native_desktop_input",
+                serde_json::json!({
+                    "operation":"move","scope":"desktop","point":[1,2],"key":null,"action":null,"handle":null
+                }),
+                serde_json::json!({"operation":"move","point":[1,2],"has_key":false}),
+            ),
+            (
+                "native_desktop_input",
+                serde_json::json!({
+                    "operation":"move","scope":"desktop","point":[1,2]
+                }),
+                serde_json::json!({"operation":"move","point":[1,2],"has_key":false}),
+            ),
+        ];
+        for (name, args, descriptor) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let mut registry = crate::tool::ToolRegistry::new();
+            // Configure only this fixture-owned recorder. start() would also
+            // start the cursor sampler, which this test deliberately avoids.
+            {
+                let mut inner = registry.recording.inner.lock().unwrap();
+                inner.enabled = true;
+                inner.output_dir = Some(directory.path().to_owned());
+            }
+            let received = Arc::new(Mutex::new(None));
+            registry.register(Box::new(NativeRecordingProbe {
+                def: crate::tool::ToolDef {
+                    name: name.into(),
+                    description: "test-only recorder echo probe".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    read_only: false,
+                    destructive: true,
+                    idempotent: false,
+                    open_world: false,
+                },
+                received: received.clone(),
+                echo: echo.clone(),
+            }));
+            let ceiling = SessionModeCeiling::for_trusted_sessions(
+                [PermissionMode::Standard],
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+            let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+                .compatibility_context(PermissionMode::Standard, None)
+                .unwrap();
+            let original = args.clone();
+            let actual = with_unreplayable_native_input(
+                "linux_native_desktop_input",
+                descriptor.clone(),
+                registry.invoke_with_context(name, args.clone(), context),
+            )
+            .await;
+            assert_eq!(actual.is_error, Some(true));
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap()["content"][0]["text"],
+                echo,
+                "the actual provider error must retain its original bytes"
+            );
+            assert_eq!(
+                args, original,
+                "recording must not mutate the caller's object"
+            );
+            let received = received
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the explicit fixture reached dispatch");
+            assert_eq!(
+                strip_internal_keys(&received).as_ref(),
+                &original,
+                "the actual invocation retains canonical argument bytes"
+            );
+            let path = directory.path().join("turn-00001/action.json");
+            let bytes = std::fs::read(&path).unwrap();
+            let action: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(action["result_summary"], "native call failed");
+            assert_eq!(action["result_error"], true);
+            assert_eq!(action["native_input"]["original_input"], descriptor);
+            assert_eq!(action["native_input"]["replay"]["status"], "unavailable");
+            for field in ["action", "key", "handle"] {
+                if name == "native_desktop_input" {
+                    let expected = original.get(field).map(|value| {
+                        if value.is_null() {
+                            Value::Null
+                        } else {
+                            Value::String("[redacted]".into())
+                        }
+                    });
+                    assert_eq!(action["arguments"].get(field), expected.as_ref());
+                }
+            }
+            if name == "native_paste_text" {
+                assert_eq!(action["arguments"]["text"], "[redacted]");
+            }
+            assert_eq!(action["arguments"]["operation"], original["operation"]);
+            let serialized = String::from_utf8(bytes).unwrap();
+            for secret in forbidden {
+                assert!(!serialized.contains(secret), "recording leaked {secret}");
+            }
+            assert!(take_native_input_recording().is_none());
+        }
+    }
+
+    #[test]
+    fn native_writer_keeps_status_and_leaves_generic_result_summaries_unchanged() {
+        for name in ["native_desktop_input", "native_paste_text", "type_text"] {
+            for failed in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let pending = PendingTurn {
+                    generation: 0,
+                    turn_dir: directory.path().to_owned(),
+                    tool_name: name.into(),
+                    args: serde_json::json!({}),
+                    native_input: None,
+                    start_ms: 0,
+                    session_start_ms: 0,
+                    window_id: None,
+                    pid: None,
+                    click_point: None,
+                    capture_visual_state: false,
+                    state_budget: None,
+                    predicted_refusal: None,
+                    before: TurnCapture::privacy_suppressed(),
+                    dispatch_click: None,
+                };
+                write_turn(pending, "fixture-private-result-echo", None, failed).unwrap();
+                let action: Value = serde_json::from_slice(
+                    &std::fs::read(directory.path().join("action.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(action["result_error"], failed);
+                let expected = match (name, failed) {
+                    ("type_text", _) => "fixture-private-result-echo",
+                    (_, true) => "native call failed",
+                    (_, false) => "native call succeeded",
+                };
+                assert_eq!(action["result_summary"], expected);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn native_input_keeps_requested_counts_without_enabling_private_capture() {

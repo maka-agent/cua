@@ -1051,3 +1051,6 @@ mod tests {
         assert!(cross.is_empty());
     }
 }
+
+// Native profile shares the existing connection/property/ownership primitives.
+pub(crate) mod native_inventory;

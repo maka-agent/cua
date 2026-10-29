@@ -49,7 +49,7 @@ impl NativeInputRelease for DisabledWindow {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "native disabled-window guard mutex poisoned")?;
+            .expect("native disabled-window guard mutex poisoned");
         state.1 = true;
         if state.0 {
             let Some(hwnd) = self.target.resolve()? else {
@@ -73,7 +73,9 @@ impl NativeInputRelease for DisabledWindow {
 }
 impl Drop for DisabledWindow {
     fn drop(&mut self) {
-        let _ = self.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.release();
+        });
     }
 }
 pub struct DisabledHwndGuard {
@@ -103,7 +105,7 @@ impl DisabledHwndGuard {
             let mut state = guard
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .expect("native disabled-window guard mutex poisoned");
             if !state.1 && !hwnd.0.is_null() && unsafe { IsWindowEnabled(hwnd) }.as_bool() {
                 let _ = unsafe { EnableWindow(hwnd, false) };
                 state.0 = !unsafe { IsWindowEnabled(hwnd) }.as_bool();
@@ -117,7 +119,9 @@ impl DisabledHwndGuard {
 }
 impl Drop for DisabledHwndGuard {
     fn drop(&mut self) {
-        let _ = self.guard.release();
+        crate::input::owned::cleanup_on_drop(|| {
+            let _ = self.guard.release();
+        });
     }
 }
 

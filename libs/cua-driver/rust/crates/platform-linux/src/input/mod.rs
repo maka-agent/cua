@@ -20,11 +20,14 @@ pub mod focus_guard;
 pub mod foreground;
 /// Low-latency ordered input batches for one target (embedders).
 pub mod interactive;
+pub mod native_desktop;
+pub mod native_window_action;
 mod mpx_keyboard;
 mod mpx_owner;
 /// Fresh native element selectors for trusted Embedded SDK calls.
 pub mod native_element;
 /// Exact-window native pointer input for trusted Embedded SDK calls.
+mod native_keys;
 pub mod native_window;
 /// One-shot targeted pointer/keyboard delivery with explicit
 /// auto/background/foreground semantics (embedders).

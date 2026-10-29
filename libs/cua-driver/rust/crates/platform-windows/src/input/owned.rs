@@ -67,8 +67,14 @@ impl Inputs {
     fn begin(&self) -> Option<Writing<'_>> {
         // One exact native write and its inserted-prefix update are ordered
         // together, including direct SDK callers sharing this binding.
-        let serial = self.writes.lock().ok()?;
-        let mut journal = self.journal.lock().ok()?;
+        let serial = self
+            .writes
+            .lock()
+            .expect("native input write mutex poisoned");
+        let mut journal = self
+            .journal
+            .lock()
+            .expect("native input journal mutex poisoned");
         if journal.closed
             || current_windows_input_binding().is_some_and(|binding| binding.check().is_err())
         {
@@ -83,13 +89,13 @@ impl Inputs {
         let mut journal = self
             .journal
             .lock()
-            .map_err(|_| "native input journal mutex poisoned")?;
+            .expect("native input journal mutex poisoned");
         journal.closed = true;
         while journal.writing != 0 {
             journal = self
                 .settled
                 .wait(journal)
-                .map_err(|_| "native input write settlement mutex poisoned")?;
+                .expect("native input write settlement mutex poisoned");
         }
         let keys: Vec<_> = journal.held.keys().copied().collect();
         let mut failures = Vec::new();
@@ -158,7 +164,7 @@ impl Inputs {
         let mut journal = self
             .journal
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .expect("native input journal mutex poisoned");
         if input.r#type == INPUT_KEYBOARD {
             // SAFETY: the discriminant selects the keyboard union member.
             let key = unsafe { input.Anonymous.ki };
@@ -218,7 +224,7 @@ impl Inputs {
         let mut journal = self
             .journal
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .expect("native input journal mutex poisoned");
         if message == WM_MOUSEMOVE {
             for (held, release) in &mut journal.held {
                 if matches!(held, Held::Posted { window, code, .. } if *window == target.0 as usize && !matches!(*code, WM_KEYDOWN | WM_SYSKEYDOWN))
@@ -287,13 +293,21 @@ struct Writing<'a>(
 );
 impl Drop for Writing<'_> {
     fn drop(&mut self) {
-        let mut journal = self
-            .0
-            .journal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        journal.writing -= 1;
-        self.0.settled.notify_all();
+        struct Wake<'a>(&'a Condvar);
+        impl Drop for Wake<'_> {
+            fn drop(&mut self) {
+                self.0.notify_all();
+            }
+        }
+        let _wake = Wake(&self.0.settled);
+        cleanup_on_drop(|| {
+            let mut journal = self
+                .0
+                .journal
+                .lock()
+                .expect("native input journal mutex poisoned");
+            journal.writing -= 1;
+        });
     }
 }
 
@@ -309,7 +323,38 @@ pub(crate) async fn scope<T>(inputs: Arc<Inputs>, call: impl Future<Output = T>)
     INPUTS.scope(inputs, call).await
 }
 
-pub(crate) fn spawn_blocking<F, T>(call: F) -> tokio::task::JoinHandle<T>
+// During an existing unwind, a second destructor panic must not abort before
+// the original payload reaches its owner. This only finishes that unwind;
+// normal cleanup still propagates every panic. Retained receipts stay owned.
+pub(crate) fn cleanup_on_drop(cleanup: impl FnOnce()) {
+    if std::thread::panicking() {
+        if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
+            // A panic payload can itself have a panicking destructor. The
+            // original unwind remains authoritative on this terminal path.
+            std::mem::forget(secondary);
+        }
+    } else {
+        cleanup();
+    }
+}
+
+pub(crate) struct Worker<T>(tokio::task::JoinHandle<T>);
+impl<T> Future for Worker<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match std::pin::Pin::new(&mut self.get_mut().0).poll(context) {
+            std::task::Poll::Ready(Err(error)) if error.is_panic() => {
+                std::panic::resume_unwind(error.into_panic())
+            }
+            result => result,
+        }
+    }
+}
+
+pub(crate) fn spawn_blocking<F, T>(call: F) -> Worker<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -317,7 +362,7 @@ where
     let inputs = current();
     let binding = current_windows_input_binding();
     let custody = cua_driver_core::tool::current_native_input_worker_lease();
-    tokio::task::spawn_blocking(move || {
+    Worker(tokio::task::spawn_blocking(move || {
         struct Restore(Option<Arc<Inputs>>);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -332,7 +377,7 @@ where
             Some(binding) => with_windows_input_worker(binding, call),
             None => call(),
         }
-    })
+    }))
 }
 
 /// Same Win32 boundary and return value; record only the successfully inserted
@@ -462,7 +507,7 @@ impl NativeInputRelease for TopmostState {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "native topmost guard mutex poisoned")?;
+            .expect("native topmost guard mutex poisoned");
         state.1 = true;
         if state.0 {
             if let Some(target) = self.target.resolve()? {
@@ -491,7 +536,9 @@ impl NativeInputRelease for TopmostState {
 }
 impl Drop for TopmostState {
     fn drop(&mut self) {
-        let _ = self.release();
+        cleanup_on_drop(|| {
+            let _ = self.release();
+        });
     }
 }
 pub(crate) struct TopmostGuard {
@@ -525,7 +572,7 @@ impl TopmostGuard {
             let mut state = guard
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .expect("native topmost guard mutex poisoned");
             if !state.1
                 && unsafe { GetWindowLongPtrW(target, GWL_EXSTYLE) as u32 } & WS_EX_TOPMOST.0 == 0
             {
@@ -552,7 +599,9 @@ impl TopmostGuard {
 }
 impl Drop for TopmostGuard {
     fn drop(&mut self) {
-        let _ = self.guard.release();
+        cleanup_on_drop(|| {
+            let _ = self.guard.release();
+        });
     }
 }
 
@@ -702,12 +751,10 @@ impl PointerLease {
         HSYNTHETICPOINTERDEVICE(self.device as *mut _)
     }
     fn send(&self, inputs: &[POINTER_TYPE_INFO]) -> windows::core::Result<()> {
-        let mut state = self.state.lock().map_err(|_| {
-            windows::core::Error::new(
-                windows::core::HRESULT(0x80004005_u32 as i32),
-                "owned native pointer mutex poisoned",
-            )
-        })?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("owned native pointer mutex poisoned");
         if state.closed
             || current_windows_input_binding().is_some_and(|binding| binding.check().is_err())
         {
@@ -792,7 +839,7 @@ impl NativeInputRelease for PointerLease {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "owned native pointer mutex poisoned")?;
+            .expect("owned native pointer mutex poisoned");
         state.closed = true;
         if let Some(contact) = &state.held {
             let up = contact.up();
@@ -816,7 +863,9 @@ impl NativeInputRelease for PointerLease {
 }
 impl Drop for PointerLease {
     fn drop(&mut self) {
-        let _ = self.release();
+        cleanup_on_drop(|| {
+            let _ = self.release();
+        });
     }
 }
 pub(crate) struct PointerStroke {
@@ -856,6 +905,65 @@ impl PointerStroke {
 }
 impl Drop for PointerStroke {
     fn drop(&mut self) {
-        let _ = self.lease.release();
+        cleanup_on_drop(|| {
+            let _ = self.lease.release();
+        });
+    }
+}
+
+#[cfg(test)]
+mod panic_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn owned_worker_preserves_native_error_but_resumes_panic_payload() {
+        assert_eq!(
+            spawn_blocking(|| Err::<(), _>("native error"))
+                .await
+                .unwrap(),
+            Err("native error")
+        );
+        let original = tokio::spawn(async {
+            let _ = spawn_blocking(|| std::panic::panic_any(53_u64)).await;
+        })
+        .await
+        .unwrap_err()
+        .into_panic();
+        assert_eq!(original.downcast_ref::<u64>(), Some(&53));
+    }
+    #[test]
+    fn poisoned_begin_is_not_an_ordinary_none() {
+        for writes in [false, true] {
+            let inputs = Arc::new(Inputs::default());
+            let poisoned = inputs.clone();
+            assert!(std::thread::spawn(move || {
+                if writes {
+                    let _guard = poisoned.writes.lock().unwrap();
+                    panic!("fixture serial write poison");
+                } else {
+                    let _guard = poisoned.journal.lock().unwrap();
+                    panic!("fixture journal poison");
+                }
+            })
+            .join()
+            .is_err());
+            assert!(std::panic::catch_unwind(|| inputs.begin()).is_err());
+        }
+    }
+    #[test]
+    fn secondary_drop_panic_never_replaces_existing_unwind() {
+        struct PanickingDrop;
+        impl Drop for PanickingDrop {
+            fn drop(&mut self) {
+                cleanup_on_drop(|| std::panic::panic_any(202_u64));
+            }
+        }
+        let original = std::panic::catch_unwind(|| {
+            let _guard = PanickingDrop;
+            std::panic::panic_any(101_u64);
+        })
+        .unwrap_err();
+        assert_eq!(original.downcast_ref::<u64>(), Some(&101));
+        let ordinary = std::panic::catch_unwind(|| drop(PanickingDrop)).unwrap_err();
+        assert_eq!(ordinary.downcast_ref::<u64>(), Some(&202));
     }
 }

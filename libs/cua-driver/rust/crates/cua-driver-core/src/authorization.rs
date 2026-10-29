@@ -235,7 +235,9 @@ const PRIVATE_OBSERVATION_OPERATIONS: &[&str] = &[
     "parse_visual_regions",
     "verify_state",
     "list_apps",
+    "native_list_apps",
     "list_windows",
+    "native_list_windows",
     "debug_window_info",
     "get_browser_state",
     "browser_dialog[action=inspect]",
@@ -283,6 +285,9 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "drag",
     "scroll",
     "move_cursor",
+    "native_desktop_input",
+    "native_paste_text",
+    "native_window_move",
     "mouse_button_down",
     "mouse_button_up",
     "mouse_drag",
@@ -293,6 +298,7 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "press_key",
     "hotkey",
     "set_value",
+    "native_secondary_action",
     "bring_to_front",
     "set_window_frame",
 ];
@@ -430,8 +436,7 @@ pub const ENFORCEMENT_ADAPTERS: &[EnforcementAdapterDescriptor] = &[
         authorization_requirement: "profile_approval_behavior_and_optional_capability_manifest",
         revocation_triggers: EXISTING_PROFILE_REVOCATION,
         refusal_code: Some("browser_consent_required"),
-        authorization_source:
-            "launch_grant_or_authorization_host_in_standard; unattended_in_bounded; trusted_launch_acknowledgement_in_unrestricted; optional_capability_manifest_ceiling",
+        authorization_source: "launch_grant_or_authorization_host_in_standard; unattended_in_bounded; trusted_launch_acknowledgement_in_unrestricted; optional_capability_manifest_ceiling",
         enforcement_by_mode: AdapterEnforcement::uniform(RiskEnforcement::Active),
         profile_behavior: AdapterProfileBehavior::GrantInStandard,
     },
@@ -584,8 +589,7 @@ pub const ENFORCEMENT_ADAPTERS: &[EnforcementAdapterDescriptor] = &[
         authorization_requirement: "driver_ownership_in_standard; unattended_in_bounded; optional_capability_manifest",
         revocation_triggers: SESSION_REVOCATION,
         refusal_code: Some("authorization_required"),
-        authorization_source:
-            "driver_ownership_in_standard; unattended_bounded_profile; trusted_unrestricted_mode; optional_capability_manifest_ceiling",
+        authorization_source: "driver_ownership_in_standard; unattended_bounded_profile; trusted_unrestricted_mode; optional_capability_manifest_ceiling",
         enforcement_by_mode: AdapterEnforcement::uniform(RiskEnforcement::Active),
         profile_behavior: AdapterProfileBehavior::BoundedOrUnrestricted,
     },
@@ -630,7 +634,7 @@ pub const ENFORCEMENT_ADAPTERS: &[EnforcementAdapterDescriptor] = &[
     },
     EnforcementAdapterDescriptor {
         id: "clipboard",
-        operations: &["clipboard_read", "clipboard_write"],
+        operations: &["clipboard_read", "clipboard_write", "native_paste_text"],
         state: RiskEnforcement::Active,
         risk_class: RiskClass::R2,
         resource_kind: "system_clipboard",
@@ -771,7 +775,9 @@ pub fn enforcement_adapters_for_call(
             | "element_bounds"
             | "verify_state"
             | "list_apps"
+            | "native_list_apps"
             | "list_windows"
+            | "native_list_windows"
             | "debug_window_info"
             | "get_browser_state"
             | "escalate_session"
@@ -800,7 +806,10 @@ pub fn enforcement_adapters_for_call(
         add("desktop_input");
     }
 
-    if matches!(tool, "clipboard_read" | "clipboard_write") {
+    if matches!(
+        tool,
+        "clipboard_read" | "clipboard_write" | "native_paste_text"
+    ) {
         add("clipboard");
     }
 
@@ -919,6 +928,8 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "drag"
         | "scroll"
         | "move_cursor"
+        | "native_desktop_input"
+        | "native_window_move"
         | "mouse_button_down"
         | "mouse_button_up"
         | "mouse_drag"
@@ -928,10 +939,12 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "press_key"
         | "hotkey"
         | "set_value"
+        | "native_secondary_action"
         | "run_steps"
         | "run_script"
         | "invoke_menu"
         | "launch_app"
+        | "native_launch_app"
         | "bring_to_front"
         | "set_window_frame"
         | "start_session"
@@ -947,8 +960,11 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         // the canonical registry boundary before platform dispatch.
         "zoom"
         | "clipboard_read"
+        | "native_paste_text"
         | "list_apps"
+        | "native_list_apps"
         | "list_windows"
+        | "native_list_windows"
         | "debug_window_info"
         | "check_permissions"
         | "get_accessibility_tree"
@@ -1070,12 +1086,15 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         "get_accessibility_tree"
         | "element_bounds"
         | "list_apps"
+        | "native_list_apps"
         | "list_windows"
+        | "native_list_windows"
         | "debug_window_info"
         | "get_browser_state"
         | "escalate_session"
         | "zoom"
-        | "clipboard_read" => RiskAssessment {
+        | "clipboard_read"
+        | "native_paste_text" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -1209,12 +1228,12 @@ pub fn authorize_tool_call_with_context(
             | crate::session_manifest::ManifestDecision::Ask => {
                 return Err(crate::policy::AuthorizationError::Denied(format!(
                     "capability manifest denies tool '{tool}'"
-                )))
+                )));
             }
             crate::session_manifest::ManifestDecision::Undeclared => {
                 return Err(crate::policy::AuthorizationError::Denied(format!(
                     "tool '{tool}' is outside the capability manifest"
-                )))
+                )));
             }
         }
     }
@@ -1242,6 +1261,8 @@ fn enforce_hard_invariants(
             | "press_key"
             | "hotkey"
             | "set_value"
+            | "native_window_move"
+            | "native_secondary_action"
             | "kill_app"
             | "bring_to_front"
             | "get_accessibility_tree"
@@ -1287,13 +1308,17 @@ pub enum PermissionModeError {
         "permission mode unrestricted requires --dangerously-bypass-approvals at trusted daemon startup"
     )]
     MissingDangerAcknowledgement,
-    #[error("--dangerously-bypass-approvals cannot be combined with a non-unrestricted --permission-mode")]
+    #[error(
+        "--dangerously-bypass-approvals cannot be combined with a non-unrestricted --permission-mode"
+    )]
     UnexpectedDangerAcknowledgement,
     #[error(
         "permission mode bounded requires --capability-manifest <path> at trusted daemon startup"
     )]
     MissingSessionPolicy,
-    #[error("a configured capability manifest requires --approve-capability-manifest at trusted daemon startup")]
+    #[error(
+        "a configured capability manifest requires --approve-capability-manifest at trusted daemon startup"
+    )]
     MissingSessionPolicyApproval,
     #[error("--approve-capability-manifest requires --capability-manifest <path>")]
     UnexpectedSessionPolicy,
@@ -1561,9 +1586,11 @@ mod tests {
     fn unknown_tools_are_unclassified_and_denied() {
         let error = authorize_tool_call("new_unreviewed_tool", &serde_json::json!({}))
             .expect_err("unknown risk must fail closed");
-        assert!(error
-            .to_string()
-            .contains("no reviewed risk classification"));
+        assert!(
+            error
+                .to_string()
+                .contains("no reviewed risk classification")
+        );
     }
 
     #[test]
@@ -1897,10 +1924,12 @@ mod tests {
             )
         };
         assert!(call(7).is_ok());
-        assert!(call(8)
-            .unwrap_err()
-            .to_string()
-            .contains("outside the capability manifest"));
+        assert!(
+            call(8)
+                .unwrap_err()
+                .to_string()
+                .contains("outside the capability manifest")
+        );
     }
 
     #[test]
@@ -2122,13 +2151,11 @@ mod tests {
         );
         assert_eq!(status["authorization_host_assurance"], "unavailable");
         assert_eq!(
-            status_json_with_provider(Some("cua_local_desktop_confirmation_v1"))
-                ["authorization_host_assurance"],
+            status_json_with_provider(Some("cua_local_desktop_confirmation_v1"))["authorization_host_assurance"],
             "host_provided"
         );
         assert_eq!(
-            status_json_with_provider(Some("external_host_consent_v1"))
-                ["authorization_host_assurance"],
+            status_json_with_provider(Some("external_host_consent_v1"))["authorization_host_assurance"],
             "host_provided"
         );
         assert_eq!(status["effective_session_mode_source"], "process");
