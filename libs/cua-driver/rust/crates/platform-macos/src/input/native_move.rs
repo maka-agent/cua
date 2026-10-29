@@ -267,6 +267,13 @@ pub fn prepare_other_event(
 }
 
 impl PreparedNativeEvent {
+    /// Adopt an already owned native event into the shared timestamp/post path.
+    pub(crate) fn from_cg_event(event: CGEvent) -> Result<Self, NativeEventError> {
+        let timebase = super::page_scroll::uptime_timebase()
+            .map_err(|_| NativeEventError::UptimeUnavailable)?;
+        Ok(Self { event, timebase })
+    }
+
     /// Stamp fresh boot uptime and post once to `pid`, with no pause.
     ///
     /// This neither checks nor creates the caller's PID authority or lease.

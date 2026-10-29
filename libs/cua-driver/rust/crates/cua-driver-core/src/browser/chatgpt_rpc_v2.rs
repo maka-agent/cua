@@ -38,7 +38,6 @@ pub(crate) enum Method {
     #[cfg(test)]
     FocusTab,
     TurnEnded,
-    #[cfg(test)]
     MarkTab,
     FinalizeTabs,
     GetCommittedTabUrl,
@@ -70,7 +69,6 @@ impl Method {
             #[cfg(test)]
             Self::FocusTab => "focusTab",
             Self::TurnEnded => "turnEnded",
-            #[cfg(test)]
             Self::MarkTab => "markTab",
             Self::FinalizeTabs => "finalizeTabs",
             Self::GetCommittedTabUrl => "getCommittedTabUrl",
@@ -100,11 +98,12 @@ impl Method {
             Self::Attach
             | Self::Detach
             | Self::TurnEnded
+            | Self::MarkTab
             | Self::FinalizeTabs
             | Self::MoveMouse
             | Self::NameSession => true,
             #[cfg(test)]
-            Self::AttachTarget | Self::DetachTarget | Self::MarkTab => true,
+            Self::AttachTarget | Self::DetachTarget => true,
             _ => false,
         }
     }

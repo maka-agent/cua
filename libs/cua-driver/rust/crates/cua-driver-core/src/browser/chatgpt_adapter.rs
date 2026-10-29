@@ -169,6 +169,10 @@ enum Stage {
     Detach(String),
     Close(CloseScope),
     Finish,
+    Mark {
+        tab: u64,
+        status: String,
+    },
     ObserveCreated(String),
     SessionHeaders {
         active: bool,
@@ -1071,6 +1075,16 @@ impl ChatgptWireAdapter {
                 ExtensionWireError::Protocol("Session task lost its semantic request".to_owned())
             })?
             .clone();
+        if call.cancelled {
+            if let Stage::Mark { tab, status } = &task.stage {
+                return Ok(self.failure(
+                    &call,
+                    "outcome_unknown",
+                    "Tab mark ACK arrived after caller cancellation",
+                    json!({"acknowledgedResult":{"marked":true,"tabId":tab,"status":status}}),
+                ));
+            }
+        }
         // A late positively acknowledged cleanup still retires execution and
         // carries exact cleanup evidence into existing retained-completion code.
         if call.cancelled {
@@ -1388,6 +1402,7 @@ impl ChatgptWireAdapter {
                 self.retire_closed_scope(&call, &scope, task.activation_epoch);
                 Ok(self.success(&call, json!({"closed":true,"proof":"close_ack"})))
             }
+            Stage::Mark { tab, status } => Ok(self.success(&call,json!({"marked":true,"tabId":tab,"status":status}))),
             Stage::Finish=>{self.finish_observed(&call, task.activation_epoch);let context=self.context(&call)?;Ok(self.success(&call,json!({"turnFinished":true,"hostSessionId":context.host_session_id(),"hostTurnId":context.host_turn_id()})))},
             Stage::ObserveCreated(token) => {
                 let inventory = match chatgpt_inventory::authoritative_inventory(value) {
@@ -2623,6 +2638,19 @@ impl ChatgptWireAdapter {
                 let params=self.params(&call,json!({"target":{"tabId":claim.tab},"method":"Target.closeTarget","commandParams":{"targetId":claim.target}}))?;
                 (Stage::Close(scope),Method::ExecuteCdp,params)
             }
+            "markTab"=>{
+                if fields.as_object().is_none_or(|fields| fields.len()!=2 || !fields.contains_key("claim") || !fields.contains_key("status")) {
+                    return Err(ExtensionWireError::LocalRefusal {code:"invalid_request".into(),message:"Tab marking requires only claim and status".into()});
+                }
+                let token=required_string(&fields,"claim")?;
+                let claim=self.owned_claim(&call,&token)?;
+                let status=required_string(&fields,"status")?;
+                if !matches!(status.as_str(),"handoff"|"deliverable") {
+                    return Err(ExtensionWireError::LocalRefusal {code:"invalid_request".into(),message:"Tab mark must be handoff or deliverable".into()});
+                }
+                let params=self.params(&call,json!({"tabId":claim.tab,"status":status}))?;
+                (Stage::Mark {tab:claim.tab,status},Method::MarkTab,params)
+            }
             "finishTurn"=>{
                 self.validate_finish(&call)?;
                 match fields.get("keep").filter(|value|!value.is_null()) {
@@ -2693,6 +2721,7 @@ fn activates_session(method: Method) -> bool {
             | Method::MoveMouse
             | Method::NameSession
             | Method::GetUserHistory
+            | Method::MarkTab
     )
 }
 

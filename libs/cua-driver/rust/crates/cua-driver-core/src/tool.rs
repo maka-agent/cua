@@ -2744,6 +2744,19 @@ impl ToolRegistry {
                 }));
             }
         }
+        let native_observation = (resolved_name == "get_window_state"
+            && args
+                .get("_raw_windows_observation")
+                .and_then(Value::as_bool)
+                == Some(true))
+        .then(|| {
+            result
+                .structured_content
+                .as_ref()?
+                .get("_native_window_observation")
+                .cloned()
+        })
+        .flatten();
         if result.is_error != Some(true) {
             if let Some(structured) = result.structured_content.clone() {
                 if let Err(error) =
@@ -2760,6 +2773,12 @@ impl ToolRegistry {
                     }));
                 }
             }
+        }
+        if let Some(committed) = native_observation {
+            result
+                .structured_content
+                .get_or_insert_with(|| serde_json::json!({}))["_native_window_observation"] =
+                committed;
         }
         // Use the original name for downstream code paths below so the
         // exit-code matching and recording paths keep treating the alias

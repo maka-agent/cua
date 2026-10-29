@@ -139,6 +139,13 @@ pub(super) enum UploadSubmitError {
     Full(UploadJob),
     Closed(UploadJob),
 }
+impl UploadSubmitError {
+    pub(super) fn into_job(self) -> UploadJob {
+        match self {
+            Self::Full(job) | Self::Closed(job) => job,
+        }
+    }
+}
 impl fmt::Display for UploadSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -389,7 +396,7 @@ fn authorize(
     authorization
         .blocking_recv()
         .map_err(|_| not_dispatched("broker ended before upload authorization"))?
-        .map_err(|reason| not_dispatched(reason))
+        .map_err(not_dispatched)
 }
 
 fn not_dispatched(reason: &'static str) -> UploadWorkerError {

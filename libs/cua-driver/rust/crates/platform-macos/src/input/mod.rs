@@ -15,6 +15,7 @@ pub mod interactive;
 pub mod keyboard;
 pub mod mouse;
 pub mod native_focus;
+pub mod native_keyboard;
 pub mod native_move;
 pub mod page_scroll;
 pub mod pointer_toolkit;

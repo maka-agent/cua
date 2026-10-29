@@ -14,8 +14,6 @@ use super::extension_upload::{
     ExtensionUploadFile, UploadError, UploadOwner, EXTENSION_UPLOAD_CHUNK_BYTES,
 };
 use super::extension_upload_placement::UploadPlacement;
-#[cfg(test)]
-use super::extension_upload_worker::JOB_RUNNING;
 use super::extension_upload_worker::{
     cancel_queued, UploadCompletion, UploadEvent, UploadJob, UploadWork, UploadWorkResult,
     UploadWorker, UploadWorkerError, UploadWorkerOwner, JOB_CANCELLED, JOB_COMPLETED, JOB_QUEUED,
@@ -211,6 +209,11 @@ pub(crate) enum ControlRequest {
         document: ExtensionPreparationDocument,
         policy: ExtensionPreparationPolicy,
     },
+    MarkTab {
+        id: u64,
+        claim: String,
+        status: ExtensionKeepStatus,
+    },
     CreatePopupTab {
         id: u64,
         claim: String,
@@ -405,6 +408,7 @@ impl ControlRequest {
             | Self::RetireClaim { id, .. }
             | Self::CreateTab { id, .. }
             | Self::PrepareClaim { id, .. }
+            | Self::MarkTab { id, .. }
             | Self::CreatePopupTab { id, .. }
             | Self::CloseTab { id, .. }
             | Self::StopCreatedTab { id, .. }
@@ -1132,6 +1136,14 @@ struct UploadAdmission {
     gates: Vec<Arc<AtomicBool>>,
     context: Option<ExtensionWireContext>,
 }
+struct UploadRetirementReply {
+    client: ClientId,
+    id: u64,
+    claim: Option<String>,
+    wire_context: Option<ExtensionWireContext>,
+    outcome: ControlOutcome,
+    cleanup: Result<(), String>,
+}
 struct PendingUpload {
     local_id: u64,
     operation: UploadControl,
@@ -1431,9 +1443,16 @@ impl ExtensionHostBroker {
                 _ = &mut deadline => {
                     let pending_ids=self.pending.iter().filter_map(|(id,pending)|matches!(pending.kind,PendingKind::Upload(_)).then_some(*id)).collect::<Vec<_>>();
                     for id in pending_ids {
-                        if let Some(Pending{client,kind:PendingKind::Upload(upload),..})=self.pending.remove(&id) {
+                        if let Some(Pending{client,kind:PendingKind::Upload(upload),wire_context,..})=self.pending.remove(&id) {
                             if let UploadControl::RetireTab{outcome,..}=upload.operation {
-                                self.upload_retirement_reply(client,upload.local_id,upload.claim,*outcome,false,Some("host upload cleanup remained unresolved at shutdown deadline".into()));
+                                self.upload_retirement_reply(UploadRetirementReply {
+                                    client,
+                                    id: upload.local_id,
+                                    claim: upload.claim,
+                                    wire_context,
+                                    outcome: *outcome,
+                                    cleanup: Err("host upload cleanup remained unresolved at shutdown deadline".into()),
+                                });
                             } else {
                                 // Running filesystem work cannot be declared unsent.
                                 // Fixed receipt contains no guessed stage/path.
@@ -1821,24 +1840,25 @@ impl ExtensionHostBroker {
             .as_ref()
             .expect("upload service was checked")
             .try_submit(job);
-        if submitted.is_err() {
+        if let Err(error) = submitted {
+            let rejected = error.into_job();
             let Some(pending) = self.pending.remove(&outer) else {
                 return;
             };
             let PendingKind::Upload(upload) = pending.kind else {
                 unreachable!()
             };
-            // The queue rejected ownership; no filesystem effect can start.
-            let _ = cancel_queued(&upload.phase);
+            // The queue returned this exact job; no filesystem effect can start.
+            let _ = cancel_queued(&rejected.phase);
             if let UploadControl::RetireTab { outcome, .. } = upload.operation {
-                self.upload_retirement_reply(
+                self.upload_retirement_reply(UploadRetirementReply {
                     client,
-                    local_id,
-                    upload.claim,
-                    *outcome,
-                    false,
-                    Some("host upload cleanup worker did not admit work".into()),
-                );
+                    id: local_id,
+                    claim: upload.claim,
+                    wire_context: pending.wire_context,
+                    outcome: *outcome,
+                    cleanup: Err("host upload cleanup worker did not admit work".into()),
+                });
                 return;
             }
             self.upload_reply(
@@ -1995,14 +2015,14 @@ impl ExtensionHostBroker {
             || !matches!(completion.phase, JOB_COMPLETED | JOB_CANCELLED)
         {
             if let UploadControl::RetireTab { outcome, .. } = upload.operation {
-                self.upload_retirement_reply(
-                    pending.client,
-                    upload.local_id,
-                    upload.claim,
-                    *outcome,
-                    false,
-                    Some("host upload cleanup completion phase is unavailable".into()),
-                );
+                self.upload_retirement_reply(UploadRetirementReply {
+                    client: pending.client,
+                    id: upload.local_id,
+                    claim: upload.claim,
+                    wire_context: pending.wire_context,
+                    outcome: *outcome,
+                    cleanup: Err("host upload cleanup completion phase is unavailable".into()),
+                });
                 self.finish_upload_generation();
                 return;
             }
@@ -2059,30 +2079,30 @@ impl ExtensionHostBroker {
                 .as_ref()
                 .is_none_or(|context| owner.session_id != context.host_session_id())
             {
-                self.upload_retirement_reply(
-                    pending.client,
-                    upload.local_id,
-                    upload.claim,
-                    *outcome,
-                    false,
-                    Some("host upload cleanup lost its captured session identity".into()),
-                );
+                self.upload_retirement_reply(UploadRetirementReply {
+                    client: pending.client,
+                    id: upload.local_id,
+                    claim: upload.claim,
+                    wire_context: pending.wire_context,
+                    outcome: *outcome,
+                    cleanup: Err("host upload cleanup lost its captured session identity".into()),
+                });
                 self.finish_upload_generation();
                 return;
             }
-            let (cleanup_confirmed, error) = match completion.result {
-                Ok(UploadWorkResult::TabRetired) => (true, None),
-                Ok(_) => (false, Some("host upload cleanup result changed".into())),
-                Err(error) => (false, Some(error.to_string())),
+            let cleanup = match completion.result {
+                Ok(UploadWorkResult::TabRetired) => Ok(()),
+                Ok(_) => Err("host upload cleanup result changed".into()),
+                Err(error) => Err(error.to_string()),
             };
-            self.upload_retirement_reply(
-                pending.client,
-                upload.local_id,
-                upload.claim,
-                *outcome,
-                cleanup_confirmed,
-                error,
-            );
+            self.upload_retirement_reply(UploadRetirementReply {
+                client: pending.client,
+                id: upload.local_id,
+                claim: upload.claim,
+                wire_context: pending.wire_context,
+                outcome: *outcome,
+                cleanup,
+            });
             self.finish_upload_generation();
             return;
         }
@@ -2210,14 +2230,16 @@ impl ExtensionHostBroker {
                     unreachable!()
                 };
                 if let UploadControl::RetireTab { outcome, .. } = upload.operation {
-                    self.upload_retirement_reply(
-                        pending.client,
-                        upload.local_id,
-                        upload.claim,
-                        *outcome,
-                        false,
-                        Some("host upload cleanup was cancelled before filesystem work".into()),
-                    );
+                    self.upload_retirement_reply(UploadRetirementReply {
+                        client: pending.client,
+                        id: upload.local_id,
+                        claim: upload.claim,
+                        wire_context: pending.wire_context,
+                        outcome: *outcome,
+                        cleanup: Err(
+                            "host upload cleanup was cancelled before filesystem work".into()
+                        ),
+                    });
                     continue;
                 }
                 self.upload_reply(
@@ -2236,26 +2258,29 @@ impl ExtensionHostBroker {
         }
     }
 
-    fn upload_retirement_reply(
-        &mut self,
-        client: ClientId,
-        id: u64,
-        claim: Option<String>,
-        outcome: ControlOutcome,
-        confirmed: bool,
-        error: Option<String>,
-    ) {
+    fn upload_retirement_reply(&mut self, reply: UploadRetirementReply) {
+        let UploadRetirementReply {
+            client,
+            id,
+            claim,
+            wire_context,
+            outcome,
+            cleanup,
+        } = reply;
+        let confirmed = cleanup.is_ok();
+        let error = cleanup.err();
         if let Some(claim) = claim {
             let event = ControlEvent::EffectsCleanup {
                 claim: claim.clone(),
                 effect: "upload_backing".into(),
                 cleanup_confirmed: confirmed,
                 error,
+                wire_context: wire_context.clone(),
             };
             match self.budget.try_charge(&event) {
                 Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
                 Err(_) => {
-                    self.queue_control_delivery(client,Queued::new(ControlEvent::EffectsCleanup{claim,effect:"upload_backing".into(),cleanup_confirmed:confirmed,error:(!confirmed).then(||"upload backing cleanup remains unconfirmed; variable receipt was not admitted".into())},None));
+                    self.queue_control_delivery(client,Queued::new(ControlEvent::EffectsCleanup{claim,effect:"upload_backing".into(),cleanup_confirmed:confirmed,error:(!confirmed).then(||"upload backing cleanup remains unconfirmed; variable receipt was not admitted".into()),wire_context},None));
                     self.fence_upload_delivery_owner(client);
                 }
             }
@@ -2585,7 +2610,9 @@ impl ExtensionHostBroker {
         }
         if matches!(
             &request,
-            ControlRequest::PrepareClaim { .. } | ControlRequest::CreatePopupTab { .. }
+            ControlRequest::PrepareClaim { .. }
+                | ControlRequest::CreatePopupTab { .. }
+                | ControlRequest::MarkTab { .. }
         ) && self.input_context.is_none()
         {
             self.reject_control(
@@ -2796,6 +2823,24 @@ impl ExtensionHostBroker {
                 (
                     "prepareClaim",
                     json!({"claim":claim,"document":document,"policy":policy}),
+                    ControlKind::Other,
+                )
+            }
+            ControlRequest::MarkTab { claim, status, .. } => {
+                if claim.is_empty() || claim.len() > 128 || !self.owns_active_claim(client, &claim)
+                {
+                    self.reject_control(
+                        client,
+                        id,
+                        "claim_unavailable",
+                        "mark claim is not active for this connection",
+                        output,
+                    );
+                    return;
+                }
+                (
+                    "markTab",
+                    json!({"claim":claim,"status":status}),
                     ControlKind::Other,
                 )
             }

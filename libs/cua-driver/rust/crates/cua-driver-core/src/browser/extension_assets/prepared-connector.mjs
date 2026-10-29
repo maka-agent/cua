@@ -290,7 +290,8 @@ export class PreparedBrowserConnector extends BrowserConnector {
       pendingAttachments === 0 &&
       unconfirmedClaims === 0 &&
       headers.cleanupConfirmed &&
-      ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed);
+      ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed
+        && !this.records.get(receipt.tabId)?.logicalLease);
     const diagnostics = settled
       .filter((result) => result.status === 'rejected')
       .map((result) => String(result.reason));

@@ -521,6 +521,8 @@ export class BrowserConnector {
     if ((record.logicalPreparation && !record.logicalEnding)
       || !this.attachmentCleanupConfirmed(record)) return;
     record.logicalPreparation = null;
+    // Logical projections carry no physical facet and survive transport cleanup.
+    if (record.logicalLease && !record.tabRemoved && !record.physicalGone) return;
     if (this.records.get(record.tabId) === record) this.records.delete(record.tabId);
   }
   async cdp(record, params) {
@@ -869,6 +871,13 @@ export class BrowserConnector {
     const receipt = this.creations.get(token);
     if (!receipt || receipt.owner !== owner || receipt.generation !== this.generation)
       fail('creation_unavailable', 'creation receipt does not belong to this owner and generation');
+    if (receipt.logicalLeaseId) {
+      const record = this.records.get(receipt.tabId);
+      if (record?.owner !== owner || record.generation !== this.generation
+        || record.logicalLease?.logicalLeaseId !== receipt.logicalLeaseId
+        || record.logicalLease.hostSessionId !== receipt.logicalHostSessionId)
+        fail('creation_unavailable', 'creation receipt belongs to an earlier logical lease');
+    }
     return this.closeCreation(receipt);
   }
   async closeCreation(receipt) {
@@ -921,7 +930,8 @@ export class BrowserConnector {
       if (record.attachedAck && !this.cleanupProven(record)) results.push(this.detach(record));
     }
     for (const receipt of this.creations.values())
-      if (receipt.owner === owner) results.push(this.closeCreation(receipt));
+      if (receipt.owner === owner && !this.records.get(receipt.tabId)?.logicalLease)
+        results.push(this.closeCreation(receipt));
     const settled = await Promise.allSettled(results);
     const remaining = [...this.records.values()].filter((record) => record.owner === owner);
     const pendingAttachments = remaining.filter((record) => record.physical && !record.attachSettled).length;
@@ -930,7 +940,8 @@ export class BrowserConnector {
       cleanupConfirmed:
         pendingAttachments === 0 &&
         unconfirmedClaims === 0 &&
-        ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed),
+        ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed
+          && !this.records.get(receipt.tabId)?.logicalLease),
       pendingAttachments,
       unconfirmedClaims,
       diagnostics: settled
@@ -941,7 +952,8 @@ export class BrowserConnector {
   async disconnect() {
     this.accepting = false;
     const owners = new Set(
-      [...this.records.values(), ...this.creations.values()].map((record) => record.owner),
+      [...this.records.values(), ...this.creations.values()].map((record) => record.owner)
+        .filter((owner) => typeof owner === 'string' && owner.length > 0),
     );
     return Promise.allSettled([...owners].map((owner) => this.closeOwner(owner)));
   }

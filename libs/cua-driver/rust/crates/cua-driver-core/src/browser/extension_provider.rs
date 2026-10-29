@@ -27,7 +27,8 @@ pub use super::extension_wire::{
     ExtensionFixedUiAck, ExtensionFixedUiAction, ExtensionFixedUiColor, ExtensionFixedUiCursor,
     ExtensionFixedUiOperation, ExtensionFixedUiRenderState, ExtensionFixedUiRenderStatus,
     ExtensionFixedUiRequest, ExtensionHeader, ExtensionPreparationDocument,
-    ExtensionPreparationPolicy, ExtensionSessionPreparation,
+    ExtensionPreparationPolicy, ExtensionRetentionPresentationAck,
+    ExtensionRetentionPresentationStatus, ExtensionSessionPreparation,
 };
 use super::local_ipc::{self, ExtensionEndpointIdentity, IpcError, ValidatedExtensionEndpoint};
 use serde::{Deserialize, Serialize};
@@ -240,6 +241,12 @@ pub struct ExtensionProviderCapabilities {
     /// Session inventory active flags are provider logical activity, not OS focus.
     #[serde(default)]
     pub session_logical_active: bool,
+    /// Session-storage logical metadata only; never a restored physical grant.
+    #[serde(default)]
+    pub logical_lease_persistence: bool,
+    /// Fixed favicon presentation only; no content or ownership authority.
+    #[serde(default)]
+    pub retained_tab_presentation: bool,
 }
 
 /// Global observed metadata: no owner, claim or tab is attributed here.
@@ -347,6 +354,8 @@ pub struct ExtensionTabInfo {
     pub last_accessed: Option<f64>,
     #[serde(rename = "groupTitleJson")]
     pub group_title: Option<super::JsonStringLiteral>,
+    #[serde(default)]
+    pub logical_lease: Option<super::ExtensionLogicalLease>,
 }
 
 // Legacy scalar metadata and the new JSON-text fields have distinct keys.
@@ -383,6 +392,8 @@ struct ExtensionTabInfoWire {
     group_title: MetadataField<Option<String>>,
     #[serde(default)]
     group_title_json: MetadataField<Option<super::JsonStringLiteral>>,
+    #[serde(default)]
+    logical_lease: Option<super::ExtensionLogicalLease>,
 }
 fn metadata_string(
     encoded: MetadataField<Option<super::JsonStringLiteral>>,
@@ -416,6 +427,7 @@ impl TryFrom<ExtensionTabInfoWire> for ExtensionTabInfo {
             active: wire.active,
             last_accessed: wire.last_accessed,
             group_title: metadata_string(wire.group_title_json, wire.group_title)?,
+            logical_lease: wire.logical_lease,
         })
     }
 }
@@ -1057,7 +1069,7 @@ impl ExtensionGroupReleaseProof {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionKeepStatus {
     Handoff,
@@ -1069,11 +1081,33 @@ pub struct ExtensionKeepTab {
     pub tab_id: u64,
     pub status: ExtensionKeepStatus,
 }
+/// Matched retention-intent ACK for one existing claim; never physical delivery proof.
+#[derive(Clone, Debug)]
+pub struct ExtensionTabMarkAck {
+    pub tab_id: u64,
+    pub status: ExtensionKeepStatus,
+    pub generation: String,
+    pub host_session_id: String,
+    pub host_turn_id: String,
+    pub logical_lease: Option<super::ExtensionLogicalLease>,
+    completion_id: u64,
+    cleanup_only: bool,
+}
+impl ExtensionTabMarkAck {
+    pub fn completion_id(&self) -> u64 {
+        self.completion_id
+    }
+    pub fn is_cleanup_only(&self) -> bool {
+        self.cleanup_only
+    }
+}
+
 /// Only a matched logical finish ACK. This is deliberately not CleanupProof.
 #[derive(Clone, Debug)]
 pub struct ExtensionTurnFinishAck {
     pub host_session_id: String,
     pub host_turn_id: String,
+    pub logical_lease_commit: Option<super::ExtensionLogicalLeaseCommit>,
     completion_id: u64,
 }
 impl ExtensionTurnFinishAck {
@@ -1262,6 +1296,11 @@ pub enum ExtensionOperation {
         y: f64,
         wait_for_arrival: Option<bool>,
     },
+    MarkTab {
+        claim: String,
+        tab_id: u64,
+        status: ExtensionKeepStatus,
+    },
     FinishTurn {
         keep: Option<Vec<ExtensionKeepTab>>,
     },
@@ -1347,6 +1386,7 @@ impl ExtensionOperation {
             Self::SetSessionHeaders { .. } => "setSessionHeaders",
             Self::ClearSessionHeaders => "clearSessionHeaders",
             Self::MoveMousePresentation { .. } => "moveMouse",
+            Self::MarkTab { .. } => "markTab",
             Self::FinishTurn { .. } => "finishTurn",
             Self::PrepareUserTab { .. } | Self::PrepareSessionTab { .. } => "prepareUserTab",
             Self::PrepareFixedSessionTab { .. } => "prepareSessionTab",
@@ -1377,7 +1417,8 @@ impl ExtensionOperation {
             | Self::PopupRequested { .. }
             | Self::OrphanCdpCompletion { .. }
             | Self::EffectsCleanup { .. } => false,
-            Self::UserHistory
+            Self::MarkTab { .. }
+            | Self::UserHistory
             | Self::NameSession { .. }
             | Self::ReadUserTab { .. }
             | Self::Inventory
@@ -1636,6 +1677,7 @@ pub struct ExtensionKnownCustody {
     pub cleanup: Option<CleanupProof>,
     pub headers: Option<ExtensionHeaderProof>,
     pub turn_finished: Option<ExtensionTurnFinishAck>,
+    pub marked: Option<ExtensionTabMarkAck>,
     pub session_headers: Option<ExtensionSessionHeaderProof>,
     pub cursor_presentation: Option<ExtensionCursorPresentationAck>,
     pub fixed_session: Option<ExtensionFixedSessionReceipt>,
@@ -1663,13 +1705,14 @@ pub enum ExtensionRecoveredOperation {
     SessionHeaders(ExtensionSessionHeaderProof),
     CursorPresentation(ExtensionCursorPresentationAck),
     TurnFinished(ExtensionTurnFinishAck),
+    Marked(ExtensionTabMarkAck),
     Claim(ExtensionPhysicalClaim),
     Created(ExtensionCreatedTab),
     Cleanup(CleanupProof),
     Headers(ExtensionHeaderProof),
     Prepared(ExtensionPreparedTab),
     SessionPrepared(ExtensionSessionPreparedTab),
-    FixedSessionPrepared(ExtensionFixedSessionPreparedTab),
+    FixedSessionPrepared(Box<ExtensionFixedSessionPreparedTab>),
     FixedUi(ExtensionFixedUiProof),
     FixedSessionCleared(ExtensionFixedSessionCleanupProof),
     ClaimPrepared(ExtensionClaimPreparationProof),
@@ -1909,6 +1952,92 @@ pub struct ExtensionBrowserProvider {
 /// Immutable call-scoped provider view sharing the same owner/transport actor.
 /// The name is an alias: it carries no extra session or authority store.
 pub type ExtensionBrowserOperation = ExtensionBrowserProvider;
+fn tab_mark_ack(
+    reply: ControlReply,
+    context: &ExtensionWireContext,
+    generation: &str,
+    tab_id: u64,
+    status: ExtensionKeepStatus,
+    cleanup_only: bool,
+    required: bool,
+) -> Result<ExtensionTabMarkAck, ExtensionProviderError> {
+    let result = reply.outcome.into_result("markTab")?;
+    let actual_status: ExtensionKeepStatus = decode(result["status"].clone())?;
+    if result["marked"] != true
+        || result["tabId"].as_u64() != Some(tab_id)
+        || actual_status != status
+    {
+        return Err(protocol(
+            "tab mark acknowledgement changed its requested tab or status",
+        ));
+    }
+    let logical_lease: Option<super::ExtensionLogicalLease> = result
+        .get("logicalLease")
+        .cloned()
+        .map(decode)
+        .transpose()?;
+    if (required && logical_lease.is_none())
+        || logical_lease.as_ref().is_some_and(|lease| {
+            lease.tab_id != tab_id
+                || lease.host_session_id != context.host_session_id()
+                || lease.host_turn_id != context.host_turn_id()
+                || lease.status != Some(status)
+                || lease.phase != super::ExtensionLogicalLeasePhase::Live
+        })
+    {
+        return Err(protocol(
+            "tab mark logical projection changed its issued scope",
+        ));
+    }
+    Ok(ExtensionTabMarkAck {
+        tab_id,
+        status,
+        generation: generation.to_owned(),
+        host_session_id: context.host_session_id().to_owned(),
+        host_turn_id: context.host_turn_id().to_owned(),
+        logical_lease,
+        completion_id: reply.id,
+        cleanup_only,
+    })
+}
+
+fn turn_finish_ack(
+    result: Value,
+    context: &ExtensionWireContext,
+    completion_id: u64,
+    required: bool,
+) -> Result<ExtensionTurnFinishAck, ExtensionProviderError> {
+    let logical_lease_commit: Option<super::ExtensionLogicalLeaseCommit> = result
+        .get("logicalLeaseCommit")
+        .cloned()
+        .map(decode)
+        .transpose()?;
+    if logical_lease_commit
+        .as_ref()
+        .is_some_and(|commit| !commit.matches(context.host_session_id(), context.host_turn_id()))
+    {
+        return Err(protocol(
+            "turn finish logical projection changed its issued scope",
+        ));
+    }
+    if required
+        && (result["turnFinished"] != true
+            || result["hostSessionId"] != context.host_session_id()
+            || result["hostTurnId"] != context.host_turn_id()
+            || logical_lease_commit.is_none())
+    {
+        return Err(protocol(
+            "persistent turn finish omitted its exact logical commit",
+        ));
+    }
+    Ok(ExtensionTurnFinishAck {
+        host_session_id: context.host_session_id().to_owned(),
+        host_turn_id: context.host_turn_id().to_owned(),
+        logical_lease_commit,
+        completion_id,
+    })
+}
+
 impl ExtensionBrowserProvider {
     pub async fn connect(
         endpoint: ValidatedExtensionEndpoint,
@@ -2101,7 +2230,7 @@ impl ExtensionBrowserProvider {
         self.inner
             .commands
             .send(ClientCommand::Control {
-                operation,
+                operation: Box::new(operation),
                 params,
                 context: self.host_operation.clone(),
                 wire_context: self.wire_context.clone(),
@@ -2172,7 +2301,10 @@ impl ExtensionBrowserProvider {
                 self.capabilities()?.cursor_presentation_owner == ExtensionEffectOwner::Provider
             }
             ExtensionOperation::FinishTurn { .. } => {
-                self.capabilities()?.turn_lifecycle_owner == ExtensionEffectOwner::Provider
+                let caps = self.capabilities()?;
+                caps.turn_lifecycle_owner == ExtensionEffectOwner::Provider
+                    || (caps.turn_lifecycle_owner == ExtensionEffectOwner::Host
+                        && caps.logical_lease_persistence)
             }
             ExtensionOperation::MuteCreatedTab { .. }
             | ExtensionOperation::UnmuteCreatedTabIfActive { .. }
@@ -3361,6 +3493,17 @@ impl ExtensionBrowserProvider {
         receipt: &ExtensionFixedSessionReceipt,
         ui: &ExtensionFixedUiRequest,
     ) -> Result<ExtensionFixedUiProof, ExtensionProviderError> {
+        if matches!(
+            ui.operation,
+            ExtensionFixedUiOperation::FinalizeDeliverable
+                | ExtensionFixedUiOperation::FinalizeHandoff
+        ) && !self.capabilities()?.retained_tab_presentation
+        {
+            return Err(self.preflight_error(
+                "sessionUi",
+                refused("unsupported", "retained tab presentation is not available"),
+            ));
+        }
         self.check_fixed_receipt(receipt, false)?;
         ui.validate()
             .map_err(|message| refused("invalid_request", message))?;
@@ -3391,7 +3534,12 @@ impl ExtensionBrowserProvider {
                 json!({"tabId":receipt.tab_id,"scopeId":receipt.scope_id,"ui":ui}),
             )
             .await?;
-        fixed_ui_proof(&reply.outcome.into_result("sessionUi")?, receipt, reply.id)
+        fixed_ui_proof(
+            &reply.outcome.into_result("sessionUi")?,
+            receipt,
+            reply.id,
+            ui.operation,
+        )
     }
 
     /// Clear the exact old logical scope; never detach or close a user tab.
@@ -3808,6 +3956,67 @@ impl ExtensionBrowserProvider {
             completion_id: reply.id,
         })
     }
+    /// Record one explicit mark on the current exact claim and logical turn.
+    /// This ACK promises only retention intent, not kept-tab or cleanup success.
+    pub async fn mark_tab(
+        &self,
+        claim: &ExtensionPhysicalClaim,
+        status: ExtensionKeepStatus,
+    ) -> Result<ExtensionTabMarkAck, ExtensionProviderError> {
+        self.check_claim(claim)
+            .map_err(|error| self.preflight_error("markTab", error))?;
+        if claim.cleanup_only {
+            return Err(self.preflight_error(
+                "markTab",
+                refused(
+                    "claim_unavailable",
+                    "cleanup-only claim cannot change a tab mark",
+                ),
+            ));
+        }
+        let context = self.wire_context.as_ref().ok_or_else(|| {
+            self.preflight_error(
+                "markTab",
+                refused(
+                    "missing_context",
+                    "tab marking requires the current Host session and turn",
+                ),
+            )
+        })?;
+        if self
+            .host_operation
+            .as_ref()
+            .is_none_or(|operation| operation.turn_id != context.host_turn_id())
+        {
+            return Err(self.preflight_error(
+                "markTab",
+                refused(
+                    "missing_context",
+                    "tab marking requires its exact Host operation",
+                ),
+            ));
+        }
+        let reply = self
+            .control(
+                ExtensionOperation::MarkTab {
+                    claim: claim.token.clone(),
+                    tab_id: claim.tab_id,
+                    status,
+                },
+                json!({"claim":claim.token,"status":status}),
+            )
+            .await?;
+        tab_mark_ack(
+            reply,
+            context,
+            &self.identity().generation,
+            claim.tab_id,
+            status,
+            false,
+            self.capabilities()?.logical_lease_persistence,
+        )
+    }
+
     /// Invoke once from the trusted Host's complete logical-turn cleanup plan.
     /// None selects turnEnded; Some selects the full finalizeTabs keep plan.
     /// Neither a void wire ACK nor this receipt proves physical tab release.
@@ -3833,12 +4042,13 @@ impl ExtensionBrowserProvider {
                 json!({"keep":keep}),
             )
             .await?;
-        reply.outcome.into_result("finishTurn")?;
-        Ok(ExtensionTurnFinishAck {
-            host_session_id: context.host_session_id().to_owned(),
-            host_turn_id: context.host_turn_id().to_owned(),
-            completion_id: reply.id,
-        })
+        let result = reply.outcome.into_result("finishTurn")?;
+        turn_finish_ack(
+            result,
+            &context,
+            reply.id,
+            self.capabilities()?.logical_lease_persistence,
+        )
     }
     /// FIFO barrier for control operations only (attach/create/preparation/
     /// headers/cleanup). None outcome remains in flight. Absence does not prove
@@ -4065,16 +4275,32 @@ impl ExtensionBrowserProvider {
                 wait_for_arrival_requested: *wait_for_arrival,
                 completion_id: completion.id,
             }),
+            ExtensionOperation::MarkTab { tab_id, status, .. } => {
+                let context = completion
+                    .wire_context
+                    .as_ref()
+                    .ok_or_else(|| protocol("mark completion lost its immutable wire context"))?;
+                ExtensionRecoveredOperation::Marked(tab_mark_ack(
+                    reply(),
+                    context,
+                    &self.identity().generation,
+                    *tab_id,
+                    *status,
+                    false,
+                    self.capabilities()?.logical_lease_persistence,
+                )?)
+            }
             ExtensionOperation::FinishTurn { .. } => {
                 let context = completion
                     .wire_context
                     .as_ref()
                     .ok_or_else(|| protocol("finish completion lost its immutable wire context"))?;
-                ExtensionRecoveredOperation::TurnFinished(ExtensionTurnFinishAck {
-                    host_session_id: context.host_session_id().to_owned(),
-                    host_turn_id: context.host_turn_id().to_owned(),
-                    completion_id: completion.id,
-                })
+                ExtensionRecoveredOperation::TurnFinished(turn_finish_ack(
+                    result,
+                    context,
+                    completion.id,
+                    self.capabilities()?.logical_lease_persistence,
+                )?)
             }
             ExtensionOperation::Attach { tab_id } => ExtensionRecoveredOperation::Claim(
                 self.claim_from_result(&result, *tab_id, completion.id, false)?,
@@ -4130,17 +4356,17 @@ impl ExtensionBrowserProvider {
                     .wire_context
                     .as_ref()
                     .ok_or_else(|| protocol("fixed preparation lost its captured wire context"))?;
-                ExtensionRecoveredOperation::FixedSessionPrepared(
+                ExtensionRecoveredOperation::FixedSessionPrepared(Box::new(
                     self.fixed_preparation_from_result(
                         &result,
                         &completion.operation,
                         context,
                         completion.id,
                     )?,
-                )
+                ))
             }
-            ExtensionOperation::SessionUi { receipt, .. } => ExtensionRecoveredOperation::FixedUi(
-                fixed_ui_proof(&result, receipt, completion.id)?,
+            ExtensionOperation::SessionUi { receipt, ui } => ExtensionRecoveredOperation::FixedUi(
+                fixed_ui_proof(&result, receipt, completion.id, ui.operation())?,
             ),
             ExtensionOperation::ClearSessionPreparation { receipt } => {
                 ExtensionRecoveredOperation::FixedSessionCleared(fixed_cleanup_proof(
@@ -4448,17 +4674,37 @@ impl ExtensionBrowserProvider {
                     });
                 }
             }
+            ExtensionOperation::MarkTab { tab_id, status, .. } => {
+                if let Some(result) = acknowledged {
+                    let context = completion.wire_context.as_ref().ok_or_else(|| {
+                        protocol("unknown mark receipt lost its immutable context")
+                    })?;
+                    custody.marked = Some(tab_mark_ack(
+                        ControlReply {
+                            id: completion.id,
+                            outcome: ExtensionOperationOutcome::Result(result.clone()),
+                        },
+                        context,
+                        &self.identity().generation,
+                        *tab_id,
+                        *status,
+                        true,
+                        false,
+                    )?);
+                }
+            }
             ExtensionOperation::FinishTurn { .. } => {
-                if acknowledged.is_some() {
+                if let Some(result) = acknowledged {
                     let context = completion
                         .wire_context
                         .as_ref()
                         .ok_or_else(|| protocol("unknown finish receipt lost wire context"))?;
-                    custody.turn_finished = Some(ExtensionTurnFinishAck {
-                        host_session_id: context.host_session_id().to_owned(),
-                        host_turn_id: context.host_turn_id().to_owned(),
-                        completion_id: completion.id,
-                    });
+                    custody.turn_finished = Some(turn_finish_ack(
+                        result.clone(),
+                        context,
+                        completion.id,
+                        self.capabilities()?.logical_lease_persistence,
+                    )?);
                 }
             }
             ExtensionOperation::Attach { tab_id } => {
@@ -4654,12 +4900,50 @@ fn fixed_ui_proof(
     result: &Value,
     receipt: &ExtensionFixedSessionReceipt,
     completion_id: u64,
+    operation: ExtensionFixedUiOperation,
 ) -> Result<ExtensionFixedUiProof, ExtensionProviderError> {
     let fields: FixedUiResult = decode(result.clone())?;
     if fields.tab_id != receipt.tab_id || fields.scope_id != receipt.scope_id {
         return Err(protocol(
             "fixed UI acknowledgement changed its issued logical scope",
         ));
+    }
+    if let ExtensionFixedUiAck::Attempted { retention, .. } = &fields.ui {
+        if retention.as_ref().is_some_and(|ack| {
+            (ack.badge_applied
+                && (!ack.renderer_acknowledged
+                    || !ack.source_favicon_available
+                    || !ack.intent_persisted))
+                || (ack.observed
+                    && ack.badge_applied
+                    && ack.status != ExtensionRetentionPresentationStatus::Active)
+                || ack
+                    .document_id
+                    .as_ref()
+                    .is_some_and(|id| id.is_empty() || id.len() > 4096)
+        }) {
+            return Err(protocol(
+                "retained presentation acknowledgement is internally inconsistent",
+            ));
+        }
+        let expected = match operation {
+            ExtensionFixedUiOperation::FinalizeDeliverable => {
+                Some(ExtensionRetentionPresentationStatus::Deliverable)
+            }
+            ExtensionFixedUiOperation::FinalizeHandoff => {
+                Some(ExtensionRetentionPresentationStatus::Handoff)
+            }
+            _ => None,
+        };
+        if expected.is_some_and(|status| {
+            retention
+                .as_ref()
+                .is_none_or(|ack| ack.tab_id != receipt.tab_id || ack.status != status)
+        }) {
+            return Err(protocol(
+                "retained presentation acknowledgement changed its requested tab or status",
+            ));
+        }
     }
     Ok(ExtensionFixedUiProof {
         ui: fields.ui,
@@ -4906,7 +5190,7 @@ fn header_proof(
 
 enum ClientCommand {
     Control {
-        operation: ExtensionOperation,
+        operation: Box<ExtensionOperation>,
         params: Value,
         context: Option<ExtensionHostOperation>,
         wire_context: Option<ExtensionWireContext>,
@@ -5153,6 +5437,7 @@ async fn run_client(
                     ClientCommand::OwnerDropped=>{break;},
                     ClientCommand::Close{reply}=>{disconnect("logical owner explicitly closed its IPC transport",&owner,&events,&mut pending,&mut opening,RouteReceipts{routes:&mut routes,retired_contexts:&mut retired_contexts},&mut next_id);writer=None;reader.abort();let _=reply.send(());None},
                     ClientCommand::Control{operation,params,context,wire_context,reply}=>{
+                        let operation=*operation;
                         if reply.is_closed(){None}
                         else if !owner_admitting(&owner){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::NotDispatched{kind:"owner_closed".into(),message:"logical owner is closing; control was not dispatched".into(),details:None}});None}
                         else if writer.is_none(){let _=reply.send(ControlReply{id:0,outcome:ExtensionOperationOutcome::Unknown{reason:"owner IPC is closed".into(),details:None}});None}
@@ -7871,7 +8156,7 @@ mod tests {
             .inner
             .commands
             .send(ClientCommand::Control {
-                operation: ExtensionOperation::Attach { tab_id: 51 },
+                operation: Box::new(ExtensionOperation::Attach { tab_id: 51 }),
                 params: json!({"tabId":51}),
                 context: None,
                 wire_context: None,

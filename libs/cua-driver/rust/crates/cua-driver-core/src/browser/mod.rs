@@ -50,6 +50,7 @@ mod extension_catalog;
 mod extension_framing;
 mod extension_host;
 mod extension_install;
+mod extension_logical_lease;
 pub mod extension_process;
 mod extension_provider;
 mod user_tab_context;
@@ -159,7 +160,9 @@ pub use local_ipc::{ExtensionEndpointIdentity, IpcError, ValidatedExtensionEndpo
 
 pub use extension_provider::ExtensionTabAbsenceObservation;
 
-pub use extension_provider::{ExtensionKeepStatus, ExtensionKeepTab, ExtensionTurnFinishAck};
+pub use extension_provider::{
+    ExtensionKeepStatus, ExtensionKeepTab, ExtensionTabMarkAck, ExtensionTurnFinishAck,
+};
 
 pub use extension_wire::{ExtensionWireContext, ExtensionWireContextError};
 
@@ -169,6 +172,15 @@ pub use extension_process::{
 
 pub use extension_provider::{
     ExtensionClaimCdpDrainProof, ExtensionClaimCdpSnapshot, ExtensionPendingCdpRequest,
+};
+
+pub use extension_logical_lease::{
+    ExtensionLogicalLease, ExtensionLogicalLeaseCommit, ExtensionLogicalLeaseOrigin,
+    ExtensionLogicalLeasePhase, ExtensionReleasedLogicalLease,
+};
+
+pub use extension_provider::{
+    ExtensionRetentionPresentationAck, ExtensionRetentionPresentationStatus,
 };
 
 #[cfg(test)]

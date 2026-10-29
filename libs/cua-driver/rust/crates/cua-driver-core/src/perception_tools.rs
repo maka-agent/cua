@@ -422,7 +422,15 @@ fn capture_provenance(
             display_id: "primary".into(),
         },
     };
-    let [m11, m12, m21, m22, tx, ty] = capture.screenshot_to_action().coefficients();
+    let transform = capture.screenshot_to_action().ok_or_else(|| {
+        error(
+            VisualParseErrorCode::InvalidFrame,
+            "capture producer did not report a native image origin",
+            false,
+            None,
+        )
+    })?;
+    let [m11, m12, m21, m22, tx, ty] = transform.coefficients();
     let action_coordinate_space = if [m11, m12, m21, m22, tx, ty] == [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
     {
         VisualActionCoordinateSpace::ScreenshotPixels

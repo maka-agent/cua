@@ -344,6 +344,24 @@ pub fn screenshot_window_bytes_with_occlusion(hwnd: u64) -> Result<(Vec<u8>, boo
     screenshot_window_mapped(hwnd).map(|(png, occluded, _)| (png, occluded))
 }
 
+/// Captured window pixels and their proven source frame, when available.
+#[derive(Debug)]
+pub(crate) struct WindowCapture {
+    pub png: Vec<u8>,
+    pub occluded: bool,
+    /// Physical screen `[left, top, width, height]`; WGC has no proven origin.
+    pub geometry: Option<[i32; 4]>,
+}
+
+pub(crate) fn screenshot_window_with_geometry(hwnd: u64) -> Result<WindowCapture> {
+    let (png, occluded, geometry) = screenshot_window_mapped(hwnd)?;
+    Ok(WindowCapture {
+        png,
+        occluded,
+        geometry: geometry.map(|frame| [frame.left, frame.top, frame.width, frame.height]),
+    })
+}
+
 /// Capture the final input point against the exact source frame. WGC supplies
 /// no proven screen origin, so it cannot produce mapped click evidence yet.
 pub(crate) fn screenshot_window_click_target(

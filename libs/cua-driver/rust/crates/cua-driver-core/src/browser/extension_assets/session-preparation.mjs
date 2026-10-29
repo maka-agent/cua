@@ -69,3 +69,26 @@ export function captureSessionScope(params, wireContext, ui = false) {
     ...(ui ? { ui: validateFixedUiRequest(params.ui) } : {}),
   };
 }
+
+// Serializable projection of existing logical records. It is never claim,
+// connection ownership, preparation policy, or execution authority.
+export const LOGICAL_TABS_KEY = 'maka.browser.logical-tabs.v1';
+export function captureLogicalTabProjection(value, chromeSessionId) {
+  const fields = ['chromeSessionId', 'logicalLeaseId', 'tabId', 'hostSessionId',
+    'hostTurnId', 'origin', 'status', 'phase', 'sequence'];
+  const text = (value, limit) => typeof value === 'string' && value.trim().length > 0
+    && value.length <= limit;
+  const uuid = (value) => typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+  if (!exactFields(value, fields) || !uuid(chromeSessionId)
+    || value.chromeSessionId !== chromeSessionId || !uuid(value.logicalLeaseId)
+    || !Number.isSafeInteger(value.tabId) || value.tabId <= 0
+    || !text(value.hostSessionId, 4096) || !text(value.hostTurnId, 4096)
+    || !['agent_created', 'user_claimed'].includes(value.origin)
+    || ![null, 'handoff', 'deliverable'].includes(value.status)
+    || !['live', 'handoff'].includes(value.phase)
+    || (value.phase === 'handoff' && value.status !== null)
+    || !Number.isSafeInteger(value.sequence) || value.sequence <= 0)
+    throw new ConnectorError('storage_invalid', 'logical tab projection has unsupported fields or identity');
+  return Object.freeze(Object.fromEntries(fields.map((field) => [field, value[field]])));
+}

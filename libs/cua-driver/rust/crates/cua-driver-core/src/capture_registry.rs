@@ -223,6 +223,7 @@ pub struct ScreenshotToActionTransform {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RectangleRatio {
+    offset: [i32; 2],
     encoded: EncodedScreenshotDimensions,
     native: NativeActionDimensions,
 }
@@ -244,8 +245,8 @@ impl RectangleRatio {
                 .map(|mapped| mapped as f64)
         };
         Some((
-            scale(x, self.native.width, self.encoded.width)?,
-            scale(y, self.native.height, self.encoded.height)?,
+            scale(x, self.native.width, self.encoded.width)? + f64::from(self.offset[0]),
+            scale(y, self.native.height, self.encoded.height)? + f64::from(self.offset[1]),
         ))
     }
 }
@@ -297,8 +298,30 @@ impl ScreenshotToActionTransform {
             m22: f64::from(native.height) / f64::from(encoded.height),
             tx: 0.0,
             ty: 0.0,
-            rectangle: Some(RectangleRatio { encoded, native }),
+            rectangle: Some(RectangleRatio {
+                encoded,
+                native,
+                offset: [0, 0],
+            }),
         }
+    }
+
+    /// Map a real cropped native image into its full window frame. Integer
+    /// image points retain rectangle-ratio truncation before the crop offset.
+    pub fn from_cropped_dimensions(
+        encoded: EncodedScreenshotDimensions,
+        image: NativeActionDimensions,
+        offset: [i32; 2],
+    ) -> Self {
+        let mut transform = Self::from_dimensions(encoded, image);
+        transform.tx = f64::from(offset[0]);
+        transform.ty = f64::from(offset[1]);
+        transform.rectangle = Some(RectangleRatio {
+            encoded,
+            native: image,
+            offset,
+        });
+        transform
     }
 
     pub fn identity() -> Self {
@@ -598,6 +621,8 @@ pub enum CaptureActionError {
     InvalidMappedPoint,
     #[error("capture native action frame no longer matches the live target")]
     NativeActionFrameMismatch,
+    #[error("capture producer did not report a native image origin")]
+    NativeActionMappingUnavailable,
 }
 
 /// Wire code for a capture ID that does not parse.
@@ -634,6 +659,7 @@ impl CaptureActionError {
             Self::Lookup(lookup) => lookup.wire_code(),
             Self::InvalidScreenshotPoint | Self::InvalidMappedPoint => "capture_coordinate_invalid",
             Self::NativeActionFrameMismatch => "capture_frame_mismatch",
+            Self::NativeActionMappingUnavailable => CAPTURE_ACTION_REFUSED_CODE,
         }
     }
 }
@@ -654,11 +680,15 @@ pub fn admission_error_code(error: &anyhow::Error) -> &'static str {
 enum CaptureLifetime {
     OneShot,
     WindowObservation(NativeWindowFrame),
+    UnmappedWindowObservation(NativeWindowFrame),
 }
 
 impl CaptureLifetime {
     fn is_window_observation(self) -> bool {
-        matches!(self, Self::WindowObservation(_))
+        matches!(
+            self,
+            Self::WindowObservation(_) | Self::UnmappedWindowObservation(_)
+        )
     }
 }
 
@@ -671,7 +701,7 @@ struct StoredCapture {
     target: CaptureTarget,
     encoded_dimensions: EncodedScreenshotDimensions,
     native_action_dimensions: NativeActionDimensions,
-    screenshot_to_action: ScreenshotToActionTransform,
+    screenshot_to_action: Option<ScreenshotToActionTransform>,
     binding: CaptureBinding,
     lifetime: CaptureLifetime,
     created_at: Duration,
@@ -731,11 +761,12 @@ impl PerceptionCapture {
     pub fn window_observation_frame(&self) -> Option<NativeWindowFrame> {
         match self.0.lifetime {
             CaptureLifetime::OneShot => None,
-            CaptureLifetime::WindowObservation(frame) => Some(frame),
+            CaptureLifetime::WindowObservation(frame)
+            | CaptureLifetime::UnmappedWindowObservation(frame) => Some(frame),
         }
     }
 
-    pub(crate) fn screenshot_to_action(&self) -> ScreenshotToActionTransform {
+    pub(crate) fn screenshot_to_action(&self) -> Option<ScreenshotToActionTransform> {
         self.0.screenshot_to_action
     }
 
@@ -848,7 +879,8 @@ impl CaptureRegistry {
                     .checked_add(self.config.ttl)
                     .ok_or(CaptureStoreError::ExpiryOverflow)?,
             ),
-            CaptureLifetime::WindowObservation(_) => None,
+            CaptureLifetime::WindowObservation(_)
+            | CaptureLifetime::UnmappedWindowObservation(_) => None,
         };
 
         let mut inner = self
@@ -885,7 +917,10 @@ impl CaptureRegistry {
             target: registration.target,
             encoded_dimensions: registration.encoded_dimensions,
             native_action_dimensions: registration.native_action_dimensions,
-            screenshot_to_action: registration.screenshot_to_action,
+            screenshot_to_action: match lifetime {
+                CaptureLifetime::UnmappedWindowObservation(_) => None,
+                _ => Some(registration.screenshot_to_action),
+            },
             binding: registration.binding,
             lifetime,
             created_at,
@@ -959,6 +994,12 @@ impl CaptureRegistry {
         if capture.target != request.target {
             return Err(CaptureLookupError::TargetMismatch.into());
         }
+        if matches!(
+            capture.lifetime,
+            CaptureLifetime::UnmappedWindowObservation(_)
+        ) {
+            return Err(CaptureActionError::NativeActionMappingUnavailable);
+        }
         if let CaptureLifetime::WindowObservation(recorded_frame) = capture.lifetime {
             let current_frame = current_frame.ok_or(CaptureLookupError::WindowFrameRequired)?;
             if recorded_frame != current_frame {
@@ -984,7 +1025,10 @@ impl CaptureRegistry {
             if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= max_x || y >= max_y {
                 return Err(CaptureActionError::InvalidScreenshotPoint);
             }
-            let (action_x, action_y) = capture.screenshot_to_action.apply(x, y);
+            let transform = capture
+                .screenshot_to_action
+                .ok_or(CaptureActionError::NativeActionMappingUnavailable)?;
+            let (action_x, action_y) = transform.apply(x, y);
             if !action_x.is_finite() || !action_y.is_finite() {
                 return Err(CaptureActionError::InvalidMappedPoint);
             }
@@ -1082,7 +1126,7 @@ impl CaptureRegistry {
             capture.binding == *binding
                 && matches!(
                     capture.lifetime,
-                    CaptureLifetime::WindowObservation(recorded) if recorded != current_frame
+                    CaptureLifetime::WindowObservation(recorded) | CaptureLifetime::UnmappedWindowObservation(recorded) if recorded != current_frame
                 )
         })
     }
@@ -1296,6 +1340,41 @@ impl CaptureService {
                 binding,
             },
             frame,
+        )
+    }
+
+    /// Retain image bytes whose native pixel origin was not reported by the
+    /// producer. No action transform is stored or inferred from image size.
+    /// The publication's image-local scale is ignored for action admission.
+    ///
+    /// # Errors
+    /// Rejects a foreign target, invalid image or binding, and exhausted storage
+    /// before replacing any previous window observation.
+    pub fn publish_window_observation_without_origin(
+        &self,
+        publication: CapturePublication,
+        frame: NativeWindowFrame,
+    ) -> Result<CaptureId, CaptureStoreError> {
+        if publication.target
+            != (CaptureTarget::Window {
+                pid: frame.pid(),
+                window_id: frame.window_id(),
+            })
+        {
+            return Err(CaptureStoreError::InvalidTarget);
+        }
+        let binding = self.binding(publication.session_id, publication.session_generation)?;
+        self.registry.store_with_lifetime(
+            CaptureRegistration {
+                encoded_bytes: publication.encoded_bytes,
+                codec: publication.codec,
+                target: publication.target,
+                encoded_dimensions: publication.encoded_dimensions,
+                native_action_dimensions: publication.native_action_dimensions,
+                screenshot_to_action: publication.screenshot_to_action,
+                binding,
+            },
+            CaptureLifetime::UnmappedWindowObservation(frame),
         )
     }
 

@@ -79,6 +79,8 @@ pub enum ExtensionFixedUiOperation {
     Hide,
     Remove,
     Finalize,
+    FinalizeDeliverable,
+    FinalizeHandoff,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -102,6 +104,14 @@ pub struct ExtensionFixedUiRequest {
 }
 impl ExtensionFixedUiRequest {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if matches!(
+            self.operation,
+            ExtensionFixedUiOperation::FinalizeDeliverable
+                | ExtensionFixedUiOperation::FinalizeHandoff
+        ) && (self.point.is_some() || self.action != ExtensionFixedUiAction::Idle)
+        {
+            return Err("retained tab presentation accepts only idle publication without a point");
+        }
         if self.cursor.id.is_empty() {
             return Err("fixed UI cursor identity is empty");
         }
@@ -150,6 +160,28 @@ fn required_fixed_ui_point<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<[f64; 2]>, D::Error> {
     Option::<[f64; 2]>::deserialize(deserializer)
 }
+/// Closed presentation metadata; never a tab claim or a content grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionRetentionPresentationStatus {
+    Active,
+    Deliverable,
+    Handoff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionRetentionPresentationAck {
+    pub tab_id: u64,
+    pub status: ExtensionRetentionPresentationStatus,
+    pub observed: bool,
+    pub intent_persisted: bool,
+    pub renderer_acknowledged: bool,
+    pub badge_applied: bool,
+    pub source_favicon_available: bool,
+    pub document_id: Option<String>,
+}
+
 /// An actual service attempt is distinct from a renderer acknowledgement.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase", deny_unknown_fields)]
@@ -159,6 +191,8 @@ pub enum ExtensionFixedUiAck {
         acknowledged: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<ExtensionFixedUiRenderState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention: Option<ExtensionRetentionPresentationAck>,
     },
     Unknown,
 }

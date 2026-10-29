@@ -11,11 +11,14 @@ import {
   CreatedTabPresentationError,
 } from './created-tab-presentation.mjs';
 import { TabPreparation } from './tab-preparation.mjs';
-import { FixedUi } from './fixed-ui.mjs';
+import { FixedUi, RetainedTabPresentation } from './fixed-ui.mjs';
 import {
   captureFixedSession,
-  captureSessionScope,
   captureSessionContext,
+  captureSessionScope,
+  exactFields,
+  captureLogicalTabProjection,
+  LOGICAL_TABS_KEY,
   sameSessionContext,
 } from './session-preparation.mjs';
 export class ExtensionBrowserConnector extends PreparedBrowserConnector {
@@ -72,7 +75,16 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
       },
     });
     this.activationSequence = 0;
+    this.logicalInitialized = false;
+    this.logicalStorageFailure = null;
+    this.logicalWrites = Promise.resolve();
+    this.nextLogicalSequence = 0;
+    this.nextLogicalRequest = 0;
+    this.retentionPresentation = new RetainedTabPresentation(chrome, {
+      records: () => this.records, chromeSessionId: () => this.chromeSessionId,
+    });
     this.fixedUi = new FixedUi(chrome, {
+      retention: this.retentionPresentation,
       resolveCurrent: (record, scope, mode) => this.fixedSessionCurrent(record, scope, mode),
       isGone: (record) => record.tabRemoved === true,
       currentScopes: () => [...this.records.values()].flatMap((record) => {
@@ -85,8 +97,372 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
       if (event.frameId === 0) this.refreshFixedSessionUi(event.tabId);
     });
   }
+  async initialize() {
+    if (this.logicalStorageFailure)
+      throw new ConnectorError('storage_unavailable', 'logical tab storage has an unresolved write');
+    const initialized = await super.initialize();
+    if (!this.logicalInitialized) {
+      const storage = this.chrome.storage?.session;
+      if (!storage || typeof storage.get !== 'function' || typeof storage.set !== 'function')
+        throw new ConnectorError('storage_unsupported', 'logical tab persistence needs chrome.storage.session');
+      const stored = (await storage.get(LOGICAL_TABS_KEY))[LOGICAL_TABS_KEY];
+      if (stored === undefined) {
+        this.chromeSessionId = this.randomUUID();
+      } else {
+        if (!exactFields(stored, ['schema', 'chromeSessionId', 'tabs']) || stored.schema !== 1
+          || typeof stored.chromeSessionId !== 'string' || !stored.chromeSessionId.trim()
+          || stored.chromeSessionId.length > 128
+          || !Array.isArray(stored.tabs) || stored.tabs.length > 1000)
+          throw new ConnectorError('storage_invalid', 'logical tab projection storage is not recognized');
+        this.chromeSessionId = stored.chromeSessionId;
+        const ids = new Set(), leases = new Set(), sequences = new Set();
+        for (const value of stored.tabs) {
+          const logical = captureLogicalTabProjection(value, this.chromeSessionId);
+          if (ids.has(logical.tabId) || leases.has(logical.logicalLeaseId) || sequences.has(logical.sequence))
+            throw new ConnectorError('storage_invalid', 'logical tab projection has duplicate identities');
+          ids.add(logical.tabId); leases.add(logical.logicalLeaseId); sequences.add(logical.sequence);
+          this.nextLogicalSequence = Math.max(this.nextLogicalSequence, logical.sequence);
+          // Metadata only. No old owner, generation, resource token, claim, grant,
+          // attached flag, preparation policy or physical proof is restored.
+          this.records.set(logical.tabId, { tabId: logical.tabId, owner: null, generation: null,
+            physical: null, physicalGone: false, tabRemoved: false, logicalLease: logical });
+        }
+      }
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(this.chromeSessionId))
+        throw new ConnectorError('storage_invalid', 'Chrome session identity must be a canonical UUID');
+      this.instanceId = this.chromeSessionId;
+      await this.persistLogicalTabs();
+      this.logicalInitialized = true;
+    }
+    if (!this.retentionPresentation.initialized) {
+      try { await this.retentionPresentation.initialize(); }
+      catch (error) { this.retentionPresentation.storageFailure = String(error?.message ?? error); }
+    }
+    // Cosmetic storage failure disables that presentation capability only.
+    // It cannot prevent the existing browser/physical cleanup service starting.
+    return initialized;
+  }
+  async persistLogicalTabs() {
+    const write = this.logicalWrites.then(async () => {
+      const tabs = [...this.records.values()].flatMap((record) =>
+        record.logicalLease && !record.tabRemoved
+          ? [captureLogicalTabProjection(record.logicalLease, this.chromeSessionId)] : []);
+      if (tabs.length > 1000)
+        throw new ConnectorError('storage_budget', 'logical tab projection budget is exhausted');
+      await this.chrome.storage.session.set({ [LOGICAL_TABS_KEY]: {
+        schema: 1, chromeSessionId: this.chromeSessionId, tabs,
+      } });
+      return tabs;
+    });
+    this.logicalWrites = write.catch(() => {});
+    try { return await write; }
+    catch (error) {
+      this.logicalStorageFailure = String(error?.message ?? error);
+      throw new ConnectorError('outcome_unknown', 'logical tab projection write was not acknowledged',
+        { storageError: this.logicalStorageFailure });
+    }
+  }
+  logicalContext(value) {
+    if (!this.logicalInitialized || this.logicalStorageFailure)
+      throw new ConnectorError('storage_unavailable', 'logical tab storage is not ready or has an unknown write');
+    return captureSessionContext(value);
+  }
+  orphanLogicalRecord(record) {
+    if (this.records.get(record.tabId) !== record || !record.logicalLease
+      || record.physical || !this.closedOwners.has(record.owner)
+      || !this.attachmentCleanupConfirmed(record)) return;
+    const previousOwner = record.owner;
+    record.owner = null; record.generation = null;
+    delete record.logicalPreparation; delete record.preparation; delete record.headerScope;
+    delete record.headerCleanupPromise;
+    for (const [token, creation] of this.creations)
+      if (creation.owner === previousOwner && creation.tabId === record.tabId && creation.settled)
+        this.creations.delete(token);
+  }
+  reserveResource(owner, id) {
+    const previous = this.records.get(id);
+    if (previous?.presentationMetadata === true && previous.owner === null
+      && previous.generation === null && !previous.logicalLease && !previous.physical
+      && !previous.logicalPreparation && !previous.preparation && !previous.headerScope) {
+      // A cosmetic metadata shell owns nothing. Reuse the original reservation
+      // checks rather than allowing presentation state to block a real claim.
+      this.records.delete(id);
+      try {
+        const record = super.reserveResource(owner, id);
+        for (const name of ['finalizedBadge', 'faviconSource', 'presentationTracked', 'presentationMetadata', 'pendingRestore'])
+          if (Object.hasOwn(previous, name)) record[name] = previous[name];
+        record.presentationRevision = (previous.presentationRevision ?? 0) + 1;
+        return record;
+      } catch (error) { if (!this.records.has(id)) this.records.set(id, previous); throw error; }
+    }
+    return super.reserveResource(owner, id);
+  }
+  reserveLogicalProjection(owner, id, context) {
+    const record = this.records.get(id), logical = record?.logicalLease;
+    if (!logical) return;
+    if (logical.hostSessionId !== context.hostSessionId && logical.phase !== 'handoff')
+      throw new ConnectorError('tab_busy', 'another logical Host session still owns this tab');
+    if (record.owner === owner && record.generation === this.generation) return;
+    if (record.owner !== null || record.generation !== null || record.physical
+      || record.logicalPreparation || record.preparation || record.headerScope)
+      throw new ConnectorError('tab_busy', 'previous physical or preparation cleanup is not confirmed');
+    // A current Host reservation may request a fresh effect. Only its actual
+    // successful claim ACK below can replace a handed-off projection's SID.
+    this.records.delete(id);
+    const reserved = this.reserveResource(owner, id);
+    reserved.logicalLease = logical;
+  }
+  activateLogicalContext(context, requestOrder) {
+    let changed = false;
+    for (const record of this.records.values()) {
+      const previous = record.logicalLease;
+      if (previous?.hostSessionId !== context.hostSessionId
+        || (record.logicalActivationOrder ?? 0) > requestOrder) continue;
+      record.logicalActivationOrder = requestOrder;
+      if (previous.hostTurnId === context.hostTurnId) continue;
+      record.logicalLease = captureLogicalTabProjection({ ...previous,
+        hostTurnId: context.hostTurnId, status: null, phase: 'live' }, this.chromeSessionId);
+      changed = true;
+    }
+    return changed;
+  }
+  rememberLogicalTab(owner, id, context, origin, requestOrder) {
+    const record = this.reserveResource(owner, id);
+    const previous = record.logicalLease;
+    if ((record.logicalActivationOrder ?? 0) > requestOrder)
+      throw new ConnectorError('outcome_unknown', 'an older claim result cannot replace current logical context');
+    const transferred = previous && previous.hostSessionId !== context.hostSessionId;
+    if (transferred && previous.phase !== 'handoff')
+      throw new ConnectorError('tab_busy', 'an active foreign logical lease cannot be replaced');
+    const sameTurn = previous?.hostSessionId === context.hostSessionId
+      && previous?.hostTurnId === context.hostTurnId;
+    const sequence = (!transferred && previous?.sequence) || ++this.nextLogicalSequence;
+    if (!Number.isSafeInteger(sequence) || sequence <= 0)
+      throw new ConnectorError('storage_budget', 'logical tab insertion sequence is exhausted');
+    record.logicalLease = captureLogicalTabProjection({
+      chromeSessionId: this.chromeSessionId,
+      logicalLeaseId: !transferred && previous?.logicalLeaseId || this.randomUUID(),
+      tabId: id, hostSessionId: context.hostSessionId, hostTurnId: context.hostTurnId,
+      origin: transferred ? 'user_claimed' : previous?.origin ?? origin,
+      status: sameTurn ? previous.status : null,
+      phase: 'live', sequence,
+    }, this.chromeSessionId);
+    record.logicalActivationOrder = requestOrder;
+    if (transferred)
+      for (const [token, creation] of this.creations)
+        if (creation.tabId === id) this.creations.delete(token);
+    for (const creation of this.creations.values())
+      if (creation.owner === owner && creation.tabId === id && creation.creationAck) {
+        creation.logicalLeaseId = record.logicalLease.logicalLeaseId;
+        creation.logicalHostSessionId = record.logicalLease.hostSessionId;
+      }
+    void this.retentionPresentation.active(record).catch(() => {});
+    return record.logicalLease;
+  }
+  async finishLogicalTurn(owner, params, wireContext) {
+    if (!exactFields(params, ['keep']) || params.keep !== null)
+      throw new ConnectorError('invalid_request', 'Host-owned logical finish accepts only keep:null');
+    const context = this.logicalContext(wireContext);
+    const selected = [...this.records.values()].filter((record) =>
+      record.logicalLease?.hostSessionId === context.hostSessionId
+      && record.logicalLease?.hostTurnId === context.hostTurnId);
+    for (const record of selected)
+      if (record.physical || record.logicalPreparation || !this.attachmentCleanupConfirmed(record))
+        throw new ConnectorError('outcome_unknown', 'logical finish requires prior actual physical and effect cleanup');
+    const kept = [], released = [];
+    for (const record of selected) {
+      const logical = record.logicalLease;
+      if (logical.status === 'handoff') {
+        record.logicalLease = captureLogicalTabProjection({ ...logical, status: null, phase: 'handoff' }, this.chromeSessionId);
+        record.owner = null; record.generation = null;
+        kept.push(record.logicalLease);
+      } else {
+        released.push({ logicalLeaseId: logical.logicalLeaseId, tabId: logical.tabId,
+          origin: logical.origin, status: logical.status });
+        delete record.logicalLease;
+        if (record.finalizedBadge || record.presentationTracked) {
+          record.owner = null; record.generation = null; record.presentationMetadata = true;
+          if (!record.finalizedBadge) record.pendingRestore = true;
+        }
+        else this.records.delete(record.tabId);
+      }
+      for (const [token, creation] of this.creations)
+        if (logical.status !== 'handoff' && creation.owner === owner
+          && creation.tabId === record.tabId && creation.settled)
+          this.creations.delete(token);
+    }
+    const committed = await this.persistLogicalTabs();
+    if (kept.some((logical) => !committed.some((value) =>
+      value.logicalLeaseId === logical.logicalLeaseId && value.phase === 'handoff')))
+      throw new ConnectorError('outcome_unknown', 'a kept logical tab changed before durable finish acknowledgement');
+    try { await this.retentionPresentation.persist(); }
+    catch (error) { this.retentionPresentation.storageFailure = String(error?.message ?? error); }
+    for (const logical of [...kept, ...released]) this.retentionPresentation.schedule(logical.tabId);
+    return { turnFinished: true, hostSessionId: context.hostSessionId, hostTurnId: context.hostTurnId,
+      logicalLeaseCommit: { chromeSessionId: this.chromeSessionId, kept, released } };
+  }
+  logicalActivationPreflight(owner, method, params, context) {
+    const only = (required, optional = []) => params && typeof params === 'object'
+      && !Array.isArray(params) && required.every((key) => Object.hasOwn(params, key))
+      && Object.keys(params).every((key) => required.includes(key) || optional.includes(key));
+    const validTab = (id) => Number.isSafeInteger(id) && id > 0;
+    const invalid = () => { throw new ConnectorError('invalid_request', 'logical activation fields are not recognized'); };
+    if (method === 'inventory' && params.sessionOnly === true) {
+      if (!only(['sessionOnly', 'knownTabIds']) || !Array.isArray(params.knownTabIds)
+        || params.knownTabIds.some((id) => !validTab(id))
+        || new Set(params.knownTabIds).size !== params.knownTabIds.length) invalid();
+      return true;
+    }
+    if (method === 'resolve' && params.sessionOnly === true) {
+      if (!only(['rawId', 'sessionOnly'], ['committedUrlOnly']) || typeof params.rawId !== 'string'
+        || !params.rawId || !validTab(Number(params.rawId))
+        || (Object.hasOwn(params, 'committedUrlOnly') && typeof params.committedUrlOnly !== 'boolean')) invalid();
+      return true;
+    }
+    if (method === 'prepareSessionTab') {
+      const captured = captureFixedSession(params, context);
+      if (!this.fixedSessionAvailable())
+        throw new ConnectorError('unsupported', 'fixed session service is not ready');
+      this.reserveLogicalProjection(owner, captured.tabId, context);
+      this.admittedTab(owner, captured.tabId, this.generation);
+      return true;
+    }
+    if (method === 'attach' || (method === 'prepareUserTab' && params.sessionOnly === true)) {
+      if (!only(['tabId'], method === 'prepareUserTab' ? ['sessionOnly'] : []) || !validTab(params.tabId)) invalid();
+      this.reserveLogicalProjection(owner, params.tabId, context);
+      this.admittedTab(owner, params.tabId, this.generation);
+      return true;
+    }
+    if (method === 'createTab') {
+      if (!only([], ['windowId']) || (Object.hasOwn(params, 'windowId')
+        && (!Number.isSafeInteger(params.windowId) || params.windowId < 0))) invalid();
+      return true;
+    }
+    if (method === 'createSessionPopupTab') {
+      const captured = captureSessionScope(params, context);
+      const { scope } = this.fixedSessionScope(owner, captured);
+      if (!sameSessionContext(scope.wireContext, context))
+        throw new ConnectorError('claim_revoked', 'popup logical scope is not current');
+      return true;
+    }
+    if (['prepareClaim', 'markTab', 'createPopupTab'].includes(method)) {
+      const fields = method === 'prepareClaim' ? ['claim', 'document', 'policy']
+        : method === 'markTab' ? ['claim', 'status'] : ['claim'];
+      if (!only(fields)) invalid();
+      const record = this.owned(owner, params.claim);
+      if (record.state !== 'owned' || !record.attachedAck || !this.live(record))
+        throw new ConnectorError('claim_revoked', 'logical activation requires its current physical claim');
+      if (method === 'prepareClaim') {
+        if (!exactFields(params.document, ['frameId', 'loaderId', 'url'])
+          || !exactFields(params.policy, ['popupEnabled', 'headerEnabled', 'headers'])) invalid();
+        this.captureLogicalPreparation(record, { wireContext: context,
+          document: params.document, ...params.policy });
+      } else {
+        const scope = record.logicalPreparation;
+        if (!scope || !this.logicalPreparationCurrent(record)
+          || !sameSessionContext(scope.wireContext, context)
+          || (scope.kind === 'session' && (scope.phase !== 'ready' || !this.fixedSessionCurrent(record, scope))))
+          throw new ConnectorError('claim_revoked', 'logical activation scope is no longer current');
+        if (method === 'markTab' && !['handoff', 'deliverable'].includes(params.status)) invalid();
+        if (method === 'createPopupTab' && scope.kind === 'session')
+          throw new ConnectorError('preparation_pending', 'fixed session popup requires its exact logical receipt');
+      }
+      return true;
+    }
+    return false;
+  }
+  logicalPostEffectError(method, result, error) {
+    if (['attach', 'createTab', 'createPopupTab', 'createSessionPopupTab'].includes(method))
+      return new ConnectorError('outcome_unknown', 'physical resource ACK exists but logical settlement is unconfirmed',
+        { acknowledgedResult: result, logicalError: String(error?.message ?? error) });
+    return error;
+  }
+  async dispatch(owner, method, params, wireContext) {
+    const cleanup = ['detach', 'closeTab', 'stopCreatedTab', 'clearScopedHeaders',
+      'clearSessionPreparation', 'closeOwner'].includes(method);
+    const context = wireContext === undefined ? null
+      : cleanup ? captureSessionContext(wireContext) : this.logicalContext(wireContext);
+    if (method === 'finishTurn') return this.finishLogicalTurn(owner, params, wireContext);
+    const requestOrder = context ? ++this.nextLogicalRequest : 0;
+    if (!Number.isSafeInteger(requestOrder))
+      throw new ConnectorError('request_budget', 'logical request ordering is exhausted');
+    if (context && this.logicalActivationPreflight(owner, method, params, context)) {
+      // Activation is logical metadata, not a page grant. Commit it after the
+      // normal closed-input/owner preflight and before any business Chrome call.
+      if (this.activateLogicalContext(context, requestOrder)) await this.persistLogicalTabs();
+    }
+    if (context && method === 'inventory' && params.sessionOnly === true && Array.isArray(params.knownTabIds)) {
+      if (params.knownTabIds.some((id) => !Number.isSafeInteger(id) || id <= 0)
+        || new Set(params.knownTabIds).size !== params.knownTabIds.length)
+        throw new ConnectorError('invalid_request', 'session inventory candidates must be unique positive safe IDs');
+      const knownTabIds = [...new Set([...params.knownTabIds, ...[...this.records.values()]
+        .filter((record) => record.logicalLease?.hostSessionId === context.hostSessionId)
+        .sort((left, right) => left.logicalLease.sequence - right.logicalLease.sequence)
+        .map((record) => record.tabId)])];
+      params = { ...params, knownTabIds };
+    }
+    const result = await this.dispatchPrepared(owner, method, params, wireContext);
+    let logical, acknowledgedClaim;
+    try {
+      if (context && method === 'attach' && typeof result?.claim === 'string') {
+        const record = this.owned(owner, result.claim);
+        if (record.tabId !== params.tabId || record.state !== 'owned'
+          || !record.attachedAck || !this.live(record))
+          throw new ConnectorError('outcome_unknown', 'fresh claim ended before logical acknowledgement');
+        acknowledgedClaim = result.claim;
+        const created = [...this.creations.values()].some((receipt) => receipt.owner === owner
+          && receipt.tabId === params.tabId && receipt.creationAck && !receipt.closed);
+        logical = this.rememberLogicalTab(owner, params.tabId, context,
+          created ? 'agent_created' : 'user_claimed', requestOrder);
+      } else if (context && ['createTab', 'createPopupTab', 'createSessionPopupTab'].includes(method)
+        && typeof result?.creation === 'string' && Number.isSafeInteger(result.tab?.id)) {
+        logical = this.rememberLogicalTab(owner, result.tab.id, context, 'agent_created', requestOrder);
+      } else if (context && method === 'markTab' && result?.marked === true) {
+        const record = this.owned(owner, params.claim);
+        if (!record.logicalLease || record.logicalLease.hostSessionId !== context.hostSessionId
+          || record.logicalLease.hostTurnId !== context.hostTurnId)
+          throw new ConnectorError('claim_revoked', 'mark has no actual current logical lease projection');
+        record.logicalLease = captureLogicalTabProjection({ ...record.logicalLease, status: result.status }, this.chromeSessionId);
+        logical = record.logicalLease;
+      }
+    } catch (error) { throw this.logicalPostEffectError(method, result, error); }
+    if (logical) {
+      let committed;
+      try { committed = await this.persistLogicalTabs(); }
+      catch (error) { throw this.logicalPostEffectError(method, result, error); }
+      if (logical && !committed.some((value) => value.logicalLeaseId === logical.logicalLeaseId
+        && value.hostSessionId === logical.hostSessionId && value.hostTurnId === logical.hostTurnId
+        && value.status === logical.status))
+        throw this.logicalPostEffectError(method, result,
+          new ConnectorError('outcome_unknown', 'logical resource changed before its durable acknowledgement'));
+      if (logical) {
+        result.logicalLease = logical;
+        if (result.tab) result.tab.logicalLease = logical;
+      }
+    }
+    if (acknowledgedClaim) {
+      const record = this.claims.get(acknowledgedClaim);
+      if (!record || record.owner !== owner || record.state !== 'owned'
+        || !record.attachedAck || !this.live(record))
+        throw this.logicalPostEffectError(method, result,
+          new ConnectorError('outcome_unknown', 'fresh claim ended during durable logical acknowledgement'));
+    }
+    if (context && result?.tab) {
+      const projection = this.records.get(result.tab.id)?.logicalLease;
+      if (projection?.hostSessionId === context.hostSessionId) result.tab.logicalLease = projection;
+    }
+    if (context && Array.isArray(result?.tabs))
+      for (const tab of result.tabs) {
+        const projection = this.records.get(tab.id)?.logicalLease;
+        if (projection?.hostSessionId === context.hostSessionId) tab.logicalLease = projection;
+      }
+    return result;
+  }
   hello() {
     const result = super.hello();
+    result.capabilities.logicalLeasePersistence = this.logicalInitialized && !this.logicalStorageFailure;
+    result.capabilities.retainedTabPresentation = this.retentionPresentation.initialized
+      && !this.retentionPresentation.storageFailure && this.fixedUi.available();
     result.capabilities.userTabsOrder = 'host';
     result.capabilities.headerScope = 'claim';
     result.capabilities.createdPresentationOwner = 'host';
@@ -562,11 +938,17 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
       record.ending &&
       this.attachmentCleanupConfirmed(record)
     ) {
+      if (record.logicalLease && !record.tabRemoved && !record.physicalGone) {
+        super.retire(record);
+        this.orphanLogicalRecord(record);
+        return;
+      }
       if (this.records.get(record.tabId) === record) this.records.delete(record.tabId);
       this.claims.delete(record.token);
       return;
     }
     super.retire(record);
+    this.orphanLogicalRecord(record);
   }
   onDetach(source, reason) {
     const record = this.recordForSource(source);
@@ -576,11 +958,15 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
   }
   onRemoved(id) {
     const record = this.records.get(id);
+    const projected = record?.logicalLease;
+    if (record) delete record.logicalLease;
     const scope = record?.logicalPreparation;
     if (record?.preparation || record?.logicalPreparation?.kind === 'session')
       void this.stopRecordPreparation(record, { gone: true }).catch(() => {});
     super.onRemoved(id);
+    if (record && !record.physical) this.retire(record);
     if (scope?.kind === 'session') void this.recoverFixedSessionGone(record, scope).catch(() => {});
+    if (projected && this.logicalInitialized) void this.persistLogicalTabs().catch(() => {});
   }
   cleanupIdentity(record, operation) {
     return Object.freeze({
@@ -654,6 +1040,9 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
     return { ...result.value, preparationCleanupConfirmed: true };
   }
   detach(record) {
+    if (this.records.get(record.tabId) !== record
+      || this.claims.get(record.physical?.token) !== record)
+      throw new ConnectorError('claim_unavailable', 'cleanup no longer names the current exact physical record');
     if (!record.physical)
       throw new ConnectorError('claim_unavailable', 'logical preparation cannot detach a debugger');
     if (record.logicalPreparation?.kind === 'session') return super.detach(record);
@@ -687,11 +1076,25 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
       ...(physicalResult.status === 'rejected' ? [String(physicalResult.reason)] : []),
       ...(prepared.status === 'fulfilled' ? prepared.value
         .filter((entry) => entry.status === 'rejected').map((entry) => String(entry.reason)) : [])];
+    const logicalRetained = records.filter((record) => record.logicalLease && !record.physical
+      && this.attachmentCleanupConfirmed(record)).map((record) => record.logicalLease);
+    if (this.logicalInitialized) {
+      for (const record of records) this.orphanLogicalRecord(record);
+      for (const [token, creation] of this.creations) {
+        const record = this.records.get(creation.tabId);
+        if (creation.owner === owner && creation.settled && record?.logicalLease
+          && !record.physical && this.attachmentCleanupConfirmed(record))
+          this.creations.delete(token);
+      }
+      await this.persistLogicalTabs();
+    }
     return {
       ...result,
+      logicalRetained,
       cleanupConfirmed:
         pendingAttachments === 0 && unconfirmedClaims === 0 && headers.cleanupConfirmed
-        && ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed),
+        && ![...this.creations.values()].some((receipt) => receipt.owner === owner && !receipt.closed
+          && !this.records.get(receipt.tabId)?.logicalLease),
       pendingAttachments, unconfirmedClaims,
       scopedHeadersCleanupConfirmed: headers.cleanupConfirmed,
       diagnostics,
@@ -749,6 +1152,13 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
         'creation_unavailable',
         'creation receipt does not belong to this active owner and generation',
       );
+    if (receipt.logicalLeaseId) {
+      const record = this.records.get(receipt.tabId);
+      if (record?.owner !== owner || record.generation !== this.generation
+        || record.logicalLease?.logicalLeaseId !== receipt.logicalLeaseId
+        || record.logicalLease.hostSessionId !== receipt.logicalHostSessionId)
+        throw new ConnectorError('creation_unavailable', 'creation belongs to an earlier logical lease');
+    }
     return Object.freeze({
       creation: token,
       owner,
@@ -767,7 +1177,7 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
       );
     return current;
   }
-  async dispatch(owner, method, params, wireContext) {
+  async dispatchPrepared(owner, method, params, wireContext) {
     try {
       switch (method) {
         case 'readUserTab':
@@ -814,6 +1224,35 @@ export class ExtensionBrowserConnector extends PreparedBrowserConnector {
             document: params.document,
             ...params.policy,
           });
+        }
+        case 'markTab': {
+          if (
+            !exactFields(params, ['claim', 'status']) ||
+            !['handoff', 'deliverable'].includes(params.status)
+          )
+            throw new ConnectorError(
+              'invalid_request',
+              'markTab requires only its exact claim and supported keep status',
+            );
+          const record = this.owned(owner, params.claim);
+          if (record.state !== 'owned' || !record.attachedAck || !this.live(record))
+            throw new ConnectorError('claim_revoked', 'markTab needs the current owned claim');
+          // The trusted envelope, never params, supplies the already prepared
+          // logical Host scope. The Host alone retains the resulting mark intent.
+          const captured = captureSessionContext(wireContext);
+          const scope = record.logicalPreparation;
+          if (
+            !scope ||
+            !this.logicalPreparationCurrent(record) ||
+            !sameSessionContext(scope.wireContext, captured) ||
+            (scope.kind === 'session' &&
+              (scope.phase !== 'ready' || !this.fixedSessionCurrent(record, scope)))
+          )
+            throw new ConnectorError(
+              'claim_revoked',
+              'markTab logical scope is no longer current for this Host turn',
+            );
+          return { marked: true, tabId: record.tabId, status: params.status };
         }
         case 'createPopupTab':
           if (

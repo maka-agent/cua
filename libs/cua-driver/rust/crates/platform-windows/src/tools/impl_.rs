@@ -1525,8 +1525,11 @@ impl Tool for GetWindowStateTool {
             // The previous `Err(_) => None` silently dropped the error and
             // upstream agents saw an empty response with no signal.
             let (screenshot, screenshot_err) = if do_shot {
-                match crate::capture::screenshot_window_bytes(hwnd) {
-                    Ok(raw) => {
+                match crate::capture::screenshot_window_with_geometry(hwnd) {
+                    Ok(capture) => {
+                        let raw = capture.png;
+                        let image_bounds = capture.geometry;
+                        let occluded = capture.occluded;
                         let (native_w, native_h) = crate::capture::png_dimensions_pub(&raw)?;
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
@@ -1536,13 +1539,31 @@ impl Tool for GetWindowStateTool {
                         if let Some(ref path) = out_file {
                             std::fs::write(path, &png)?;
                             (
-                                Some((None, Some(path.clone()), w, h, native_w, native_h, png)),
+                                Some((
+                                    None,
+                                    Some(path.clone()),
+                                    w,
+                                    h,
+                                    native_w,
+                                    native_h,
+                                    png,
+                                    (image_bounds, occluded),
+                                )),
                                 None,
                             )
                         } else {
                             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                             (
-                                Some((Some(B64.encode(&png)), None, w, h, native_w, native_h, png)),
+                                Some((
+                                    Some(B64.encode(&png)),
+                                    None,
+                                    w,
+                                    h,
+                                    native_w,
+                                    native_h,
+                                    png,
+                                    (image_bounds, occluded),
+                                )),
                                 None,
                             )
                         }
@@ -1583,9 +1604,15 @@ impl Tool for GetWindowStateTool {
                 }
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": hwnd, "pid": pid });
+                let mut native_observation = raw_frame.map(|frame| {
+                    json!({
+                        "frame":frame, "logical_size":null,
+                        "captures":{"kind":"unchanged"}, "image_bounds":null, "target_committed":false,
+                    })
+                });
                 let screenshot_scale = screenshot_opt
                     .as_ref()
-                    .map(|(_, _, w, _, native_w, _, _)| *native_w as f64 / *w as f64);
+                    .map(|(_, _, w, _, native_w, _, _, _)| *native_w as f64 / *w as f64);
                 let mut published_snapshot = false;
                 let mut invalidated = Vec::new();
 
@@ -1648,11 +1675,12 @@ impl Tool for GetWindowStateTool {
                     // bitmap origin (the inverse of the pixel tools'
                     // `bitmap_to_screen`), downsized by delivered/native.
                     let elements = match screenshot_opt.as_ref() {
-                        Some((_, _, w, _, native_w, _, _)) if *native_w > 0 => {
-                            let (ox, oy) = bitmap_to_screen(hwnd, 0, 0);
+                        Some((_, _, w, _, native_w, _, _, (Some([ox, oy, _, _]), _)))
+                            if *native_w > 0 =>
+                        {
                             cua_driver_core::element_frame::with_screenshot_frames(
                                 elements,
-                                (f64::from(ox), f64::from(oy)),
+                                (f64::from(*ox), f64::from(*oy)),
                                 f64::from(*w) / f64::from(*native_w),
                             )
                         }
@@ -1778,8 +1806,21 @@ impl Tool for GetWindowStateTool {
                     if let Err(error) = bridge.retire_window_observations(&args) {
                         return capture_admission_refusal(error);
                     }
+                    if let Some(committed) = native_observation.as_mut() {
+                        committed["captures"] = json!({"kind":"cleared"});
+                    }
                 }
-                if let Some((b64_opt, file_path, w, h, native_w, native_h, png)) = screenshot_opt {
+                if let Some((
+                    b64_opt,
+                    file_path,
+                    w,
+                    h,
+                    native_w,
+                    native_h,
+                    png,
+                    (image_bounds, occluded),
+                )) = screenshot_opt
+                {
                     let capture_id = if !observation_only {
                         if let Some(bridge) = &state.capture_bridge {
                             let geometry = match crate::capture_admission::CaptureGeometry::new(
@@ -1800,22 +1841,37 @@ impl Tool for GetWindowStateTool {
                                     if let Err(error)=binding.check() {return ToolResult::error(error.to_string());}
                                 }
                             }
+                            if let Some(committed) = native_observation.as_mut() {
+                                committed["logical_size"] = json!([w, h]);
+                                committed["image_bounds"] = json!(image_bounds);
+                            }
                             let target = crate::capture_admission::WindowsCaptureTarget::Window {
                                 pid,
                                 window_id: hwnd,
                             };
                             let publication = match raw_frame {
                                 Some(frame) => bridge.publish_window_observation(
-                                    &args, png, target, geometry, frame,
+                                    &args,
+                                    png,
+                                    target,
+                                    geometry,
+                                    frame,
+                                    image_bounds,
                                 ),
                                 None => bridge.publish(&args, png, target, geometry),
                             };
                             match publication {
                                 Ok(capture_id) => capture_id,
                                 Err(error) => {
-                                    return ToolResult::error(format!(
+                                    let mut refused = ToolResult::error(format!(
                                         "Window capture publication failed: {error}"
-                                    ))
+                                    ));
+                                    if let Some(committed) = &native_observation {
+                                        refused = refused.with_structured(
+                                            json!({"_native_window_observation":committed}),
+                                        );
+                                    }
+                                    return refused;
                                 }
                             }
                         } else {
@@ -1843,7 +1899,16 @@ impl Tool for GetWindowStateTool {
                     // magic bytes off the base64 to know the format.
                     structured["screenshot_mime_type"] = json!("image/png");
                     if let Some(capture_id) = capture_id {
+                        if let Some(committed) = native_observation.as_mut() {
+                            committed["captures"] = json!({"kind":"replaced", "id":capture_id});
+                        }
                         structured["capture_id"] = json!(capture_id);
+                    }
+                    if let Some(bounds) = image_bounds {
+                        structured["screenshot_native_bounds"] = json!(bounds);
+                    }
+                    if occluded {
+                        structured["screenshot_occluded"] = json!(true);
                     }
                     if let Some(fp) = file_path {
                         structured["screenshot_file_path"] = json!(fp);
@@ -1860,6 +1925,10 @@ impl Tool for GetWindowStateTool {
                         "screenshot unavailable: {err}"
                     )));
                     structured["screenshot_error"] = json!(err);
+                }
+
+                if let Some(committed) = native_observation {
+                    structured["_native_window_observation"] = committed;
                 }
 
                 // Window identity metadata (additive): title + on-screen
@@ -1920,6 +1989,9 @@ impl Tool for GetWindowStateTool {
                     );
                 }
 
+                if let Some(committed) = structured.get_mut("_native_window_observation") {
+                    committed["target_committed"] = json!(true);
+                }
                 ToolResult {
                     content,
                     is_error: None,
@@ -4340,7 +4412,15 @@ impl Tool for ClickTool {
             }
             // px/py are bitmap pixels — see `bitmap_to_screen` for the
             // mapping (DWM-frame top-left + 1-px inset, NOT ClientToScreen).
-            let (sx_i, sy_i) = match native_frame {
+            let (sx_i, sy_i) = match input_frame {
+                Some(frame) if capture_frame.is_some() => {
+                    match crate::capture_admission::capture_screen_point(
+                        frame, px as i32, py as i32,
+                    ) {
+                        Ok(point) => point,
+                        Err(error) => return capture_admission_refusal(error),
+                    }
+                }
                 Some(frame) => match super::window_coordinates::screen_point(frame, px, py) {
                     Ok(point) => point,
                     Err(error) => return error,
@@ -6819,7 +6899,11 @@ impl ScrollTool {
                     super::window_coordinates::revalidate(frame)
                         .map_err(|refusal| refusal.result())?;
                 }
-                let point = match native_frame {
+                let point = match input_frame {
+                    Some(frame) if native_frame.is_none() => {
+                        crate::capture_admission::capture_screen_point(frame, x, y)
+                            .map_err(capture_admission_refusal)?
+                    }
                     Some(frame) => {
                         super::window_coordinates::screen_point(frame, f64::from(x), f64::from(y))?
                     }
@@ -8512,10 +8596,30 @@ impl Tool for DragTool {
                 to_x *= ratio;
                 to_y *= ratio;
             }
-            (
-                bitmap_to_screen(hwnd, from_x as i32, from_y as i32),
-                bitmap_to_screen(hwnd, to_x as i32, to_y as i32),
-            )
+            if let Some(frame) = capture_frame {
+                let from = match crate::capture_admission::capture_screen_point(
+                    frame,
+                    from_x as i32,
+                    from_y as i32,
+                ) {
+                    Ok(point) => point,
+                    Err(error) => return capture_admission_refusal(error),
+                };
+                let to = match crate::capture_admission::capture_screen_point(
+                    frame,
+                    to_x as i32,
+                    to_y as i32,
+                ) {
+                    Ok(point) => point,
+                    Err(error) => return capture_admission_refusal(error),
+                };
+                (from, to)
+            } else {
+                (
+                    bitmap_to_screen(hwnd, from_x as i32, from_y as i32),
+                    bitmap_to_screen(hwnd, to_x as i32, to_y as i32),
+                )
+            }
         };
 
         // delivery_mode:"background" on WinUI3: a pointer drag can't both land and

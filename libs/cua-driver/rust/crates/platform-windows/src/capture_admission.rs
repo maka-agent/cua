@@ -63,6 +63,19 @@ pub(crate) fn round_action_point(x: f64, y: f64) -> anyhow::Result<(i32, i32)> {
     Ok((round(x)?, round(y)?))
 }
 
+/// Capture admission already bounded the point to the actual image. A valid
+/// image may include non-client pixels outside DWM's visible frame.
+pub(crate) fn capture_screen_point(
+    frame: NativeWindowFrame,
+    x: i32,
+    y: i32,
+) -> anyhow::Result<(i32, i32)> {
+    let [left, top, _, _] = frame.bounds();
+    left.checked_add(x)
+        .zip(top.checked_add(y))
+        .ok_or_else(|| anyhow::anyhow!("capture screen point overflows Windows coordinates"))
+}
+
 pub(crate) struct WindowsCaptureBridge {
     service: Arc<CaptureService>,
 }
@@ -126,28 +139,55 @@ impl WindowsCaptureBridge {
         target: WindowsCaptureTarget,
         geometry: CaptureGeometry,
         frame: NativeWindowFrame,
+        image_bounds: Option<[i32; 4]>,
     ) -> anyhow::Result<Option<String>> {
-        anyhow::ensure!(
-            live_window_frame(target)? == frame,
-            "window bounds changed during observation"
-        );
         let binding = self.service.binding_from_args(args)?;
         let encoded =
             EncodedScreenshotDimensions::new(geometry.encoded_width, geometry.encoded_height)?;
-        let native = NativeActionDimensions::new(geometry.native_width, geometry.native_height)?;
-        let id = self.service.publish_window_observation(
-            CapturePublication {
-                encoded_bytes: png,
-                codec: ScreenshotCodec::Png,
-                target: target.core(),
-                encoded_dimensions: encoded,
-                native_action_dimensions: native,
-                screenshot_to_action: ScreenshotToActionTransform::from_dimensions(encoded, native),
-                session_id: binding.session_id().into(),
-                session_generation: binding.session_generation(),
-            },
-            frame,
-        )?;
+        let image = NativeActionDimensions::new(geometry.native_width, geometry.native_height)?;
+        let [left, top, width, height] = frame.bounds();
+        let native = NativeActionDimensions::new(width as u32, height as u32)?;
+        let transform = match image_bounds {
+            Some([x, y, w, h]) => {
+                anyhow::ensure!(
+                    w > 0
+                        && h > 0
+                        && w as u32 == geometry.native_width
+                        && h as u32 == geometry.native_height,
+                    "capture image bounds disagree with its native pixels"
+                );
+                ScreenshotToActionTransform::from_cropped_dimensions(
+                    encoded,
+                    image,
+                    [
+                        x.checked_sub(left)
+                            .ok_or_else(|| anyhow::anyhow!("capture x offset overflows"))?,
+                        y.checked_sub(top)
+                            .ok_or_else(|| anyhow::anyhow!("capture y offset overflows"))?,
+                    ],
+                )
+            }
+            None => ScreenshotToActionTransform::from_dimensions(encoded, image),
+        };
+        let publication = CapturePublication {
+            encoded_bytes: png,
+            codec: ScreenshotCodec::Png,
+            target: target.core(),
+            encoded_dimensions: encoded,
+            native_action_dimensions: native,
+            screenshot_to_action: transform,
+            session_id: binding.session_id().into(),
+            session_generation: binding.session_generation(),
+        };
+        // The image may still be returned and retained when its producer has
+        // no origin. That record has no action or visual-grounding transform.
+        let id = if image_bounds.is_some() {
+            self.service
+                .publish_window_observation(publication, frame)?
+        } else {
+            self.service
+                .publish_window_observation_without_origin(publication, frame)?
+        };
         Ok(Some(id.to_string()))
     }
 
@@ -197,8 +237,14 @@ impl WindowsCaptureBridge {
         if args.get("capture_id").and_then(Value::as_str).is_none() {
             return Ok(None);
         }
-        let current_geometry = live_geometry(target)?;
         let frame = self.action_frame(args, target)?;
+        let current_geometry = match frame {
+            Some(frame) => {
+                let [_, _, width, height] = frame.bounds();
+                CaptureGeometry::new(width as u32, height as u32, width as u32, height as u32)?
+            }
+            None => live_geometry(target)?,
+        };
         self.admit_click_with_frame(
             args,
             target,
@@ -219,8 +265,14 @@ impl WindowsCaptureBridge {
         if args.get("capture_id").and_then(Value::as_str).is_none() {
             return Ok(None);
         }
-        let current_geometry = live_geometry(target)?;
         let frame = self.action_frame(args, target)?;
+        let current_geometry = match frame {
+            Some(frame) => {
+                let [_, _, width, height] = frame.bounds();
+                CaptureGeometry::new(width as u32, height as u32, width as u32, height as u32)?
+            }
+            None => live_geometry(target)?,
+        };
         self.admit_drag_with_frame(args, target, current_geometry, from, to, frame)
     }
 
