@@ -11385,8 +11385,7 @@ mod display_only_tests;
 #[cfg(test)]
 mod value_write_readback_tests;
 
-// Append to platform-windows/src/tools/impl_.rs; register with the exact same
-// pid_window_guarded(...,&pid_window_candidates) wrapper as ClickTool.
+// Uses the same pid_window_guarded(..., &pid_window_candidates) wrapper as ClickTool.
 
 pub struct NativeSecondaryActionTool {
     state: Arc<ToolState>,

@@ -5004,7 +5004,7 @@ mod tests {
     }
 }
 
-// Append to cua-driver-sdk/src/lib.rs. These exercise the actual Embedded ABI,
+// These exercise the actual Embedded ABI,
 // canonical request checks and Core policy/recording with an always-refusing
 // actuator probe. They never open an X11 connection or claim native delivery.
 #[cfg(all(test, target_os = "linux", not(target_env = "musl")))]

@@ -15513,8 +15513,4 @@ mod cursor_hook_emission_tests {
     }
 }
 
-// Add module input::native_desktop in platform-linux/src/input/mod.rs.
-// Register NativeDesktopInputTool in the existing Linux tool registry.
-// Add "native_desktop_input" to Core DESKTOP_INPUT_OPERATIONS and the
-// local reversible-control classification beside mouse_button_down/up.
 // The same Core execution path must mint current_native_input_worker_lease.

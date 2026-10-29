@@ -364,6 +364,143 @@ fn prepare_activation_mouse(
     Ok(PreparedNativeEvent { event, timebase })
 }
 
+/// The three mouse buttons accepted by the native click factory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeClickButton {
+    /// The left mouse button.
+    Left,
+    /// The right mouse button.
+    Right,
+    /// The other mouse button.
+    Other,
+}
+
+/// Screen geometry and fields for a complete native click sequence.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeClickRequest {
+    /// The selected mouse button.
+    pub button: NativeClickButton,
+    /// The number of down/up pairs, starting with click count one.
+    pub count: i64,
+    /// The global screen point before window-local translation.
+    pub screen_point: [f64; 2],
+    /// The effective CoreGraphics event flags.
+    pub flags: u64,
+    /// An optional window number, independently of its bounds.
+    pub window_id: Option<u32>,
+    /// Optional window bounds as x, y, width and height.
+    pub window_bounds: Option<[f64; 4]>,
+    /// Whether the window-local vertical coordinate is flipped.
+    pub window_uses_flipped_coordinates: bool,
+}
+
+/// A fully prepared mouse down and its corresponding retained release event.
+#[derive(Debug)]
+#[must_use = "preparing native clicks does not send them"]
+pub struct NativeClickPair {
+    /// The prepared mouse-down event.
+    pub down: PreparedNativeEvent,
+    /// The matching mouse-up event, sharing the down event's event number.
+    pub up: PreparedNativeEvent,
+}
+
+/// A native click sequence could not be prepared.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NativeClickError {
+    #[error("native click count must be at least one")]
+    InvalidCount,
+    #[error("native mouse event number cannot be represented")]
+    EventNumberExhausted,
+    #[error(transparent)]
+    Event(#[from] NativeEventError),
+}
+
+/// Prepare every down/up pair before the caller sends any event.
+///
+/// Call and consume the retained events on one native worker inside its
+/// autorelease pool. This creates no PID authority, delivery delay or lease.
+///
+/// # Errors
+/// Returns an invalid count, exhausted event number or native event failure.
+pub fn prepare_native_click(
+    request: NativeClickRequest,
+) -> Result<Vec<NativeClickPair>, NativeClickError> {
+    if request.count < 1 {
+        return Err(NativeClickError::InvalidCount);
+    }
+    let (down_type, up_type) = match request.button {
+        NativeClickButton::Left => (1, 2),
+        NativeClickButton::Right => (3, 4),
+        NativeClickButton::Other => (25, 26),
+    };
+    let mut pairs = Vec::new();
+    for click_count in 1..=request.count {
+        let event_number = allocate_event_number(&NEXT_EVENT_NUMBER)
+            .map_err(|_| NativeClickError::EventNumberExhausted)?;
+        let down = prepare_click_event(&request, down_type, event_number, click_count)?;
+        let up = prepare_click_event(&request, up_type, event_number, click_count)?;
+        pairs.push(NativeClickPair { down, up });
+    }
+    Ok(pairs)
+}
+
+fn prepare_click_event(
+    request: &NativeClickRequest,
+    event_type: u32,
+    event_number: i64,
+    click_count: i64,
+) -> Result<PreparedNativeEvent, NativeEventError> {
+    let point = CGPoint::new(request.screen_point[0], request.screen_point[1]);
+    // SAFETY: these are AppKit's native mouse factory argument types on the
+    // supported 64-bit platforms. NSEvent stays in this worker's autorelease
+    // pool; its nullable CGEvent is retained before the NSEvent is released.
+    let native = unsafe {
+        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            NSEventType(event_type as usize), NSPoint::new(point.x, point.y),
+            NSEventModifierFlags::empty(), 0.0,
+            request.window_id.unwrap_or(0) as isize, None,
+            event_number as isize, click_count as isize, 1.0,
+        )
+    }.ok_or(NativeEventError::EventUnavailable)?;
+    let event = retained_cg_event(&native).ok_or(NativeEventError::CgEventUnavailable)?;
+    event.set_flags(CGEventFlags::from_bits_retain(request.flags));
+    super::set_event_location(&event, point);
+    let button = match request.button {
+        NativeClickButton::Left => 0,
+        NativeClickButton::Right => 1,
+        NativeClickButton::Other => 2,
+    };
+    event.set_integer_value_field(3, button);
+    event.set_integer_value_field(7, 3);
+    if let Some(window_id) = request.window_id {
+        event.set_integer_value_field(91, i64::from(window_id));
+        event.set_integer_value_field(92, i64::from(window_id));
+    }
+    if let (Some(_), Some(bounds)) = (request.window_id, request.window_bounds) {
+        let actual = event.location();
+        let rectangle = CGRect::new(
+            &CGPoint::new(bounds[0], bounds[1]),
+            &CGSize::new(bounds[2], bounds[3]),
+        );
+        // SAFETY: the by-value CoreGraphics types have their declared ABI.
+        // Native rectangle accessors preserve negative-size rectangle semantics.
+        let mut local = unsafe {
+            let min_x = CGRectGetMinX(rectangle);
+            let min_y = CGRectGetMinY(rectangle);
+            let transform = CGAffineTransformMakeTranslation(-min_x, -min_y);
+            CGPointApplyAffineTransform(actual, transform)
+        };
+        if request.window_uses_flipped_coordinates {
+            // SAFETY: rectangle is a native CGRect value as above.
+            local.y = unsafe { CGRectGetHeight(rectangle) } - local.y;
+        }
+        super::page_scroll::set_window_location(event.as_ptr(), local)
+            .map_err(|_| NativeEventError::WindowLocationUnavailable)?;
+    }
+    PreparedNativeEvent::from_cg_event(event)
+}
+
 fn timestamp_and_post(
     event: &CGEvent,
     pid: i32,
@@ -384,6 +521,7 @@ fn timestamp_and_post(
 unsafe extern "C" {
     fn CGRectGetMinX(rectangle: CGRect) -> f64;
     fn CGRectGetMinY(rectangle: CGRect) -> f64;
+    fn CGRectGetHeight(rectangle: CGRect) -> f64;
     fn CGAffineTransformMakeTranslation(x: f64, y: f64) -> CGAffineTransform;
     fn CGPointApplyAffineTransform(point: CGPoint, transform: CGAffineTransform) -> CGPoint;
     fn CGEventSetTimestamp(event: CGEventRef, timestamp: u64);
