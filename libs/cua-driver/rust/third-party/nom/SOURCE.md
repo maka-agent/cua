@@ -1,8 +1,8 @@
 # nom 1.2.4 source provenance
 
 This directory contains the published MIT-licensed `nom 1.2.4` source used by
-`meval 0.2.0`, with bounded fixes for compiler diagnostics observed in the Cua
-Linux build. It retains the existing math-expression parser and evaluator used
+`meval 0.2.0`, with local compiler-compatibility fixes. It retains the existing
+math-expression parser and evaluator used
 for function trajectories.
 
 - Upstream repository: <https://github.com/Geal/nom>.
@@ -21,12 +21,8 @@ changes are part of this adaptation.
 
 ## Expression-macro semicolons
 
-The Cua Linux dependency build reported ten instances at the original
-`src/macros.rs` lines 482, 1221, and 1268. A subsequent standalone default-feature
-library-test compilation reported the same language error at 27 additional
-unique sites; its summary counted 102 errors, while its output rendered 50
-repeated diagnostic blocks. Every reported site forwards an expression to a
-nested macro. Remove only that expansion's final semicolon so the parser result
+Expression-forwarding macros must preserve the nested macro's return value.
+Remove only the expansion's final semicolon so the parser result
 remains the expression's value. Adding semicolons at the callers would discard
 required return values.
 
@@ -38,25 +34,16 @@ required return values.
 | `src/str.rs` | 191, 232, 261 |
 
 See the [Rust compiler lint explanation](https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#semicolon-in-expressions-from-macros)
-for the language rule. These changes address the dependency and default-feature
-library-test paths actually compiled. They do not certify all optional `nom`
-features or every exported macro form against future compiler versions.
+for the language rule. The repairs cover the listed macro forms; optional
+features and future compiler versions may require additional adaptations.
 
-The official registry has no newer compatible `nom 1.x` release. The official
-[`meval` master manifest](https://github.com/rekka/meval-rs/blob/ac9586fb19e1d6fb505425dbbc9598f372122130/Cargo.toml)
-still selects `nom = "1.0.0"`. The unmerged
-[`meval` nom 7 migration](https://github.com/rekka/meval-rs/pull/27) rewrites the
-parser and is outside this bounded repair. These upstream states were checked
-on 2026-10-26.
+`meval 0.2.0` requires `nom 1.x`. This adaptation retains that parser and its
+public contract rather than migrating to a different major version.
 
-## Additional observed compiler diagnostics
+## Additional compiler-compatibility changes
 
-Once the package was selected as a local path dependency, Cua's Linux Clippy
-build exposed 25 existing Rust compiler warnings that registry dependency lint
-capping had hidden. The three expression-macro warnings above were already gone.
-The following source changes address those 25 diagnostics without changing the
-edition, replacing the parser, or suppressing warnings. Line numbers below refer
-to the original package.
+The following adaptations preserve the edition and parser without suppressing
+warnings. Line numbers refer to the original package.
 
 | File and original lines | Exact adaptation and reason |
 | --- | --- |
@@ -76,12 +63,9 @@ function, trait method, macro, or debug field is removed by these adaptations.
 
 ## Default-feature library-test repairs
 
-Standalone library-test compilation exposed another 23 warnings. Nine were
-redundant semicolons after nested test-function definitions, two were unused
-test imports, five were bare trait objects, one was inconsistent lifetime
-spelling in `named!`, and six were repeated warnings about the same unsafe
-`count_fixed!` array initialization. The original tests were not executed while
-that invalid-value construction remained present.
+Library-test adaptations remove redundant semicolons and unused imports, use
+explicit trait objects and lifetimes, and replace invalid uninitialized arrays
+in `count_fixed!` with initialized storage.
 
 | Original package file and lines | Exact adaptation and reason |
 | --- | --- |
@@ -106,9 +90,9 @@ The [array repeat rules](https://doc.rust-lang.org/reference/expressions/array-e
 [`Option<T>` copy implementation](https://doc.rust-lang.org/std/option/enum.Option.html#impl-Copy-for-Option%3CT%3E),
 and [safe array mapping](https://doc.rust-lang.org/std/primitive.array.html#method.map)
 provide the relevant language and library contracts. Default library tests need
-the upstream `assets/testfile.txt` omitted from the published package, plus its
-`LICENSE`; those inputs are prepared separately in disposable verification data.
-The integration MP4 fixtures and optional-feature suites remain separate scope.
+the upstream `assets/testfile.txt`, which is omitted from the published package,
+and its `LICENSE`. Integration MP4 fixtures and optional-feature suites require
+their corresponding upstream assets.
 
 ## Manifest integration
 
@@ -120,8 +104,7 @@ adapted source hashes below.
 
 ## Imported whitespace cleanup
 
-The first staged whitespace check also reported whitespace inherited from the
-published package. Remove trailing spaces from two documentation lines and one
+Local whitespace cleanup removes trailing spaces from two documentation lines and one
 blank line in `src/macros.rs`, and from four lines in `src/methods.rs`. Remove
 extra blank lines at the ends of `Cargo.toml`,
 `tests/cross_function_backtracking.rs`, and `tests/mp4.rs`, retaining one final

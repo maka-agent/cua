@@ -113,8 +113,7 @@ native `amount` range of 1–20000. Windows accepts finite `pixels` with x/y and
 foreground delivery, exclusive with `by`, `amount` and `element_token`. It signs
 the distance by direction, applies JavaScript `Math.round`, and submits raw wheel
 deltas bounded per axis to [-32768,32767] without a detent multiplier or cursor
-restoration. Rounded inputs must fit the supported signed 32-bit domain; the
-original native parser's larger-integer behavior remains unverified. Linux
+restoration. Rounded inputs must fit the supported signed 32-bit domain. Linux
 converts pixels to wheel detents. Neither route promises a viewport displacement.
 These native forms are outside the portable DTO, and must not be sent to a
 backend that does not advertise them.
