@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use cua_driver_core::action_record::ActionTransport;
+use cua_driver_core::capture_runtime::ScreenshotCodec;
 
 /// Pin the agent-cursor overlay above `hwnd` in the z-order, normalising to
 /// the **root** ancestor so the pin lands on the window that actually appears
@@ -642,6 +643,7 @@ pub struct ToolState {
     pub cursor_registry: Arc<CursorRegistry>,
     pub config: Arc<RwLock<DriverConfig>>,
     capture_bridge: Option<Arc<crate::capture_admission::WindowsCaptureBridge>>,
+    raw_window_capture: std::sync::Mutex<Option<crate::wgc::MonitorRegionCapture>>,
 }
 
 impl ToolState {
@@ -654,6 +656,7 @@ impl ToolState {
             config: Arc::new(RwLock::new(load_driver_config())),
             capture_bridge: capture_service
                 .map(crate::capture_admission::WindowsCaptureBridge::new),
+            raw_window_capture: std::sync::Mutex::new(None),
         })
     }
 
@@ -669,6 +672,64 @@ impl ToolState {
             args.get("_session_id").and_then(Value::as_str),
         )
     }
+}
+
+fn capture_raw_window_jpeg(
+    state: &ToolState,
+    frame: cua_driver_core::tool::NativeWindowFrame,
+    deadline: std::time::Instant,
+) -> anyhow::Result<crate::wgc::MonitorRegionJpeg> {
+    let target = crate::capture_admission::WindowsCaptureTarget::Window {
+        pid: frame.pid(),
+        window_id: frame.window_id(),
+    };
+    // This cache contains only the backend's official agile/Send projections.
+    // Serial ownership covers the whole capture, including detached workers
+    // which still hold their existing native-worker lease after caller timeout.
+    let mut capture = state
+        .raw_window_capture
+        .lock()
+        .map_err(|_| anyhow::anyhow!("raw Windows capture cache was poisoned"))?;
+    let check = || -> anyhow::Result<()> {
+        if let Some(binding) =
+            cua_driver_core::windows_interruption::current_windows_input_binding()
+        {
+            binding.check()?;
+        }
+        anyhow::ensure!(
+            crate::capture_admission::live_window_frame(target)? == frame,
+            "native window changed during raw Windows capture"
+        );
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "raw Windows capture exceeded its deadline"
+        );
+        Ok(())
+    };
+    check()?;
+    if capture.is_none() {
+        *capture = Some(crate::wgc::MonitorRegionCapture::new()?);
+    }
+    check()?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    anyhow::ensure!(
+        !remaining.is_zero(),
+        "raw Windows capture exceeded its deadline"
+    );
+    let image = capture
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("raw Windows capture cache is unavailable"))?
+        .capture(frame.window_id(), frame.bounds(), remaining)?;
+    check()?;
+    anyhow::ensure!(
+        image.encoded_width > 0
+            && image.encoded_height > 0
+            && image.cropped_width > 0
+            && image.cropped_height > 0
+            && image.dpi > 0,
+        "raw Windows capture returned invalid image dimensions or DPI"
+    );
+    Ok(image)
 }
 
 fn screenshot_scale(
@@ -1516,6 +1577,13 @@ impl Tool for GetWindowStateTool {
         } else {
             None
         };
+        let screenshot_state = state.clone();
+        let capture_deadline = std::time::Instant::now() + UIA_SCREENSHOT_TIMEOUT;
+        let screenshot_codec = if raw_observation {
+            ScreenshotCodec::Jpeg
+        } else {
+            ScreenshotCodec::Png
+        };
         let blocking = crate::input::owned::spawn_blocking(move || -> anyhow::Result<_> {
             // Capture screenshot AND any error message so the response can
             // surface *why* there's no image (the iconic-window guard from
@@ -1525,19 +1593,58 @@ impl Tool for GetWindowStateTool {
             // The previous `Err(_) => None` silently dropped the error and
             // upstream agents saw an empty response with no signal.
             let (screenshot, screenshot_err) = if do_shot {
-                match crate::capture::screenshot_window_with_geometry(hwnd) {
-                    Ok(capture) => {
-                        let raw = capture.png;
-                        let image_bounds = capture.geometry;
-                        let occluded = capture.occluded;
-                        let (native_w, native_h) = crate::capture::png_dimensions_pub(&raw)?;
-                        let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
-                        let (w, h) = crate::capture::png_dimensions_pub(&png)?;
+                let captured = if raw_observation {
+                    match raw_frame {
+                        Some(frame) => {
+                            capture_raw_window_jpeg(&screenshot_state, frame, capture_deadline).map(
+                                |image| {
+                                    let [_, _, native_w, native_h] = frame.bounds();
+                                    // DPI scaling is already encoded by the monitor
+                                    // backend. A sampled window rectangle does not
+                                    // prove the cropped pixels' physical origin.
+                                    (
+                                        image.jpeg,
+                                        image.encoded_width,
+                                        image.encoded_height,
+                                        native_w as u32,
+                                        native_h as u32,
+                                        None,
+                                        false,
+                                    )
+                                },
+                            )
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "raw Windows capture lost its sampled window frame"
+                        )),
+                    }
+                } else {
+                    match crate::capture::screenshot_window_with_geometry(hwnd) {
+                        Ok(capture) => {
+                            let raw = capture.png;
+                            let (native_w, native_h) = crate::capture::png_dimensions_pub(&raw)?;
+                            let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
+                            let (w, h) = crate::capture::png_dimensions_pub(&png)?;
+                            Ok((
+                                png,
+                                w,
+                                h,
+                                native_w,
+                                native_h,
+                                capture.geometry,
+                                capture.occluded,
+                            ))
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                match captured {
+                    Ok((encoded, w, h, native_w, native_h, image_bounds, occluded)) => {
                         // `screenshot_out_file` set (any mode) → write to disk and
                         // surface the path, never embed bytes. Otherwise (vision,
                         // no out_file) → embed base64.
                         if let Some(ref path) = out_file {
-                            std::fs::write(path, &png)?;
+                            std::fs::write(path, &encoded)?;
                             (
                                 Some((
                                     None,
@@ -1546,7 +1653,7 @@ impl Tool for GetWindowStateTool {
                                     h,
                                     native_w,
                                     native_h,
-                                    png,
+                                    encoded,
                                     (image_bounds, occluded),
                                 )),
                                 None,
@@ -1555,13 +1662,13 @@ impl Tool for GetWindowStateTool {
                             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                             (
                                 Some((
-                                    Some(B64.encode(&png)),
+                                    Some(B64.encode(&encoded)),
                                     None,
                                     w,
                                     h,
                                     native_w,
                                     native_h,
-                                    png,
+                                    encoded,
                                     (image_bounds, occluded),
                                 )),
                                 None,
@@ -1817,7 +1924,7 @@ impl Tool for GetWindowStateTool {
                     h,
                     native_w,
                     native_h,
-                    png,
+                    encoded,
                     (image_bounds, occluded),
                 )) = screenshot_opt
                 {
@@ -1850,15 +1957,22 @@ impl Tool for GetWindowStateTool {
                                 window_id: hwnd,
                             };
                             let publication = match raw_frame {
-                                Some(frame) => bridge.publish_window_observation(
-                                    &args,
-                                    png,
-                                    target,
-                                    geometry,
-                                    frame,
-                                    image_bounds,
-                                ),
-                                None => bridge.publish(&args, png, target, geometry),
+                                Some(frame) => {
+                                    // Revalidate at commit as well as around the
+                                    // producer call. These are sampled frames,
+                                    // not a claim of an atomic image/rect pair.
+                                    match crate::capture_admission::live_window_frame(target) {
+                                        Ok(current) if current == frame => {}
+                                        Ok(_) => {
+                                            return ToolResult::error(
+                                                "native window changed before raw Windows capture publication",
+                                            )
+                                        }
+                                        Err(error) => return ToolResult::error(error.to_string()),
+                                    }
+                                    bridge.publish_raw_window_jpeg(&args, encoded, geometry, frame)
+                                }
+                                None => bridge.publish(&args, encoded, target, geometry),
                             };
                             match publication {
                                 Ok(capture_id) => capture_id,
@@ -1886,7 +2000,14 @@ impl Tool for GetWindowStateTool {
                     // part when the image went to disk so the response is never
                     // empty on the capture-only path (which has no tree markdown).
                     if let Some(b64) = b64_opt {
-                        content.push(cua_driver_core::protocol::Content::image_png(b64));
+                        content.push(match screenshot_codec {
+                            ScreenshotCodec::Jpeg => {
+                                cua_driver_core::protocol::Content::image_jpeg(b64)
+                            }
+                            ScreenshotCodec::Png => {
+                                cua_driver_core::protocol::Content::image_png(b64)
+                            }
+                        });
                     } else if let Some(fp) = &file_path {
                         content.push(cua_driver_core::protocol::Content::text(format!(
                             "window_id={hwnd} pid={pid} size={w}x{h} screenshot written to {fp}"
@@ -1897,7 +2018,7 @@ impl Tool for GetWindowStateTool {
                     // Surface 7: mirror the MCP image part's `mimeType` onto
                     // the structured payload so consumers don't have to sniff
                     // magic bytes off the base64 to know the format.
-                    structured["screenshot_mime_type"] = json!("image/png");
+                    structured["screenshot_mime_type"] = json!(screenshot_codec.mime_type());
                     if let Some(capture_id) = capture_id {
                         if let Some(committed) = native_observation.as_mut() {
                             committed["captures"] = json!({"kind":"replaced", "id":capture_id});

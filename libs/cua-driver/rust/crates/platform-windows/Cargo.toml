@@ -86,6 +86,8 @@ windows = { version = "0.58", features = [
     # and the screen-region BitBlt fallback returns the occluding
     # window's pixels. Min OS: Win10 1903 (~100% of users today).
     "Graphics_Capture",
+    "Graphics_Imaging",
+    "Storage_Streams",
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
     "Win32_Graphics_Direct3D11",

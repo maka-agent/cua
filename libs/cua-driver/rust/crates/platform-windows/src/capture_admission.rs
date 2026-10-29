@@ -132,62 +132,41 @@ impl WindowsCaptureBridge {
         Ok(())
     }
 
-    pub(crate) fn publish_window_observation(
+    pub(crate) fn publish_raw_window_jpeg(
         &self,
         args: &Value,
-        png: Vec<u8>,
-        target: WindowsCaptureTarget,
+        jpeg: Vec<u8>,
         geometry: CaptureGeometry,
         frame: NativeWindowFrame,
-        image_bounds: Option<[i32; 4]>,
     ) -> anyhow::Result<Option<String>> {
         let binding = self.service.binding_from_args(args)?;
         let encoded =
             EncodedScreenshotDimensions::new(geometry.encoded_width, geometry.encoded_height)?;
-        let image = NativeActionDimensions::new(geometry.native_width, geometry.native_height)?;
-        let [left, top, width, height] = frame.bounds();
+        let [_, _, width, height] = frame.bounds();
         let native = NativeActionDimensions::new(width as u32, height as u32)?;
-        let transform = match image_bounds {
-            Some([x, y, w, h]) => {
-                anyhow::ensure!(
-                    w > 0
-                        && h > 0
-                        && w as u32 == geometry.native_width
-                        && h as u32 == geometry.native_height,
-                    "capture image bounds disagree with its native pixels"
-                );
-                ScreenshotToActionTransform::from_cropped_dimensions(
-                    encoded,
-                    image,
-                    [
-                        x.checked_sub(left)
-                            .ok_or_else(|| anyhow::anyhow!("capture x offset overflows"))?,
-                        y.checked_sub(top)
-                            .ok_or_else(|| anyhow::anyhow!("capture y offset overflows"))?,
-                    ],
-                )
-            }
-            None => ScreenshotToActionTransform::from_dimensions(encoded, image),
-        };
+        anyhow::ensure!(
+            geometry.native_width == width as u32 && geometry.native_height == height as u32,
+            "raw Windows capture geometry disagrees with its sampled window"
+        );
         let publication = CapturePublication {
-            encoded_bytes: png,
-            codec: ScreenshotCodec::Png,
-            target: target.core(),
+            encoded_bytes: jpeg,
+            codec: ScreenshotCodec::Jpeg,
+            target: CaptureTarget::Window {
+                pid: frame.pid(),
+                window_id: frame.window_id(),
+            },
             encoded_dimensions: encoded,
             native_action_dimensions: native,
-            screenshot_to_action: transform,
+            screenshot_to_action: ScreenshotToActionTransform::from_dimensions(encoded, native),
             session_id: binding.session_id().into(),
             session_generation: binding.session_generation(),
         };
-        // The image may still be returned and retained when its producer has
-        // no origin. That record has no action or visual-grounding transform.
-        let id = if image_bounds.is_some() {
-            self.service
-                .publish_window_observation(publication, frame)?
-        } else {
-            self.service
-                .publish_window_observation_without_origin(publication, frame)?
-        };
+        // This producer uses the sampled window as its logical viewport. That
+        // dimension mapping supports capture-bound actions independently of an
+        // image_bounds claim about the cropped pixels' physical screen origin.
+        let id = self
+            .service
+            .publish_window_observation(publication, frame)?;
         Ok(Some(id.to_string()))
     }
 

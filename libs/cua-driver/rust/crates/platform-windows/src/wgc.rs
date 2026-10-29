@@ -64,34 +64,7 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
         );
     }
 
-    // 1. D3D11 device — feature level 11.0 + BGRA support (required by WGC).
-    let mut d3d_device: Option<ID3D11Device> = None;
-    let mut d3d_context: Option<ID3D11DeviceContext> = None;
-    D3D11CreateDevice(
-        None,
-        D3D_DRIVER_TYPE_HARDWARE,
-        windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        Some(&[D3D_FEATURE_LEVEL_11_0]),
-        D3D11_SDK_VERSION,
-        Some(&mut d3d_device),
-        None,
-        Some(&mut d3d_context),
-    )
-    .context("D3D11CreateDevice failed (hardware feature-level 11.0 + BGRA)")?;
-    let d3d_device = d3d_device.context("D3D11CreateDevice returned a None device")?;
-    let d3d_context = d3d_context.context("D3D11CreateDevice returned a None context")?;
-
-    // 2. DXGI device interface for the D3D11 device, then the WinRT
-    //    IDirect3DDevice wrapper that GraphicsCaptureFramePool needs.
-    let dxgi_device: IDXGIDevice = d3d_device
-        .cast()
-        .context("ID3D11Device → IDXGIDevice cast")?;
-    let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
-        .context("CreateDirect3D11DeviceFromDXGIDevice failed")?;
-    let direct3d_device: IDirect3DDevice = inspectable
-        .cast()
-        .context("CreateDirect3D11DeviceFromDXGIDevice → IDirect3DDevice cast")?;
+    let (d3d_device, d3d_context, direct3d_device) = create_wgc_device()?;
 
     // 3. GraphicsCaptureItem for our target HWND.
     let interop_factory: IGraphicsCaptureItemInterop =
@@ -247,4 +220,373 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
     let _ = pool.Close();
 
     Ok((bgra, content_width, content_height))
+}
+
+unsafe fn create_wgc_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice)> {
+    let mut d3d_device: Option<ID3D11Device> = None;
+    let mut d3d_context: Option<ID3D11DeviceContext> = None;
+    D3D11CreateDevice(
+        None,
+        D3D_DRIVER_TYPE_HARDWARE,
+        windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        Some(&[D3D_FEATURE_LEVEL_11_0]),
+        D3D11_SDK_VERSION,
+        Some(&mut d3d_device),
+        None,
+        Some(&mut d3d_context),
+    )
+    .context("D3D11CreateDevice failed (hardware feature-level 11.0 + BGRA)")?;
+    let d3d_device = d3d_device.context("D3D11CreateDevice returned a None device")?;
+    let d3d_context = d3d_context.context("D3D11CreateDevice returned a None context")?;
+
+    let dxgi_device: IDXGIDevice = d3d_device
+        .cast()
+        .context("ID3D11Device → IDXGIDevice cast")?;
+    let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
+        .context("CreateDirect3D11DeviceFromDXGIDevice failed")?;
+    let direct3d_device: IDirect3DDevice = inspectable
+        .cast()
+        .context("CreateDirect3D11DeviceFromDXGIDevice → IDirect3DDevice cast")?;
+
+    Ok((d3d_device, d3d_context, direct3d_device))
+}
+
+/// A JPEG of a sampled window viewport taken from its nearest monitor.
+pub(crate) struct MonitorRegionJpeg {
+    pub jpeg: Vec<u8>,
+    pub encoded_width: u32,
+    pub encoded_height: u32,
+    pub cropped_width: u32,
+    pub cropped_height: u32,
+    pub dpi: u32,
+}
+
+/// Reusable monitor capture state. The owning ToolState must serialize access.
+/// Device proxies are resolved on each calling thread; no immediate D3D context
+/// is retained across calls.
+pub(crate) struct MonitorRegionCapture {
+    sessions: std::collections::HashMap<usize, CachedMonitorSession>,
+    device: windows::core::AgileReference<IDirect3DDevice>,
+}
+
+impl MonitorRegionCapture {
+    pub(crate) fn new() -> Result<Self> {
+        // Reuse the Windows projection's apartment-aware activation mechanism.
+        let _: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        // SAFETY: the helper creates local devices using initialized output
+        // storage. The immediate context is released on this calling thread.
+        let (_, _, device) = unsafe { create_wgc_device() }?;
+        let device = windows::core::AgileReference::new(&device)?;
+        Ok(Self {
+            sessions: std::collections::HashMap::new(),
+            device,
+        })
+    }
+
+    /// Capture physical desktop bounds using the selected window's monitor.
+    /// Cropped pixel dimensions do not replace the supplied action viewport.
+    pub(crate) fn capture(
+        &mut self,
+        hwnd: u64,
+        sampled_bounds: [i32; 4],
+        caller_timeout: Duration,
+    ) -> Result<MonitorRegionJpeg> {
+        use windows::Win32::{
+            Graphics::Gdi::{
+                GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            },
+            UI::HiDpi::GetDpiForWindow,
+        };
+
+        let [left, top, width, height] = sampled_bounds;
+        anyhow::ensure!(width > 0 && height > 0, "window viewport is empty");
+        let hwnd = HWND(hwnd as usize as *mut _);
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: HWND is observed only. The monitor-info pointer references a
+        // fully initialized output buffer. Target identity is the caller's lease.
+        let (monitor, dpi) = unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            anyhow::ensure!(!monitor.0.is_null(), "window has no capture monitor");
+            GetMonitorInfoW(monitor, &mut monitor_info).ok()?;
+            (monitor, GetDpiForWindow(hwnd).max(96))
+        };
+        let region = [
+            left.wrapping_sub(monitor_info.rcMonitor.left),
+            top.wrapping_sub(monitor_info.rcMonitor.top),
+            width,
+            height,
+        ];
+        let key = monitor.0 as usize;
+        let device = self.device.resolve()?;
+        if let Some(session) = self.sessions.get_mut(&key) {
+            if let Ok(image) = session.capture(&device, region, dpi, caller_timeout) {
+                return Ok(image);
+            }
+            self.sessions.remove(&key);
+        }
+        let mut session = CachedMonitorSession::new(monitor, &device)?;
+        let image = session.capture(&device, region, dpi, caller_timeout)?;
+        self.sessions.insert(key, session);
+        Ok(image)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.sessions.clear();
+    }
+}
+
+impl Drop for MonitorRegionCapture {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+struct CachedMonitorSession {
+    item: GraphicsCaptureItem,
+    pool: Direct3D11CaptureFramePool,
+    session: windows::Graphics::Capture::GraphicsCaptureSession,
+    size: windows::Graphics::SizeInt32,
+}
+
+impl CachedMonitorSession {
+    fn new(
+        monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+        device: &IDirect3DDevice,
+    ) -> Result<Self> {
+        let factory: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        // SAFETY: this monitor handle was obtained from MonitorFromWindow during
+        // the current capture, and no ownership of it is transferred.
+        let item: GraphicsCaptureItem = unsafe { factory.CreateForMonitor(monitor) }?;
+        let size = item.Size()?;
+        anyhow::ensure!(
+            size.Width > 0 && size.Height > 0,
+            "capture monitor is empty"
+        );
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            1,
+            size,
+        )?;
+        let session = match pool.CreateCaptureSession(&item) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = pool.Close();
+                return Err(error.into());
+            }
+        };
+        let capture = Self {
+            item,
+            pool,
+            session,
+            size,
+        };
+        capture.session.SetIsCursorCaptureEnabled(true)?;
+        capture.session.SetIsBorderRequired(false)?;
+        capture.session.StartCapture()?;
+        Ok(capture)
+    }
+
+    fn capture(
+        &mut self,
+        device: &IDirect3DDevice,
+        region: [i32; 4],
+        dpi: u32,
+        caller_timeout: Duration,
+    ) -> Result<MonitorRegionJpeg> {
+        use std::sync::{mpsc, Mutex};
+        use windows::Foundation::TypedEventHandler;
+
+        let size = self.item.Size()?;
+        anyhow::ensure!(
+            size.Width > 0 && size.Height > 0,
+            "capture monitor is empty"
+        );
+        if size.Width != self.size.Width || size.Height != self.size.Height {
+            self.pool
+                .Recreate(device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, size)?;
+            self.size = size;
+        }
+        while let Ok(frame) = self.pool.TryGetNextFrame() {
+            let _ = frame.Close();
+        }
+        let (sender, receiver) =
+            mpsc::sync_channel::<std::result::Result<MonitorRegionJpeg, String>>(1);
+        let sender = Mutex::new(Some(sender));
+        let handler =
+            TypedEventHandler::<Direct3D11CaptureFramePool, windows::core::IInspectable>::new(
+                move |pool, _| {
+                    let Some(sender) = sender
+                        .lock()
+                        .expect("monitor capture sender poisoned")
+                        .take()
+                    else {
+                        return Ok(());
+                    };
+                    let result = match pool.as_ref() {
+                        Some(pool) => encode_latest_monitor_frame(pool, region, dpi),
+                        None => Err(anyhow::anyhow!("capture callback has no frame pool")),
+                    };
+                    // Native error information is converted while the callback's
+                    // apartment is alive; only owned bytes and text cross threads.
+                    let _ = sender.send(result.map_err(|error| error.to_string()));
+                    Ok(())
+                },
+            );
+        let token = self.pool.FrameArrived(&handler)?;
+        let _registration = MonitorFrameRegistration {
+            pool: self.pool.clone(),
+            token,
+        };
+        receiver
+            .recv_timeout(caller_timeout.min(Duration::from_secs(2)))
+            .context("monitor capture did not produce an image before its deadline")?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+impl Drop for CachedMonitorSession {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+struct MonitorFrameRegistration {
+    pool: Direct3D11CaptureFramePool,
+    token: windows::Foundation::EventRegistrationToken,
+}
+
+impl Drop for MonitorFrameRegistration {
+    fn drop(&mut self) {
+        let _ = self.pool.RemoveFrameArrived(self.token);
+    }
+}
+
+fn encode_latest_monitor_frame(
+    pool: &Direct3D11CaptureFramePool,
+    region: [i32; 4],
+    dpi: u32,
+) -> Result<MonitorRegionJpeg> {
+    let mut latest = None;
+    loop {
+        match pool.TryGetNextFrame() {
+            Ok(frame) => {
+                latest = Some(encode_monitor_region(&frame, region, dpi));
+                let _ = frame.Close();
+            }
+            Err(error) => {
+                return latest.unwrap_or_else(|| Err(error.into()));
+            }
+        }
+    }
+}
+
+fn encode_monitor_region(
+    frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
+    region: [i32; 4],
+    dpi: u32,
+) -> Result<MonitorRegionJpeg> {
+    use windows::{
+        core::HSTRING,
+        Foundation::{PropertyType, PropertyValue},
+        Graphics::Imaging::{
+            BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat, BitmapPropertySet, BitmapTypedValue,
+            SoftwareBitmap,
+        },
+        Storage::Streams::{Buffer, DataReader, InMemoryRandomAccessStream},
+    };
+
+    let bitmap = SoftwareBitmap::CreateCopyFromSurfaceAsync(&frame.Surface()?)?.get()?;
+    let bitmap_width = bitmap.PixelWidth()?;
+    let bitmap_height = bitmap.PixelHeight()?;
+    anyhow::ensure!(
+        bitmap_width > 0 && bitmap_height > 0,
+        "captured monitor is empty"
+    );
+    anyhow::ensure!(
+        bitmap.BitmapPixelFormat()? == BitmapPixelFormat::Bgra8
+            && bitmap.BitmapAlphaMode()? == BitmapAlphaMode::Straight,
+        "captured monitor bitmap has an unsupported pixel format"
+    );
+    let [x, y, width, height] = region;
+    let left = x.clamp(0, bitmap_width);
+    let top = y.clamp(0, bitmap_height);
+    let right = x.wrapping_add(width).clamp(0, bitmap_width);
+    let bottom = y.wrapping_add(height).clamp(0, bitmap_height);
+    let cropped_width = right - left;
+    let cropped_height = bottom - top;
+    anyhow::ensure!(
+        cropped_width > 0 && cropped_height > 0,
+        "window viewport is outside the captured monitor"
+    );
+    let full_bytes = (bitmap_width as u32)
+        .checked_mul(bitmap_height as u32)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("monitor bitmap byte length overflows")?;
+    let buffer = Buffer::Create(full_bytes)?;
+    bitmap.CopyToBuffer(&buffer)?;
+    let mut full = vec![0; full_bytes as usize];
+    DataReader::FromBuffer(&buffer)?.ReadBytes(&mut full)?;
+    let stride = bitmap_width as usize * 4;
+    let row_bytes = cropped_width as usize * 4;
+    let mut pixels = Vec::with_capacity(row_bytes * cropped_height as usize);
+    for row in top as usize..bottom as usize {
+        let start = row * stride + left as usize * 4;
+        pixels.extend_from_slice(&full[start..start + row_bytes]);
+    }
+    let dpi = dpi.max(96);
+    let scale = |extent: i32| -> u32 {
+        ((i64::from(extent) * 96 + i64::from(dpi / 2)) / i64::from(dpi)).max(1) as u32
+    };
+    let encoded_width = scale(cropped_width);
+    let encoded_height = scale(cropped_height);
+    let options = BitmapPropertySet::new()?;
+    let quality =
+        BitmapTypedValue::Create(&PropertyValue::CreateSingle(0.8_f32)?, PropertyType::Single)?;
+    options.Insert(&HSTRING::from("ImageQuality"), &quality)?;
+    let stream = InMemoryRandomAccessStream::new()?;
+    let encoder = BitmapEncoder::CreateWithEncodingOptionsAsync(
+        BitmapEncoder::JpegEncoderId()?,
+        &stream,
+        &options,
+    )?
+    .get()?;
+    let transform = encoder.BitmapTransform()?;
+    transform.SetScaledWidth(encoded_width)?;
+    transform.SetScaledHeight(encoded_height)?;
+    encoder.SetPixelData(
+        BitmapPixelFormat::Bgra8,
+        BitmapAlphaMode::Straight,
+        cropped_width as u32,
+        cropped_height as u32,
+        f64::from(dpi),
+        f64::from(dpi),
+        &pixels,
+    )?;
+    encoder.FlushAsync()?.get()?;
+    let jpeg_len = u32::try_from(stream.Size()?)
+        .context("encoded monitor image exceeds stream read limits")?;
+    let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
+    let loaded = reader.LoadAsync(jpeg_len)?.get()?;
+    anyhow::ensure!(
+        loaded == jpeg_len,
+        "encoded monitor image stream is incomplete"
+    );
+    let mut jpeg = vec![0; jpeg_len as usize];
+    reader.ReadBytes(&mut jpeg)?;
+    Ok(MonitorRegionJpeg {
+        jpeg,
+        encoded_width,
+        encoded_height,
+        cropped_width: cropped_width as u32,
+        cropped_height: cropped_height as u32,
+        dpi,
+    })
 }
