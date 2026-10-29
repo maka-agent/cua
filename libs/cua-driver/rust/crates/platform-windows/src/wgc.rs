@@ -178,6 +178,15 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
         )
     })?;
 
+    let content_size = frame.ContentSize().context("frame.ContentSize")?;
+    let content_width =
+        u32::try_from(content_size.Width).context("WGC frame content width is negative")?;
+    let content_height =
+        u32::try_from(content_size.Height).context("WGC frame content height is negative")?;
+    if content_width == 0 || content_height == 0 {
+        bail!("WGC frame content size is {content_width}x{content_height}");
+    }
+
     // 8. Pull the underlying ID3D11Texture2D out of the WinRT frame
     //    surface via the IDirect3DDxgiInterfaceAccess shim.
     let surface = frame.Surface().context("frame.Surface")?;
@@ -191,6 +200,15 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
     // 9. Create a staging texture we can map for CPU read, copy frame in.
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     frame_texture.GetDesc(&mut desc);
+    // The pool-sized surface can contain undefined pixels outside ContentSize.
+    // A larger content size means this frame was clipped and is incomplete.
+    if content_width > desc.Width || content_height > desc.Height {
+        bail!(
+            "WGC frame content {content_width}x{content_height} exceeds surface {}x{}",
+            desc.Width,
+            desc.Height
+        );
+    }
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -208,8 +226,8 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
     d3d_context
         .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
         .context("ID3D11DeviceContext::Map")?;
-    let width = desc.Width as usize;
-    let height = desc.Height as usize;
+    let width = content_width as usize;
+    let height = content_height as usize;
     let stride = mapped.RowPitch as usize;
     let mut bgra = vec![0u8; width * height * 4];
     let src_base = mapped.pData as *const u8;
@@ -228,5 +246,5 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
     let _ = session.Close();
     let _ = pool.Close();
 
-    Ok((bgra, desc.Width, desc.Height))
+    Ok((bgra, content_width, content_height))
 }
