@@ -17,6 +17,11 @@ use super::cdp_ws::{
     ReplyDisposition,
 };
 use super::extension_process::{ExtensionAdapterSelection, ExtensionAdapterSelectionError};
+pub use super::extension_upload::{
+    ExtensionRetainedUpload, ExtensionUploadAbandonAck, ExtensionUploadChunkAck,
+    ExtensionUploadDescriptorError, ExtensionUploadFile, ExtensionUploadModifiedTime,
+    ExtensionUploadStage, EXTENSION_UPLOAD_CHUNK_BYTES,
+};
 use super::extension_wire::{ExtensionCdpWritePhase, ExtensionWireContext};
 pub use super::extension_wire::{
     ExtensionFixedUiAck, ExtensionFixedUiAction, ExtensionFixedUiColor, ExtensionFixedUiCursor,
@@ -191,6 +196,9 @@ pub enum ExtensionAttachmentPreparation {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionProviderCapabilities {
+    /// Native-host byte staging with actual browser placement; never a filesystem grant.
+    #[serde(default)]
+    pub upload_staging: bool,
     /// Explicit preparation service; never inferred from attachment metadata.
     #[serde(default)]
     pub session_preparation: ExtensionSessionPreparation,
@@ -1161,6 +1169,24 @@ pub enum ExtensionOperation {
     NameSession {
         name: String,
     },
+    BeginUpload {
+        claim: String,
+        tab_id: u64,
+        target_id: String,
+        files: Vec<ExtensionUploadFile>,
+    },
+    WriteUploadChunk {
+        stage: ExtensionUploadStage,
+        file_index: u32,
+        offset: u64,
+        bytes: u64,
+    },
+    RetainUploadForSelection {
+        stage: ExtensionUploadStage,
+    },
+    AbandonUpload {
+        stage: ExtensionUploadStage,
+    },
     Inventory,
     SessionInventory,
     Resolve {
@@ -1295,6 +1321,10 @@ impl ExtensionOperation {
             Self::ReadUserTab { .. } => "readUserTab",
             Self::UserHistory => "userHistory",
             Self::NameSession { .. } => "nameSession",
+            Self::BeginUpload { .. } => "beginUpload",
+            Self::WriteUploadChunk { .. } => "writeUploadChunk",
+            Self::RetainUploadForSelection { .. } => "retainUploadForSelection",
+            Self::AbandonUpload { .. } => "abandonUpload",
             Self::Inventory | Self::SessionInventory => "inventory",
             Self::Resolve { .. }
             | Self::ResolveSessionTab { .. }
@@ -1335,7 +1365,11 @@ impl ExtensionOperation {
         match self {
             // These are Rust-local fences or the direct turn-ended message,
             // not new requests through the logical session client.
-            Self::FenceCdp { .. }
+            Self::BeginUpload { .. }
+            | Self::WriteUploadChunk { .. }
+            | Self::RetainUploadForSelection { .. }
+            | Self::AbandonUpload { .. }
+            | Self::FenceCdp { .. }
             | Self::RetireClaim { .. }
             | Self::FinishTurn { .. }
             | Self::SessionPopupRequested { .. }
@@ -1401,6 +1435,97 @@ impl ExtensionOperation {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostUploadCustodyMarker {
+    stage: uuid::Uuid,
+    state: HostUploadCustodyState,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum HostUploadCustodyState {
+    Begun,
+    PartialBegin,
+    ChunkWritten,
+    Retained,
+    Abandoned,
+}
+
+fn upload_chunk_ack(
+    result: &Value,
+    operation: &ExtensionOperation,
+    completion_id: u64,
+) -> Result<ExtensionUploadChunkAck, ExtensionProviderError> {
+    let ExtensionOperation::WriteUploadChunk {
+        stage,
+        file_index,
+        offset,
+        bytes,
+    } = operation
+    else {
+        return Err(protocol("upload chunk lost issued operation"));
+    };
+    if result["stage"].as_str() != Some(stage.id.to_string().as_str())
+        || result["fileIndex"].as_u64() != Some(u64::from(*file_index))
+        || result["offset"].as_u64() != Some(*offset)
+        || result["bytes"].as_u64() != Some(*bytes)
+        || result["written"] != true
+    {
+        return Err(protocol(
+            "upload chunk acknowledgement changed its issued range",
+        ));
+    }
+    Ok(ExtensionUploadChunkAck {
+        stage_id: stage.id,
+        completion_id,
+    })
+}
+fn upload_retained(
+    result: &Value,
+    stage: &ExtensionUploadStage,
+    completion_id: u64,
+) -> Result<ExtensionRetainedUpload, ExtensionProviderError> {
+    if result["stage"].as_str() != Some(stage.id.to_string().as_str()) || result["retained"] != true
+    {
+        return Err(protocol(
+            "upload retain acknowledgement lacks its issued resource",
+        ));
+    }
+    let paths: Vec<std::path::PathBuf> = decode(result["paths"].clone())?;
+    if paths.len() != stage.files.len()
+        || paths.iter().zip(&stage.files).any(|(path, file)| {
+            !path.is_absolute()
+                || path.file_name().and_then(|name| name.to_str()) != Some(file.name())
+        })
+    {
+        return Err(protocol(
+            "upload retained paths changed actual file names or cardinality",
+        ));
+    }
+    Ok(ExtensionRetainedUpload {
+        stage: stage.clone(),
+        paths,
+        completion_id,
+    })
+}
+fn upload_abandon_ack(
+    result: &Value,
+    stage: &ExtensionUploadStage,
+    completion_id: u64,
+) -> Result<ExtensionUploadAbandonAck, ExtensionProviderError> {
+    if result["stage"].as_str() != Some(stage.id.to_string().as_str())
+        || result["abandoned"] != true
+    {
+        return Err(protocol(
+            "upload abandon acknowledgement lacks its issued resource",
+        ));
+    }
+    Ok(ExtensionUploadAbandonAck {
+        stage_id: stage.id,
+        completion_id,
+    })
+}
+
 fn unacknowledged_retirement_fact(operation: &ExtensionOperation, claim: &str) -> bool {
     match operation {
         ExtensionOperation::EffectsCleanup {
@@ -1408,7 +1533,9 @@ fn unacknowledged_retirement_fact(operation: &ExtensionOperation, claim: &str) -
             effect,
             cleanup_confirmed: false,
             ..
-        } => issued == claim && effect == "extension_cdp_effect",
+        } => {
+            issued == claim && matches!(effect.as_str(), "extension_cdp_effect" | "upload_backing")
+        }
         ExtensionOperation::OrphanCdpCompletion { claim: issued, .. } => issued == claim,
         _ => false,
     }
@@ -1512,6 +1639,12 @@ pub struct ExtensionKnownCustody {
     pub session_headers: Option<ExtensionSessionHeaderProof>,
     pub cursor_presentation: Option<ExtensionCursorPresentationAck>,
     pub fixed_session: Option<ExtensionFixedSessionReceipt>,
+    pub upload_stage: Option<ExtensionUploadStage>,
+    pub upload_retained: Option<ExtensionRetainedUpload>,
+    /// Actual retained backing whose paths could not be represented/delivered.
+    /// Cleanup-only resource custody; this cannot authorize or replay a setter.
+    pub upload_retained_backing: Option<ExtensionUploadStage>,
+    pub upload_abandoned: Option<ExtensionUploadAbandonAck>,
 }
 /// Capabilities below originate only from the actor's still-retained completion.
 /// Unknown positive-ACK capabilities are cleanup-only and remain old-generation.
@@ -1523,6 +1656,10 @@ pub enum ExtensionRecoveredOperation {
     },
     /// History never mints a tab/claim or a site permission.
     UserHistory,
+    UploadBegun(ExtensionUploadStage),
+    UploadChunkWritten(ExtensionUploadChunkAck),
+    UploadRetained(ExtensionRetainedUpload),
+    UploadAbandoned(ExtensionUploadAbandonAck),
     SessionHeaders(ExtensionSessionHeaderProof),
     CursorPresentation(ExtensionCursorPresentationAck),
     TurnFinished(ExtensionTurnFinishAck),
@@ -1998,6 +2135,10 @@ impl ExtensionBrowserProvider {
             ExtensionOperation::ReadUserTab { .. } => self.capabilities()?.user_tab_context_read,
             ExtensionOperation::UserHistory => self.capabilities()?.user_history,
             ExtensionOperation::NameSession { .. } => self.capabilities()?.session_naming,
+            ExtensionOperation::BeginUpload { .. }
+            | ExtensionOperation::WriteUploadChunk { .. }
+            | ExtensionOperation::RetainUploadForSelection { .. }
+            | ExtensionOperation::AbandonUpload { .. } => self.capabilities()?.upload_staging,
             ExtensionOperation::SessionInventory => self.capabilities()?.session_tab_inventory,
             ExtensionOperation::CommittedSessionTabUrl { .. } => {
                 self.capabilities()?.session_committed_url
@@ -2049,6 +2190,188 @@ impl ExtensionBrowserProvider {
             ));
         }
         Ok(())
+    }
+    fn check_upload_stage(
+        &self,
+        stage: &ExtensionUploadStage,
+    ) -> Result<(), ExtensionProviderError> {
+        if stage.binding != self.inner.binding || self.wire_context.as_ref() != Some(&stage.context)
+        {
+            return Err(refused(
+                "upload_unavailable",
+                "upload belongs to another provider or captured scope",
+            ));
+        }
+        Ok(())
+    }
+    pub async fn begin_upload(
+        &self,
+        claim: &ExtensionPhysicalClaim,
+        files: &[ExtensionUploadFile],
+    ) -> Result<ExtensionUploadStage, ExtensionProviderError> {
+        self.check_claim(claim)
+            .map_err(|error| self.preflight_error("beginUpload", error))?;
+        if claim.cleanup_only {
+            return Err(self.preflight_error(
+                "beginUpload",
+                refused("claim_unavailable", "uncertain claim permits cleanup only"),
+            ));
+        }
+        let context = self.wire_context.as_ref().ok_or_else(|| {
+            self.preflight_error(
+                "beginUpload",
+                refused(
+                    "context_required",
+                    "upload requires captured trusted context",
+                ),
+            )
+        })?;
+        let operation = ExtensionOperation::BeginUpload {
+            claim: claim.token.clone(),
+            tab_id: claim.tab_id,
+            target_id: claim.target_id.clone(),
+            files: files.to_vec(),
+        };
+        let reply = self
+            .control(
+                operation.clone(),
+                json!({"claim":claim.token,"files":files}),
+            )
+            .await?;
+        let result = reply.outcome.into_result("beginUpload")?;
+        self.upload_stage_from_result(&result, &operation, context, reply.id)
+    }
+    pub async fn write_upload_chunk(
+        &self,
+        stage: &ExtensionUploadStage,
+        file_index: u32,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<ExtensionUploadChunkAck, ExtensionProviderError> {
+        use base64::Engine;
+        self.check_upload_stage(stage)
+            .map_err(|error| self.preflight_error("writeUploadChunk", error))?;
+        if stage.cleanup_only {
+            return Err(self.preflight_error(
+                "writeUploadChunk",
+                refused(
+                    "upload_cleanup_only",
+                    "uncertain upload custody permits cleanup only",
+                ),
+            ));
+        }
+
+        if bytes.is_empty() || bytes.len() > EXTENSION_UPLOAD_CHUNK_BYTES {
+            return Err(self.preflight_error(
+                "writeUploadChunk",
+                refused(
+                    "upload_chunk",
+                    "upload chunks must contain 1 through 65536 bytes",
+                ),
+            ));
+        }
+        let operation = ExtensionOperation::WriteUploadChunk {
+            stage: stage.clone(),
+            file_index,
+            offset,
+            bytes: bytes.len() as u64,
+        };
+        let reply=self.control(operation.clone(),json!({"stage":stage.id,"fileIndex":file_index,"offset":offset,"bytes":base64::engine::general_purpose::STANDARD.encode(bytes)})).await?;
+        let result = reply.outcome.into_result("writeUploadChunk")?;
+        upload_chunk_ack(&result, &operation, reply.id)
+    }
+    /// Validate size and digest, then retain backing before exposing any paths.
+    /// Main must receive this ACK before issuing its existing DOM/CDP setter.
+    pub async fn retain_upload_for_selection(
+        &self,
+        stage: &ExtensionUploadStage,
+    ) -> Result<ExtensionRetainedUpload, ExtensionProviderError> {
+        self.check_upload_stage(stage)
+            .map_err(|error| self.preflight_error("retainUploadForSelection", error))?;
+        if stage.cleanup_only {
+            return Err(self.preflight_error(
+                "retainUploadForSelection",
+                refused(
+                    "upload_cleanup_only",
+                    "uncertain upload custody permits cleanup only",
+                ),
+            ));
+        }
+
+        let reply = self
+            .control(
+                ExtensionOperation::RetainUploadForSelection {
+                    stage: stage.clone(),
+                },
+                json!({"stage":stage.id}),
+            )
+            .await?;
+        upload_retained(
+            &reply.outcome.into_result("retainUploadForSelection")?,
+            stage,
+            reply.id,
+        )
+    }
+    /// Abandon only backing whose paths have never been exposed by retain.
+    pub async fn abandon_upload(
+        &self,
+        stage: &ExtensionUploadStage,
+    ) -> Result<ExtensionUploadAbandonAck, ExtensionProviderError> {
+        self.check_upload_stage(stage)
+            .map_err(|error| self.preflight_error("abandonUpload", error))?;
+        let reply = self
+            .control(
+                ExtensionOperation::AbandonUpload {
+                    stage: stage.clone(),
+                },
+                json!({"stage":stage.id}),
+            )
+            .await?;
+        upload_abandon_ack(
+            &reply.outcome.into_result("abandonUpload")?,
+            stage,
+            reply.id,
+        )
+    }
+    fn upload_stage_from_result(
+        &self,
+        result: &Value,
+        operation: &ExtensionOperation,
+        context: &ExtensionWireContext,
+        completion_id: u64,
+    ) -> Result<ExtensionUploadStage, ExtensionProviderError> {
+        let ExtensionOperation::BeginUpload {
+            claim,
+            tab_id,
+            target_id,
+            files,
+        } = operation
+        else {
+            return Err(protocol("upload stage has no issued begin operation"));
+        };
+        if result["tabId"].as_u64() != Some(*tab_id)
+            || result["targetId"].as_str() != Some(target_id.as_str())
+            || decode::<Vec<ExtensionUploadFile>>(result["files"].clone())? != *files
+        {
+            return Err(protocol(
+                "upload stage changed its issued file or tab identity",
+            ));
+        }
+        let id = result["stage"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or_else(|| protocol("upload stage lacks its actual resource address"))?;
+        Ok(ExtensionUploadStage {
+            binding: self.inner.binding,
+            context: context.clone(),
+            id,
+            tab_id: *tab_id,
+            target_id: target_id.clone(),
+            claim: claim.clone(),
+            files: files.clone(),
+            completion_id,
+            cleanup_only: false,
+        })
     }
     fn check_claim(&self, claim: &ExtensionPhysicalClaim) -> Result<(), ExtensionProviderError> {
         if claim.binding != self.inner.binding || claim.generation != self.inner.identity.generation
@@ -3683,6 +4006,39 @@ impl ExtensionBrowserProvider {
                 }
                 ExtensionRecoveredOperation::SessionNamed { name: name.clone() }
             }
+            ExtensionOperation::BeginUpload { .. } => {
+                let context = completion
+                    .wire_context
+                    .as_ref()
+                    .ok_or_else(|| protocol("upload begin lost captured context"))?;
+                ExtensionRecoveredOperation::UploadBegun(self.upload_stage_from_result(
+                    &result,
+                    &completion.operation,
+                    context,
+                    completion.id,
+                )?)
+            }
+            ExtensionOperation::WriteUploadChunk { .. } => {
+                ExtensionRecoveredOperation::UploadChunkWritten(upload_chunk_ack(
+                    &result,
+                    &completion.operation,
+                    completion.id,
+                )?)
+            }
+            ExtensionOperation::RetainUploadForSelection { stage } => {
+                ExtensionRecoveredOperation::UploadRetained(upload_retained(
+                    &result,
+                    stage,
+                    completion.id,
+                )?)
+            }
+            ExtensionOperation::AbandonUpload { stage } => {
+                ExtensionRecoveredOperation::UploadAbandoned(upload_abandon_ack(
+                    &result,
+                    stage,
+                    completion.id,
+                )?)
+            }
             ExtensionOperation::SetSessionHeaders { .. }
             | ExtensionOperation::ClearSessionHeaders => {
                 let context = completion.wire_context.as_ref().ok_or_else(|| {
@@ -3952,10 +4308,109 @@ impl ExtensionBrowserProvider {
             fixed_session,
             ..ExtensionKnownCustody::default()
         };
+        match &completion.operation {
+            ExtensionOperation::WriteUploadChunk { stage, .. }
+            | ExtensionOperation::RetainUploadForSelection { stage }
+            | ExtensionOperation::AbandonUpload { stage } => {
+                let mut known = stage.clone();
+                known.cleanup_only = true;
+                custody.upload_stage = Some(known);
+            }
+            _ => {}
+        }
         let Some(details) = details else {
             return Ok(custody);
         };
         let acknowledged = details.get("acknowledgedResult");
+        if let Some(marker_value) = details.get("hostUploadCustody") {
+            if let Ok(marker) =
+                serde_json::from_value::<HostUploadCustodyMarker>(marker_value.clone())
+            {
+                if marker_value["stage"].as_str() == Some(marker.stage.to_string().as_str()) {
+                    match (&completion.operation, marker.state) {
+                        (
+                            ExtensionOperation::BeginUpload {
+                                claim,
+                                tab_id,
+                                target_id,
+                                files,
+                            },
+                            HostUploadCustodyState::Begun | HostUploadCustodyState::PartialBegin,
+                        ) => {
+                            if let Some(context) = completion.wire_context.as_ref() {
+                                custody.upload_stage = Some(ExtensionUploadStage {
+                                    binding: self.inner.binding,
+                                    context: context.clone(),
+                                    id: marker.stage,
+                                    tab_id: *tab_id,
+                                    target_id: target_id.clone(),
+                                    claim: claim.clone(),
+                                    files: files.clone(),
+                                    completion_id: completion.id,
+                                    cleanup_only: true,
+                                });
+                            }
+                        }
+                        (
+                            ExtensionOperation::RetainUploadForSelection { stage },
+                            HostUploadCustodyState::Retained,
+                        ) if marker.stage == stage.id => {
+                            let mut known = stage.clone();
+                            known.cleanup_only = true;
+                            custody.upload_retained_backing = Some(known.clone());
+                            custody.upload_stage = Some(known);
+                        }
+                        (
+                            ExtensionOperation::AbandonUpload { stage },
+                            HostUploadCustodyState::Abandoned,
+                        ) if marker.stage == stage.id => {
+                            custody.upload_abandoned = Some(ExtensionUploadAbandonAck {
+                                stage_id: stage.id,
+                                completion_id: completion.id,
+                            });
+                        }
+                        // The issued write already contributes its cleanup-only
+                        // stage above. No extra permission follows a written fact.
+                        (
+                            ExtensionOperation::WriteUploadChunk { stage, .. },
+                            HostUploadCustodyState::ChunkWritten,
+                        ) if marker.stage == stage.id => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
+        match &completion.operation {
+            ExtensionOperation::BeginUpload { .. } => {
+                if let Some(actual) = details.get("uploadStage").or(acknowledged) {
+                    if let Some(context) = completion.wire_context.as_ref() {
+                        // An invalid optional subproof never erases the raw Unknown
+                        // cause, its address metadata, or independent valid custody.
+                        if let Ok(mut stage) = self.upload_stage_from_result(
+                            actual,
+                            &completion.operation,
+                            context,
+                            completion.id,
+                        ) {
+                            stage.cleanup_only = true;
+                            custody.upload_stage = Some(stage);
+                        }
+                    }
+                }
+            }
+            ExtensionOperation::RetainUploadForSelection { stage } => {
+                custody.upload_retained = acknowledged
+                    .and_then(|actual| upload_retained(actual, stage, completion.id).ok());
+            }
+            ExtensionOperation::AbandonUpload { stage } => {
+                if let Some(proof) = acknowledged
+                    .and_then(|actual| upload_abandon_ack(actual, stage, completion.id).ok())
+                {
+                    custody.upload_abandoned = Some(proof);
+                }
+            }
+            _ => {}
+        }
         match &completion.operation {
             ExtensionOperation::SetSessionHeaders { .. }
             | ExtensionOperation::ClearSessionHeaders => {
@@ -10082,6 +10537,110 @@ mod tests {
             matches!(&orphan.operation, ExtensionOperation::OrphanCdpCompletion { event:ExtensionCdpCompletionOutcome::ChromeJson(actual), .. } if actual == &text)
         );
         assert_eq!(ready.iter().filter(|entry| matches!(&entry.operation, ExtensionOperation::EffectsCleanup { effect,cleanup_confirmed:false,.. } if effect == "extension_cdp_effect")).count(), 1, "actual raw result does not clear original Unknown cleanup debt");
+        provider.close().await;
+    }
+    #[cfg(unix)]
+    async fn upload_stage_fixture(
+        provider: &ExtensionBrowserProvider,
+        server: &mut tokio::net::UnixStream,
+    ) -> ExtensionUploadStage {
+        use sha2::Digest;
+        let claim = attach_fixture(provider, server, 7, "upload-claim").await;
+        let files = vec![ExtensionUploadFile::new(
+            "Café 日本語 🐧.txt".into(),
+            4,
+            sha2::Sha256::digest(b"data").into(),
+        )
+        .unwrap()];
+        let call = {
+            let view = provider.clone();
+            let files = files.clone();
+            tokio::spawn(async move { view.begin_upload(&claim, &files).await })
+        };
+        let sent = request(server).await;
+        assert_eq!(sent["request"]["method"], "beginUpload");
+        assert_eq!(
+            sent["request"]["files"],
+            serde_json::to_value(&files).unwrap()
+        );
+        let stage = uuid::Uuid::new_v4();
+        control_result(
+            server,
+            sent["request"]["id"].as_u64().unwrap(),
+            json!({"stage":stage,"tabId":7,"targetId":"target-7","files":files}),
+        )
+        .await;
+        bounded(call).await.unwrap().unwrap()
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_contract_context_and_foreign_stage_refuse_before_dispatch() {
+        use sha2::Digest;
+        let (provider, mut server) = fixture();
+        let claim = attach_fixture(&provider, &mut server, 7, "upload-claim").await;
+        let files = vec![ExtensionUploadFile::new(
+            "file.txt".into(),
+            4,
+            sha2::Sha256::digest(b"data").into(),
+        )
+        .unwrap()];
+        assert!(
+            matches!(provider.begin_upload(&claim,&files).await,Err(ExtensionProviderError::NotDispatched{kind,..})if kind=="context_required")
+        );
+        let view = provider
+            .with_wire_context(ExtensionWireContext::new("upload-owner", "upload-turn").unwrap());
+        assert!(
+            matches!(view.begin_upload(&claim,&files).await,Err(ExtensionProviderError::NotDispatched{kind,..})if kind=="unsupported")
+        );
+        let mut byte = [0];
+        assert_eq!(
+            server.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(provider.pending_completions().await.unwrap().is_empty());
+        provider.close().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_upload_retain_ack_is_recoverable_without_replaying_a_setter() {
+        let mut capabilities = maka_capabilities();
+        capabilities["uploadStaging"] = json!(true);
+        let (provider, mut server) = fixture_with_capabilities(capabilities);
+        let view = provider
+            .with_wire_context(ExtensionWireContext::new("upload-owner", "upload-turn").unwrap());
+        let stage = upload_stage_fixture(&view, &mut server).await;
+        view.acknowledge_completion(stage.completion_id())
+            .await
+            .unwrap();
+        let call = {
+            let view = view.clone();
+            let stage = stage.clone();
+            tokio::spawn(async move { view.retain_upload_for_selection(&stage).await })
+        };
+        let sent = request(&mut server).await;
+        let id = sent["request"]["id"].as_u64().unwrap();
+        call.abort();
+        let _ = call.await;
+        let path = std::env::temp_dir()
+            .join("maka-unit-upload-late-no-file")
+            .join(stage.files[0].name());
+        control_result(
+            &mut server,
+            id,
+            json!({"stage":stage.id,"retained":true,"paths":[path]}),
+        )
+        .await;
+        let ready = wait_ready(&view).await;
+        assert_eq!(ready.len(), 1);
+        assert!(
+            matches!(view.recover_completion(id).await.unwrap(),ExtensionRecoveredOperation::UploadRetained(proof)if proof.stage_id()==stage.id)
+        );
+        let mut byte = [0];
+        assert_eq!(
+            server.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        view.acknowledge_completion(id).await.unwrap();
         provider.close().await;
     }
 }

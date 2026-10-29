@@ -66,6 +66,40 @@ pub(super) fn validate_directory(path: &Path) -> Result<(), IpcError> {
     Ok(())
 }
 
+pub(super) fn create_private_upload_directory(path: &Path) -> Result<(), IpcError> {
+    if !path.is_absolute() {
+        return Err(rejected("upload directory is not absolute"));
+    }
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    secure_new_directory(path)?;
+    validate_directory(path)
+}
+pub(super) fn open_private_upload_directory(path: &Path) -> Result<File, IpcError> {
+    validate_directory(path)?;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(Into::into)
+}
+
+pub(super) fn open_upload_file_for_identity(path: &Path) -> Result<File, IpcError> {
+    no_symlink_components(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(rejected("upload backing path is not a regular file"));
+    }
+    Ok(file)
+}
+
+pub(super) fn upload_directory_native_path(file: &File, path: &Path) -> Result<PathBuf, IpcError> {
+    file_identity(file)?;
+    Ok(path.to_owned())
+}
+
 pub(super) fn ensure_directory(path: &Path) -> Result<(), IpcError> {
     let parent = path
         .parent()

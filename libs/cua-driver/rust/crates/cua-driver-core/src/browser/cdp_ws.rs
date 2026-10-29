@@ -70,6 +70,7 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Page.getResourceTree",
     "Page.handleJavaScriptDialog",
     "Page.navigate",
+    "Page.setInterceptFileChooserDialog",
     "Runtime.callFunctionOn",
     "Runtime.evaluate",
     "Runtime.getProperties",

@@ -9,7 +9,7 @@
 use super::extension_broker::{CheckedLocalPeer, LocalPrincipal};
 use super::extension_framing::{self, Direction};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -25,6 +25,61 @@ mod platform;
 mod platform;
 
 pub use platform::LocalStream;
+
+/// Actual object identity of a newly created, private native-host upload directory.
+/// A resource address never substitutes for this kept descriptor and identity.
+pub(super) struct UploadDirectoryIdentity {
+    file: std::fs::File,
+    identity: platform::FileIdentity,
+}
+impl UploadDirectoryIdentity {
+    /// The native object path, with a global volume-GUID prefix on Windows.
+    /// This changes only the private staging prefix, never an approved basename.
+    pub(super) fn native_path(&self, current: &Path) -> Result<PathBuf, IpcError> {
+        self.validate_path(current)?;
+        platform::upload_directory_native_path(&self.file, current)
+    }
+    pub(super) fn validate_path(&self, path: &Path) -> Result<(), IpcError> {
+        if platform::file_identity(&self.file)? != self.identity {
+            return Err(rejected(
+                "owned upload directory descriptor changed identity",
+            ));
+        }
+        let current = platform::open_private_upload_directory(path)?;
+        if platform::file_identity(&current)? != self.identity {
+            return Err(rejected("owned upload directory path was replaced"));
+        }
+        Ok(())
+    }
+}
+pub(super) struct UploadFileIdentity(platform::FileIdentity);
+pub(super) fn upload_file_identity(file: &std::fs::File) -> Result<UploadFileIdentity, IpcError> {
+    if !file.metadata()?.is_file() {
+        return Err(rejected("upload backing is not a regular file"));
+    }
+    Ok(UploadFileIdentity(platform::file_identity(file)?))
+}
+impl UploadFileIdentity {
+    pub(super) fn validate_path(&self, file: &std::fs::File, path: &Path) -> Result<(), IpcError> {
+        if platform::file_identity(file)? != self.0 {
+            return Err(rejected("upload backing descriptor changed identity"));
+        }
+        let actual = platform::open_upload_file_for_identity(path)?;
+        if platform::file_identity(&actual)? != self.0 {
+            return Err(rejected("upload backing path was replaced"));
+        }
+        Ok(())
+    }
+}
+
+/// Only the upload worker supplies this internally minted absolute path. Creation
+/// is exclusive, and applies existing current-user directory security primitives.
+pub(super) fn create_upload_directory(path: &Path) -> Result<UploadDirectoryIdentity, IpcError> {
+    platform::create_private_upload_directory(path)?;
+    let file = platform::open_private_upload_directory(path)?;
+    let identity = platform::file_identity(&file)?;
+    Ok(UploadDirectoryIdentity { file, identity })
+}
 
 const MAX_LOCAL_FRAME: usize = 64 * 1024 * 1024;
 const MAX_DESCRIPTOR: u64 = 64 * 1024;
@@ -693,14 +748,12 @@ mod tests {
             validate_descriptor(&path, "org.apache.maka.browser_connector", &descriptor).is_ok()
         );
         assert!(validate_descriptor(&path, "other.adapter", &descriptor).is_err());
-        assert!(
-            validate_descriptor(
-                Path::new("/private/different.json"),
-                "org.apache.maka.browser_connector",
-                &descriptor
-            )
-            .is_err()
-        );
+        assert!(validate_descriptor(
+            Path::new("/private/different.json"),
+            "org.apache.maka.browser_connector",
+            &descriptor
+        )
+        .is_err());
         let mut changed = descriptor;
         changed.identity.generation = changed.identity.generation.to_uppercase();
         assert!(validate_descriptor(&path, "org.apache.maka.browser_connector", &changed).is_err());

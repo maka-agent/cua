@@ -8,7 +8,7 @@
 //! The process ends with this Chrome extension port, without starting a daemon.
 
 use super::{
-    broker_delivery::{DeliveryError, IPC_SHUTDOWN_DRAIN_TIMEOUT, Queued},
+    broker_delivery::{DeliveryError, Queued, IPC_SHUTDOWN_DRAIN_TIMEOUT},
     extension_broker::{
         BrokerError, BrokerHandle, ClientConnection, ControlEvent, ControlRequest,
         ExtensionHostBroker, RouteSender,
@@ -17,13 +17,15 @@ use super::{
     extension_framing::{self, Direction, FrameError},
     extension_host::{
         AdapterRegistration, ExtensionInvocation, ExtensionOrigin, HostError, InstalledHostConfig,
-        MAKA_HOST_NAME, Platform,
+        Platform, MAKA_HOST_NAME,
     },
+    extension_upload_placement::UploadPlacement,
+    extension_upload_worker::UploadWorkerOwner,
     extension_wire::ExtensionWireContext,
     local_ipc::{self, ExtensionEndpointIdentity, IpcError, PublishedEndpoint},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{collections::HashMap, io, path::PathBuf, process::ExitCode};
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -237,8 +239,8 @@ pub(crate) struct InstalledSelections {
 }
 
 /// Discovery consumes exact validated entries and reports invalid siblings.
-pub(crate) fn load_installed_selections()
--> Result<InstalledSelections, ExtensionAdapterSelectionError> {
+pub(crate) fn load_installed_selections(
+) -> Result<InstalledSelections, ExtensionAdapterSelectionError> {
     let load = || -> Result<InstalledSelections, ProcessError> {
         let executable = std::env::current_exe()?;
         let catalog = extension_catalog::load(&executable)?;
@@ -347,6 +349,54 @@ pub(crate) fn bootstrap(config: ExtensionProcessConfig) -> Option<ExitCode> {
     })
 }
 
+// Called only after registration selected this process's native-host entry.
+// This is placement evidence, never an added browser identity or file grant.
+fn native_upload_service(broker: &mut ExtensionHostBroker) -> Option<UploadWorkerOwner> {
+    let placement = match UploadPlacement::capture_native_launch() {
+        Ok(placement) => placement,
+        Err(error) => {
+            eprintln!("Maka native upload placement is unavailable: {error}");
+            return None;
+        }
+    };
+    match broker.install_native_uploads(placement) {
+        Ok(owner) => Some(owner),
+        Err(error) => {
+            eprintln!("Maka native upload worker is unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn finish_native_uploads(
+    owner: Option<UploadWorkerOwner>,
+    outcome: Result<(), ProcessError>,
+) -> Result<(), ProcessError> {
+    let Some(owner) = owner else {
+        return outcome;
+    };
+    // This joins the sole host resource owner outside the broker/runtime actor.
+    let cleanup = match owner.shutdown() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ProcessError::Lifecycle(format!(
+            "native upload backing cleanup remains unconfirmed: {error}"
+        ))),
+        Err(_) => Err(ProcessError::Lifecycle(
+            "native upload worker ended without final cleanup proof".into(),
+        )),
+    };
+    if let Err(error) = &cleanup {
+        eprintln!("{error}");
+    }
+    match (outcome, cleanup) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(outcome), Ok(())) => Err(outcome),
+        (Err(outcome), Err(cleanup)) => {
+            Err(ProcessError::Lifecycle(format!("{outcome}; {cleanup}")))
+        }
+    }
+}
+
 /// The reviewed foreign protocol starts itself (getInfo), then supplies the
 /// same broker's normalized actual hello. No Maka hello/bound frame is imposed.
 fn run_adapted_extension_host(
@@ -359,8 +409,10 @@ fn run_adapted_extension_host(
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
-        let (handle,broker,outgoing)=ExtensionHostBroker::channels(selection.config.expected_extension.clone(),principal);
+    let (handle, mut broker, outgoing) =
+        ExtensionHostBroker::channels(selection.config.expected_extension.clone(), principal);
+    let upload_owner = native_upload_service(&mut broker);
+    let outcome=runtime.block_on(async move {
         let adapter=super::extension_adapter_factory::for_installed(&selection,broker.generation().to_owned())
             .map_err(|error|ProcessError::Lifecycle(error.to_string()))?;
         let mut broker_task=tokio::spawn(broker.run());
@@ -397,7 +449,8 @@ fn run_adapted_extension_host(
         if !broker_task.is_finished(){let _=broker_task.await;}
         if !actor_task.is_finished(){actor_task.abort();}
         result
-    })
+     });
+    finish_native_uploads(upload_owner, outcome)
 }
 
 fn read_initial_hello(expected: &ExtensionOrigin) -> Result<Value, ProcessError> {
@@ -427,8 +480,9 @@ fn run_extension_host(
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
-        let (handle,broker,mut outgoing)=ExtensionHostBroker::channels(expected,principal);
+    let (handle, mut broker, mut outgoing) = ExtensionHostBroker::channels(expected, principal);
+    let upload_owner = native_upload_service(&mut broker);
+    let outcome=runtime.block_on(async move {
         let mut broker_task=tokio::spawn(broker.run());
         let (report_send,mut reports)=mpsc::channel(128);
         let (failure_send,mut failures)=watch::channel::<Option<String>>(None);
@@ -495,7 +549,8 @@ fn run_extension_host(
         if !broker_task.is_finished() { let _=broker_task.await; }
         report_task.abort();
         outcome
-    })
+     });
+    finish_native_uploads(upload_owner, outcome)
 }
 
 async fn wait_failure(receiver: &mut watch::Receiver<Option<String>>) {
@@ -826,12 +881,10 @@ mod tests {
         let request: ClientWire =
             serde_json::from_value(json!({"kind":"closeCdp","route":5})).unwrap();
         assert!(matches!(request, ClientWire::CloseCdp { route: 5 }));
-        assert!(
-            serde_json::from_value::<ClientWire>(
-                json!({"kind":"closeCdp","route":5,"claim":"foreign","owner":"foreign"})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<ClientWire>(
+            json!({"kind":"closeCdp","route":5,"claim":"foreign","owner":"foreign"})
+        )
+        .is_err());
     }
 
     #[test]
@@ -860,10 +913,11 @@ mod tests {
         assert_eq!(original.expected_extension_id(), extension.id());
         assert_eq!(original.runtime_directory(), directory);
         assert!(ExtensionAdapterSelection::from_config(config(CHATGPT_HOST_NAME, None)).is_err());
-        assert!(
-            ExtensionAdapterSelection::from_config(config("unsupported.adapter", Some(directory),))
-                .is_err()
-        );
+        assert!(ExtensionAdapterSelection::from_config(config(
+            "unsupported.adapter",
+            Some(directory),
+        ))
+        .is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::{
     ffi::c_void,
     fs::{self, File},
     os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::MetadataExt,
         io::{AsRawHandle, FromRawHandle},
     },
@@ -96,6 +96,7 @@ unsafe extern "system" {
         template: Handle,
     ) -> Handle;
     fn GetFileInformationByHandle(file: Handle, information: *mut FileInformation) -> i32;
+    fn GetFinalPathNameByHandleW(file: Handle, path: *mut u16, length: u32, flags: u32) -> u32;
 }
 #[link(name = "advapi32")]
 unsafe extern "system" {
@@ -403,6 +404,120 @@ pub(super) fn validate_directory(path: &Path) -> Result<(), IpcError> {
         return Err(rejected("Windows private IPC directory is not a directory"));
     }
     validate_acl(path, DirectoryPolicy::CurrentUserOnly)
+}
+
+pub(super) fn create_private_upload_directory(path: &Path) -> Result<(), IpcError> {
+    if !path.is_absolute() {
+        return Err(rejected("upload directory is not absolute"));
+    }
+    let security = user_security(&current_sid()?)?;
+    let attributes = attributes(&security);
+    let name = wide(path)?;
+    // SAFETY: the private descriptor and terminated path live through creation.
+    // Unlike ensure_directory, an existing path is never adopted by upload.
+    if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    validate_directory(path)
+}
+pub(super) fn open_private_upload_directory(path: &Path) -> Result<File, IpcError> {
+    validate_directory(path)?;
+    let name = wide(path)?;
+    // SAFETY: this opens only a directory already checked current-user private.
+    // BACKUP_SEMANTICS permits directory handles; OPEN_REPARSE_POINT refuses
+    // following a substituted reparse endpoint. Sharing permits owned cleanup.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            0x80,
+            1 | 2 | 4,
+            std::ptr::null(),
+            3,
+            FILE_FLAG_OPEN_REPARSE_POINT | 0x0200_0000,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: successful CreateFileW transfers one owned handle.
+    let file = unsafe { File::from_raw_handle(handle.cast()) };
+    if !file.metadata()?.is_dir() {
+        return Err(rejected("upload directory handle is not a directory"));
+    }
+    file_identity(&file)?;
+    Ok(file)
+}
+
+pub(super) fn open_upload_file_for_identity(path: &Path) -> Result<File, IpcError> {
+    no_reparse_components(path)?;
+    let name = wide(path)?;
+    // SAFETY: only readonly attribute access to this internally owned path;
+    // reparse endpoints are opened as objects and rejected by file_identity.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            0x80,
+            1 | 2 | 4,
+            std::ptr::null(),
+            3,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: successful CreateFileW transfers an owned handle.
+    let file = unsafe { File::from_raw_handle(handle.cast()) };
+    if !file.metadata()?.is_file() {
+        return Err(rejected("upload backing path is not a regular file"));
+    }
+    file_identity(&file)?;
+    Ok(file)
+}
+
+pub(super) fn upload_directory_native_path(file: &File, _path: &Path) -> Result<PathBuf, IpcError> {
+    // VOLUME_NAME_GUID asks the OS for the created object's actual volume path,
+    // avoiding a browser/host drive-letter mapping assumption.
+    const VOLUME_NAME_GUID: u32 = 1;
+    // SAFETY: the first call queries required UTF-16 capacity for this live handle.
+    let needed = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle().cast(),
+            std::ptr::null_mut(),
+            0,
+            VOLUME_NAME_GUID,
+        )
+    };
+    if needed == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut buffer = vec![0_u16; needed as usize + 1];
+    // SAFETY: buffer owns its reported capacity, and file retains the directory.
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle().cast(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            VOLUME_NAME_GUID,
+        )
+    };
+    if written == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if written as usize >= buffer.len() {
+        return Err(rejected(
+            "upload directory path changed while observing its native volume path",
+        ));
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written as usize]));
+    if !path.is_absolute() {
+        return Err(rejected(
+            "native upload directory volume path is not absolute",
+        ));
+    }
+    Ok(path)
 }
 
 pub(super) fn ensure_directory(path: &Path) -> Result<(), IpcError> {

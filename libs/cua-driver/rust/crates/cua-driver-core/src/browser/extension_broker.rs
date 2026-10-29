@@ -10,6 +10,16 @@
 use super::broker_delivery::{
     ByteBudget, ByteCharge, DeliveryError, Queued, IPC_SHUTDOWN_DRAIN_TIMEOUT,
 };
+use super::extension_upload::{
+    ExtensionUploadFile, UploadError, UploadOwner, EXTENSION_UPLOAD_CHUNK_BYTES,
+};
+use super::extension_upload_placement::UploadPlacement;
+#[cfg(test)]
+use super::extension_upload_worker::JOB_RUNNING;
+use super::extension_upload_worker::{
+    cancel_queued, UploadCompletion, UploadEvent, UploadJob, UploadWork, UploadWorkResult,
+    UploadWorker, UploadWorkerError, UploadWorkerOwner, JOB_CANCELLED, JOB_COMPLETED, JOB_QUEUED,
+};
 use super::extension_wire::{
     ExtensionCdpWritePhase, ExtensionFixedUiRequest, ExtensionPreparationDocument,
     ExtensionPreparationPolicy, ExtensionReplyProvenance, ExtensionWireContext,
@@ -25,11 +35,12 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
 };
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 const MAX_CLIENTS: usize = 32;
 const MAX_NORMAL_PENDING: usize = 64;
@@ -127,6 +138,27 @@ pub(crate) enum ControlRequest {
         #[serde(rename = "expectedUrl")]
         expected_url: String,
         read: super::user_tab_context::BrowserUserTabRead,
+    },
+    BeginUpload {
+        id: u64,
+        claim: String,
+        files: Vec<ExtensionUploadFile>,
+    },
+    WriteUploadChunk {
+        id: u64,
+        stage: Uuid,
+        #[serde(rename = "fileIndex")]
+        file_index: u32,
+        offset: u64,
+        bytes: String,
+    },
+    RetainUploadForSelection {
+        id: u64,
+        stage: Uuid,
+    },
+    AbandonUpload {
+        id: u64,
+        stage: Uuid,
     },
     Inventory {
         id: u64,
@@ -360,6 +392,10 @@ impl ControlRequest {
     }
     fn id(&self) -> u64 {
         match self {
+            Self::BeginUpload { id, .. }
+            | Self::WriteUploadChunk { id, .. }
+            | Self::RetainUploadForSelection { id, .. }
+            | Self::AbandonUpload { id, .. } => *id,
             Self::ReadUserTab { id, .. }
             | Self::Inventory { id, .. }
             | Self::Resolve { id, .. }
@@ -684,8 +720,22 @@ impl BrokerHandle {
     }
 }
 
+// Counts only controls admitted to the existing input channel, never requests
+// still waiting for the byte budget. The guard is the queued input's lifetime.
+struct ControlIngress {
+    count: Arc<AtomicUsize>,
+    progress: mpsc::Sender<Input>,
+}
+impl Drop for ControlIngress {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.progress.try_send(Input::DeliveryProgress);
+    }
+}
+
 struct ClientLease {
     id: ClientId,
+    controls_in_flight: Arc<AtomicUsize>,
     alive: Arc<AtomicBool>,
     input: mpsc::Sender<Input>,
     budget: ByteBudget,
@@ -727,6 +777,17 @@ impl ClientSender {
         } else {
             Some(self.lease.budget.charge(&request).await?)
         };
+        // Publish the reservation before the second alive check. A concurrent
+        // closure either sees this finite input or this request returns Closed;
+        // no control can enter behind the owner's final EOF receipt.
+        self.lease.controls_in_flight.fetch_add(1, Ordering::SeqCst);
+        let ingress = ControlIngress {
+            count: self.lease.controls_in_flight.clone(),
+            progress: self.lease.input.clone(),
+        };
+        if !self.lease.alive.load(Ordering::SeqCst) {
+            return Err(BrokerError::Closed);
+        }
         self.lease
             .input
             .send(Input::Control {
@@ -734,6 +795,7 @@ impl ClientSender {
                 charge,
                 wire_context,
                 request,
+                ingress,
             })
             .await
             .map_err(|_| BrokerError::Closed)
@@ -872,6 +934,7 @@ enum Input {
         request: ControlRequest,
         charge: Option<Arc<ByteCharge>>,
         wire_context: Option<ExtensionWireContext>,
+        ingress: ControlIngress,
     },
     Cdp {
         client: ClientId,
@@ -890,6 +953,10 @@ enum Input {
     },
     ExtensionEof(String),
     Written(WriteReport),
+    Upload {
+        event: UploadEvent,
+        charge: Option<Arc<ByteCharge>>,
+    },
     DeliveryProgress,
 }
 
@@ -906,7 +973,7 @@ impl Input {
     fn charge(&self) -> Option<Arc<ByteCharge>> {
         match self {
             Self::Extension { charge, .. } | Self::Cdp { charge, .. } => Some(charge.clone()),
-            Self::Control { charge, .. } => charge.clone(),
+            Self::Control { charge, .. } | Self::Upload { charge, .. } => charge.clone(),
             _ => None,
         }
     }
@@ -928,6 +995,15 @@ enum Delivery {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnerCleanup {
+    Unrequested,
+    // The attempt remains known after an Unknown/error removes its Pending;
+    // it is never inferred from logical admission closure or retried.
+    Requested { outer_id: u64 },
+    Confirmed,
+}
+
 struct ClientState {
     owner: String,
     alive: Arc<AtomicBool>,
@@ -936,6 +1012,11 @@ struct ClientState {
     undelivered: VecDeque<Queued<ControlEvent>>,
     high_water: u64,
     closing: bool,
+    extension_cleanup: OwnerCleanup,
+    controls_in_flight: Arc<AtomicUsize>,
+    // One already-created EOF receipt, held only while local job custody is
+    // pending. This is transport egress, never another owner/session registry.
+    deferred_generation_close: Option<Queued<ControlEvent>>,
     attaching: HashSet<u64>,
     early: HashMap<String, BufferedEvents>,
 }
@@ -978,16 +1059,90 @@ struct RouteState {
     high_water: u64,
 }
 #[derive(Clone, Debug)]
+struct ClosingClaim {
+    claim: String,
+    tab_id: u64,
+    target_id: String,
+}
+
+#[derive(Clone, Debug)]
 enum ControlKind {
     Inventory,
     Resolve,
     Attach(u64),
     Detach(String),
-    Close(String),
+    Close(ClosingClaim),
     StopCreated(Option<u64>),
     Other,
 }
+#[derive(Clone, Copy)]
+enum UploadCustodyFact {
+    Begun(Uuid),
+    PartialBegin(Uuid),
+    ChunkWritten(Uuid),
+    Retained(Uuid),
+    Abandoned(Uuid),
+}
+impl UploadCustodyFact {
+    fn value(self) -> Value {
+        let (stage, state) = match self {
+            Self::Begun(stage) => (stage, "begun"),
+            Self::PartialBegin(stage) => (stage, "partialBegin"),
+            Self::ChunkWritten(stage) => (stage, "chunkWritten"),
+            Self::Retained(stage) => (stage, "retained"),
+            Self::Abandoned(stage) => (stage, "abandoned"),
+        };
+        json!({"stage":stage,"state":state})
+    }
+}
+
+enum UploadControl {
+    Begin {
+        owner: UploadOwner,
+        files: Arc<Vec<ExtensionUploadFile>>,
+    },
+    Write {
+        stage: Uuid,
+        file_index: u32,
+        offset: u64,
+        bytes: u64,
+    },
+    Retain {
+        stage: Uuid,
+    },
+    Abandon {
+        stage: Uuid,
+    },
+    RetireTab {
+        owner: UploadOwner,
+        outcome: Box<ControlOutcome>,
+    },
+}
+impl UploadControl {
+    fn cleanup(&self) -> bool {
+        matches!(self, Self::Abandon { .. } | Self::RetireTab { .. })
+    }
+}
+struct UploadAdmission {
+    client: ClientId,
+    local_id: u64,
+    operation: UploadControl,
+    work: UploadWork,
+    claim: Option<String>,
+    gates: Vec<Arc<AtomicBool>>,
+    context: Option<ExtensionWireContext>,
+}
+struct PendingUpload {
+    local_id: u64,
+    operation: UploadControl,
+    claim: Option<String>,
+    phase: Arc<AtomicU8>,
+    interrupted: Option<&'static str>,
+    _charge: Option<Arc<ByteCharge>>,
+}
+
 enum PendingKind {
+    Upload(PendingUpload),
     Control {
         local_id: u64,
         operation: ControlKind,
@@ -1046,6 +1201,8 @@ pub(crate) struct ExtensionHostBroker {
     input: mpsc::Receiver<Input>,
     input_sender: mpsc::Sender<Input>,
     extension_output: Option<mpsc::Sender<ExtensionOutbound>>,
+    uploads: Option<UploadWorker>,
+    closing_uploads: Option<String>,
 }
 
 impl ExtensionHostBroker {
@@ -1083,8 +1240,37 @@ impl ExtensionHostBroker {
             input,
             input_sender,
             extension_output: Some(extension_output),
+            uploads: None,
+            closing_uploads: None,
         };
         (handle, broker, output)
+    }
+
+    /// Install only from the validated registered native-host process entry.
+    /// The worker confirms placement on its own actual execution thread.
+    pub(super) fn install_native_uploads(
+        &mut self,
+        placement: UploadPlacement,
+    ) -> std::io::Result<UploadWorkerOwner> {
+        if self.bound || self.uploads.is_some() {
+            return Err(std::io::Error::other(
+                "upload service must be installed before handshake",
+            ));
+        }
+        let input = self.input_sender.clone();
+        let budget = self.budget.clone();
+        let (worker, owner) = UploadWorker::start(placement, move |event| {
+            let (event, charge) = match event {
+                UploadEvent::Completed(completion) => {
+                    let (completion, charge) = prepare_upload_completion(completion, &budget);
+                    (UploadEvent::Completed(completion), charge)
+                }
+                event => (event, None),
+            };
+            input.blocking_send(Input::Upload { event, charge }).is_ok()
+        })?;
+        self.uploads = Some(worker);
+        Ok(owner)
     }
 
     pub(crate) fn generation(&self) -> &str {
@@ -1119,7 +1305,11 @@ impl ExtensionHostBroker {
                     request,
                     charge: _,
                     wire_context: _,
-                } => self.control(client, request, &mut output),
+                    ingress,
+                } => {
+                    drop(ingress);
+                    self.control(client, request, &mut output);
+                }
                 Input::Cdp {
                     client,
                     route,
@@ -1146,7 +1336,9 @@ impl ExtensionHostBroker {
                 Input::ExtensionEof(reason) => self.end_generation(&reason),
                 Input::DeliveryProgress => {}
                 Input::Written(report) => self.written(report, &mut output),
+                Input::Upload { event, charge: _ } => self.upload_event(event),
             }
+            self.finish_upload_generation();
             self.current_charge = None;
             self.input_context = None;
             self.flush_deliveries();
@@ -1223,22 +1415,48 @@ impl ExtensionHostBroker {
                 );
             }
         }
+        self.finish_upload_generation();
     }
 
     async fn drain_stopped_deliveries(&mut self) {
         let deadline = tokio::time::sleep(IPC_SHUTDOWN_DRAIN_TIMEOUT);
         tokio::pin!(deadline);
         loop {
+            self.finish_upload_generation();
             self.flush_deliveries();
-            if self.deliveries.is_empty() {
+            if self.deliveries.is_empty() && self.closing_uploads.is_none() {
                 return;
             }
             tokio::select! {
-                _ = &mut deadline => return,
+                _ = &mut deadline => {
+                    let pending_ids=self.pending.iter().filter_map(|(id,pending)|matches!(pending.kind,PendingKind::Upload(_)).then_some(*id)).collect::<Vec<_>>();
+                    for id in pending_ids {
+                        if let Some(Pending{client,kind:PendingKind::Upload(upload),..})=self.pending.remove(&id) {
+                            if let UploadControl::RetireTab{outcome,..}=upload.operation {
+                                self.upload_retirement_reply(client,upload.local_id,upload.claim,*outcome,false,Some("host upload cleanup remained unresolved at shutdown deadline".into()));
+                            } else {
+                                // Running filesystem work cannot be declared unsent.
+                                // Fixed receipt contains no guessed stage/path.
+                                self.queue_control_delivery(client,Queued::new(ControlEvent::Reply{id:upload.local_id,outcome:ControlOutcome::Unknown{reason:"host upload I/O remained unresolved at the existing shutdown deadline".into(),details:None}},None));
+                            }
+                        }
+                    }
+                    self.finish_upload_generation();
+                    self.flush_deliveries();
+                    return;
+                },
                 input = self.input.recv() => match input {
                     Some(Input::Identity(reply)) => { let _ = reply.send(Err(BrokerError::Closed)); }
                     Some(Input::Admit { reply, .. }) => { let _ = reply.send(Err(BrokerError::Closed)); }
                     Some(Input::BindRoute { reply, .. }) => { let _ = reply.send(Err(BrokerError::Closed)); }
+                    Some(Input::Upload {event,charge:_}) => self.upload_event(event),
+                    Some(Input::Control {client,request,ingress,..}) => {
+                        drop(ingress);
+                        // Already-admitted uploads receive a known unsent
+                        // terminal before the generation's final EOF.
+                        self.control(client, request, &mut Vec::new());
+                        self.finish_upload_generation();
+                    }
                     Some(Input::ClientClosed(client)) => {
                         if let Some(state) = self.clients.get_mut(&client) {
                             state.closing = true;
@@ -1273,6 +1491,7 @@ impl ExtensionHostBroker {
         let id = ClientId(self.next_client);
         let owner = format!("{}:{}", uuid::Uuid::new_v4(), self.next_client);
         let alive = Arc::new(AtomicBool::new(true));
+        let controls_in_flight = Arc::new(AtomicUsize::new(0));
         let (events, receiver) = mpsc::channel(EVENT_CAPACITY);
         self.owners.insert(owner.clone(), id);
         self.clients.insert(
@@ -1285,12 +1504,16 @@ impl ExtensionHostBroker {
                 undelivered: VecDeque::new(),
                 high_water: 0,
                 closing: false,
+                extension_cleanup: OwnerCleanup::Unrequested,
+                controls_in_flight: controls_in_flight.clone(),
+                deferred_generation_close: None,
                 attaching: HashSet::new(),
                 early: HashMap::new(),
             },
         );
         let lease = Arc::new(ClientLease {
             id,
+            controls_in_flight,
             alive,
             input: self.input_sender.clone(),
             budget: self.budget.clone(),
@@ -1408,6 +1631,753 @@ impl ExtensionHostBroker {
         );
     }
 
+    fn upload_control(
+        &mut self,
+        client: ClientId,
+        request: ControlRequest,
+        output: &mut Vec<ExtensionOutbound>,
+    ) {
+        let id = request.id();
+        if self.uploads.is_none() {
+            self.reject_control(
+                client,
+                id,
+                "unsupported",
+                "actual native-host upload placement is unavailable",
+                output,
+            );
+            return;
+        }
+        let Some(context) = self.input_context.clone() else {
+            self.reject_control(
+                client,
+                id,
+                "context_required",
+                "upload requires captured trusted context",
+                output,
+            );
+            return;
+        };
+        if self.normal_pending() >= MAX_NORMAL_PENDING {
+            self.reject_control(
+                client,
+                id,
+                "request_budget",
+                "host upload work shares the normal pending budget",
+                output,
+            );
+            return;
+        }
+        let (operation, work, claim, claim_gate) = match request {
+            ControlRequest::BeginUpload { claim, files, .. } => {
+                let Some(record) = self.claims.get(&claim).filter(|record| {
+                    record.client == client
+                        && record.alive.load(Ordering::SeqCst)
+                        && !record.cleanup_only
+                        && !record.cdp_fenced
+                }) else {
+                    self.reject_control(
+                        client,
+                        id,
+                        "claim_unavailable",
+                        "upload requires this connection's current physical claim",
+                        output,
+                    );
+                    return;
+                };
+                let owner = UploadOwner {
+                    session_id: context.host_session_id().to_owned(),
+                    tab_id: record.tab_id,
+                    target_id: record.target_id.clone(),
+                };
+                let files = Arc::new(files);
+                (
+                    UploadControl::Begin {
+                        owner: owner.clone(),
+                        files: files.clone(),
+                    },
+                    UploadWork::Begin { owner, files },
+                    Some(claim),
+                    Some(record.alive.clone()),
+                )
+            }
+            ControlRequest::WriteUploadChunk {
+                stage,
+                file_index,
+                offset,
+                bytes,
+                ..
+            } => {
+                let bytes = match decode_upload_chunk(&bytes) {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        self.reject_control(client, id, "upload_chunk", message, output);
+                        return;
+                    }
+                };
+                (
+                    UploadControl::Write {
+                        stage,
+                        file_index,
+                        offset,
+                        bytes: bytes.len() as u64,
+                    },
+                    UploadWork::Write {
+                        session_id: context.host_session_id().to_owned(),
+                        stage,
+                        file_index,
+                        offset,
+                        bytes,
+                    },
+                    None,
+                    None,
+                )
+            }
+            ControlRequest::RetainUploadForSelection { stage, .. } => (
+                UploadControl::Retain { stage },
+                UploadWork::Retain {
+                    session_id: context.host_session_id().to_owned(),
+                    stage,
+                },
+                None,
+                None,
+            ),
+            ControlRequest::AbandonUpload { stage, .. } => (
+                UploadControl::Abandon { stage },
+                UploadWork::Abandon {
+                    session_id: context.host_session_id().to_owned(),
+                    stage,
+                },
+                None,
+                None,
+            ),
+            _ => unreachable!("upload_control receives only the four local upload operations"),
+        };
+        let mut gates = vec![
+            self.generation_alive.clone(),
+            self.clients[&client].alive.clone(),
+        ];
+        if let Some(gate) = claim_gate {
+            gates.push(gate);
+        }
+        self.queue_upload(UploadAdmission {
+            client,
+            local_id: id,
+            operation,
+            work,
+            claim,
+            gates,
+            context: Some(context),
+        });
+    }
+
+    fn queue_upload(&mut self, admission: UploadAdmission) {
+        let UploadAdmission {
+            client,
+            local_id,
+            operation,
+            work,
+            claim,
+            mut gates,
+            context,
+        } = admission;
+        let Some(outer) = self.next_outer.checked_add(1) else {
+            self.end_generation("host upload ID exhausted");
+            return;
+        };
+        self.next_outer = outer;
+        let phase = Arc::new(AtomicU8::new(JOB_QUEUED));
+        let scope_fence = (!operation.cleanup()).then(|| Arc::new(AtomicBool::new(true)));
+        if let Some(gate) = &scope_fence {
+            gates.push(gate.clone());
+        }
+        let charge = self.current_charge.clone();
+        self.pending.insert(
+            outer,
+            Pending {
+                client,
+                kind: PendingKind::Upload(PendingUpload {
+                    local_id,
+                    operation,
+                    claim,
+                    phase: phase.clone(),
+                    interrupted: None,
+                    _charge: charge.clone(),
+                }),
+                dispatch: Arc::new(AtomicU8::new(QUEUED)),
+                wire_context: context,
+                scope_fence,
+            },
+        );
+        let job = UploadJob {
+            id: outer,
+            work,
+            phase,
+            gates,
+            _charge: charge,
+        };
+        let submitted = self
+            .uploads
+            .as_ref()
+            .expect("upload service was checked")
+            .try_submit(job);
+        if submitted.is_err() {
+            let Some(pending) = self.pending.remove(&outer) else {
+                return;
+            };
+            let PendingKind::Upload(upload) = pending.kind else {
+                unreachable!()
+            };
+            // The queue rejected ownership; no filesystem effect can start.
+            let _ = cancel_queued(&upload.phase);
+            if let UploadControl::RetireTab { outcome, .. } = upload.operation {
+                self.upload_retirement_reply(
+                    client,
+                    local_id,
+                    upload.claim,
+                    *outcome,
+                    false,
+                    Some("host upload cleanup worker did not admit work".into()),
+                );
+                return;
+            }
+            self.upload_reply(
+                client,
+                local_id,
+                ControlOutcome::NotDispatched {
+                    kind: "request_budget".into(),
+                    message: "host upload worker did not admit this operation".into(),
+                    details: None,
+                },
+            );
+        }
+    }
+
+    fn upload_reply(&mut self, client: ClientId, id: u64, outcome: ControlOutcome) {
+        self.upload_reply_custody(client, id, outcome, None);
+    }
+
+    fn upload_reply_custody(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        mut outcome: ControlOutcome,
+        fact: Option<UploadCustodyFact>,
+    ) {
+        if let (Some(fact), ControlOutcome::Unknown { details, .. }) = (fact, &mut outcome) {
+            let details = details.get_or_insert_with(|| json!({}));
+            details["hostUploadCustody"] = fact.value();
+        }
+        let event = ControlEvent::Reply { id, outcome };
+        match self.budget.try_charge(&event) {
+            Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
+            Err(_) => {
+                // Fixed source-derived custody survives a full variable byte
+                // budget. The client has its exact issued operation/context;
+                // this marker grants no paths or usable new upload stage.
+                let known_unsent = matches!(
+                    &event,
+                    ControlEvent::Reply {
+                        outcome: ControlOutcome::NotDispatched { .. },
+                        ..
+                    }
+                );
+                let details = fact.map(|fact| json!({"hostUploadCustody":fact.value()}));
+                let outcome = if known_unsent {
+                    ControlOutcome::NotDispatched {
+                        kind: "upload_not_dispatched".into(),
+                        message: "local upload did not enter filesystem work".into(),
+                        details: None,
+                    }
+                } else {
+                    ControlOutcome::Unknown{reason:"host upload variable receipt was not admitted; resource custody remains unknown".into(),details}
+                };
+                self.queue_control_delivery(
+                    client,
+                    Queued::new(ControlEvent::Reply { id, outcome }, None),
+                );
+                self.fence_upload_delivery_owner(client);
+            }
+        }
+    }
+
+    fn fence_upload_delivery_owner(&mut self, client: ClientId) {
+        let Some(state) = self.clients.get_mut(&client) else {
+            return;
+        };
+        let first = !state.closing;
+        state.closing = true;
+        state.alive.store(false, Ordering::SeqCst);
+        if first {
+            state.deferred_generation_close=Some(Queued::new(ControlEvent::GenerationClosed{reason:"owner upload delivery admission closed; existing resource custody is retained".into()},None));
+            // Logical admission closure adds no native effect or early EOF.
+            // Other running jobs retain their sole custody terminal; only
+            // actual IPC EOF invokes the existing native CloseOwner route.
+            self.interrupt_uploads(
+                Some(client),
+                "upload I/O completed after delivery admission closed",
+            );
+        }
+    }
+
+    fn upload_event(&mut self, event: UploadEvent) {
+        match event {
+            UploadEvent::Authorize { id, owner, reply } => {
+                let answer = self.authorize_upload(id, &owner);
+                let _ = reply.send(answer);
+            }
+            UploadEvent::Completed(completion) => self.upload_completed(completion),
+        }
+    }
+
+    fn authorize_upload(
+        &mut self,
+        id: u64,
+        owner: &UploadOwner,
+    ) -> Result<Vec<Arc<AtomicBool>>, &'static str> {
+        let pending = self
+            .pending
+            .get_mut(&id)
+            .ok_or("upload operation is no longer pending")?;
+        let PendingKind::Upload(upload) = &mut pending.kind else {
+            return Err("upload operation identity changed");
+        };
+        let context = pending
+            .wire_context
+            .as_ref()
+            .ok_or("upload context is unavailable")?;
+        if self.stopped
+            || !self.generation_alive.load(Ordering::SeqCst)
+            || owner.session_id != context.host_session_id()
+        {
+            return Err("upload owner or generation is unavailable");
+        }
+        let client = self
+            .clients
+            .get(&pending.client)
+            .filter(|state| state.alive.load(Ordering::SeqCst) && !state.closing)
+            .ok_or("upload connection is closed")?;
+        let mut gates = vec![self.generation_alive.clone(), client.alive.clone()];
+        if !upload.operation.cleanup() {
+            let (token, claim) = self
+                .claims
+                .iter()
+                .find(|(_, claim)| {
+                    claim.client == pending.client
+                        && claim.tab_id == owner.tab_id
+                        && claim.target_id == owner.target_id
+                        && claim.alive.load(Ordering::SeqCst)
+                        && !claim.cleanup_only
+                        && !claim.cdp_fenced
+                })
+                .ok_or("upload's actual physical claim is unavailable")?;
+            upload.claim = Some(token.clone());
+            gates.push(claim.alive.clone());
+            if let Some(scope) = &pending.scope_fence {
+                gates.push(scope.clone());
+            }
+        }
+        Ok(gates)
+    }
+
+    fn upload_completed(&mut self, completion: UploadCompletion) {
+        let Some(pending) = self.pending.remove(&completion.id) else {
+            return;
+        };
+        if !matches!(&pending.kind, PendingKind::Upload(_)) {
+            self.pending.insert(completion.id, pending);
+            return;
+        }
+        let PendingKind::Upload(upload) = pending.kind else {
+            unreachable!("upload kind was checked")
+        };
+        if completion.phase != upload.phase.load(Ordering::SeqCst)
+            || !matches!(completion.phase, JOB_COMPLETED | JOB_CANCELLED)
+        {
+            if let UploadControl::RetireTab { outcome, .. } = upload.operation {
+                self.upload_retirement_reply(
+                    pending.client,
+                    upload.local_id,
+                    upload.claim,
+                    *outcome,
+                    false,
+                    Some("host upload cleanup completion phase is unavailable".into()),
+                );
+                self.finish_upload_generation();
+                return;
+            }
+            self.upload_reply(
+                pending.client,
+                upload.local_id,
+                ControlOutcome::Unknown {
+                    reason: "host upload completion phase is unavailable".into(),
+                    details: None,
+                },
+            );
+            return;
+        }
+        let fact = match (&upload.operation, &completion.result) {
+            (UploadControl::Begin { .. }, Ok(UploadWorkResult::Begun(stage))) => {
+                Some(UploadCustodyFact::Begun(*stage))
+            }
+            (
+                UploadControl::Begin { .. },
+                Err(UploadWorkerError::Resource(UploadError::BeginIo { stage, .. })),
+            ) => Some(UploadCustodyFact::PartialBegin(*stage)),
+            (UploadControl::Write { stage, .. }, Ok(UploadWorkResult::Written)) => {
+                Some(UploadCustodyFact::ChunkWritten(*stage))
+            }
+            (
+                UploadControl::Retain { stage },
+                Ok(UploadWorkResult::Retained(_) | UploadWorkResult::RetainedUnexposed),
+            ) => Some(UploadCustodyFact::Retained(*stage)),
+            (UploadControl::Retain { stage }, Err(UploadWorkerError::RetainedPlacement { .. })) => {
+                Some(UploadCustodyFact::Retained(*stage))
+            }
+            (UploadControl::Abandon { stage }, Ok(UploadWorkResult::Abandoned)) => {
+                Some(UploadCustodyFact::Abandoned(*stage))
+            }
+            _ => None,
+        };
+        let owner_ended = self
+            .clients
+            .get(&pending.client)
+            .is_none_or(|state| state.closing || !state.alive.load(Ordering::SeqCst));
+        let interrupted = upload
+            .interrupted
+            .or(owner_ended.then_some("upload I/O completed after its owner admission ended"))
+            .or_else(|| {
+                pending
+                    .scope_fence
+                    .as_ref()
+                    .filter(|gate| !gate.load(Ordering::SeqCst))
+                    .map(|_| "upload I/O completed after its captured execution scope ended")
+            });
+        if let UploadControl::RetireTab { owner, outcome } = upload.operation {
+            if pending
+                .wire_context
+                .as_ref()
+                .is_none_or(|context| owner.session_id != context.host_session_id())
+            {
+                self.upload_retirement_reply(
+                    pending.client,
+                    upload.local_id,
+                    upload.claim,
+                    *outcome,
+                    false,
+                    Some("host upload cleanup lost its captured session identity".into()),
+                );
+                self.finish_upload_generation();
+                return;
+            }
+            let (cleanup_confirmed, error) = match completion.result {
+                Ok(UploadWorkResult::TabRetired) => (true, None),
+                Ok(_) => (false, Some("host upload cleanup result changed".into())),
+                Err(error) => (false, Some(error.to_string())),
+            };
+            self.upload_retirement_reply(
+                pending.client,
+                upload.local_id,
+                upload.claim,
+                *outcome,
+                cleanup_confirmed,
+                error,
+            );
+            self.finish_upload_generation();
+            return;
+        }
+        let outcome = match completion.result {
+            Ok(result) => {
+                let result = match (&upload.operation, result) {
+                    (UploadControl::Begin { owner, files }, UploadWorkResult::Begun(stage)) => {
+                        json!({"stage":stage,"tabId":owner.tab_id,"targetId":owner.target_id,"files":files.as_ref()})
+                    }
+                    (
+                        UploadControl::Write {
+                            stage,
+                            file_index,
+                            offset,
+                            bytes,
+                        },
+                        UploadWorkResult::Written,
+                    ) => {
+                        json!({"stage":stage,"fileIndex":file_index,"offset":offset,"bytes":bytes,"written":true})
+                    }
+                    (UploadControl::Retain { .. }, UploadWorkResult::RetainedUnexposed) => {
+                        self.upload_reply_custody(pending.client,upload.local_id,ControlOutcome::Unknown{reason:"actual retained backing paths were not admitted to this transport".into(),details:None},fact);
+                        self.finish_upload_generation();
+                        return;
+                    }
+                    (UploadControl::Retain { stage }, UploadWorkResult::Retained(paths)) => {
+                        let paths = match serde_json::to_value(paths) {
+                            Ok(paths) => paths,
+                            Err(_) => {
+                                self.upload_reply_custody(pending.client,upload.local_id,ControlOutcome::Unknown{reason:"retained upload backing paths cannot be represented by this JSON transport".into(),details:None},fact);
+                                self.finish_upload_generation();
+                                return;
+                            }
+                        };
+                        json!({"stage":stage,"retained":true,"paths":paths})
+                    }
+                    (UploadControl::Abandon { stage }, UploadWorkResult::Abandoned) => {
+                        json!({"stage":stage,"abandoned":true})
+                    }
+                    _ => {
+                        self.upload_reply(
+                            pending.client,
+                            upload.local_id,
+                            ControlOutcome::Unknown {
+                                reason: "host upload result changed its issued operation".into(),
+                                details: None,
+                            },
+                        );
+                        self.finish_upload_generation();
+                        return;
+                    }
+                };
+                if let Some(reason) = interrupted {
+                    ControlOutcome::Unknown {
+                        reason: reason.into(),
+                        details: Some(json!({"acknowledgedResult":result})),
+                    }
+                } else {
+                    ControlOutcome::Result(result)
+                }
+            }
+            Err(error) => {
+                if completion.phase == JOB_CANCELLED {
+                    ControlOutcome::NotDispatched {
+                        kind: "upload_not_dispatched".into(),
+                        message: error.to_string(),
+                        details: None,
+                    }
+                } else {
+                    let details = match (&upload.operation, &error) {
+                        (
+                            UploadControl::Begin { owner, files },
+                            UploadWorkerError::Resource(UploadError::BeginIo { stage, .. }),
+                        ) => Some(
+                            json!({"uploadStage":{"stage":stage,"tabId":owner.tab_id,"targetId":owner.target_id,"files":files.as_ref()}}),
+                        ),
+                        _ => None,
+                    };
+                    match error {
+                        UploadWorkerError::Resource(UploadError::Refused(reason))
+                            if interrupted.is_none() =>
+                        {
+                            ControlOutcome::ConnectorRejected {
+                                kind: "upload_refused".into(),
+                                message: reason.into(),
+                                details,
+                            }
+                        }
+                        error => ControlOutcome::Unknown {
+                            reason: error.to_string(),
+                            details,
+                        },
+                    }
+                }
+            }
+        };
+        self.upload_reply_custody(pending.client, upload.local_id, outcome, fact);
+        self.finish_upload_generation();
+    }
+
+    fn interrupt_uploads(&mut self, client: Option<ClientId>, reason: &'static str) {
+        let ids = self
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                (client.is_none_or(|client| client == pending.client)
+                    && matches!(pending.kind, PendingKind::Upload(_)))
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            let Some(mut pending) = self.pending.remove(&id) else {
+                continue;
+            };
+            let PendingKind::Upload(upload) = &mut pending.kind else {
+                unreachable!()
+            };
+            // Tab retirement is host-resource cleanup, not client-owned work.
+            if client.is_some() && matches!(upload.operation, UploadControl::RetireTab { .. }) {
+                self.pending.insert(id, pending);
+                continue;
+            }
+            if cancel_queued(&upload.phase) {
+                let PendingKind::Upload(upload) = pending.kind else {
+                    unreachable!()
+                };
+                if let UploadControl::RetireTab { outcome, .. } = upload.operation {
+                    self.upload_retirement_reply(
+                        pending.client,
+                        upload.local_id,
+                        upload.claim,
+                        *outcome,
+                        false,
+                        Some("host upload cleanup was cancelled before filesystem work".into()),
+                    );
+                    continue;
+                }
+                self.upload_reply(
+                    pending.client,
+                    upload.local_id,
+                    ControlOutcome::NotDispatched {
+                        kind: "upload_not_dispatched".into(),
+                        message: "queued upload was cancelled before filesystem work".into(),
+                        details: None,
+                    },
+                );
+            } else {
+                upload.interrupted = Some(reason);
+                self.pending.insert(id, pending);
+            }
+        }
+    }
+
+    fn upload_retirement_reply(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        claim: Option<String>,
+        outcome: ControlOutcome,
+        confirmed: bool,
+        error: Option<String>,
+    ) {
+        if let Some(claim) = claim {
+            let event = ControlEvent::EffectsCleanup {
+                claim: claim.clone(),
+                effect: "upload_backing".into(),
+                cleanup_confirmed: confirmed,
+                error,
+            };
+            match self.budget.try_charge(&event) {
+                Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
+                Err(_) => {
+                    self.queue_control_delivery(client,Queued::new(ControlEvent::EffectsCleanup{claim,effect:"upload_backing".into(),cleanup_confirmed:confirmed,error:(!confirmed).then(||"upload backing cleanup remains unconfirmed; variable receipt was not admitted".into())},None));
+                    self.fence_upload_delivery_owner(client);
+                }
+            }
+        }
+        let physical = match &outcome {
+            ControlOutcome::Result(result) => Some(result),
+            ControlOutcome::Unknown {
+                details: Some(details),
+                ..
+            } => details
+                .get("acknowledgedResult")
+                .or_else(|| details.get("physicalProof")),
+            _ => None,
+        }
+        .filter(|result| result["closed"] == true)
+        .and_then(|result| match result["proof"].as_str() {
+            Some("close_ack") => Some(json!({"closed":true,"proof":"close_ack"})),
+            Some("tab_removed") => Some(json!({"closed":true,"proof":"tab_removed"})),
+            _ => None,
+        });
+        let event = ControlEvent::Reply { id, outcome };
+        match self.budget.try_charge(&event) {
+            Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
+            Err(_) => {
+                self.queue_control_delivery(client,Queued::new(ControlEvent::Reply{id,outcome:ControlOutcome::Unknown{reason:"actual Chrome close acknowledged; variable resource cleanup receipt was not admitted".into(),details:physical.map(|physical|json!({"physicalProof":physical}))}},None));
+                self.fence_upload_delivery_owner(client);
+            }
+        }
+    }
+
+    fn resource_work_pending(&self, client: ClientId) -> bool {
+        self.pending.values().any(|pending| {
+            pending.client == client
+                && matches!(
+                    pending.kind,
+                    PendingKind::Upload(_)
+                        | PendingKind::Control {
+                            operation: ControlKind::Close(_),
+                            ..
+                        }
+                )
+        })
+    }
+
+    fn finish_upload_generation(&mut self) {
+        if !self.stopped {
+            let ready = self
+                .clients
+                .keys()
+                .copied()
+                .filter(|client| {
+                    self.clients[client]
+                        .controls_in_flight
+                        .load(Ordering::SeqCst)
+                        == 0
+                        && !self.pending.values().any(|pending| {
+                            pending.client == *client
+                                && matches!(pending.kind, PendingKind::Upload(_))
+                        })
+                })
+                .collect::<Vec<_>>();
+            for client in ready {
+                if let Some(event) = self
+                    .clients
+                    .get_mut(&client)
+                    .and_then(|state| state.deferred_generation_close.take())
+                {
+                    self.queue_control_delivery(client, event);
+                }
+            }
+
+            let retired = self
+                .clients
+                .iter()
+                .filter_map(|(id, state)| {
+                    (state.closing
+                        && matches!(state.extension_cleanup, OwnerCleanup::Confirmed)
+                        && state.controls_in_flight.load(Ordering::SeqCst) == 0
+                        && !self.resource_work_pending(*id))
+                    .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in retired {
+                if let Some(client) = self.clients.remove(&id) {
+                    self.owners.remove(&client.owner);
+                }
+            }
+        }
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending.kind, PendingKind::Upload(_)))
+            || self
+                .clients
+                .values()
+                .any(|state| state.controls_in_flight.load(Ordering::SeqCst) != 0)
+        {
+            return;
+        }
+        if let Some(reason) = self.closing_uploads.take() {
+            self.generation_closed_receipts(&reason);
+        }
+    }
+
+    fn generation_closed_receipts(&mut self, reason: &str) {
+        for client in self.clients.keys().copied().collect::<Vec<_>>() {
+            if let Some(state) = self.clients.get_mut(&client) {
+                state.deferred_generation_close = None;
+            }
+            self.queue_control_delivery(
+                client,
+                Queued::new(
+                    ControlEvent::GenerationClosed {
+                        reason: reason.to_owned(),
+                    },
+                    None,
+                ),
+            );
+        }
+        self.budget.close();
+    }
+
     fn control(
         &mut self,
         client: ClientId,
@@ -1423,6 +2393,29 @@ impl ExtensionHostBroker {
             || state.closing
             || (state.delivery_blocked && !cleanup)
         {
+            if matches!(
+                &request,
+                ControlRequest::BeginUpload { .. }
+                    | ControlRequest::WriteUploadChunk { .. }
+                    | ControlRequest::RetainUploadForSelection { .. }
+                    | ControlRequest::AbandonUpload { .. }
+            ) {
+                let outcome = if id == 0 || id <= state.high_water {
+                    ControlOutcome::ConnectorRejected {
+                        kind: "duplicate_local_id".into(),
+                        message: "local upload IDs cannot alias an earlier request".into(),
+                        details: None,
+                    }
+                } else {
+                    state.high_water = id;
+                    ControlOutcome::NotDispatched{kind:"owner_closed".into(),message:"upload admission closed before this queued request entered filesystem work".into(),details:None}
+                };
+                self.queue_control_delivery(
+                    client,
+                    Queued::new(ControlEvent::Reply { id, outcome }, None),
+                );
+                return;
+            }
             if matches!(
                 request,
                 ControlRequest::FenceCdp { .. } | ControlRequest::RetireClaim { .. }
@@ -1506,6 +2499,16 @@ impl ExtensionHostBroker {
                 "extension cleanup control budget exhausted; connection EOF still reserves closeOwner",
                 output,
             );
+            return;
+        }
+        if matches!(
+            &request,
+            ControlRequest::BeginUpload { .. }
+                | ControlRequest::WriteUploadChunk { .. }
+                | ControlRequest::RetainUploadForSelection { .. }
+                | ControlRequest::AbandonUpload { .. }
+        ) {
+            self.upload_control(client, request, output);
             return;
         }
         let fixed_session = matches!(
@@ -1960,10 +2963,16 @@ impl ExtensionHostBroker {
                     );
                     return;
                 }
+                let record = &self.claims[&claim];
+                let identity = ClosingClaim {
+                    claim: claim.clone(),
+                    tab_id: record.tab_id,
+                    target_id: record.target_id.clone(),
+                };
                 (
                     "closeTab",
                     json!({"claim":claim}),
-                    ControlKind::Close(claim),
+                    ControlKind::Close(identity),
                 )
             }
             ControlRequest::ClearScopedHeaders { claim, .. } => {
@@ -2141,6 +3150,15 @@ impl ExtensionHostBroker {
         // already owns its route's atomic gate, so retiring those routes and
         // refusing future binds fences CDP without revoking header cleanup.
         record.cdp_fenced = true;
+        for pending in self.pending.values() {
+            if let PendingKind::Upload(upload) = &pending.kind {
+                if upload.claim.as_deref() == Some(claim) && !upload.operation.cleanup() {
+                    if let Some(gate) = &pending.scope_fence {
+                        gate.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
         let routes = self
             .routes
             .iter()
@@ -2370,7 +3388,8 @@ impl ExtensionHostBroker {
             .filter(|pending| {
                 matches!(
                     pending.kind,
-                    PendingKind::Cdp { .. }
+                    PendingKind::Upload(_)
+                        | PendingKind::Cdp { .. }
                         | PendingKind::Control {
                             operation: ControlKind::Inventory
                                 | ControlKind::Resolve
@@ -2534,9 +3553,25 @@ impl ExtensionHostBroker {
         // proof. Do not recurse through route cleanup or extension EOF while
         // emitting EOF metadata under an exhausted byte budget.
         if first_failure {
-            self.queue_control_delivery(client, Queued::new(ControlEvent::GenerationClosed {
-                reason: "owner CDP delivery budget exhausted; invocation and effect settlement remain unknown".to_owned(),
-            }, None));
+            let event=Queued::new(ControlEvent::GenerationClosed{reason:"owner CDP delivery budget exhausted; invocation and effect settlement remain unknown".to_owned()},None);
+            if self.clients[&client]
+                .controls_in_flight
+                .load(Ordering::SeqCst)
+                != 0
+                || self.pending.values().any(|pending| {
+                    pending.client == client && matches!(pending.kind, PendingKind::Upload(_))
+                })
+            {
+                if let Some(state) = self.clients.get_mut(&client) {
+                    state.deferred_generation_close = Some(event);
+                }
+                self.interrupt_uploads(
+                    Some(client),
+                    "upload I/O completed after CDP delivery admission ended",
+                );
+            } else {
+                self.queue_control_delivery(client, event);
+            }
         }
     }
 
@@ -2621,12 +3656,13 @@ impl ExtensionHostBroker {
         let Some(state) = self.clients.get_mut(&client) else {
             return;
         };
-        if state.closing {
+        if !matches!(state.extension_cleanup, OwnerCleanup::Unrequested) {
             return;
         }
         state.closing = true;
         state.alive.store(false, Ordering::SeqCst);
         state.early.clear();
+        self.interrupt_uploads(Some(client), "upload I/O completed after its owner ended");
         for claim in self.claims.values().filter(|claim| claim.client == client) {
             claim.alive.store(false, Ordering::SeqCst);
         }
@@ -2646,7 +3682,16 @@ impl ExtensionHostBroker {
             .pending
             .iter()
             .filter(|(_, pending)| {
-                pending.client == client && matches!(pending.kind, PendingKind::Control { .. })
+                pending.client == client
+                    && matches!(pending.kind, PendingKind::Control { .. })
+                    && !(self.uploads.is_some()
+                        && matches!(
+                            pending.kind,
+                            PendingKind::Control {
+                                operation: ControlKind::Close(_),
+                                ..
+                            }
+                        ))
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
@@ -2669,6 +3714,7 @@ impl ExtensionHostBroker {
                 );
             }
         }
+        let previous_outer = self.next_outer;
         self.enqueue(
             client,
             "closeOwner",
@@ -2677,6 +3723,19 @@ impl ExtensionHostBroker {
             None,
             output,
         );
+        // Set Requested only after the actual existing Pending/outbound was
+        // created. A failed/unknown later attempt remains Requested, not retry.
+        if self.next_outer > previous_outer
+            && self.pending.get(&self.next_outer).is_some_and(|pending| {
+                pending.client == client && matches!(pending.kind, PendingKind::CloseOwner)
+            })
+        {
+            if let Some(state) = self.clients.get_mut(&client) {
+                state.extension_cleanup = OwnerCleanup::Requested {
+                    outer_id: self.next_outer,
+                };
+            }
+        }
     }
 
     fn emit_control(
@@ -2950,6 +4009,8 @@ impl ExtensionHostBroker {
                     "extension hello lacks actual capability flags".to_owned(),
                 ));
             }
+            let mut capabilities = value["capabilities"].clone();
+            capabilities["uploadStaging"] = json!(self.uploads.is_some());
             self.identity = Some(ExtensionIdentity {
                 extension_id: value["extensionId"]
                     .as_str()
@@ -2960,7 +4021,7 @@ impl ExtensionHostBroker {
                     .expect("hello instance was checked")
                     .to_owned(),
                 generation: self.generation.clone(),
-                capabilities: value["capabilities"].clone(),
+                capabilities,
             });
             self.bound = true;
             output.push(ExtensionOutbound {
@@ -3046,6 +4107,15 @@ impl ExtensionHostBroker {
     ) -> Result<(), BrokerError> {
         let outer = canonical_id(value["id"].as_str())
             .ok_or_else(|| BrokerError::Protocol("invalid outer response ID".to_owned()))?;
+        if self
+            .pending
+            .get(&outer)
+            .is_some_and(|pending| matches!(pending.kind, PendingKind::Upload(_)))
+        {
+            return Err(BrokerError::Protocol(
+                "extension reply cannot settle host-local upload work".to_owned(),
+            ));
+        }
         if let ExtensionReplyProvenance::Matched(proof) = &provenance {
             if let Some(pending) = self.pending.get(&outer) {
                 let owner = self
@@ -3099,6 +4169,9 @@ impl ExtensionHostBroker {
             ));
         }
         match pending.kind {
+            PendingKind::Upload(_) => {
+                unreachable!("local upload completions use typed worker input")
+            }
             PendingKind::Cdp {
                 route,
                 claim,
@@ -3318,14 +4391,44 @@ impl ExtensionHostBroker {
                         ControlOutcome::Result(result)
                     }
                 };
-                self.emit_control(
-                    pending.client,
-                    ControlEvent::Reply {
-                        id: local_id,
-                        outcome,
-                    },
-                    output,
-                );
+                let cleanup_owner = match (&operation, pending.wire_context.as_ref()) {
+                    (ControlKind::Close(issued), Some(context))
+                        if self.uploads.is_some() && known_upload_close(&outcome, issued) =>
+                    {
+                        Some((
+                            UploadOwner {
+                                session_id: context.host_session_id().to_owned(),
+                                tab_id: issued.tab_id,
+                                target_id: issued.target_id.clone(),
+                            },
+                            issued.claim.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some((owner, claim)) = cleanup_owner {
+                    self.queue_upload(UploadAdmission {
+                        client: pending.client,
+                        local_id,
+                        operation: UploadControl::RetireTab {
+                            owner: owner.clone(),
+                            outcome: Box::new(outcome),
+                        },
+                        work: UploadWork::RetireTab { owner },
+                        claim: Some(claim),
+                        gates: vec![self.generation_alive.clone()],
+                        context: pending.wire_context.clone(),
+                    });
+                } else {
+                    self.emit_control(
+                        pending.client,
+                        ControlEvent::Reply {
+                            id: local_id,
+                            outcome,
+                        },
+                        output,
+                    );
+                }
                 if let Some(client) = self.clients.get_mut(&pending.client) {
                     if client.attaching.is_empty() {
                         client.early.clear();
@@ -3333,17 +4436,22 @@ impl ExtensionHostBroker {
                 }
             }
             PendingKind::CloseOwner => {
-                if value["result"]["cleanupConfirmed"] == true {
-                    if let Some(client) = self.clients.remove(&pending.client) {
-                        self.owners.remove(&client.owner);
+                if value["result"]["cleanupConfirmed"] == true
+                    && self.clients.get(&pending.client).is_some_and(|client| {
+                        matches!(client.extension_cleanup, OwnerCleanup::Requested {outer_id} if outer_id==outer)
+                    })
+                {
+                    if let Some(client) = self.clients.get_mut(&pending.client) {
+                        client.extension_cleanup = OwnerCleanup::Confirmed;
                     }
-                    self.claims
-                        .retain(|_, claim| claim.client != pending.client);
+                    self.claims.retain(|_, claim| claim.client != pending.client);
+                    self.finish_upload_generation();
                 }
                 // A rejection or cleanupConfirmed=false retains the closed-owner
                 // tombstone. No retry or fabricated successful cleanup occurs.
             }
         }
+        self.finish_upload_generation();
         Ok(())
     }
 
@@ -3364,11 +4472,11 @@ impl ExtensionHostBroker {
             {
                 Some(claim)
             }
-            ControlKind::Close(claim)
+            ControlKind::Close(issued)
                 if result["closed"] == true
                     && matches!(result["proof"].as_str(), Some("close_ack" | "tab_removed")) =>
             {
-                Some(claim)
+                Some(&issued.claim)
             }
             _ => None,
         };
@@ -3902,7 +5010,10 @@ impl ExtensionHostBroker {
         for route in routes_with_pending {
             self.route_unconfirmed(route, None);
         }
-        self.budget.close();
+        self.interrupt_uploads(
+            None,
+            "upload I/O completed after its extension generation ended",
+        );
         let routes = self.routes.keys().copied().collect::<Vec<_>>();
         for route in routes {
             self.retire_route(
@@ -3910,22 +5021,13 @@ impl ExtensionHostBroker {
                 &format!("extension generation ended: {reason}; do not replay"),
             );
         }
-        let clients = self.clients.keys().copied().collect::<Vec<_>>();
-        for client in clients {
-            if let Some(state) = self.clients.get(&client) {
-                state.alive.store(false, Ordering::SeqCst);
-            }
-            self.queue_control_delivery(
-                client,
-                Queued::new(
-                    ControlEvent::GenerationClosed {
-                        reason: reason.to_owned(),
-                    },
-                    None,
-                ),
-            );
+        for state in self.clients.values() {
+            state.alive.store(false, Ordering::SeqCst);
         }
-        self.pending.clear();
+        self.pending
+            .retain(|_, pending| matches!(pending.kind, PendingKind::Upload(_)));
+        self.closing_uploads = Some(reason.to_owned());
+        self.finish_upload_generation();
         for claim in self.claims.values() {
             claim.alive.store(false, Ordering::SeqCst);
         }
@@ -3954,6 +5056,9 @@ impl ExtensionHostBroker {
             "extension command was fenced before any write"
         };
         match pending.kind {
+            PendingKind::Upload(_) => {
+                unreachable!("filesystem jobs never enter the extension writer")
+            }
             PendingKind::Cdp {
                 route,
                 claim,
@@ -4058,6 +5163,9 @@ impl ExtensionHostBroker {
         output: &mut Vec<ExtensionOutbound>,
     ) {
         match pending.kind {
+            PendingKind::Upload(_) => {
+                unreachable!("filesystem jobs never enter the extension writer")
+            }
             PendingKind::Cdp {
                 route,
                 claim,
@@ -4101,6 +5209,102 @@ impl ExtensionHostBroker {
             PendingKind::CloseOwner => {}
         }
     }
+}
+
+fn prepare_upload_completion(
+    mut completion: UploadCompletion,
+    budget: &ByteBudget,
+) -> (UploadCompletion, Option<Arc<ByteCharge>>) {
+    // Never wait for a second permit while the original request's Pending/job
+    // still owns the budget. A fixed Unknown preserves host resource custody.
+    let charge = upload_completion_payload(&completion)
+        .ok()
+        .and_then(|payload| budget.try_charge(&payload).ok());
+    if charge.is_none() {
+        bound_undelivered_upload_completion(&mut completion);
+    }
+    (completion, charge)
+}
+
+fn upload_completion_payload(completion: &UploadCompletion) -> Result<Value, serde_json::Error> {
+    let payload = match &completion.result {
+        Ok(UploadWorkResult::Retained(paths)) => {
+            json!({"kind":"retained","paths":serde_json::to_value(paths)?})
+        }
+        Ok(UploadWorkResult::RetainedUnexposed) => json!({"kind":"retainedUnexposed"}),
+        Ok(UploadWorkResult::Begun(stage)) => json!({"kind":"begun","stage":stage}),
+        Ok(UploadWorkResult::Written) => json!({"kind":"written"}),
+        Ok(UploadWorkResult::Abandoned) => json!({"kind":"abandoned"}),
+        Ok(UploadWorkResult::TabRetired) => json!({"kind":"tabRetired"}),
+        Err(error) => json!({"kind":"unknown","error":error.to_string()}),
+    };
+    Ok(json!({"id":completion.id,"phase":completion.phase,"result":payload}))
+}
+
+fn bound_undelivered_upload_completion(completion: &mut UploadCompletion) {
+    let error =
+        || std::io::Error::other("host upload completion was not admitted to the bounded queue");
+    completion.result = match std::mem::replace(
+        &mut completion.result,
+        Err(UploadWorkerError::StateUnavailable),
+    ) {
+        // Preserve fixed positive addresses; no variable paths may bypass a
+        // closed/saturated byte budget and no later setter is authorized.
+        Ok(UploadWorkResult::Begun(stage)) => Ok(UploadWorkResult::Begun(stage)),
+        Ok(UploadWorkResult::Retained(_) | UploadWorkResult::RetainedUnexposed)
+        | Err(UploadWorkerError::RetainedPlacement { .. }) => {
+            Ok(UploadWorkResult::RetainedUnexposed)
+        }
+        Ok(UploadWorkResult::Written) => Ok(UploadWorkResult::Written),
+        Ok(UploadWorkResult::Abandoned) => Ok(UploadWorkResult::Abandoned),
+        Ok(UploadWorkResult::TabRetired) => Ok(UploadWorkResult::TabRetired),
+        Err(UploadWorkerError::Resource(UploadError::BeginIo { stage, .. })) => {
+            Err(UploadWorkerError::Resource(UploadError::BeginIo {
+                stage,
+                error: error(),
+            }))
+        }
+        _ => Err(UploadWorkerError::Resource(UploadError::Io(error()))),
+    };
+}
+
+fn decode_upload_chunk(encoded: &str) -> Result<Vec<u8>, &'static str> {
+    if encoded.len() > EXTENSION_UPLOAD_CHUNK_BYTES.div_ceil(3) * 4 {
+        return Err("encoded upload chunk exceeds 64 KiB");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "upload chunk is not valid base64")?;
+    if bytes.is_empty() || bytes.len() > EXTENSION_UPLOAD_CHUNK_BYTES {
+        return Err("upload chunk must contain 1 through 65536 bytes");
+    }
+    Ok(bytes)
+}
+
+fn known_upload_close(outcome: &ControlOutcome, issued: &ClosingClaim) -> bool {
+    let result = match outcome {
+        ControlOutcome::Result(result) => Some(result),
+        ControlOutcome::Unknown {
+            details: Some(details),
+            ..
+        } => details
+            .get("acknowledgedResult")
+            .or_else(|| details.get("physicalProof")),
+        _ => None,
+    };
+    result.is_some_and(|result| {
+        result["closed"] == true
+            && matches!(result["proof"].as_str(), Some("close_ack" | "tab_removed"))
+            && result
+                .get("claim")
+                .is_none_or(|value| value.as_str() == Some(issued.claim.as_str()))
+            && result
+                .get("tabId")
+                .is_none_or(|value| value.as_u64() == Some(issued.tab_id))
+            && result
+                .get("targetId")
+                .is_none_or(|value| value.as_str() == Some(issued.target_id.as_str()))
+    })
 }
 
 pub(crate) fn canonical_id(value: Option<&str>) -> Option<u64> {

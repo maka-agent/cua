@@ -54,6 +54,9 @@ pub mod extension_process;
 mod extension_provider;
 mod user_tab_context;
 pub use user_tab_context::{BrowserUserTabRead, BrowserWorkspaceExportFormat};
+mod extension_upload;
+mod extension_upload_placement;
+mod extension_upload_worker;
 mod extension_wire;
 mod grant;
 mod js_string;
@@ -146,6 +149,11 @@ pub use extension_provider::{
     ExtensionSessionCleanupObservation, ExtensionSessionHeaderProof, ExtensionSessionPopupRequest,
     ExtensionSessionPreparation, ExtensionSessionPreparedTab, ExtensionSessionRequestRegistration,
     ExtensionTabInfo, ExtensionUserTabsOrder,
+};
+pub use extension_provider::{
+    ExtensionRetainedUpload, ExtensionUploadAbandonAck, ExtensionUploadChunkAck,
+    ExtensionUploadDescriptorError, ExtensionUploadFile, ExtensionUploadModifiedTime,
+    ExtensionUploadStage, EXTENSION_UPLOAD_CHUNK_BYTES,
 };
 pub use local_ipc::{ExtensionEndpointIdentity, IpcError, ValidatedExtensionEndpoint};
 
