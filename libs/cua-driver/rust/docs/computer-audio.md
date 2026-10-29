@@ -76,11 +76,9 @@ host epoch needs a distinct native `public_session` in the same runtime:
 resource keys use the runtime generation and that public session, rather than
 the identity of the SDK handle. A fresh epoch then has no active recording to
 stop, while permission revocation can still discard the retained old binding.
-This host API adds no model operation or approval authority. Native completion
-notifications for macOS and Windows are source changes pending real native
-verification; no new cross-platform completion claim follows from them.
+This host API adds no model operation or approval authority.
 
-Audio has its own reviewed `system_audio_output` observation adapter. Its
+Audio uses a `system_audio_output` observation adapter. Its
 scope names the trusted runtime, session, fixed default-output loopback, and
 absence of microphone or caller-selected device. Stop also authorizes the
 owned temporary file output. A bounded manifest must explicitly set
@@ -90,61 +88,28 @@ audio opt-in and platform approval policy. In particular, the original macOS
 reference requires a high-risk session audio grant; enabling Cua alone does
 not implement that host user interface.
 
-## Evidence and verification limits
+## Platform requirements and limits
 
-The public behavior above is based on inspection of the original shipped
-runtime and its type declarations in the task-owned verified Linux development
-fixture. The private REA audit summary has evidence ID
-`ev_9015d8f727058f31eec7b97e59ef21aca32f0e2e6916347a2198a9cc377eb1dd`.
-Source artifact identity is SHA-256
-`71d2a64db3d7b74c00cdb73bf47cbee76d60e7611e4c6e23f2aced25c5c22957`.
-No original implementation or application binary is included here.
+Short Linux captures need output to be playing before capture starts. PulseAudio
+render latency can otherwise consume part of the recording interval before the
+signal reaches the monitor. Duration limits use device timestamps and do not
+guarantee an exact PCM sample count or wall-clock interval.
 
-Core tests cover options, WAV chunk validation, isolated session ownership,
-output lifetime, bounded-manifest denial, and an accepted-start/end race.
-SDK tests cover constructor registration and canonical bound-session cleanup.
-The ignored `audio_loopback_test` uses generated 440 Hz output and a private
-PulseAudio null sink through `scripts/ci/run-rust-loopback-audio-e2e.sh`; it
-must never run against a personal sound server. It checks PCM format, signal,
-returned bytes, retained completion, and native session cleanup. The runner
-does not use the caller's audio server or microphone.
+The Windows duration parser accepts null or an unsigned 32-bit integer. It
+rejects strings, fractional numbers, negative values, and larger integers before
+checking active capture or touching the previous file. Null or an absent field
+uses the default. Linux and macOS use their platform argument normalization.
 
-The Linux x86_64 SDK test passed in a disposable, network-disabled container:
-73006 exact WAV bytes, 439.69 Hz measured generated tone, identical stereo
-channels, native automatic completion, explicit end cleanup, returned-file
-retirement, and bound SDK session close cleanup. An independent original
-public-client probe in the same private null-sink fixture measured 439.85 Hz.
-The source-backed FFmpeg/Pulse pipeline uses device timestamps for its duration
-limit: the original 1500 ms automatic recording contained 0.81392 seconds of
-PCM, while this candidate run contained 0.75967 seconds. This fixture does not
-establish exact sample-count or wall-clock duration equivalence. Output must
-already be playing before short captures, because Pulse render latency can
-otherwise consume the short recording before the generated tone reaches its
-monitor. These observations do not justify changing native recording flags or
-claiming exact timing parity.
+After Windows Start consumes a previous WAV slot, terminal cleanup does not
+retry that file or recursively remove other contents of its private wrapper
+directory. It only attempts to remove that directory if empty. An unconsumed
+result and an active capture retain their session cleanup obligations. Outer
+host or operating-system temporary-file cleanup is independent of this policy.
 
-The Windows next-Start file policy is based on static inspection of the
-selected native helper, SHA-256
-`9493af2cebd3c11e2e38ce692f6ccd8e00f4320bdbbcf14f242d036a9736635f`.
-The selected field parser accepts null or an unsigned 32-bit integer, rejects
-strings, floating-point values, negative values and larger integers before
-checking active capture or touching the previous file, and treats null or an
-absent field as the default. Windows audio retains those original JSON types
-at the shared scalar-normalization boundary; Linux and macOS retain their
-existing normalization and parser. This static parser evidence is recorded in
-REA `ev_0410e5c48da4d23de959f107c47883ff7ccf03bd266b228a0254c662fde1cecd`.
-Hermetic policy tests do not prove native deletion success,
-Windows playback/capture, or error equivalence. After Windows Start consumes a
-previous WAV slot, terminal cleanup does not retry that file or recursively
-remove other contents of its private wrapper directory. It only attempts to
-remove that directory if empty. An unconsumed result and an active capture keep
-the existing session cleanup. The wrapper directory is Cua-owned transport
-storage; its recursive cleanup is not part of the observed original completed-
-slot lifecycle. This rule does not establish cleanup by an outer host or
-operating-system temporary-file policy.
+macOS requires ScreenCaptureKit permission; Windows requires an available
+WASAPI loopback endpoint. Device changes, OS permission settings, and backend
+failures can affect capture.
 
-Windows GNU cross-checks and pure timeline tests, and macOS API type checking
-and pure conversion/timeline tests, are structural evidence only. They do not
-prove native endpoint behavior, ScreenCaptureKit permissions, device changes,
-or parity with original helpers. Real task-owned macOS and Windows audio
-fixtures remain required before claiming platform behavior equivalence.
+For isolated Linux loopback checks, use
+`scripts/ci/run-rust-loopback-audio-e2e.sh`. It creates a private PulseAudio null
+sink and generated output; never run it against a personal sound server.

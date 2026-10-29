@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! Chatgpt extension wire adapter for the existing finite host and Cua provider.
+//! ChatGPT extension wire adapter for the finite Host and Cua provider.
 //!
 //! This translates transport operations. Host authorization, origin/turn policy,
 //! selectors, input, screenshots, CDP pending calls and engine state stay in the
-//! existing Host/Cua implementation. No Chatgpt application code is imported.
-//! Source-only aftercopy: compilation and integrated desktop execution are pending.
+//! Host/Cua implementation.
 
 use super::chatgpt_inventory::{
     self, AbsenceEvidence, Caller, EndpointIdentity, InventoryFreshness, KnownCreated,

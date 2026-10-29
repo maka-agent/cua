@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! Validates Chatgpt full extension inventory and narrowly scopes Created-tab absence observations.
+//! Validates full ChatGPT extension inventories and created-tab absence observations.
 //!
-//! Private source proposal; authored tests have not been compiled or executed.
-//! Source basis: current retained background.js `getUserTabs({})` selects `Uw`
-//! then `pu({})`, with no query/protocol/incognito filter and a 1000-row cap.
+//! Full inventory uses unfiltered `getUserTabs({})` with a 1000-row cap.
 //! Supplying limit/query/includeFavicons selects a different search path; that
 //! path cannot establish the full-inventory observation used here.
 

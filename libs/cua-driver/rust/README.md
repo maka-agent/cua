@@ -138,6 +138,4 @@ protocol boundaries, and the stock OpenCLI compatibility limit.
 The macOS adapter exposes owned activation observers, global and per-process
 event taps, and prepared focus events for the caller's retained input session.
 The caller supplies authorization and must seal admission before explicitly
-draining and joining these resources. These primitives do not change the
-generic desktop input route. Native macOS compilation and desktop verification
-are still pending; their presence does not establish macOS behavior parity.
+draining and joining these resources. The generic desktop input route is separate.

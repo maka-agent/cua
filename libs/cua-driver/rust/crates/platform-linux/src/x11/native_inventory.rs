@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Native candidate policy over the existing X11 inventory primitives.
-//! Seed union/order, DFS, 10,000 seen-ID limit and exact focus equality are
-//! proven by ELF6d CLI ev_ce687; the three seed/focus literals by Root's
-//! mapped fixed-byte reads. Attrs bool and type projection are independently
-//! closed below; descriptor edge cases and live behavior remain unverified.
+//! Native X11 inventory over shared window primitives.
+//!
+//! Preserves seed order, depth-first traversal, a 10,000 seen-ID limit,
+//! and exact focus equality.
 
 use super::*;
 use serde_json::{Value, json};

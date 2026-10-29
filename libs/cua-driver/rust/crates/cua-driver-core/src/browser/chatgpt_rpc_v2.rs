@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! Correlates the observed Chatgpt extension JSON-RPC without owning browser authorization or transport.
+//! Correlates ChatGPT extension JSON-RPC replies without owning browser authorization or transport.
 //!
-//! Private source proposal. Extension byte framing belongs to the existing helper boundary.
-//! The host must inject its maka authorized context before calling [`RpcCodec::begin`].
-//! No OpenAI implementation is imported. Tests below are authored, not compiled or run.
+//! Extension byte framing belongs to the helper boundary. The Host supplies its
+//! authorized context before calling [`RpcCodec::begin`].
 
 use std::collections::BTreeMap;
 use std::error::Error;
