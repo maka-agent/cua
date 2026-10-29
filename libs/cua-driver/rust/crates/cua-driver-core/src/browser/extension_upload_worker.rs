@@ -35,6 +35,7 @@ pub(super) enum UploadWork {
     Begin {
         owner: UploadOwner,
         files: Arc<Vec<ExtensionUploadFile>>,
+        producer: Arc<AtomicBool>,
     },
     Write {
         session_id: String,
@@ -53,6 +54,9 @@ pub(super) enum UploadWork {
     },
     RetireTab {
         owner: UploadOwner,
+    },
+    RetireProducer {
+        producer: Arc<AtomicBool>,
     },
 }
 
@@ -97,6 +101,7 @@ pub(super) enum UploadWorkResult {
     RetainedUnexposed,
     Abandoned,
     TabRetired,
+    ProducerRetired,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -292,6 +297,23 @@ fn execute_job(
         if job.phase.load(Ordering::SeqCst) != JOB_QUEUED {
             return Err(UploadWorkerError::StateUnavailable);
         }
+        if let UploadWork::RetireProducer { producer } = &job.work {
+            // The actor sealed this original producer before queueing cleanup.
+            // This one worker first finishes every previously accepted I/O job.
+            // Its stored stage identities, rather than a session string or a
+            // browser/pipe close, identify the unselected objects to remove.
+            return run_admitted(
+                &job.phase,
+                &job.gates,
+                || placement.revalidate_owned_cleanup(),
+                || {
+                    resources
+                        .retire_producer(producer)
+                        .map(|()| UploadWorkResult::ProducerRetired)
+                        .map_err(UploadWorkerError::Resource)
+                },
+            );
+        }
         if !job.gates.iter().all(|gate| gate.load(Ordering::SeqCst)) {
             return refuse_before_start(&job.phase, "captured upload scope is closed");
         }
@@ -307,6 +329,7 @@ fn execute_job(
                 job.gates.extend(gates);
                 owner
             }
+            UploadWork::RetireProducer { .. } => unreachable!("producer cleanup returned above"),
         };
         let owned_cleanup = matches!(
             &job.work,
@@ -328,9 +351,11 @@ fn execute_job(
                 // No await separates the queued preflight, Running CAS and I/O on
                 // this exact thread. No native frame-written state is involved.
                 match job.work {
-                    UploadWork::Begin { files, .. } => {
-                        resources.begin(owner, &files).map(UploadWorkResult::Begun)
-                    }
+                    UploadWork::Begin {
+                        files, producer, ..
+                    } => resources
+                        .begin(owner, &files, producer)
+                        .map(UploadWorkResult::Begun),
                     UploadWork::Write {
                         stage,
                         file_index,
@@ -351,6 +376,9 @@ fn execute_job(
                     UploadWork::RetireTab { .. } => resources
                         .retire_tab(&owner)
                         .map(|()| UploadWorkResult::TabRetired),
+                    UploadWork::RetireProducer { .. } => {
+                        unreachable!("producer cleanup returned above")
+                    }
                 }
                 .map_err(UploadWorkerError::Resource)
             },

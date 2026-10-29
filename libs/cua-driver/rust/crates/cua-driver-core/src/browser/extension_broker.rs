@@ -1017,6 +1017,7 @@ struct ClientState {
     high_water: u64,
     closing: bool,
     extension_cleanup: OwnerCleanup,
+    upload_cleanup: OwnerCleanup,
     controls_in_flight: Arc<AtomicUsize>,
     // One already-created EOF receipt, held only while local job custody is
     // pending. This is transport egress, never another owner/session registry.
@@ -1121,10 +1122,14 @@ enum UploadControl {
         owner: UploadOwner,
         outcome: Box<ControlOutcome>,
     },
+    RetireProducer,
 }
 impl UploadControl {
     fn cleanup(&self) -> bool {
-        matches!(self, Self::Abandon { .. } | Self::RetireTab { .. })
+        matches!(
+            self,
+            Self::Abandon { .. } | Self::RetireTab { .. } | Self::RetireProducer
+        )
     }
 }
 struct UploadAdmission {
@@ -1444,7 +1449,9 @@ impl ExtensionHostBroker {
                     let pending_ids=self.pending.iter().filter_map(|(id,pending)|matches!(pending.kind,PendingKind::Upload(_)).then_some(*id)).collect::<Vec<_>>();
                     for id in pending_ids {
                         if let Some(Pending{client,kind:PendingKind::Upload(upload),wire_context,..})=self.pending.remove(&id) {
-                            if let UploadControl::RetireTab{outcome,..}=upload.operation {
+                            if matches!(upload.operation, UploadControl::RetireProducer) {
+                                self.upload_producer_cleanup_reply(client,id,Err("host upload cleanup remained unresolved at shutdown deadline".into()));
+                            } else if let UploadControl::RetireTab{outcome,..}=upload.operation {
                                 self.upload_retirement_reply(UploadRetirementReply {
                                     client,
                                     id: upload.local_id,
@@ -1524,6 +1531,11 @@ impl ExtensionHostBroker {
                 high_water: 0,
                 closing: false,
                 extension_cleanup: OwnerCleanup::Unrequested,
+                upload_cleanup: if self.uploads.is_some() {
+                    OwnerCleanup::Unrequested
+                } else {
+                    OwnerCleanup::Confirmed
+                },
                 controls_in_flight: controls_in_flight.clone(),
                 deferred_generation_close: None,
                 attaching: HashSet::new(),
@@ -1715,7 +1727,11 @@ impl ExtensionHostBroker {
                         owner: owner.clone(),
                         files: files.clone(),
                     },
-                    UploadWork::Begin { owner, files },
+                    UploadWork::Begin {
+                        owner,
+                        files,
+                        producer: self.clients[&client].alive.clone(),
+                    },
                     Some(claim),
                     Some(record.alive.clone()),
                 )
@@ -1805,6 +1821,11 @@ impl ExtensionHostBroker {
             return;
         };
         self.next_outer = outer;
+        if let (UploadControl::RetireProducer, Some(state)) =
+            (&operation, self.clients.get_mut(&client))
+        {
+            state.upload_cleanup = OwnerCleanup::Requested { outer_id: outer };
+        }
         let phase = Arc::new(AtomicU8::new(JOB_QUEUED));
         let scope_fence = (!operation.cleanup()).then(|| Arc::new(AtomicBool::new(true)));
         if let Some(gate) = &scope_fence {
@@ -1850,6 +1871,14 @@ impl ExtensionHostBroker {
             };
             // The queue returned this exact job; no filesystem effect can start.
             let _ = cancel_queued(&rejected.phase);
+            if matches!(upload.operation, UploadControl::RetireProducer) {
+                self.upload_producer_cleanup_reply(
+                    client,
+                    outer,
+                    Err("host upload cleanup worker did not admit work".into()),
+                );
+                return;
+            }
             if let UploadControl::RetireTab { outcome, .. } = upload.operation {
                 self.upload_retirement_reply(UploadRetirementReply {
                     client,
@@ -2014,6 +2043,15 @@ impl ExtensionHostBroker {
         if completion.phase != upload.phase.load(Ordering::SeqCst)
             || !matches!(completion.phase, JOB_COMPLETED | JOB_CANCELLED)
         {
+            if matches!(upload.operation, UploadControl::RetireProducer) {
+                self.upload_producer_cleanup_reply(
+                    pending.client,
+                    completion.id,
+                    Err("host upload cleanup completion phase is unavailable".into()),
+                );
+                self.finish_upload_generation();
+                return;
+            }
             if let UploadControl::RetireTab { outcome, .. } = upload.operation {
                 self.upload_retirement_reply(UploadRetirementReply {
                     client: pending.client,
@@ -2034,6 +2072,16 @@ impl ExtensionHostBroker {
                     details: None,
                 },
             );
+            return;
+        }
+        if matches!(upload.operation, UploadControl::RetireProducer) {
+            let cleanup = match completion.result {
+                Ok(UploadWorkResult::ProducerRetired) => Ok(()),
+                Ok(_) => Err("host upload cleanup result changed".into()),
+                Err(error) => Err(error.to_string()),
+            };
+            self.upload_producer_cleanup_reply(pending.client, completion.id, cleanup);
+            self.finish_upload_generation();
             return;
         }
         let fact = match (&upload.operation, &completion.result) {
@@ -2221,7 +2269,12 @@ impl ExtensionHostBroker {
                 unreachable!()
             };
             // Tab retirement is host-resource cleanup, not client-owned work.
-            if client.is_some() && matches!(upload.operation, UploadControl::RetireTab { .. }) {
+            if client.is_some()
+                && matches!(
+                    upload.operation,
+                    UploadControl::RetireTab { .. } | UploadControl::RetireProducer
+                )
+            {
                 self.pending.insert(id, pending);
                 continue;
             }
@@ -2229,6 +2282,14 @@ impl ExtensionHostBroker {
                 let PendingKind::Upload(upload) = pending.kind else {
                     unreachable!()
                 };
+                if matches!(upload.operation, UploadControl::RetireProducer) {
+                    self.upload_producer_cleanup_reply(
+                        pending.client,
+                        id,
+                        Err("host upload cleanup was cancelled before filesystem work".into()),
+                    );
+                    continue;
+                }
                 if let UploadControl::RetireTab { outcome, .. } = upload.operation {
                     self.upload_retirement_reply(UploadRetirementReply {
                         client: pending.client,
@@ -2254,6 +2315,60 @@ impl ExtensionHostBroker {
             } else {
                 upload.interrupted = Some(reason);
                 self.pending.insert(id, pending);
+            }
+        }
+    }
+
+    fn upload_producer_cleanup_reply(
+        &mut self,
+        client: ClientId,
+        outer: u64,
+        cleanup: Result<(), String>,
+    ) {
+        let Some(state) = self.clients.get_mut(&client) else {
+            return;
+        };
+        if state.upload_cleanup != (OwnerCleanup::Requested { outer_id: outer }) {
+            return;
+        }
+        let confirmed = cleanup.is_ok();
+        if confirmed {
+            state.upload_cleanup = OwnerCleanup::Confirmed;
+        }
+        let error = cleanup.err();
+        let claims = self
+            .claims
+            .iter()
+            .filter_map(|(token, claim)| (claim.client == client).then_some(token.clone()))
+            .collect::<Vec<_>>();
+        for claim in claims {
+            let event = ControlEvent::EffectsCleanup {
+                claim: claim.clone(),
+                effect: "upload_staging".into(),
+                cleanup_confirmed: confirmed,
+                error: error.clone(),
+                wire_context: None,
+            };
+            match self.budget.try_charge(&event) {
+                Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
+                Err(_) => {
+                    self.queue_control_delivery(
+                        client,
+                        Queued::new(
+                            ControlEvent::EffectsCleanup {
+                                claim,
+                                effect: "upload_staging".into(),
+                                cleanup_confirmed: confirmed,
+                                error: (!confirmed).then(|| {
+                                    "upload staging cleanup remains unconfirmed; variable receipt was not admitted".into()
+                                }),
+                                wire_context: None,
+                            },
+                            None,
+                        ),
+                    );
+                    self.fence_upload_delivery_owner(client);
+                }
             }
         }
     }
@@ -2358,6 +2473,7 @@ impl ExtensionHostBroker {
                 .filter_map(|(id, state)| {
                     (state.closing
                         && matches!(state.extension_cleanup, OwnerCleanup::Confirmed)
+                        && matches!(state.upload_cleanup, OwnerCleanup::Confirmed)
                         && state.controls_in_flight.load(Ordering::SeqCst) == 0
                         && !self.resource_work_pending(*id))
                     .then_some(*id)
@@ -2366,6 +2482,7 @@ impl ExtensionHostBroker {
             for id in retired {
                 if let Some(client) = self.clients.remove(&id) {
                     self.owners.remove(&client.owner);
+                    self.claims.retain(|_, claim| claim.client != id);
                 }
             }
         }
@@ -3707,7 +3824,22 @@ impl ExtensionHostBroker {
         state.closing = true;
         state.alive.store(false, Ordering::SeqCst);
         state.early.clear();
+        let producer = self.uploads.as_ref().map(|_| state.alive.clone());
         self.interrupt_uploads(Some(client), "upload I/O completed after its owner ended");
+        if let Some(producer) = producer {
+            // This existing producer is sealed before the serial cleanup job.
+            // A Running retain settles first and retains its backing; a queued
+            // retain loses its original CAS and cannot expose new paths later.
+            self.queue_upload(UploadAdmission {
+                client,
+                local_id: 0,
+                operation: UploadControl::RetireProducer,
+                work: UploadWork::RetireProducer { producer },
+                claim: None,
+                gates: Vec::new(),
+                context: None,
+            });
+        }
         for claim in self.claims.values().filter(|claim| claim.client == client) {
             claim.alive.store(false, Ordering::SeqCst);
         }
@@ -4489,7 +4621,6 @@ impl ExtensionHostBroker {
                     if let Some(client) = self.clients.get_mut(&pending.client) {
                         client.extension_cleanup = OwnerCleanup::Confirmed;
                     }
-                    self.claims.retain(|_, claim| claim.client != pending.client);
                     self.finish_upload_generation();
                 }
                 // A rejection or cleanupConfirmed=false retains the closed-owner
@@ -5281,6 +5412,7 @@ fn upload_completion_payload(completion: &UploadCompletion) -> Result<Value, ser
         Ok(UploadWorkResult::Written) => json!({"kind":"written"}),
         Ok(UploadWorkResult::Abandoned) => json!({"kind":"abandoned"}),
         Ok(UploadWorkResult::TabRetired) => json!({"kind":"tabRetired"}),
+        Ok(UploadWorkResult::ProducerRetired) => json!({"kind":"producerRetired"}),
         Err(error) => json!({"kind":"unknown","error":error.to_string()}),
     };
     Ok(json!({"id":completion.id,"phase":completion.phase,"result":payload}))
@@ -5303,6 +5435,7 @@ fn bound_undelivered_upload_completion(completion: &mut UploadCompletion) {
         Ok(UploadWorkResult::Written) => Ok(UploadWorkResult::Written),
         Ok(UploadWorkResult::Abandoned) => Ok(UploadWorkResult::Abandoned),
         Ok(UploadWorkResult::TabRetired) => Ok(UploadWorkResult::TabRetired),
+        Ok(UploadWorkResult::ProducerRetired) => Ok(UploadWorkResult::ProducerRetired),
         Err(UploadWorkerError::Resource(UploadError::BeginIo { stage, .. })) => {
             Err(UploadWorkerError::Resource(UploadError::BeginIo {
                 stage,

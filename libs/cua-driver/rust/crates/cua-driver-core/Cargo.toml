@@ -41,7 +41,7 @@ zune-core = { workspace = true }
 # contract is loopback ws:// only.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 sha2 = "0.10"
 url = "2.5"

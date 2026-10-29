@@ -14,6 +14,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use uuid::Uuid;
 
@@ -281,6 +285,7 @@ struct UploadFile {
 }
 struct Stage {
     owner: UploadOwner,
+    producer: Arc<AtomicBool>,
     directory: PathBuf,
     directory_proof: Option<super::local_ipc::UploadDirectoryIdentity>,
     index_directories: Vec<(PathBuf, super::local_ipc::UploadDirectoryIdentity)>,
@@ -302,6 +307,7 @@ impl UploadResources {
         &mut self,
         owner: UploadOwner,
         descriptors: &[ExtensionUploadFile],
+        producer: Arc<AtomicBool>,
     ) -> Result<Uuid, UploadError> {
         if descriptors.is_empty() {
             return Err(UploadError::Refused("upload has no files"));
@@ -323,6 +329,7 @@ impl UploadResources {
             id,
             Stage {
                 owner,
+                producer,
                 directory,
                 directory_proof: None,
                 index_directories: Vec::new(),
@@ -534,6 +541,31 @@ impl UploadResources {
         }
         self.remove(id)
     }
+    /// Finish this closed producer's unselected staging only. Retained backing
+    /// stays in this store with its original producer identity; its independent
+    /// File lifetime is not a prerequisite for retiring the producer.
+    pub(super) fn retire_producer(
+        &mut self,
+        producer: &Arc<AtomicBool>,
+    ) -> Result<(), UploadError> {
+        if producer.load(Ordering::SeqCst) {
+            return Err(UploadError::Refused("upload producer is still open"));
+        }
+        let ids = self
+            .stages
+            .iter()
+            .filter_map(|(id, stage)| {
+                (Arc::ptr_eq(&stage.producer, producer) && !stage.retained).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for id in ids {
+            if let Err(error) = self.remove(id) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
     /// An exact tab-close acknowledgement ends this tab's unselected stages.
     /// It cannot prove that another browser consumer no longer holds a File.
     pub(super) fn retire_tab(&mut self, owner: &UploadOwner) -> Result<(), UploadError> {
@@ -660,8 +692,13 @@ mod tests {
         let bytes = vec![42; EXTENSION_UPLOAD_CHUNK_BYTES + 19];
         let mut resources = UploadResources::default();
         let binding = owner();
+        let producer = Arc::new(AtomicBool::new(true));
         let id = resources
-            .begin(binding.clone(), &[file("Café 日本語 🐧.txt", &bytes)])
+            .begin(
+                binding.clone(),
+                &[file("Café 日本語 🐧.txt", &bytes)],
+                producer.clone(),
+            )
             .unwrap();
         assert!(resources.retain(id, &binding).is_err());
         assert!(resources
@@ -698,9 +735,40 @@ mod tests {
             ))
         ));
         assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+        let unretained = resources
+            .begin(
+                binding.clone(),
+                &[file("pending.txt", b"pending")],
+                producer.clone(),
+            )
+            .unwrap();
+        resources
+            .write_chunk(unretained, &binding, 0, 0, b"pending")
+            .unwrap();
+        let unretained_path = resources.stages[&unretained].files[0].path.clone();
+        // The same session/tab may have another real producer. Its resource
+        // must not be collected by closing this producer's staging lifetime.
+        let other = resources
+            .begin(
+                binding.clone(),
+                &[file("other.txt", b"other")],
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        resources
+            .write_chunk(other, &binding, 0, 0, b"other")
+            .unwrap();
+        let other_path = resources.stages[&other].files[0].path.clone();
+        producer.store(false, Ordering::SeqCst);
+        resources.retire_producer(&producer).unwrap();
+        assert!(!unretained_path.exists());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+        assert_eq!(std::fs::read(&other_path).unwrap(), b"other");
         // No browser received this test-owned fixture. Its local owner can
         // remove it explicitly without inventing a production File-death proof.
         resources.remove(id).unwrap();
+        resources.remove(other).unwrap();
         assert!(!paths[0].exists());
+        assert!(!other_path.exists());
     }
 }
