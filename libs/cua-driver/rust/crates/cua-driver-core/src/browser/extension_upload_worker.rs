@@ -5,7 +5,7 @@
 //! The registered native-host entry creates this worker only after placement was
 //! captured there. Dropping a client handle neither removes resources nor joins
 //! this thread. Host shutdown cleans unselected stages after placement validation;
-//! selected backing without confirmed tab retirement remains cleanup-unconfirmed.
+//! selected backing without a confirmed File lifetime end remains cleanup-unconfirmed.
 
 use super::broker_delivery::ByteCharge;
 use super::extension_upload::{ExtensionUploadFile, UploadError, UploadOwner, UploadResources};

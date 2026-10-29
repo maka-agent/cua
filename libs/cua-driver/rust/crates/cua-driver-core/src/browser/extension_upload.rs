@@ -207,8 +207,8 @@ impl ExtensionUploadChunkAck {
 
 /// Only an actual retain acknowledgement exposes browser-local paths.
 /// Its backing survives turn completion, debugger detach and client disconnect.
-/// It is released only by known matching tab retirement. Host shutdown without
-/// that proof leaves the backing and reports unconfirmed cleanup.
+/// Tab retirement does not prove that every browser consumer released a File.
+/// Without that proof, cleanup leaves the backing and reports an unconfirmed result.
 #[derive(Clone, Debug)]
 pub struct ExtensionRetainedUpload {
     pub(super) stage: ExtensionUploadStage,
