@@ -404,6 +404,18 @@ pub struct NativeClickPair {
     pub up: PreparedNativeEvent,
 }
 
+/// A retained down, three ordered drag events and their matching release.
+#[derive(Debug)]
+#[must_use = "preparing native drags does not send them"]
+pub struct NativeDragGroup {
+    /// The mouse-down event at the starting point.
+    pub down: PreparedNativeEvent,
+    /// Drag events at the start, midpoint and target, sharing an event number.
+    pub dragged: [PreparedNativeEvent; 3],
+    /// The mouse-up event at the target, sharing the down event's event number.
+    pub up: PreparedNativeEvent,
+}
+
 /// A native click sequence could not be prepared.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -443,6 +455,55 @@ pub fn prepare_native_click(
         pairs.push(NativeClickPair { down, up });
     }
     Ok(pairs)
+}
+
+/// Prepare complete drag groups without posting or delaying any event.
+///
+/// Call and consume the retained events on one native worker inside its
+/// autorelease pool. Every group contains a down at the start, three drag
+/// events at the start, midpoint and target, then an up at the target.
+///
+/// # Errors
+/// Returns an invalid count, exhausted event number or native event failure.
+pub fn prepare_native_drag(
+    request: NativeClickRequest,
+    screen_target: [f64; 2],
+) -> Result<Vec<NativeDragGroup>, NativeClickError> {
+    if request.count < 1 {
+        return Err(NativeClickError::InvalidCount);
+    }
+    let (down_type, dragged_type, up_type) = match request.button {
+        NativeClickButton::Left => (1, 6, 2),
+        NativeClickButton::Right => (3, 7, 4),
+        NativeClickButton::Other => (25, 27, 26),
+    };
+    let midpoint = NativeClickRequest {
+        screen_point: [
+            (request.screen_point[0] + screen_target[0]) * 0.5,
+            (request.screen_point[1] + screen_target[1]) * 0.5,
+        ],
+        ..request
+    };
+    let target = NativeClickRequest {
+        screen_point: screen_target,
+        ..request
+    };
+    let mut groups = Vec::new();
+    for click_count in 1..=request.count {
+        let event_number = allocate_event_number(&NEXT_EVENT_NUMBER)
+            .map_err(|_| NativeClickError::EventNumberExhausted)?;
+        let down = prepare_click_event(&request, down_type, event_number, click_count)?;
+        let dragged_number = allocate_event_number(&NEXT_EVENT_NUMBER)
+            .map_err(|_| NativeClickError::EventNumberExhausted)?;
+        let dragged = [
+            prepare_click_event(&request, dragged_type, dragged_number, 0)?,
+            prepare_click_event(&midpoint, dragged_type, dragged_number, 0)?,
+            prepare_click_event(&target, dragged_type, dragged_number, 0)?,
+        ];
+        let up = prepare_click_event(&target, up_type, event_number, click_count)?;
+        groups.push(NativeDragGroup { down, dragged, up });
+    }
+    Ok(groups)
 }
 
 fn prepare_click_event(
