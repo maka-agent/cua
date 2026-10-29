@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["third-party/nom", "vendor/clipboard-rs"]
+exclude = ["third-party/nom", "third-party/zbus", "vendor/clipboard-rs"]
 members = [
     "crates/cua-driver",
     "crates/cua-driver-contract",
@@ -31,6 +31,7 @@ repository = "https://github.com/trycua/cua"
 # Preserve meval's parser while repairing legacy macros and fixed-array initialization.
 # Downstream workspace roots must select this same source; see its SOURCE.md.
 nom = { path = "third-party/nom" }
+zbus = { path = "third-party/zbus" }
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

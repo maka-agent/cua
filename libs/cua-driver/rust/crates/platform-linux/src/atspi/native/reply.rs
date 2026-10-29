@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! Retain the original body signature through the existing zvariant decoder.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use atspi::zbus::{
-    Proxy,
     message::Message,
-    zvariant::{DynamicType, Endian, OwnedValue, Signature, Type, serialized_size},
+    zvariant::{serialized_size, DynamicType, Endian, OwnedValue, Signature, Type},
+    Proxy,
 };
 use serde::{
-    Deserialize, Deserializer,
     de::{DeserializeSeed, Error, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
 };
 
 /// The Original reader accepts every nonzero D-Bus boolean word. The existing
@@ -229,7 +229,7 @@ pub(super) fn variant_i32(reply: &Message) -> Result<Option<i32>> {
         .data()
         .deserialize_for_signature::<_, I32Variant>(&Signature::Variant)?
         .0
-        .0)
+         .0)
 }
 
 pub(super) fn boolean(reply: &Message) -> Result<Option<bool>> {
@@ -318,7 +318,7 @@ fn first_string(reply: &Message, signature: &str) -> Result<Option<String>> {
                 .data()
                 .deserialize_for_signature::<_, StringVariant>(&Signature::Variant)?
                 .0
-                .0);
+                 .0);
         }
         _ => return Ok(None),
     };
@@ -380,6 +380,13 @@ pub(super) fn native_error(
                 Err(error) => return error,
             };
             anyhow::anyhow!("D-Bus {interface}.{method} failed: {name}: {message}")
+        }
+        atspi::zbus::Error::MissingErrorName(reply) => {
+            let message = match string(&reply) {
+                Ok(message) => message.unwrap_or_else(|| "method call failed".to_owned()),
+                Err(error) => return error,
+            };
+            anyhow::anyhow!("D-Bus {interface}.{method} failed: unknown error: {message}")
         }
         other => other.into(),
     }
@@ -542,6 +549,25 @@ mod tests {
                 )
             );
         }
+        let call = reply(&());
+        let returned = Message::method_return(&call.header())
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let mut header = returned.header();
+        header
+            .primary_mut()
+            .set_msg_type(atspi::zbus::message::Type::Error);
+        let unnamed = atspi::zbus::message::Builder::from(header)
+            .build(&"unnamed body")
+            .unwrap();
+        let unnamed = atspi::zbus::Error::from(unnamed);
+        assert!(matches!(&unnamed, atspi::zbus::Error::MissingErrorName(_)));
+        assert_eq!(
+            native_error("org.a11y.atspi.Action", "DoAction", unnamed).to_string(),
+            "D-Bus org.a11y.atspi.Action.DoAction failed: unknown error: unnamed body"
+        );
+
         let local = atspi::zbus::Error::Failure("local transport failure".to_owned());
         let expected = local.to_string();
         assert_eq!(
