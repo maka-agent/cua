@@ -51,6 +51,11 @@ pub(crate) struct InstalledCatalog {
 }
 
 fn validate_config(config: &InstalledHostConfig, executable: &Path) -> Result<(), CatalogError> {
+    if config.handoff.is_some() && config.adapter != CHATGPT_HOST_NAME {
+        return Err(CatalogError::Refused(
+            "on-demand handoff requires the ChatGPT adapter".into(),
+        ));
+    }
     if config.protocol != 1 || !ADAPTERS.contains(&config.adapter.as_str()) {
         return Err(CatalogError::Refused(
             "unsupported installation protocol or adapter".into(),
@@ -365,6 +370,7 @@ mod tests {
             let state = self._directory.path().join(format!("state-{id}"));
             local_ipc::ensure_private_state_directory(&state).unwrap();
             InstalledHostConfig {
+                handoff: None,
                 protocol: 1,
                 adapter: adapter.into(),
                 expected_extension_id: id.to_string().repeat(32),
@@ -650,7 +656,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_catalog_or_world_readable_selected_entry_is_rejected() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let fixture = Fixture::new();
         let maka = fixture.config(MAKA_HOST_NAME, 'a');
         fixture.slot(MAKA_HOST_NAME, &maka);

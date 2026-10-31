@@ -1609,7 +1609,7 @@ fn session_only_resolve_rejects_missing_context_and_malformed_selector_without_d
 }
 
 #[test]
-fn finished_turn_cannot_session_resolve_after_lease_removal_but_next_turn_can_query() {
+fn completed_usage_can_reactivate_the_same_host_turn_with_a_fresh_epoch() {
     let (mut adapter, context, now) = boot();
     let create = frame(
         &adapter
@@ -1622,51 +1622,35 @@ fn finished_turn_cannot_session_resolve_after_lease_removal_but_next_turn_can_qu
         json!({"id":2001,"url":"about:blank"}),
         now,
     );
+    let old_epoch = adapter.session_turns[SID].epoch;
     let finish = frame(
         &adapter
             .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
-            .expect("finish exact turn"),
+            .expect("finish exact usage"),
     );
     adapter
         .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("actual finish ACK");
     assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
     assert!(adapter.leases.is_empty());
-    assert!(matches!(
-        adapter.written_semantic(semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})), Some(&context), now),
-        Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "turn_finished"
-    ));
-    assert_eq!(adapter.rpc.pending_len(), 0);
-    let global = frame(
-        &adapter
-            .written_semantic(
-                semantic("4", "resolve", json!({"rawId":"2001","sessionOnly":false})),
-                Some(&context),
-                now,
-            )
-            .expect("normal resolve keeps global observation semantics"),
-    );
-    assert_eq!(global["method"], "getUserTabs");
-    let observed = response(&reply(&mut adapter, &global, json!([{"id":2001}]), now));
-    assert!(observed["result"].get("sessionOnly").is_none());
-    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Finished);
-    let next = ExtensionWireContext::new(SID, "turn2").expect("next trusted turn");
     let request = frame(
         &adapter
             .written_semantic(
-                semantic("5", "resolve", json!({"rawId":"2001","sessionOnly":true})),
-                Some(&next),
+                semantic("3", "resolve", json!({"rawId":"2001","sessionOnly":true})),
+                Some(&context),
                 now,
             )
-            .expect("new turn must query actual managed inventory"),
+            .expect("fresh usage can reactivate the same trusted Host turn"),
     );
     assert_eq!(request["method"], "getTabs");
-    assert_eq!(request["params"]["turn_id"], "turn2");
+    assert_eq!(request["params"]["turn_id"], "turn1");
     let output = response(&reply(&mut adapter, &request, json!([{"id":2001}]), now));
     assert_eq!(output["result"]["sessionOnly"], true);
+    assert_ne!(adapter.session_turns[SID].epoch, old_epoch);
+    assert_eq!(adapter.session_turns[SID].phase, TurnPhase::Active);
     assert!(
         adapter.leases.is_empty(),
-        "session metadata does not restore an acquisition row"
+        "metadata cannot restore acquisition authority"
     );
 }
 
@@ -1933,7 +1917,7 @@ fn forced_session_preparation_uses_direct_native_claim_and_confirms_exact_purpos
 }
 
 #[test]
-fn forced_session_preparation_refuses_untrusted_or_finished_scope_before_native_effects() {
+fn forced_session_preparation_requires_trusted_scope_and_can_start_a_fresh_usage() {
     let (mut adapter, context, now) = boot();
     assert!(
         matches!(adapter.written_semantic(semantic("1", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), None, now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "wire_context_required")
@@ -1960,10 +1944,28 @@ fn forced_session_preparation_refuses_untrusted_or_finished_scope_before_native_
     adapter
         .written_extension(json!({"jsonrpc":"2.0","id":finish["id"]}), now)
         .expect("actual finish ACK");
-    assert!(
-        matches!(adapter.written_semantic(semantic("5", "prepareUserTab", json!({"tabId":2001,"sessionOnly":true})), Some(&context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "turn_finished")
+    let claim = frame(
+        &adapter
+            .written_semantic(
+                semantic(
+                    "5",
+                    "prepareUserTab",
+                    json!({"tabId":2001,"sessionOnly":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .expect("fresh trusted usage after an acknowledged finish"),
     );
-    assert!(adapter.leases.is_empty());
+    assert_eq!(claim["method"], "claimUserTab");
+    assert_eq!(claim["params"]["turn_id"], "turn1");
+    reply(
+        &mut adapter,
+        &claim,
+        json!({"id":2001,"url":"about:blank"}),
+        now,
+    );
+    assert_eq!(adapter.leases[&2001], ("owner".to_owned(), SID.to_owned()));
     assert!(adapter.claims.is_empty());
     assert_eq!(adapter.rpc.pending_len(), 0);
 }
@@ -2904,10 +2906,12 @@ fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback
                 }
                 _ => {}
             }
-            assert!(
-                matches!(adapter.written_semantic(committed_url_semantic("3","7"),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code==if mode=="finished" {"turn_finished"} else {"session_unavailable"})
-            );
-            continue;
+            if mode != "finished" {
+                assert!(
+                    matches!(adapter.written_semantic(committed_url_semantic("3","7"),Some(&context),now),Err(ExtensionWireError::LocalRefusal{code,..}) if code=="session_unavailable")
+                );
+                continue;
+            }
         }
         if mode == "closed" {
             let claim = attached(&mut adapter, &context, "2", 7, now);
@@ -2933,7 +2937,7 @@ fn committed_url_missing_reply_finish_and_closed_scope_never_use_global_fallback
             "missing-result"=>adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"]}),now).expect("source nonvoid method cannot accept id-only ACK"),
             "timeout"=>adapter.expire(now+DEADLINE+Duration::from_millis(1)),
             "eof"=>adapter.on_eof("owned URL connection ended"),
-            "closed"=>adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"Tab is not part of this browser session"}}),now).expect("extension actual owned check refuses closed row"),
+            "finished" | "closed"=>adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"Tab is not part of this browser session"}}),now).expect("extension actual owned check refuses closed row"),
             _=>unreachable!("each mode handled"),
         };
         assert_eq!(response(&actions)["error"]["kind"], "outcome_unknown");

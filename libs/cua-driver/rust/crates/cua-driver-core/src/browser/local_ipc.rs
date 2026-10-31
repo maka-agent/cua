@@ -24,6 +24,7 @@ mod platform;
 #[path = "local_ipc/windows.rs"]
 mod platform;
 
+pub(crate) use platform::LocalListener;
 pub use platform::LocalStream;
 
 /// Actual object identity of a newly created, private native-host upload directory.
@@ -99,7 +100,7 @@ pub struct ExtensionEndpointIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "address", rename_all = "camelCase")]
-enum EndpointAddress {
+pub(crate) enum EndpointAddress {
     Unix(PathBuf),
     Windows(String),
 }
@@ -200,6 +201,32 @@ impl ValidatedExtensionEndpoint {
 
     pub fn identity(&self) -> &ExtensionEndpointIdentity {
         &self.descriptor.identity
+    }
+
+    /// Remove this captured generation after its exact native-host process has
+    /// been confirmed exited by the handoff supervisor. Never call on a live host.
+    pub fn cleanup_after_host_exit(&self) -> Result<(), IpcError> {
+        platform::remove_owned_file(&self.descriptor_path, &self.file_identity)?;
+        #[cfg(unix)]
+        {
+            let EndpointAddress::Unix(path) = &self.descriptor.endpoint else {
+                return Err(rejected("retired endpoint is not a Unix socket"));
+            };
+            let parent = self
+                .descriptor_path
+                .parent()
+                .ok_or_else(|| rejected("descriptor lacks parent"))?;
+            match platform::validate_address(
+                parent,
+                &self.descriptor.identity.generation,
+                &self.descriptor.endpoint,
+            ) {
+                Ok(()) => std::fs::remove_file(path)?,
+                Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Compare physical endpoint identity without exposing its routing capability.
@@ -417,6 +444,23 @@ fn load_installation_file(path: &Path) -> Result<LoadedInstallationFile, IpcErro
         bytes,
         identity,
     })
+}
+
+/// Private state grows with actual live owners rather than a descriptor budget.
+pub(crate) fn load_private_state(path: &Path) -> Result<Vec<u8>, IpcError> {
+    platform::validate_directory(
+        path.parent()
+            .ok_or_else(|| rejected("state lacks parent"))?,
+    )?;
+    let mut file = match platform::open_private_file(path) {
+        Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(IpcError::MissingInstallationFile);
+        }
+        result => result?,
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 pub(crate) fn load_private_installation_config(path: &Path) -> Result<Vec<u8>, IpcError> {
@@ -810,4 +854,14 @@ mod tests {
         let mut partial = std::io::Cursor::new([1_u8, 2]);
         assert!(read_json(&mut partial).await.is_err());
     }
+}
+
+pub(crate) async fn connect_service(
+    directory: &Path,
+    generation: &str,
+    address: &EndpointAddress,
+    pid: u32,
+) -> Result<LocalStream, IpcError> {
+    platform::validate_address(directory, generation, address)?;
+    platform::connect(address, pid).await
 }

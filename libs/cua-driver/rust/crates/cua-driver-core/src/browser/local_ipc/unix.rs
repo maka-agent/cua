@@ -438,14 +438,14 @@ pub(super) async fn connect(
     Ok(stream)
 }
 
-pub(super) struct LocalListener {
+pub(crate) struct LocalListener {
     listener: UnixListener,
     path: PathBuf,
     identity: FileIdentity,
 }
 
 impl LocalListener {
-    pub(super) async fn bind(
+    pub(crate) async fn bind(
         directory: &Path,
         generation: &str,
     ) -> Result<(Self, EndpointAddress), IpcError> {
@@ -476,7 +476,7 @@ impl LocalListener {
         ))
     }
 
-    pub(super) async fn accept(&mut self) -> Result<(LocalStream, CheckedLocalPeer), IpcError> {
+    pub(crate) async fn accept(&mut self) -> Result<(LocalStream, CheckedLocalPeer), IpcError> {
         loop {
             let (stream, _) = self.listener.accept().await?;
             let credentials = match stream.peer_cred() {
@@ -499,7 +499,7 @@ impl LocalListener {
         }
     }
 
-    pub(super) fn cleanup(self) -> Result<(), IpcError> {
+    pub(crate) fn cleanup(self) -> Result<(), IpcError> {
         drop(self.listener);
         let metadata = match fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,

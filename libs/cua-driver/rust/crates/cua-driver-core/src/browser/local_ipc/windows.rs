@@ -783,13 +783,13 @@ fn create_pipe(name: &str, first: bool) -> Result<NamedPipeServer, IpcError> {
     }?)
 }
 
-pub(super) struct LocalListener {
+pub(crate) struct LocalListener {
     name: String,
     pending: Option<NamedPipeServer>,
     sid: String,
 }
 impl LocalListener {
-    pub(super) async fn bind(
+    pub(crate) async fn bind(
         directory: &Path,
         generation: &str,
     ) -> Result<(Self, EndpointAddress), IpcError> {
@@ -807,7 +807,7 @@ impl LocalListener {
         ))
     }
 
-    pub(super) async fn accept(&mut self) -> Result<(LocalStream, CheckedLocalPeer), IpcError> {
+    pub(crate) async fn accept(&mut self) -> Result<(LocalStream, CheckedLocalPeer), IpcError> {
         loop {
             // Retain the reserved handle while awaiting: the outer loop can
             // cancel accept to service a completed client or shutdown signal.
@@ -848,7 +848,7 @@ impl LocalListener {
         }
     }
 
-    pub(super) fn cleanup(self) -> Result<(), IpcError> {
+    pub(crate) fn cleanup(self) -> Result<(), IpcError> {
         drop(self);
         Ok(())
     }

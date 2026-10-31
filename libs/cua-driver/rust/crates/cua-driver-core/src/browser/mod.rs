@@ -53,6 +53,7 @@ mod extension_install;
 mod extension_logical_lease;
 pub mod extension_process;
 mod extension_provider;
+pub mod host_handoff;
 mod user_tab_context;
 pub use user_tab_context::{BrowserUserTabRead, BrowserWorkspaceExportFormat};
 mod extension_upload;

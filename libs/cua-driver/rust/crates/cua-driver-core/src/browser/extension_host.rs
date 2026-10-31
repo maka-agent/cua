@@ -192,6 +192,8 @@ pub(crate) struct InstalledHostConfig {
     pub(crate) expected_extension_id: String,
     pub(crate) executable: PathBuf,
     pub(crate) private_state_directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) handoff: Option<super::host_handoff::BrowserFamily>,
 }
 
 pub(crate) fn installed_sidecar_path(executable: &Path) -> Result<PathBuf, HostError> {
@@ -333,6 +335,7 @@ pub(crate) fn registration_plan(
         home.join(".maka-browser")
     };
     let sidecar = InstalledHostConfig {
+        handoff: None,
         protocol: 1,
         adapter: adapter.host_name.clone(),
         expected_extension_id: adapter.extension.id.clone(),

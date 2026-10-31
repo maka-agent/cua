@@ -7,6 +7,7 @@
 //! compatibility requires the explicit adapter option and actual extension ID.
 //! Existing changed registrations refuse; only exactly matched maka entries remove.
 
+use super::host_handoff::BrowserFamily;
 use super::{
     extension_catalog,
     extension_host::{
@@ -54,16 +55,11 @@ fn current_plan(extension_id: &str) -> Result<RegistrationPlan, InstallError> {
     )?))
 }
 
-fn current_plan_for(adapter: AdapterRegistration) -> Result<RegistrationPlan, InstallError> {
+pub(super) fn current_plan_for(
+    adapter: AdapterRegistration,
+) -> Result<RegistrationPlan, InstallError> {
     let executable = std::fs::canonicalize(std::env::current_exe()?)?;
-    #[cfg(unix)]
-    let home = std::env::var_os("HOME");
-    #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE");
-    let home =
-        std::fs::canonicalize(PathBuf::from(home.ok_or_else(|| {
-            InstallError::Refused("user home is unavailable".to_owned())
-        })?))?;
+    let home = current_home()?;
     let state = local_ipc::current_user_runtime_directory()?;
     #[cfg(target_os = "linux")]
     let platform = Platform::Linux;
@@ -78,6 +74,18 @@ fn current_plan_for(adapter: AdapterRegistration) -> Result<RegistrationPlan, In
         &executable,
         Some(&state),
     )?)
+}
+
+pub(super) fn current_home() -> Result<PathBuf, InstallError> {
+    #[cfg(unix)]
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    let home =
+        std::fs::canonicalize(PathBuf::from(home.ok_or_else(|| {
+            InstallError::Refused("user home is unavailable".to_owned())
+        })?))?;
+    Ok(home)
 }
 
 fn existing(path: &Path) -> Result<Option<Vec<u8>>, InstallError> {
@@ -104,6 +112,16 @@ fn install_chatgpt(extension_id: &str) -> Result<InstallReport, InstallError> {
     install_plan(current_plan_for(chatgpt_registration(extension_id)?)?)
 }
 
+fn on_demand_plan(
+    mut plan: RegistrationPlan,
+    browser: BrowserFamily,
+) -> Result<RegistrationPlan, InstallError> {
+    let mut config: InstalledHostConfig = serde_json::from_str(&plan.sidecar_json)?;
+    config.handoff = Some(browser);
+    plan.sidecar_json = serde_json::to_string_pretty(&config)? + "\n";
+    Ok(plan)
+}
+
 fn install_plan(plan: RegistrationPlan) -> Result<InstallReport, InstallError> {
     ensure_no_alternate_registration(&plan)?;
     install_entries(plan)
@@ -111,6 +129,7 @@ fn install_plan(plan: RegistrationPlan) -> Result<InstallReport, InstallError> {
 
 fn install_entries(plan: RegistrationPlan) -> Result<InstallReport, InstallError> {
     let sidecar: InstalledHostConfig = serde_json::from_str(&plan.sidecar_json)?;
+    let register = sidecar.handoff.is_none();
     let mutation = extension_catalog::Mutation::open(&sidecar.executable)?;
     local_ipc::ensure_private_state_directory(&sidecar.private_state_directory)?;
     mutation.load()?.validate_new_entry(&sidecar)?;
@@ -119,23 +138,35 @@ fn install_entries(plan: RegistrationPlan) -> Result<InstallReport, InstallError
             .parent()
             .ok_or_else(|| InstallError::Refused("installation entry lacks parent".to_owned()))?,
     )?;
-    local_ipc::ensure_installation_directory(
-        plan.manifest_path
-            .parent()
-            .ok_or_else(|| InstallError::Refused("manifest lacks parent".to_owned()))?,
-    )?;
-    let manifest = existing(&plan.manifest_path)?;
+    if register {
+        local_ipc::ensure_installation_directory(
+            plan.manifest_path
+                .parent()
+                .ok_or_else(|| InstallError::Refused("manifest lacks parent".to_owned()))?,
+        )?;
+    }
     let sidecar_existing = existing(&plan.sidecar_path)?;
-    let manifest_action = plan.inspect_existing_manifest(manifest.as_deref())?;
+    let manifest_action = if register {
+        Some(plan.inspect_existing_manifest(existing(&plan.manifest_path)?.as_deref())?)
+    } else {
+        None
+    };
     plan.inspect_existing_sidecar(sidecar_existing.as_deref())?;
     #[cfg(windows)]
-    let registry_existing = registry::read(
-        plan.registry
-            .as_ref()
-            .ok_or_else(|| InstallError::Refused("Windows registry plan is absent".to_owned()))?,
-    )?;
+    let registry_existing =
+        if register {
+            registry::read(plan.registry.as_ref().ok_or_else(|| {
+                InstallError::Refused("Windows registry plan is absent".to_owned())
+            })?)?
+        } else {
+            None
+        };
     #[cfg(windows)]
-    let registry_action = plan.inspect_existing_registry_value(registry_existing.as_deref())?;
+    let registry_action = if register {
+        Some(plan.inspect_existing_registry_value(registry_existing.as_deref())?)
+    } else {
+        None
+    };
     // Selected legacy migration commits independently. If a later write fails,
     // roll back only this transaction's new files, preserving the migrated registration.
     let migrated = mutation.migrate_legacy_for(&sidecar.adapter)?;
@@ -144,18 +175,15 @@ fn install_entries(plan: RegistrationPlan) -> Result<InstallReport, InstallError
     let mut created: Vec<CreatedInstallationFile> = Vec::new();
     let mut unchanged = 0;
     let writes = (|| {
-        for (action, path, bytes) in [
-            (
-                sidecar_action,
-                &plan.sidecar_path,
-                plan.sidecar_json.as_bytes(),
-            ),
-            (
-                manifest_action,
-                &plan.manifest_path,
-                plan.manifest_json.as_bytes(),
-            ),
-        ] {
+        let mut entries = vec![(
+            sidecar_action,
+            &plan.sidecar_path,
+            plan.sidecar_json.as_bytes(),
+        )];
+        if let Some(action) = manifest_action {
+            entries.push((action, &plan.manifest_path, plan.manifest_json.as_bytes()));
+        }
+        for (action, path, bytes) in entries {
             match action {
                 ExistingRegistration::Create => {
                     created.push(local_ipc::create_installation_file(path, bytes)?)
@@ -169,10 +197,11 @@ fn install_entries(plan: RegistrationPlan) -> Result<InstallReport, InstallError
         }
         #[cfg(windows)]
         match registry_action {
-            ExistingRegistration::Create => {
+            Some(ExistingRegistration::Create) => {
                 registry::create_exact(plan.registry.as_ref().expect("Windows plan checked above"))?
             }
-            ExistingRegistration::Unchanged => unchanged += 1,
+            Some(ExistingRegistration::Unchanged) => unchanged += 1,
+            None => {}
         }
         Ok::<(), InstallError>(())
     })();
@@ -194,7 +223,7 @@ fn install_entries(plan: RegistrationPlan) -> Result<InstallReport, InstallError
     }
     let count = created.len() + usize::from(migrated);
     #[cfg(windows)]
-    let count = count + usize::from(registry_action == ExistingRegistration::Create);
+    let count = count + usize::from(registry_action == Some(ExistingRegistration::Create));
     Ok(InstallReport {
         created_entries: count,
         unchanged_entries: unchanged,
@@ -314,6 +343,18 @@ fn uninstall_entries(
     installed: &InstalledHostConfig,
     bytes: &[u8],
 ) -> Result<(), InstallError> {
+    if installed.handoff.is_some() {
+        super::host_handoff::ConfiguredHandoff::for_executable(&installed.executable)
+            .map_err(|error| InstallError::Refused(error.to_string()))?
+            .ok_or_else(|| InstallError::Refused("on-demand configuration disappeared".into()))?
+            .restore()
+            .map_err(|error| InstallError::Refused(error.to_string()))?;
+        mutation.migrate_legacy_for(&installed.adapter)?;
+        let path =
+            extension_host::installed_adapter_path(&installed.executable, &installed.adapter)?;
+        local_ipc::remove_exact_installation_file(&path, &serde_json::from_slice::<Value>(bytes)?)?;
+        return Ok(());
+    }
     plan.inspect_existing_sidecar(Some(bytes))?;
     let manifest = existing(&plan.manifest_path)?;
     plan.inspect_existing_manifest(manifest.as_deref())?;
@@ -411,17 +452,48 @@ fn export_extension(destination: &Path) -> Result<InstallReport, InstallError> {
 
 enum SetupCommand {
     Install(String),
-    InstallChatgpt { extension_id: String },
+    InstallChatgpt {
+        extension_id: String,
+    },
+    InstallChatgptOnDemand {
+        extension_id: String,
+        browser: BrowserFamily,
+    },
     Uninstall,
     UninstallChatgpt,
     Export(PathBuf),
+    Restore,
 }
 fn setup_command(arguments: &[OsString]) -> Option<Result<SetupCommand, InstallError>> {
     if arguments.first().and_then(|arg| arg.to_str()) != Some("browser") {
         return None;
     }
     match arguments.get(1).and_then(|arg| arg.to_str()) {
+        Some("restore") => Some(match arguments {
+            [_, _] => Ok(SetupCommand::Restore),
+            _ => Err(InstallError::Refused("use browser restore".into())),
+        }),
         Some("install") => Some(match arguments {
+            [_, _, provider_flag, provider, id_flag, id, mode]
+                if provider_flag == "--provider" && provider == "chatgpt"
+                    && id_flag == "--extension-id" && mode == "--on-demand" => {
+                id.to_str().ok_or_else(|| InstallError::Refused("extension ID is not Unicode".into()))
+                    .and_then(|id| { chatgpt_registration(id)?; Ok(SetupCommand::InstallChatgptOnDemand { extension_id: id.into(), browser: BrowserFamily::Chrome }) })
+            }
+            [_, _, provider_flag, provider, id_flag, id, mode, browser_flag, browser]
+                if provider_flag == "--provider" && provider == "chatgpt"
+                    && id_flag == "--extension-id" && mode == "--on-demand" && browser_flag == "--browser" => {
+                let parsed = match browser.to_str() {
+                    Some("chrome") => Ok(BrowserFamily::Chrome),
+                    Some("chromium") => Ok(BrowserFamily::Chromium),
+                    _ => Err(InstallError::Refused("browser must be chrome or chromium".into())),
+                };
+                parsed.and_then(|browser| {
+                    let id = id.to_str().ok_or_else(|| InstallError::Refused("extension ID is not Unicode".into()))?;
+                    chatgpt_registration(id)?;
+                    Ok(SetupCommand::InstallChatgptOnDemand { extension_id: id.into(), browser })
+                })
+            }
             [_, _, flag, id] if flag == "--extension-id" => id
                 .to_str()
                 .ok_or_else(|| InstallError::Refused("extension ID is not Unicode".to_owned()))
@@ -480,6 +552,9 @@ fn setup_command(arguments: &[OsString]) -> Option<Result<SetupCommand, InstallE
 pub(crate) fn bootstrap_setup(arguments: &[OsString]) -> Option<ExitCode> {
     let command = setup_command(arguments)?;
     let outcome = match command {
+        Ok(SetupCommand::Restore) => super::host_handoff::restore_current()
+            .map(|()| "Restored the original browser host registration.".to_owned())
+            .map_err(|error| InstallError::Refused(error.to_string())),
         Ok(SetupCommand::Install(id)) => install_current_user(&id).map(|report| {
             format!(
                 "Registered own browser connector: {} created, {} unchanged; install or enable the matching own extension in Chrome.",
@@ -493,6 +568,12 @@ pub(crate) fn bootstrap_setup(arguments: &[OsString]) -> Option<ExitCode> {
                     report.created_entries, report.unchanged_entries,
                 )
             })
+        }
+        Ok(SetupCommand::InstallChatgptOnDemand { extension_id, browser }) => {
+            chatgpt_registration(&extension_id).and_then(current_plan_for)
+                .and_then(|plan| on_demand_plan(plan, browser))
+                .and_then(install_entries)
+                .map(|report| format!("Configured on-demand ChatGPT host handoff: {} created, {} unchanged; the original host registration is unchanged.", report.created_entries, report.unchanged_entries))
         }
         Ok(SetupCommand::Uninstall) => uninstall_current_user()
             .map(|()| "Removed exact own browser connector registration.".to_owned()),
@@ -821,6 +902,103 @@ mod tests {
             let entry = catalog.entry(&expected.adapter)?;
             let bytes = local_ipc::load_private_installation_config(&entry.path)?;
             uninstall_entries(&mutation, plan, &entry.config, &bytes)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_demand_setup_handoff_and_removal_preserve_original_host() {
+        for (browser, system_registration) in [
+            (BrowserFamily::Chrome, false),
+            (BrowserFamily::Chrome, true),
+            (BrowserFamily::Chromium, false),
+            (BrowserFamily::Chromium, true),
+        ] {
+            let fixture = InstallationFixture::new();
+            let mut plan = on_demand_plan(
+                fixture.plan(
+                    super::super::extension_process::CHATGPT_HOST_NAME,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+                browser,
+            )
+            .unwrap();
+            plan.manifest_path = browser.user_manifest(&fixture.home, None).unwrap();
+            std::fs::create_dir_all(plan.manifest_path.parent().unwrap()).unwrap();
+            let other_browser = match browser {
+                BrowserFamily::Chrome => BrowserFamily::Chromium,
+                BrowserFamily::Chromium => BrowserFamily::Chrome,
+            };
+            let other_path = other_browser.user_manifest(&fixture.home, None).unwrap();
+            std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+            std::fs::write(&other_path, b"other browser registration stays unchanged").unwrap();
+            let original_executable = fixture.home.join("original-host");
+            std::fs::write(&original_executable, b"never executed").unwrap();
+            let original = serde_json::to_vec(&serde_json::json!({
+                "name": "com.openai.codexextension", "path": original_executable,
+                "type": "stdio", "description": "original host", "allowed_origins": [
+                    "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+                    "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"
+                ]
+            }))
+            .unwrap();
+            let system = fixture.home.join("system-manifest.json");
+            let original_path = if system_registration {
+                &system
+            } else {
+                &plan.manifest_path
+            };
+            std::fs::write(original_path, &original).unwrap();
+            let before = std::fs::metadata(original_path).unwrap().permissions();
+            assert_eq!(install_entries(plan.clone()).unwrap().created_entries, 1);
+            let configured =
+                super::super::host_handoff::ConfiguredHandoff::for_executable(&fixture.executable)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(configured.browser(), browser);
+            assert_eq!(
+                configured.extension_id(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+            assert_eq!(std::fs::read(original_path).unwrap(), original);
+            assert_eq!(
+                std::fs::metadata(original_path).unwrap().permissions(),
+                before
+            );
+            assert_eq!(install_entries(plan.clone()).unwrap().created_entries, 0);
+            let prepared = configured.prepare_files(plan.clone(), &system).unwrap();
+            assert_eq!(prepared.original.executable, original_executable);
+            let mut transaction = super::super::host_handoff::RegistrationTransaction::open(
+                &configured.recovery_directory(),
+            )
+            .unwrap();
+            let original_host = prepared.publish(&mut transaction).unwrap();
+            let published: Value =
+                serde_json::from_slice(&std::fs::read(&plan.manifest_path).unwrap()).unwrap();
+            assert_eq!(
+                published["path"],
+                serde_json::to_value(&fixture.executable).unwrap()
+            );
+            assert_eq!(
+                published["allowed_origins"],
+                serde_json::to_value(&original_host.allowed_origins).unwrap()
+            );
+            transaction.restore().unwrap();
+            drop(transaction);
+            if system_registration {
+                assert!(!plan.manifest_path.exists());
+            }
+            assert_eq!(
+                std::fs::read(&other_path).unwrap(),
+                b"other browser registration stays unchanged"
+            );
+            fixture.uninstall(&plan).unwrap();
+            assert!(!plan.sidecar_path.exists());
+            assert_eq!(std::fs::read(original_path).unwrap(), original);
+            assert_eq!(
+                std::fs::metadata(original_path).unwrap().permissions(),
+                before
+            );
         }
     }
 

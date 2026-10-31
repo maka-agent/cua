@@ -259,6 +259,19 @@ impl ChatgptWireAdapter {
     ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
         if let Some(call) = task.call.as_ref() {
             if activates_session(method) {
+                let context = self.context(call)?;
+                if matches!(task.stage, Stage::SessionHeaders { active: false })
+                    && self
+                        .session_turns
+                        .get(context.host_session_id())
+                        .is_some_and(|turn| turn.phase == TurnPhase::Finished)
+                {
+                    return Err(ExtensionWireError::LocalRefusal {
+                        code: "turn_finished".to_owned(),
+                        message: "Header cleanup cannot reactivate a finished browser usage"
+                            .to_owned(),
+                    });
+                }
                 self.validate_activation(call)?;
             } else if matches!(task.stage, Stage::Finish) {
                 self.validate_finish(call)?;
@@ -545,12 +558,6 @@ impl ChatgptWireAdapter {
                 return Err(ExtensionWireError::LocalRefusal {
                     code: "session_unavailable".to_owned(),
                     message: "ChatGPT session has an unresolved transition or finish".to_owned(),
-                });
-            }
-            if current.turn == context.host_turn_id() && current.phase == TurnPhase::Finished {
-                return Err(ExtensionWireError::LocalRefusal {
-                    code: "turn_finished".to_owned(),
-                    message: "This trusted Host turn has already finished".to_owned(),
                 });
             }
         }
