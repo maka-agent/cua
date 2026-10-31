@@ -3,10 +3,11 @@
 use super::{BrowserFamily, ConfiguredHandoff, HandoffError, OriginalHost};
 use crate::browser::{
     extension_host::{ExtensionOrigin, InstalledHostConfig},
-    extension_install,
     extension_process::CHATGPT_HOST_NAME,
     local_ipc,
 };
+#[cfg(unix)]
+use crate::browser::extension_install;
 use std::path::{Path, PathBuf};
 
 fn configuration(error: impl std::fmt::Display) -> HandoffError {
