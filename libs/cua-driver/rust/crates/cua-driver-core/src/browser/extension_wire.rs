@@ -199,12 +199,6 @@ pub enum ExtensionFixedUiAck {
 
 const MAX_ID_BYTES: usize = 4096;
 
-/// Maximum finite normalized action batch accepted by the serialized actor.
-///
-/// A translator must fit all terminal custody replies plus its final marker;
-/// the bound is independent of per-request and per-message byte accounting.
-pub(crate) const MAX_ACTION_BATCH: usize = 1024;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "WireContextFields")]
 pub struct ExtensionWireContext {

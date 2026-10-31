@@ -6,6 +6,7 @@
 //! selectors, input, screenshots, CDP pending calls and engine state stay in the
 //! Host/Cua implementation.
 
+use super::broker_delivery::{ByteBudget, Queued};
 use super::chatgpt_inventory::{
     self, AbsenceEvidence, Caller, EndpointIdentity, InventoryFreshness, KnownCreated,
 };
@@ -23,11 +24,9 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const MAX_TASKS: usize = 192;
-const _: () = assert!(3 * MAX_TASKS < super::extension_wire::MAX_ACTION_BATCH);
 const MAX_NORMAL_TASKS: usize = 64;
 const MAX_CLAIMS: usize = 256;
 const MAX_CHILDREN: usize = 1024;
-const MAX_EARLY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct Call {
@@ -81,14 +80,13 @@ struct CdpScope {
     attach_revoked: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Attaching {
     owner: String,
     session: String,
     turn: String,
     revoked: bool,
-    events: Vec<(String, Value, Option<String>)>,
-    event_bytes: usize,
+    events: Vec<Queued<(String, Value, Option<String>)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +217,7 @@ pub(crate) struct ChatgptWireAdapter {
     ready: bool,
     ended: bool,
     extension_instance: Option<String>,
-    early_bytes: usize,
+    early_budget: ByteBudget,
 }
 
 impl ChatgptWireAdapter {
@@ -246,7 +244,7 @@ impl ChatgptWireAdapter {
             ready: false,
             ended: false,
             extension_instance: None,
-            early_bytes: 0,
+            early_budget: ByteBudget::new(),
         })
     }
 
@@ -1390,7 +1388,8 @@ impl ChatgptWireAdapter {
                     .unwrap_or_default();
                 let mut actions =
                     self.success(&call, json!({"tabId":tab,"targetId":target,"claim":token}));
-                for (method, params, params_json) in early {
+                for event in early {
+                    let ((method, params, params_json), _charge) = event.into_parts();
                     actions.extend(self.notification_with_json(&method, params, params_json)?);
                 }
                 Ok(actions)
@@ -1605,7 +1604,6 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
                         turn: context.host_turn_id().to_owned(),
                         revoked: false,
                         events: Vec::new(),
-                        event_bytes: 0,
                     },
                 );
                 self.children.retain(|(root, _), _| *root != tab);
@@ -1841,21 +1839,19 @@ impl ChatgptWireAdapter {
         };
         if method == "onCDPEvent" {
             if let Some(pending) = self.attaching.get_mut(&tab) {
-                let bytes = serde_json::to_vec(&(&params, &params_json))
+                let bytes = serde_json::to_vec(&params)
                     .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?
-                    .len();
-                if pending.events.len() >= 64
-                    || self.early_bytes.saturating_add(bytes) > MAX_EARLY_BYTES
-                {
-                    return Err(ExtensionWireError::Protocol(
-                        "ChatGPT early CDP event budget exhausted".to_owned(),
-                    ));
-                }
-                pending.event_bytes += bytes;
-                self.early_bytes += bytes;
-                pending
-                    .events
-                    .push((method.to_owned(), params, params_json));
+                    .len()
+                    + params_json.as_ref().map_or(0, String::len)
+                    + method.len();
+                let charge = self
+                    .early_budget
+                    .try_charge_bytes(bytes)
+                    .map_err(|error| ExtensionWireError::Protocol(error.to_string()))?;
+                pending.events.push(Queued::new(
+                    (method.to_owned(), params, params_json),
+                    Some(charge),
+                ));
                 return Ok(Vec::new());
             }
         }
@@ -2217,9 +2213,7 @@ impl ChatgptWireAdapter {
     }
 
     fn retire_attaching(&mut self, tab: u64) -> Option<Attaching> {
-        let entry = self.attaching.remove(&tab)?;
-        self.early_bytes = self.early_bytes.saturating_sub(entry.event_bytes);
-        Some(entry)
+        self.attaching.remove(&tab)
     }
     fn endpoint(&self) -> Result<EndpointIdentity, ExtensionWireError> {
         Ok(EndpointIdentity {

@@ -47,7 +47,7 @@ impl ByteBudget {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn test_with_capacity(bytes: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(bytes)),
@@ -89,6 +89,11 @@ impl ByteBudget {
         value: &T,
     ) -> Result<Arc<ByteCharge>, DeliveryError> {
         let bytes = extension_framing::encode_json(value, Direction::ChromeToHost)?.len();
+        self.try_charge_bytes(bytes)
+    }
+
+    /// Reserve already measured internal storage without imposing a wire-frame limit.
+    pub(crate) fn try_charge_bytes(&self, bytes: usize) -> Result<Arc<ByteCharge>, DeliveryError> {
         let permits = u32::try_from(bytes).map_err(|_| DeliveryError::PermitRange)?;
         let permit = self.permits.clone().try_acquire_many_owned(permits)?;
         Ok(Arc::new(ByteCharge {

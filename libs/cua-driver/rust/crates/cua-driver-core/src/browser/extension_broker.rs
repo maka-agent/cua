@@ -45,8 +45,6 @@ const MAX_NORMAL_PENDING: usize = 64;
 // Cleanup headroom bounds concurrent pending work, never total claim lifetime.
 const MAX_CLEANUP_PENDING: usize = MAX_CLIENTS * (MAX_NORMAL_PENDING + 1);
 const EVENT_CAPACITY: usize = 64;
-const MAX_BUFFERED_EVENTS: usize = 64;
-const MAX_BUFFERED_EVENT_BYTES: usize = 1024 * 1024;
 const CHUNK_BYTES: usize = 192 * 1024;
 const NATIVE_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const QUEUED: u8 = 0;
@@ -695,7 +693,16 @@ impl BrokerHandle {
         value: Value,
         provenance: ExtensionReplyProvenance,
     ) -> Result<(), BrokerError> {
-        let charge = self.budget.charge(&value).await?;
+        let charge = match self.budget.try_charge(&value) {
+            Ok(charge) => charge,
+            Err(error) => {
+                // A full early-event queue cannot drain until this same reader
+                // delivers the attach reply. End the generation instead of waiting.
+                self.extension_eof("extension input queued-byte budget is unavailable")
+                    .await;
+                return Err(error.into());
+            }
+        };
         self.input
             .send(Input::Extension {
                 value,
@@ -1027,9 +1034,7 @@ struct ClientState {
 }
 #[derive(Default)]
 struct BufferedEvents {
-    events: VecDeque<BrokerCdpEvent>,
-    charges: VecDeque<Option<Arc<ByteCharge>>>,
-    bytes: usize,
+    events: VecDeque<Queued<BrokerCdpEvent>>,
     revoked: Option<String>,
 }
 struct ClaimState {
@@ -1212,6 +1217,7 @@ pub(crate) struct ExtensionHostBroker {
     next_route: u64,
     next_outer: u64,
     budget: ByteBudget,
+    lifecycle_budget: ByteBudget,
     current_charge: Option<Arc<ByteCharge>>,
     input_context: Option<ExtensionWireContext>,
     deliveries: VecDeque<Delivery>,
@@ -1251,6 +1257,7 @@ impl ExtensionHostBroker {
             next_route: 0,
             next_outer: 0,
             budget,
+            lifecycle_budget: ByteBudget::new(),
             current_charge: None,
             input_context: None,
             deliveries: VecDeque::new(),
@@ -1620,8 +1627,9 @@ impl ExtensionHostBroker {
             RouteDelivery::Direct => {}
         }
         while let Some(event) = early.events.pop_front() {
+            let (event, charge) = event.into_parts();
             let prior_charge = self.current_charge.take();
-            self.current_charge = early.charges.pop_front().unwrap_or(None);
+            self.current_charge = charge;
             self.emit_cdp_with_context(id, event, None);
             self.current_charge = prior_charge;
         }
@@ -3384,7 +3392,7 @@ impl ExtensionHostBroker {
                     },
                     output,
                 );
-                self.close_client(client, output);
+                self.fail_client_cdp_delivery(client);
             }
         }
     }
@@ -3692,7 +3700,17 @@ impl ExtensionHostBroker {
     }
 
     fn queue_cdp_control(&mut self, client: ClientId, event: ControlEvent) {
-        match self.budget.try_charge(&event) {
+        // Route lifecycle metadata needs headroom to drain a full payload
+        // budget, but still retains a reservation while its writer is blocked.
+        let budget = if matches!(
+            event,
+            ControlEvent::CdpOpened { .. } | ControlEvent::CdpRouteClosed { .. }
+        ) {
+            &self.lifecycle_budget
+        } else {
+            &self.budget
+        };
+        match budget.try_charge(&event) {
             Ok(charge) => self.queue_control_delivery(client, Queued::new(event, Some(charge))),
             Err(_) => self.fail_client_cdp_delivery(client),
         }
@@ -3946,15 +3964,23 @@ impl ExtensionHostBroker {
         };
         match state.delivery {
             RouteDelivery::Ordered { .. } => {
-                self.queue_cdp_control(
-                    state.client,
-                    ControlEvent::CdpMessage {
-                        route: route.0,
-                        claim: state.claim.clone(),
-                        event,
-                        wire_context,
-                    },
-                );
+                let client = state.client;
+                let transferred_charge = if wire_context.is_none() {
+                    self.current_charge.clone()
+                } else {
+                    None
+                };
+                let event = ControlEvent::CdpMessage {
+                    route: route.0,
+                    claim: state.claim.clone(),
+                    event,
+                    wire_context,
+                };
+                if transferred_charge.is_some() {
+                    self.queue_control_delivery(client, Queued::new(event, transferred_charge));
+                } else {
+                    self.queue_cdp_control(client, event);
+                }
             }
             #[cfg(test)]
             RouteDelivery::Direct => self.queue_cdp_delivery(
@@ -5128,14 +5154,11 @@ impl ExtensionHostBroker {
             } else if let Some(route) = record.route {
                 self.emit_cdp(route, event.expect("non-revoked event was built"), output);
             } else if let Some(record) = self.claims.get_mut(&token) {
-                if !buffer_event(
+                buffer_event(
                     &mut record.early,
                     event.expect("non-revoked event was built"),
                     self.current_charge.clone(),
-                ) {
-                    record.alive.store(false, Ordering::SeqCst);
-                    self.emit_control(client, ControlEvent::ClaimUnavailable { claim:token, reason:"event buffer exceeded before a CDP route was opened; physical custody retained for explicit cleanup".to_owned() }, output);
-                }
+                );
             }
         } else if let Some(state) = self.clients.get_mut(&client) {
             if state.attaching.is_empty() {
@@ -5155,12 +5178,12 @@ impl ExtensionHostBroker {
                         })?
                         .to_owned(),
                 );
-            } else if !buffer_event(
-                early,
-                event.expect("non-revoked event was built"),
-                self.current_charge.clone(),
-            ) {
-                self.close_client(client, output);
+            } else {
+                buffer_event(
+                    early,
+                    event.expect("non-revoked event was built"),
+                    self.current_charge.clone(),
+                );
             }
         }
         Ok(())
@@ -5547,19 +5570,8 @@ fn buffer_event(
     buffer: &mut BufferedEvents,
     value: BrokerCdpEvent,
     charge: Option<Arc<ByteCharge>>,
-) -> bool {
-    let Ok(bytes) = extension_framing::encode_json(&value, Direction::HostToChrome) else {
-        return false;
-    };
-    if buffer.events.len() >= MAX_BUFFERED_EVENTS
-        || buffer.bytes.saturating_add(bytes.len()) > MAX_BUFFERED_EVENT_BYTES
-    {
-        return false;
-    }
-    buffer.bytes += bytes.len();
-    buffer.events.push_back(value);
-    buffer.charges.push_back(charge);
-    true
+) {
+    buffer.events.push_back(Queued::new(value, charge));
 }
 
 #[derive(Debug, PartialEq, Eq)]

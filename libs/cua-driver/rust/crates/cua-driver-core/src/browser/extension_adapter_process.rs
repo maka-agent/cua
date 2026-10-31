@@ -16,12 +16,12 @@ use super::{
     extension_framing::{self, Direction, FrameError},
     extension_wire::{
         ExtensionReplyProvenance, ExtensionRpcTrace, ExtensionWireAction, ExtensionWireAdapter,
-        ExtensionWireError, MAX_ACTION_BATCH,
+        ExtensionWireError,
     },
 };
 use serde_json::Value;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io::{self, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -32,8 +32,6 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_SEMANTICS: usize = 128;
-const MAX_DEFERRED_CLEANUP: usize = 32;
-const MAX_CLEANUP_BYTES: usize = 64 * 1024;
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) const NORMALIZED_QUEUE_CAPACITY: usize = 16;
 
@@ -270,8 +268,8 @@ impl Normalizer {
         let task = tokio::spawn(async move {
             while let Some(message) = input.recv().await {
                 let (message, charge) = message.into_parts();
-                // This pump can wait for the broker's shared budget without
-                // blocking the serialized adapter or its raw phase input.
+                // Broker ingress never waits for payload bytes held by early events.
+                // This pump drains independently of the serialized adapter.
                 broker
                     .extension_adapter_message(message.value, message.provenance)
                     .await
@@ -295,24 +293,8 @@ struct Actor {
     io: ExtensionIo,
     normalizer: Normalizer,
     pending: HashMap<String, Semantic>,
-    cleanup: VecDeque<ExtensionOutbound>,
     ready: Option<oneshot::Sender<Result<(), String>>>,
     retiring: bool,
-}
-
-fn cleanup_method(value: &Value) -> bool {
-    matches!(
-        value["method"].as_str(),
-        Some(
-            "closeOwner"
-                | "detach"
-                | "stopCreatedTab"
-                | "finishTurn"
-                | "clearScopedHeaders"
-                | "clearSessionHeaders"
-                | "clearSessionPreparation"
-        )
-    )
 }
 
 impl Actor {
@@ -334,28 +316,6 @@ impl Actor {
             Err(AdapterProcessError::Ended(
                 "backpressured request was already started; outcome remains unknown".to_owned(),
             ))
-        }
-    }
-
-    async fn pressure_input(
-        &mut self,
-        frame: ExtensionOutbound,
-    ) -> Result<(), AdapterProcessError> {
-        if cleanup_method(frame.payload_for_transport()) {
-            let bytes = extension_framing::encode_json(
-                frame.payload_for_transport(),
-                Direction::ChromeToHost,
-            )?;
-            if bytes.len() > MAX_CLEANUP_BYTES || self.cleanup.len() >= MAX_DEFERRED_CLEANUP {
-                return Err(AdapterProcessError::Ended(
-                    "reserved extension cleanup admission exceeded its bounded domain".to_owned(),
-                ));
-            }
-            // Exact original context and guard move with this trusted cleanup.
-            self.cleanup.push_back(frame);
-            Ok(())
-        } else {
-            self.reject_unadmitted(frame).await
         }
     }
 
@@ -388,7 +348,6 @@ impl Actor {
                     _=&mut deadline=>return Err(AdapterProcessError::Ended("normalized admission deadline expired; delivery remains unknown".to_owned())),
                     result=&mut admission=>break result.map_err(|error|AdapterProcessError::Ended(error.to_string()))?,
                     _=self.io.failure.changed(), if !self.retiring=>return Err(self.failure().await),
-                    frame=self.outgoing.recv()=>match frame {Some(frame)=>self.pressure_input(frame).await?,None=>return Err(AdapterProcessError::Ended("broker output ended during normalized delivery".to_owned()))},
                 }
             }
         };
@@ -400,7 +359,6 @@ impl Actor {
                 _=&mut deadline=>return Err(AdapterProcessError::Ended("normalized queue deadline expired; delivery remains unknown".to_owned())),
                 result=&mut reserve=>break result.map_err(|_|AdapterProcessError::Ended("normalizer ended".to_owned()))?,
                 _=self.io.failure.changed(), if !self.retiring=>return Err(self.failure().await),
-                frame=self.outgoing.recv()=>match frame {Some(frame)=>self.pressure_input(frame).await?,None=>return Err(AdapterProcessError::Ended("broker output ended during normalized delivery".to_owned()))},
             }
         };
         permit.send(Queued::new(
@@ -564,7 +522,7 @@ impl Actor {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn extension(&mut self, value: Value) -> Result<(), AdapterProcessError> {
         let json = serde_json::value::to_raw_value(&value)
             .map_err(|error| AdapterProcessError::Ended(error.to_string()))?;
@@ -588,11 +546,6 @@ impl Actor {
         Box<dyn std::future::Future<Output = Result<(), AdapterProcessError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if actions.len() > MAX_ACTION_BATCH {
-                return Err(AdapterProcessError::Ended(
-                    "adapter action batch exceeds its bound".to_owned(),
-                ));
-            }
             let mut frames: HashMap<String, usize> = HashMap::new();
             let mut payloads: HashMap<String, Arc<ByteCharge>> = HashMap::new();
             for action in &actions {
@@ -788,10 +741,6 @@ impl Actor {
             if !self.io.port_live.load(Ordering::SeqCst) {
                 return Err(self.failure().await);
             }
-            if let Some(request) = self.cleanup.pop_front() {
-                self.semantic(request).await?;
-                continue;
-            }
             tokio::select! {
                 _=self.io.failure.changed()=>return Err(self.failure().await),
                 _=expiry.tick()=>{self.cancel_dead().await?;let actions=self.adapter.expire(Instant::now());self.actions(actions).await?;},
@@ -821,7 +770,6 @@ pub(crate) async fn run(
         io,
         normalizer,
         pending: HashMap::new(),
-        cleanup: VecDeque::new(),
         ready: Some(ready),
         retiring: false,
     };
@@ -1001,18 +949,6 @@ mod tests {
         assert!(writer.into_inner().is_empty());
     }
 
-    #[test]
-    fn cleanup_reserve_excludes_tab_stop_from_whole_turn_finish() {
-        assert!(cleanup_method(&serde_json::json!({"method":"finishTurn"})));
-        assert!(cleanup_method(
-            &serde_json::json!({"method":"stopCreatedTab"})
-        ));
-        assert!(!cleanup_method(
-            &serde_json::json!({"method":"cdp","params":{"method":"turnEnded"}})
-        ));
-        assert!(!cleanup_method(&serde_json::json!({"method":"inventory"})));
-    }
-
     #[tokio::test]
     async fn terminal_marker_keeps_every_pending_custody_receipt_before_transport_end() {
         use super::super::{
@@ -1053,7 +989,6 @@ mod tests {
                 task: None,
             },
             pending: HashMap::new(),
-            cleanup: VecDeque::new(),
             ready: None,
             retiring: false,
         };
@@ -1089,6 +1024,12 @@ mod tests {
                 actions.push(ExtensionWireAction::BrokerMessage(custody));
             }
             actions.push(ExtensionWireAction::SemanticFinished { semantic_id: id });
+        }
+        for _ in 0..1100 {
+            actions.push(ExtensionWireAction::Diagnostic {
+                semantic_id: None,
+                message: String::new(),
+            });
         }
         actions.push(ExtensionWireAction::TransportEnded {
             reason: "matched protocol violation".to_owned(),
@@ -1252,7 +1193,6 @@ mod tests {
                 task: None,
             },
             pending: HashMap::new(),
-            cleanup: VecDeque::new(),
             ready: None,
             retiring: false,
         };
@@ -1264,6 +1204,76 @@ mod tests {
             _failure: failure_sender,
             broker_task,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normalized_event_backpressure_preserves_queued_browser_commands() {
+        use super::super::extension_broker::{CheckedLocalPeer, ControlRequest};
+        use std::{future::Future, task::Poll};
+
+        let mut fixture = translated_fixture().await;
+        let mut client = fixture
+            .actor
+            .broker
+            .admit_peer(CheckedLocalPeer::from_checked_principal(
+                LocalPrincipal::UnixUid(123),
+            ))
+            .await
+            .unwrap();
+        let slots = fixture.actor.normalizer.sender.capacity();
+        for index in 0..slots {
+            fixture
+                .actor
+                .forward(json!({"buffered":index}), ExtensionReplyProvenance::Adapted)
+                .await
+                .unwrap();
+        }
+        client
+            .sender
+            .control_with_context(
+                ControlRequest::Inventory {
+                    id: 42,
+                    session_only: None,
+                    known_tab_ids: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        fixture.actor.broker.identity().await.unwrap();
+
+        let mut delivery = Box::pin(
+            fixture
+                .actor
+                .forward(json!({"last":true}), ExtensionReplyProvenance::Adapted),
+        );
+        std::future::poll_fn(|context| match delivery.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => panic!("event must wait for its occupied queue: {result:?}"),
+        })
+        .await;
+        drop(fixture.normalized.recv().await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let command = fixture.actor.outgoing.try_recv().expect(
+            "page events must leave concurrent browser commands queued for normal admission",
+        );
+        assert_eq!(command.payload_for_transport()["method"], "inventory");
+        assert!(
+            client.events.try_recv().is_err(),
+            "temporary event backpressure must not reject a browser command"
+        );
+        for _ in 1..slots {
+            drop(fixture.normalized.recv().await.unwrap());
+        }
+        assert_eq!(
+            fixture.normalized.recv().await.unwrap().event().value,
+            json!({"last":true})
+        );
     }
 
     #[cfg(unix)]

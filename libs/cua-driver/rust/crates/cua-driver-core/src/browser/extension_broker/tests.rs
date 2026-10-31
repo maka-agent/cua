@@ -598,10 +598,9 @@ async fn async_actor_publishes_only_the_actual_successful_hello_identity() {
     let identity = handle.identity().await.unwrap();
     assert_eq!(identity.instance_id, "actual-instance");
     assert_eq!(identity.generation, bound["generation"]);
-    assert_eq!(
-        identity.capabilities,
-        json!({"metadata":true,"nativeWindowProof":false})
-    );
+    assert_eq!(identity.capabilities["metadata"], true);
+    assert_eq!(identity.capabilities["nativeWindowProof"], false);
+    assert_eq!(identity.capabilities["uploadStaging"], false);
     handle.extension_eof("fixture EOF").await;
     task.await.unwrap();
 }
@@ -3846,4 +3845,223 @@ fn raw_chrome_data_survives_generic_value_ipc_and_charges_encoded_wrapper_bytes(
     drop(charge);
     assert_eq!(budget.available_bytes(), initial);
     assert!(chrome_result_json(42, r#"{"bad":"\!"}"#).is_err());
+}
+
+#[test]
+fn ordered_events_survive_attach_and_route_gaps_without_small_buffer_quotas() {
+    for (count, payload_bytes) in [(96, 0), (1, 1024 * 1024 + 256)] {
+        let mut broker = fixture();
+        let mut client = admit(&mut broker);
+        let client_id = client.sender.lease.id;
+        let owner = broker.clients[&client_id].owner.clone();
+        let command = request(
+            &mut broker,
+            &client,
+            ControlRequest::Attach { id: 1, tab_id: 11 },
+        );
+        let mut output = Vec::new();
+        for sequence in 0..count {
+            broker.extension(json!({"kind":"event","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","method":"Runtime.consoleAPICalled","params":{"sequence":sequence,"payload":"x".repeat(payload_bytes)}}), &mut output).unwrap();
+        }
+        assert!(
+            client.sender.lease.alive.load(Ordering::SeqCst),
+            "valid Chrome notifications must not revoke an attaching owner"
+        );
+        reply(
+            &mut broker,
+            &command,
+            json!({"claim":"claim-a","tabId":11,"targetId":"opaque-target-11"}),
+        );
+        assert!(matches!(
+            client.events.try_recv().unwrap().into_parts().0,
+            ControlEvent::Reply {
+                id: 1,
+                outcome: ControlOutcome::Result(_)
+            }
+        ));
+        let mut previous_route = None;
+        for open_id in [9, 10] {
+            let route = broker
+                .bind_route_with_delivery(client_id, "claim-a", RouteDelivery::Ordered { open_id })
+                .unwrap();
+            broker.flush_deliveries();
+            assert!(
+                matches!(client.events.try_recv().unwrap().into_parts().0, ControlEvent::CdpOpened { id, .. } if id == open_id)
+            );
+            for sequence in 0..count {
+                broker.flush_deliveries();
+                let (event, _) = client.events.try_recv().unwrap().into_parts();
+                assert!(
+                    matches!(event, ControlEvent::CdpMessage { event:BrokerCdpEvent::ChromeMessage(value),wire_context:None,.. } if value["params"]["sequence"] == sequence && value["params"]["payload"].as_str().unwrap().len() == payload_bytes)
+                );
+            }
+            assert!(client.events.try_recv().is_err());
+            if let Some(old) = previous_route.take() {
+                assert_ne!(old, route.sender.lease.id);
+            }
+            broker.close_route(route.sender.lease.id, "consumer ended", &mut output);
+            assert!(!route.sender.lease.alive.load(Ordering::SeqCst));
+            assert!(broker.claims["claim-a"].alive.load(Ordering::SeqCst));
+            assert!(matches!(
+                client.events.try_recv().unwrap().into_parts().0,
+                ControlEvent::CdpRouteClosed { .. }
+            ));
+            previous_route = Some(route.sender.lease.id);
+            if open_id == 9 {
+                for sequence in 0..count {
+                    broker.extension(json!({"kind":"event","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","method":"Runtime.consoleAPICalled","params":{"sequence":sequence,"payload":"x".repeat(payload_bytes)}}), &mut output).unwrap();
+                }
+            }
+        }
+        let detach = request(
+            &mut broker,
+            &client,
+            ControlRequest::Detach {
+                id: 11,
+                claim: "claim-a".into(),
+            },
+        );
+        reply(
+            &mut broker,
+            &detach,
+            json!({"detached":true,"proof":"detach_ack"}),
+        );
+        assert!(
+            matches!(terminal_control(&mut client).into_parts().0, ControlEvent::Reply { id:11, outcome:ControlOutcome::Result(value) } if value["detached"] == true)
+        );
+    }
+}
+
+#[test]
+fn ordered_early_replay_transfers_its_original_charge_at_full_budget() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let client_id = client.sender.lease.id;
+    let owner = broker.clients[&client_id].owner.clone();
+    let command = request(
+        &mut broker,
+        &client,
+        ControlRequest::Attach { id: 1, tab_id: 11 },
+    );
+    reply(
+        &mut broker,
+        &command,
+        json!({"claim":"claim-a","tabId":11,"targetId":"opaque-target-11"}),
+    );
+    let _ = client.events.try_recv().unwrap();
+    let value = json!({"kind":"event","protocol":1,"generation":broker.generation,"owner":owner,"claim":"claim-a","method":"Runtime.consoleAPICalled","params":{"sequence":1}});
+    let bytes = serde_json::to_vec(&value).unwrap().len();
+    broker.budget = ByteBudget::test_with_capacity(bytes);
+    broker.current_charge = Some(broker.budget.try_charge(&value).unwrap());
+    broker.extension(value, &mut Vec::new()).unwrap();
+    broker.current_charge = None;
+    assert_eq!(broker.budget.available_bytes(), 0);
+    let route = broker
+        .bind_route_with_delivery(client_id, "claim-a", RouteDelivery::Ordered { open_id: 9 })
+        .unwrap();
+    assert!(client.sender.lease.alive.load(Ordering::SeqCst));
+    assert!(matches!(
+        client.events.try_recv().unwrap().into_parts().0,
+        ControlEvent::CdpOpened { id: 9, .. }
+    ));
+    let (event, charge) = client.events.try_recv().unwrap().into_parts();
+    assert!(
+        matches!(event, ControlEvent::CdpMessage { event:BrokerCdpEvent::ChromeMessage(value),.. } if value["params"]["sequence"] == 1)
+    );
+    assert!(charge.is_some());
+    assert_eq!(broker.budget.available_bytes(), 0);
+    drop(charge);
+    assert_eq!(broker.budget.available_bytes(), bytes);
+    assert!(route.sender.lease.alive.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn exhausted_extension_ingress_announces_eof_instead_of_waiting_on_early_events() {
+    let value = json!({"kind":"event","params":{"payload":"fills the test budget"}});
+    let budget = ByteBudget::test_with_capacity(serde_json::to_vec(&value).unwrap().len());
+    let _retained = budget.try_charge(&value).unwrap();
+    let (input, mut receiver) = mpsc::channel(1);
+    let handle = BrokerHandle { input, budget };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle.extension_message(value),
+    )
+    .await
+    .expect("ingress cannot wait for events that have no CDP consumer");
+    assert!(matches!(
+        result,
+        Err(BrokerError::Delivery(DeliveryError::Unavailable(_)))
+    ));
+    assert!(
+        matches!(receiver.try_recv().unwrap(), Input::ExtensionEof(reason) if reason == "extension input queued-byte budget is unavailable")
+    );
+}
+
+#[test]
+fn stalled_lifecycle_writer_retains_a_bounded_reservation_until_delivery() {
+    let mut broker = fixture();
+    let mut client = admit(&mut broker);
+    let client_id = client.sender.lease.id;
+    let command = request(
+        &mut broker,
+        &client,
+        ControlRequest::Attach { id: 1, tab_id: 11 },
+    );
+    reply(
+        &mut broker,
+        &command,
+        json!({"claim":"claim-a","tabId":11,"targetId":"opaque-target-11"}),
+    );
+    let _ = client.events.try_recv().unwrap();
+    let capacity = serde_json::to_vec(&ControlEvent::CdpOpened { id: 9, route: 1 })
+        .unwrap()
+        .len()
+        + serde_json::to_vec(&ControlEvent::CdpRouteClosed {
+            route: 1,
+            claim: "claim-a".into(),
+            reason: "extension CDP route ended; physical claim custody is retained".into(),
+        })
+        .unwrap()
+        .len();
+    broker.lifecycle_budget = ByteBudget::test_with_capacity(capacity);
+    let mut output = Vec::new();
+    let route = broker
+        .bind_route_with_delivery(client_id, "claim-a", RouteDelivery::Ordered { open_id: 9 })
+        .unwrap();
+    broker.close_route(route.sender.lease.id, "consumer ended", &mut output);
+    assert_eq!(broker.lifecycle_budget.available_bytes(), 0);
+    let exhausted = broker
+        .bind_route_with_delivery(client_id, "claim-a", RouteDelivery::Ordered { open_id: 10 })
+        .unwrap();
+    assert!(!exhausted.sender.lease.alive.load(Ordering::SeqCst));
+    assert!(!client.sender.lease.alive.load(Ordering::SeqCst));
+    let mut delivered = Vec::new();
+    while let Ok(queued) = client.events.try_recv() {
+        delivered.push(queued.into_parts().0);
+    }
+    assert_eq!(delivered.len(), 3);
+    assert!(matches!(
+        delivered[0],
+        ControlEvent::CdpOpened { id: 9, .. }
+    ));
+    assert!(matches!(delivered[1], ControlEvent::CdpRouteClosed { .. }));
+    assert!(
+        matches!(&delivered[2], ControlEvent::GenerationClosed { reason } if reason == "owner CDP delivery budget exhausted; invocation and effect settlement remain unknown")
+    );
+    assert_eq!(broker.lifecycle_budget.available_bytes(), capacity);
+    assert!(broker.claims.contains_key("claim-a"));
+    assert!(broker.claims["claim-a"].cleanup_id.is_none());
+    assert!(
+        output.is_empty(),
+        "resource failure cannot mint a physical cleanup effect"
+    );
+    assert!(matches!(
+        broker.bind_route_with_delivery(
+            client_id,
+            "claim-a",
+            RouteDelivery::Ordered { open_id: 11 }
+        ),
+        Err(BrokerError::Closed)
+    ));
+    assert!(client.events.try_recv().is_err());
 }

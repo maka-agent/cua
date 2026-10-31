@@ -3533,3 +3533,68 @@ fn original_debugger_claim_and_attached_event_preserve_preexisting_lone_title() 
     );
     assert_eq!(forwarded["claim"], token);
 }
+
+#[test]
+fn early_notifications_replay_past_old_count_and_size_quotas_in_order() {
+    for (count, padding) in [(1100, 8), (1, 1024 * 1024 + 1)] {
+        let (mut adapter, context, now) = boot();
+        let available = adapter.early_budget.available_bytes();
+        let attach = before_attach_ack(&mut adapter, &context, "1", 7, now);
+        for index in 0..count {
+            let actions = adapter
+                .written_extension(
+                    json!({
+                        "jsonrpc":"2.0", "method":"onCDPEvent",
+                        "params":{"source":{"tabId":7}, "method":"Runtime.consoleAPICalled",
+                            "params":{"index":index, "padding":"x".repeat(padding)}}
+                    }),
+                    now,
+                )
+                .expect("legitimate early notifications must not end the generation");
+            assert!(actions.is_empty());
+        }
+        assert!(adapter.early_budget.available_bytes() < available);
+        let probe = frame(
+            &adapter
+                .written_extension(json!({"jsonrpc":"2.0","id":attach["id"]}), now)
+                .unwrap(),
+        );
+        let targets = frame(&reply(
+            &mut adapter,
+            &probe,
+            json!({"result":{"value":0}}),
+            now,
+        ));
+        let actions = reply(
+            &mut adapter,
+            &targets,
+            json!({"targetInfos":[{"tabId":7,"type":"page","targetId":"target-7","attached":true}]}),
+            now,
+        );
+        let token = response(&actions)["result"]["claim"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let events: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                ExtensionWireAction::BrokerMessage(value) if value["kind"] == "event" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), count);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["claim"], token);
+            let params = event
+                .get("paramsJson")
+                .and_then(Value::as_str)
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .unwrap_or_else(|| event["params"].clone());
+            assert_eq!(params["index"], index);
+            assert_eq!(params["padding"].as_str().unwrap().len(), padding);
+        }
+        assert_eq!(adapter.early_budget.available_bytes(), available);
+    }
+}

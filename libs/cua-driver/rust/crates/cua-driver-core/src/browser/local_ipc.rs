@@ -428,15 +428,10 @@ fn load_installation_file(path: &Path) -> Result<LoadedInstallationFile, IpcErro
         }
         result => result?,
     };
-    if file.metadata()?.len() > MAX_DESCRIPTOR {
-        return Err(rejected("installation sidecar exceeds byte budget"));
-    }
     let identity = platform::file_identity(&file)?;
     let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(MAX_DESCRIPTOR + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_DESCRIPTOR || platform::path_identity(path)? != identity {
+    file.read_to_end(&mut bytes)?;
+    if platform::path_identity(path)? != identity {
         return Err(rejected("installation sidecar changed while loading"));
     }
     Ok(LoadedInstallationFile {
