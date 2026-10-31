@@ -15,12 +15,13 @@ use std::{
 mod browser_family;
 pub use browser_family::BrowserFamily;
 mod configuration;
+mod discovery;
 mod plan;
 pub mod transport;
 pub use plan::{OriginalHost, PreparedHandoff};
 mod storage;
 pub use configuration::{
-    ConfiguredHandoff, NativeHostReceipt, recorded_native_hosts, restore_current,
+    recorded_native_hosts, restore_browser, restore_current, ConfiguredHandoff, NativeHostReceipt,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

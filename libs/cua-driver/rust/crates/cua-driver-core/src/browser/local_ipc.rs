@@ -448,19 +448,22 @@ fn load_installation_file(path: &Path) -> Result<LoadedInstallationFile, IpcErro
 
 /// Private state grows with actual live owners rather than a descriptor budget.
 pub(crate) fn load_private_state(path: &Path) -> Result<Vec<u8>, IpcError> {
-    platform::validate_directory(
-        path.parent()
-            .ok_or_else(|| rejected("state lacks parent"))?,
-    )?;
-    let mut file = match platform::open_private_file(path) {
-        Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(IpcError::MissingInstallationFile);
-        }
-        result => result?,
+    let read = || {
+        platform::validate_directory(
+            path.parent()
+                .ok_or_else(|| rejected("state lacks parent"))?,
+        )?;
+        let mut file = platform::open_private_file(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    match read() {
+        Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Err(IpcError::MissingInstallationFile)
+        }
+        result => result,
+    }
 }
 
 pub(crate) fn load_private_installation_config(path: &Path) -> Result<Vec<u8>, IpcError> {
@@ -767,6 +770,22 @@ pub(crate) async fn write_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_private_state_is_missing_with_or_without_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temp.path()).unwrap().join("scope");
+        let state = directory.join("active-host.json");
+        assert!(matches!(
+            load_private_state(&state),
+            Err(IpcError::MissingInstallationFile)
+        ));
+        ensure_private_state_directory(&directory).unwrap();
+        assert!(matches!(
+            load_private_state(&state),
+            Err(IpcError::MissingInstallationFile)
+        ));
+    }
 
     fn descriptor() -> Descriptor {
         Descriptor {

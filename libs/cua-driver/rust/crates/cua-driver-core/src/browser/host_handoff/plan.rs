@@ -153,48 +153,23 @@ fn rewrite(
     manifest_path: &Path,
     bytes: &[u8],
 ) -> Result<(OriginalHost, Vec<u8>), HandoffError> {
-    let mut manifest: serde_json::Value = serde_json::from_slice(bytes)?;
-    if manifest["name"] != CHATGPT_HOST_NAME || manifest["type"] != "stdio" {
-        return Err(configuration(
-            "original registration is not a ChatGPT stdio host",
-        ));
-    }
-    let path = manifest["path"]
-        .as_str()
-        .ok_or_else(|| configuration("original host path is missing"))?;
-    let executable = Path::new(path);
-    #[cfg(unix)]
-    if !executable.is_absolute() {
-        return Err(configuration("original host path must be absolute"));
-    }
-    let executable = if executable.is_absolute() {
-        executable.to_owned()
-    } else {
-        manifest_path
-            .parent()
-            .ok_or_else(|| configuration("manifest lacks parent"))?
-            .join(executable)
-    };
-    let executable = std::fs::canonicalize(executable)?;
-    if executable == config.executable() {
+    let original = super::discovery::parse_host(manifest_path, bytes)?;
+    if original.executable == config.executable() {
         return Err(configuration(
             "registration already points to Maka; restore the previous handoff first",
         ));
     }
-    let allowed_origins: Vec<String> = serde_json::from_value(manifest["allowed_origins"].clone())?;
-    if !allowed_origins.contains(&format!("chrome-extension://{}/", config.extension_id())) {
+    if !original
+        .allowed_origins
+        .contains(&format!("chrome-extension://{}/", config.extension_id()))
+    {
         return Err(configuration(
             "original host registration does not allow the selected extension",
         ));
     }
+    let mut manifest: serde_json::Value = serde_json::from_slice(bytes)?;
     manifest["path"] = serde_json::to_value(config.executable())?;
-    Ok((
-        OriginalHost {
-            executable,
-            allowed_origins,
-        },
-        serde_json::to_vec_pretty(&manifest)?,
-    ))
+    Ok((original, serde_json::to_vec_pretty(&manifest)?))
 }
 
 #[cfg(windows)]

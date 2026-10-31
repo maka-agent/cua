@@ -36,7 +36,7 @@ const MAX_CONNECTIONS: usize = 32;
 
 pub(crate) const CHATGPT_HOST_NAME: &str = "com.openai.codexextension";
 
-/// A supported adapter selected by an exact private installation sidecar.
+/// A supported adapter selected by setup or discovered native registration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtensionAdapterMode {
     Maka,
@@ -244,6 +244,14 @@ pub(crate) fn load_installed_selections(
     let load = || -> Result<InstalledSelections, ProcessError> {
         let executable = std::env::current_exe()?;
         let catalog = extension_catalog::load(&executable)?;
+        let explicit_chatgpt = catalog
+            .entries
+            .iter()
+            .any(|entry| entry.config.adapter == CHATGPT_HOST_NAME)
+            || catalog
+                .rejected
+                .iter()
+                .any(|entry| entry.adapter == CHATGPT_HOST_NAME);
         let mut result = InstalledSelections {
             selections: Vec::new(),
             rejected: catalog
@@ -256,6 +264,20 @@ pub(crate) fn load_installed_selections(
             match process_config(&entry.config).and_then(ExtensionAdapterSelection::from_config) {
                 Ok(selection) => result.selections.push(selection),
                 Err(error) => result.rejected.push((entry.path, error.to_string())),
+            }
+        }
+        if !explicit_chatgpt {
+            match super::host_handoff::ConfiguredHandoff::load() {
+                Ok(Some(config)) => match config.selection() {
+                    Ok(selection) => result.selections.push(selection),
+                    Err(error) => result
+                        .rejected
+                        .push((executable.clone(), error.to_string())),
+                },
+                Ok(None) => {}
+                Err(error) => result
+                    .rejected
+                    .push((executable.clone(), error.to_string())),
             }
         }
         Ok(result)
@@ -274,7 +296,25 @@ fn installed_config(
         ProcessError::Lifecycle("extension invocation origin is not Unicode".into())
     })?;
     let catalog = extension_catalog::load(current_executable)?;
-    process_config(&catalog.origin(origin)?.config)
+    let entry = catalog.origin(origin)?;
+    if entry.config.handoff.is_some() {
+        return Err(ProcessError::Lifecycle(
+            "on-demand native host requires supervisor admission".into(),
+        ));
+    }
+    process_config(&entry.config)
+}
+
+pub(crate) fn handoff_selection(
+    config: &InstalledHostConfig,
+) -> Result<ExtensionAdapterSelection, ProcessError> {
+    ExtensionAdapterSelection::from_config(process_config(config)?)
+}
+
+pub(crate) fn bootstrap_handoff(
+    config: &InstalledHostConfig,
+) -> Result<Option<ExitCode>, ProcessError> {
+    Ok(bootstrap(process_config(config)?))
 }
 
 /// Binary startup hook: ordinary CLI invocations do not probe installation data.

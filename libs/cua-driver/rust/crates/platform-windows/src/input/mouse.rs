@@ -1553,7 +1553,12 @@ mod wheel_tests {
             }
         }
         if msg == WM_MOUSEMOVE {
-            let _ = PostMessageW(hwnd, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                WM_MOUSELEAVE,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }

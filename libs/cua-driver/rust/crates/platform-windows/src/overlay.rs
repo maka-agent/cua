@@ -30,7 +30,7 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -481,26 +481,7 @@ impl RenderEntry for RenderState {
     // `tick` (arrival on path end) and `needs_frame_tick` use the shared
     // defaults. The shared predicate keeps a revealed cursor with resting
     // motion (the float bob) at the ACTIVE cadence, and parks a reduced-motion
-    // cursor through its constant-alpha idle-hide countdown; that countdown is
-    // advanced by [`RenderState::in_idle_countdown`] at the slow IDLE cadence.
-}
-
-impl RenderState {
-    /// True while the cursor rests on-screen at full alpha with idle-hide
-    /// pending: pixels are static (alpha pinned at 1.0) but `idle_secs` must
-    /// keep accruing wall-clock time so the fade still starts on schedule.
-    /// Ticked at the slow IDLE cadence; see the `real_dt` catch-up in the
-    /// WM_TIMER handler, which compensates for the 0.05 s motion-dt clamp.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    fn in_idle_countdown(&self) -> bool {
-        self.core.trajectory.is_none()
-            && self.core.click_t.is_none()
-            && self.core.click_age.is_none()
-            && self.core.motion.idle_hide_ms > 0.0
-            && self.core.visible
-            && self.core.placed
-            && self.core.idle_alpha >= 1.0
-    }
+    // cursor through its constant-alpha idle-hide countdown.
 }
 
 // ── Win32 message-loop thread ─────────────────────────────────────────────
@@ -1176,10 +1157,18 @@ unsafe extern "system" fn wnd_proc(
                     // Drain the channel via get-or-create; the shared map
                     // tracks the last-touched key for z-order pinning.
                     let mut had_msg = false;
+                    let mut new_moves = HashSet::new();
                     if let Ok(rx_guard) = CMD_RX_WIN.try_lock() {
                         if let Some(ref rx) = *rx_guard {
                             while let Ok(m) = rx.try_recv() {
                                 had_msg = true;
+                                if let OverlayMsg::Cmd(KeyedOverlayCommand {
+                                    key,
+                                    cmd: OverlayCommand::MoveTo { .. },
+                                }) = &m
+                                {
+                                    new_moves.insert(key.clone());
+                                }
                                 apply_msg(map, m);
                             }
                         }
@@ -1201,33 +1190,11 @@ unsafe extern "system" fn wnd_proc(
                             None => false,
                         }
                     });
-                    let real_dt = now.duration_since(map.platform.last_tick).as_secs_f64();
-                    // Clamped dt for the motion physics: a large gap between
-                    // ticks must not teleport an in-flight glide.
-                    let dt = real_dt.clamp(0.0, 0.05);
+                    let dt = now.duration_since(map.platform.last_tick).as_secs_f64();
                     map.platform.last_tick = now;
 
                     // Tick every cursor; record the ones that just arrived.
-                    let mut arrived: Vec<CursorKey> = Vec::new();
-                    for (k, rs) in map.cursors.iter_mut() {
-                        if rs.tick(dt) {
-                            arrived.push(k.clone());
-                        }
-                        // Idle-countdown wall-clock catch-up (render-gate fix):
-                        // cursors parked in the constant-alpha countdown tick at
-                        // the slow IDLE cadence, where the 0.05 s motion clamp
-                        // would stretch the `idle_hide_ms` countdown ~5x. Credit
-                        // the unclamped remainder so the fade starts on real
-                        // time — but never advance past `fade_start`, so the
-                        // 180 ms fade itself always plays out at frame cadence
-                        // (a single 250 ms step would otherwise skip the fade
-                        // and pop the cursor out).
-                        if real_dt > dt && rs.in_idle_countdown() {
-                            let fade_start = rs.core.motion.idle_hide_ms / 1000.0;
-                            rs.core.idle_secs =
-                                (rs.core.idle_secs + (real_dt - dt)).min(fade_start);
-                        }
-                    }
+                    let arrived = map.tick_frame(dt, &new_moves);
                     let mut pointer = POINT::default();
                     let pointer = GetCursorPos(&mut pointer)
                         .ok()
@@ -1747,6 +1714,17 @@ mod tests {
     }
 
     #[test]
+    fn a_new_move_does_not_consume_time_before_its_command() {
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("existing", 80.0, 80.0));
+        apply_msg(&mut map, move_msg("new", 250.0, 150.0));
+        let arrived = map.tick_frame(1.0, &HashSet::from(["new".to_owned()]));
+        assert_eq!(arrived, ["existing"]);
+        assert_eq!(map.cursors["new"].core.motion_t, 0.0);
+        assert_eq!(map.tick_frame(1.0, &HashSet::new()), ["new"]);
+    }
+
+    #[test]
     fn removal_through_the_adapter_resolves_no_pin_key() {
         let mut map = empty_map();
         assert_eq!(
@@ -1800,13 +1778,6 @@ mod tests {
         assert!(rs.core.trajectory.is_none());
         assert_eq!(rs.core.idle_alpha, 1.0);
         assert!(!map.needs_frame_tick());
-        assert!(rs.in_idle_countdown());
-        let rs = map.cursors.get_mut("sessA").unwrap();
-        rs.core.pos = (-200.0, -200.0);
-        assert!(rs.in_idle_countdown());
-        rs.core.placed = false;
-        assert!(!rs.in_idle_countdown());
-        rs.core.placed = true;
 
         // The fade animates pixels, so frame ticks return until alpha ~0.
         let rs = map.cursors.get_mut("sessA").unwrap();
@@ -1814,7 +1785,6 @@ mod tests {
         rs.tick(0.016);
         assert!(rs.core.idle_alpha < 1.0 && rs.core.idle_alpha >= 0.004);
         assert!(rs.needs_frame_tick());
-        assert!(!rs.in_idle_countdown());
 
         for _ in 0..60 {
             map.tick_all(0.016);

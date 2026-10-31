@@ -709,6 +709,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         let mut dirty = false;
         let mut shutdown = false;
         let mut pending = first_cmd;
+        let mut new_moves = HashSet::new();
         let frame = output_frame(&state);
         loop {
             let received = pending.take().map(Ok).unwrap_or_else(|| rx.try_recv());
@@ -718,6 +719,9 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                     break;
                 }
                 Ok(WlOverlayCmd::Cmd { key, cmd }) => {
+                    if matches!(cmd, OverlayCommand::MoveTo { .. }) {
+                        new_moves.insert(key.clone());
+                    }
                     dirty |= apply_keyed_command(&mut state.render, frame, key, cmd);
                 }
                 Ok(WlOverlayCmd::Remove(key)) => {
@@ -744,11 +748,19 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         if let Some(timeout_kind) = timed_out {
             match timeout_kind {
                 WlWait::Frame => {
-                    arrived.extend(tick_all_cores(&mut state.render.cursors, elapsed.min(0.05)));
+                    arrived.extend(tick_all_cores(
+                        &mut state.render.cursors,
+                        elapsed,
+                        &new_moves,
+                    ));
                     dirty = true;
                 }
                 WlWait::Deadline(_) => {
-                    arrived.extend(tick_all_cores(&mut state.render.cursors, elapsed));
+                    arrived.extend(tick_all_cores(
+                        &mut state.render.cursors,
+                        elapsed,
+                        &new_moves,
+                    ));
                     dirty = true;
                 }
                 WlWait::Maintenance(_) => {
@@ -758,7 +770,11 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                         .iter()
                         .map(|(key, core)| (key.clone(), core.idle_alpha))
                         .collect();
-                    arrived.extend(tick_all_cores(&mut state.render.cursors, elapsed));
+                    arrived.extend(tick_all_cores(
+                        &mut state.render.cursors,
+                        elapsed,
+                        &new_moves,
+                    ));
                     dirty |= state.render.cursors.iter().any(|(key, core)| {
                         before
                             .get(key)
@@ -860,11 +876,18 @@ fn earliest_idle_fade_wait(cores: &CursorMap<RenderStateCore>) -> Option<Duratio
 }
 
 /// Advance every cursor and return the keys whose planned glide just ended.
-fn tick_all_cores(cores: &mut CursorMap<RenderStateCore>, dt: f64) -> Vec<CursorKey> {
+fn tick_all_cores(
+    cores: &mut CursorMap<RenderStateCore>,
+    dt: f64,
+    new_moves: &HashSet<CursorKey>,
+) -> Vec<CursorKey> {
     cursor_overlay::render_map::update_peer_presence(cores.values_mut());
     cores
         .iter_mut()
-        .filter_map(|(key, core)| core.tick_motion(dt).then(|| key.clone()))
+        .filter_map(|(key, core)| {
+            core.tick_motion(if new_moves.contains(key) { 0.0 } else { dt })
+                .then(|| key.clone())
+        })
         .collect()
 }
 
@@ -1457,7 +1480,11 @@ mod tests {
 
         let mut arrivals = Vec::new();
         for _ in 0..600 {
-            arrivals.extend(tick_all_cores(&mut render.cursors, 1.0 / 60.0));
+            arrivals.extend(tick_all_cores(
+                &mut render.cursors,
+                1.0 / 60.0,
+                &HashSet::new(),
+            ));
         }
         assert_eq!(arrivals, vec!["mover".to_owned()]);
         assert!(

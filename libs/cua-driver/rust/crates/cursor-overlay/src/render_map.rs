@@ -367,10 +367,20 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
 
     /// Advance every cursor; returns the keys whose planned path just ended.
     pub fn tick_all(&mut self, dt: f64) -> Vec<CursorKey> {
+        self.tick_frame(dt, &HashSet::new())
+    }
+
+    /// Advance existing motion by elapsed wall time. Moves received this frame
+    /// start at zero so they cannot consume time before their command.
+    pub fn tick_frame(&mut self, elapsed: f64, new_moves: &HashSet<CursorKey>) -> Vec<CursorKey> {
         update_peer_presence(self.cursors.values_mut().map(S::core_mut));
         let mut arrived = Vec::new();
         for (key, cursor) in self.cursors.iter_mut() {
-            if cursor.tick(dt) {
+            if cursor.tick(if new_moves.contains(key) {
+                0.0
+            } else {
+                elapsed
+            }) {
                 arrived.push(key.clone());
             }
         }

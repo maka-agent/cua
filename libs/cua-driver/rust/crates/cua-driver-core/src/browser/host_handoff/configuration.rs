@@ -15,11 +15,11 @@ pub struct NativeHostReceipt {
     pub executable: PathBuf,
 }
 
-/// An opt-in selected by connector setup, read without changing the browser.
+/// A configured or discovered browser host, read without changing the browser.
 #[derive(Debug, Clone)]
 pub struct ConfiguredHandoff {
     pub(super) config: InstalledHostConfig,
-    browser: super::BrowserFamily,
+    pub(super) browser: super::BrowserFamily,
 }
 
 impl ConfiguredHandoff {
@@ -78,16 +78,102 @@ impl ConfiguredHandoff {
         {
             return Err(HandoffError::Configuration(rejected.reason.clone()));
         }
-        Ok(catalog.entries.into_iter().find_map(|entry| {
-            if entry.config.adapter != CHATGPT_HOST_NAME {
-                return None;
-            }
-            let browser = entry.config.handoff?;
-            Some(Self {
+        if let Some(entry) = catalog
+            .entries
+            .into_iter()
+            .find(|entry| entry.config.adapter == CHATGPT_HOST_NAME)
+        {
+            return Ok(entry.config.handoff.map(|browser| Self {
                 config: entry.config,
                 browser,
-            })
-        }))
+            }));
+        }
+        for browser in [super::BrowserFamily::Chrome, super::BrowserFamily::Chromium] {
+            if let Some(mut config) = Self::captured(browser)? {
+                if config.has_pending_registration()? {
+                    config.config.executable = std::fs::canonicalize(executable)?;
+                    return Ok(Some(config));
+                }
+            }
+            if let Some(config) = super::discovery::discover(executable, browser)? {
+                return Ok(Some(config));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retain the exact native launch scope before publishing its registration.
+    pub fn remember_selection(&self) -> Result<(), HandoffError> {
+        super::storage::atomic_file(
+            &self.recovery_directory().join("active-host.json"),
+            &serde_json::to_vec(&self.config)?,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Native launches use their actual browser ancestry, never client preference.
+    pub fn native_launch(browser: super::BrowserFamily) -> Result<Option<Self>, HandoffError> {
+        let catalog = extension_catalog::load(&std::env::current_exe()?)
+            .map_err(|error| HandoffError::Configuration(error.to_string()))?;
+        if let Some(rejected) = catalog
+            .rejected
+            .iter()
+            .find(|entry| entry.adapter == CHATGPT_HOST_NAME)
+        {
+            return Err(HandoffError::Configuration(rejected.reason.clone()));
+        }
+        if catalog.entries.iter().any(|entry| {
+            entry.config.adapter == CHATGPT_HOST_NAME && entry.config.handoff.is_none()
+        }) {
+            return Ok(None);
+        }
+        Self::captured(browser)
+    }
+
+    /// Read the supervisor's captured scope even if discovery or setup changed.
+    pub fn captured(browser: super::BrowserFamily) -> Result<Option<Self>, HandoffError> {
+        let directory = crate::browser::local_ipc::current_user_runtime_directory()
+            .map_err(|error| HandoffError::Configuration(error.to_string()))?;
+        let path = directory
+            .join(browser.recovery_name())
+            .join("active-host.json");
+        let bytes = match crate::browser::local_ipc::load_private_state(&path) {
+            Ok(bytes) => bytes,
+            Err(crate::browser::local_ipc::IpcError::MissingInstallationFile) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let config: InstalledHostConfig = serde_json::from_slice(&bytes)?;
+        if config.adapter != CHATGPT_HOST_NAME || config.handoff != Some(browser) {
+            return Err(HandoffError::Configuration(
+                "captured native host scope disagrees".into(),
+            ));
+        }
+        Ok(Some(Self { config, browser }))
+    }
+
+    /// The caller must first admit this exact native process to its supervisor.
+    pub fn bootstrap_native(&self) -> Result<Option<std::process::ExitCode>, HandoffError> {
+        crate::browser::extension_process::bootstrap_handoff(&self.config)
+            .map_err(|error| HandoffError::Configuration(error.to_string()))
+    }
+
+    pub(crate) fn selection(
+        &self,
+    ) -> Result<
+        crate::browser::extension_process::ExtensionAdapterSelection,
+        crate::browser::extension_process::ProcessError,
+    > {
+        crate::browser::extension_process::handoff_selection(&self.config)
+    }
+
+    /// A live journal owns its snapshot; after return follow the current installer.
+    pub fn forwarding_host(&self) -> Result<super::OriginalHost, HandoffError> {
+        if self.has_pending_registration()? {
+            self.original()
+        } else {
+            super::discovery::registered_host(self)
+        }
     }
 
     pub fn browser(&self) -> super::BrowserFamily {
@@ -119,6 +205,18 @@ pub fn restore_current() -> Result<(), HandoffError> {
     let directory = crate::browser::local_ipc::current_user_runtime_directory()
         .map_err(|error| HandoffError::Configuration(error.to_string()))?;
     restore_directory(&directory)
+}
+
+/// Restore one exact registration scope when its captured host metadata is absent.
+pub fn restore_browser(browser: super::BrowserFamily) -> Result<(), HandoffError> {
+    let directory = crate::browser::local_ipc::current_user_runtime_directory()
+        .map_err(|error| HandoffError::Configuration(error.to_string()))?;
+    let scope = directory.join(browser.recovery_name());
+    match std::fs::symlink_metadata(&scope) {
+        Ok(_) => RegistrationTransaction::open(&scope)?.restore(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn restore_directory(directory: &Path) -> Result<(), HandoffError> {

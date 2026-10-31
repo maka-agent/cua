@@ -29,11 +29,8 @@ type PostToPidFn = unsafe extern "C" fn(pid_t, *mut c_void);
 /// `void SLEventSetAuthenticationMessage(CGEventRef, id)`
 type SetAuthMsgFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
-/// `void CGEventSetWindowLocation(CGEventRef, double x, double y)`
-///
-/// NOTE: CGPoint on 64-bit ARM/x86 is two f64 values packed consecutively.
-/// We pass them as two separate f64 arguments which has identical ABI.
-type SetWindowLocFn = unsafe extern "C" fn(*mut c_void, f64, f64);
+/// `void CGEventSetWindowLocation(CGEventRef, CGPoint)`
+type SetWindowLocFn = unsafe extern "C" fn(*mut c_void, core_graphics::geometry::CGPoint);
 
 /// `void SLEventSetIntegerValueField(CGEventRef, uint32_t field, int64_t value)`
 type SetIntFieldFn = unsafe extern "C" fn(*mut c_void, u32, i64);
@@ -660,7 +657,7 @@ pub(super) fn post_to_pid(pid: pid_t, event_ptr: *mut c_void, attach_auth_messag
 pub(super) fn set_window_location(event_ptr: *mut c_void, x: f64, y: f64) -> bool {
     match set_window_loc_fn() {
         Some(f) => {
-            unsafe { f(event_ptr, x, y) };
+            unsafe { f(event_ptr, core_graphics::geometry::CGPoint::new(x, y)) };
             true
         }
         None => false,
@@ -847,10 +844,10 @@ pub fn hw_capture_window(window_id: u32) -> Option<core_graphics::image::CGImage
 
 // ── Original-profile focus APIs ──────────────────────────────────────────────
 
-/// `OSStatus _CPSGetKeyFocusProcess(ProcessSerialNumber *psn, Boolean *secondary)`.
+/// `OSStatus CPSGetKeyFocusProcess(ProcessSerialNumber *psn, Boolean *secondary)`.
 type NativeGetKeyFocusProcessFn = unsafe extern "C" fn(*mut u32, *mut u8) -> i32;
 
-/// `OSStatus _CPSReleaseKeyFocusWithID(uint32_t theft_id)`.
+/// `OSStatus CPSReleaseKeyFocusWithID(uint32_t theft_id)`.
 type NativeReleaseKeyFocusFn = unsafe extern "C" fn(u32) -> i32;
 
 /// `AXError _AXUIElementGetActualPid(AXUIElementRef element, pid_t *pid)`.
@@ -867,7 +864,7 @@ pub struct NativeFocusQuery {
     pub process_serial_number: [u32; 2],
     /// The secondary Boolean byte, preserved without normalization.
     pub secondary: u8,
-    /// The status returned by `_CPSGetKeyFocusProcess`.
+    /// The status returned by `CPSGetKeyFocusProcess`.
     pub query_status: i32,
     /// The status returned by the subsequent `GetProcessPID` call.
     pub process_pid_status: i32,
@@ -908,12 +905,12 @@ impl NativeFocusApis {
     pub fn resolve() -> Result<Self, NativeFocusError> {
         static APIS: OnceLock<Result<NativeFocusApis, NativeFocusError>> = OnceLock::new();
         *APIS.get_or_init(|| {
-            let key_focus = find_sym(b"_CPSGetKeyFocusProcess\0")
-                .ok_or(NativeFocusError::MissingApi("_CPSGetKeyFocusProcess"))?;
+            let key_focus = find_sym(b"CPSGetKeyFocusProcess\0")
+                .ok_or(NativeFocusError::MissingApi("CPSGetKeyFocusProcess"))?;
             let process_pid =
                 get_process_pid_fn().ok_or(NativeFocusError::MissingApi("GetProcessPID"))?;
-            let release = find_sym(b"_CPSReleaseKeyFocusWithID\0")
-                .ok_or(NativeFocusError::MissingApi("_CPSReleaseKeyFocusWithID"))?;
+            let release = find_sym(b"CPSReleaseKeyFocusWithID\0")
+                .ok_or(NativeFocusError::MissingApi("CPSReleaseKeyFocusWithID"))?;
             let actual_pid = find_sym(b"_AXUIElementGetActualPid\0")
                 .ok_or(NativeFocusError::MissingApi("_AXUIElementGetActualPid"))?;
             // SAFETY: Each exact symbol has the corresponding C ABI declared above;
@@ -1923,5 +1920,14 @@ mod key_prime_tests {
             let r = prime_exact_window_key(7, || focused, || true, || true);
             assert!(r.unwrap_err().contains("no keys were sent"));
         }
+    }
+}
+
+#[cfg(test)]
+mod native_api_tests {
+    #[test]
+    fn native_focus_apis_resolve_without_changing_focus() {
+        super::NativeFocusApis::resolve()
+            .expect("resolve the native focus bridge without posting input");
     }
 }

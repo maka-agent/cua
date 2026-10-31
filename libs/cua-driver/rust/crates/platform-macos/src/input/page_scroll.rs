@@ -16,7 +16,7 @@ use core_graphics::{
 };
 use foreign_types::ForeignType;
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
-use std::{cell::RefCell, ffi::c_void, future::Future, sync::OnceLock, time::Duration};
+use std::{cell::RefCell, future::Future, time::Duration};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageScrollRequest {
@@ -159,18 +159,9 @@ pub(super) fn uptime_timebase() -> anyhow::Result<mach_timebase_info_data_t> {
 }
 
 pub(super) fn set_window_location(event: CGEventRef, point: CGPoint) -> anyhow::Result<()> {
-    type SetWindowLocation = unsafe extern "C" fn(CGEventRef, CGPoint);
-    static FUNCTION: OnceLock<Option<SetWindowLocation>> = OnceLock::new();
-    let function = FUNCTION.get_or_init(|| {
-        super::skylight::find_sym(b"_CGEventSetWindowLocation\0").map(|pointer| {
-            // SAFETY: this exact symbol has the fixed CGEventRef + CGPoint ABI.
-            unsafe { std::mem::transmute::<*mut c_void, SetWindowLocation>(pointer) }
-        })
-    });
-    let function = function
-        .ok_or_else(|| anyhow::anyhow!("native page scroll window-location API unavailable"))?;
-    // SAFETY: preparation retains `event` and supplies finite local coordinates.
-    unsafe { function(event, point) };
+    if !super::skylight::set_window_location(event.cast(), point.x, point.y) {
+        anyhow::bail!("native page scroll window-location API unavailable");
+    }
     Ok(())
 }
 
@@ -198,6 +189,25 @@ mod request_tests {
             },
             native_window_pixels: [37.5, 25.0],
         }
+    }
+
+    #[test]
+    fn prepared_page_scroll_accepts_fractional_window_coordinates_without_posting() {
+        let event = prepare_page_scroll(PageScrollRequest {
+            pid: std::process::id() as i32,
+            window_id: 17,
+            screen_point: CGPoint::new(100.25, 150.75),
+            window_bounds: CGRect::new(&CGPoint::new(20.0, 30.0), &CGSize::new(300.0, 200.0)),
+            window_uses_flipped_coordinates: true,
+            direction: PageDirection::Down,
+            pages: 1.0,
+            extent: 200.0,
+        })
+        .expect("prepare the retained event without delivering input");
+        assert_eq!(
+            (event.event.location().x, event.event.location().y),
+            (100.25, 150.75)
+        );
     }
 
     #[tokio::test]

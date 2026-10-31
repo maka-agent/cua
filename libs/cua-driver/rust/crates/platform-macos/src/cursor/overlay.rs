@@ -27,7 +27,7 @@
 //! `render_frame`). macOS uses the shared trajectory player and first-placement
 //! variants of MoveTo / ClickPulse — see `apply_command_base` below.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -895,7 +895,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacMsg>) {
             // let the wake-up frame render the newly-applied state at t=0.
             0.0
         } else {
-            now.duration_since(last_tick).as_secs_f64().min(0.05)
+            now.duration_since(last_tick).as_secs_f64()
         };
         last_tick = now;
 
@@ -921,13 +921,28 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacMsg>) {
                     // can read its pinned_wid after ticking.
                     let mut last_key: Option<CursorKey> = None;
                     let mut had_msg = false;
+                    let mut new_moves = HashSet::new();
                     if let Some(msg) = first_msg {
+                        if let MacMsg::Overlay(OverlayMsg::Cmd(KeyedOverlayCommand {
+                            key,
+                            cmd: OverlayCommand::MoveTo { .. },
+                        })) = &msg
+                        {
+                            new_moves.insert(key.clone());
+                        }
                         had_msg = true;
                         if let Some(k) = apply_mac_msg(map, msg) {
                             last_key = Some(k);
                         }
                     }
                     while let Ok(msg) = rx.try_recv() {
+                        if let MacMsg::Overlay(OverlayMsg::Cmd(KeyedOverlayCommand {
+                            key,
+                            cmd: OverlayCommand::MoveTo { .. },
+                        })) = &msg
+                        {
+                            new_moves.insert(key.clone());
+                        }
                         had_msg = true;
                         if let Some(k) = apply_mac_msg(map, msg) {
                             last_key = Some(k);
@@ -939,7 +954,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacMsg>) {
                     // this frame without waiting for the next 16ms tick.
                     let mut arrived: Vec<CursorKey> = Vec::new();
                     if frame_tick_needed || had_msg {
-                        arrived = map.tick_all(dt);
+                        arrived = map.tick_frame(dt, &new_moves);
                     }
                     let pointer = if hover_poll_tick
                         || map
@@ -1485,7 +1500,7 @@ mod tests {
         set_input_origin(human, InputOrigin::Agent);
         assert!(draws_cursor(human));
     }
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // The keyed lifecycle, sentinel seed, and shared frame-tick predicate are
     // covered once in `cursor_overlay::render_map`. These tests cover only the

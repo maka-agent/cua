@@ -7,6 +7,7 @@ fn tool() -> ScrollTool {
             cursor_registry: Arc::new(CursorRegistry::new()),
             config: Arc::new(RwLock::new(DriverConfig::default())),
             capture_bridge: None,
+            raw_window_capture: std::sync::Mutex::new(None),
         }),
     }
 }

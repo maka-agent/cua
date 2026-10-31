@@ -890,7 +890,7 @@ fn apply_messages_after_wake(
     first_msg: Option<OverlayMsg>,
     rx: &std::sync::mpsc::Receiver<OverlayMsg>,
     parked_elapsed: Option<f64>,
-) -> (Vec<CursorKey>, bool) {
+) -> (Vec<CursorKey>, bool, HashSet<CursorKey>) {
     // For a parked wake, advance pre-existing quiescent state before commands
     // mutate it. This preserves each cursor's independent idle clock while
     // ensuring newly commanded animations render their initial frame at dt=0.
@@ -898,15 +898,30 @@ fn apply_messages_after_wake(
         .map(|dt| map.tick_all(dt))
         .unwrap_or_default();
     let mut had_msg = false;
+    let mut new_moves = HashSet::new();
     if let Some(msg) = first_msg {
+        if let OverlayMsg::Cmd(KeyedOverlayCommand {
+            key,
+            cmd: OverlayCommand::MoveTo { .. },
+        }) = &msg
+        {
+            new_moves.insert(key.clone());
+        }
         had_msg = true;
         apply_msg(map, msg);
     }
     while let Ok(msg) = rx.try_recv() {
+        if let OverlayMsg::Cmd(KeyedOverlayCommand {
+            key,
+            cmd: OverlayCommand::MoveTo { .. },
+        }) = &msg
+        {
+            new_moves.insert(key.clone());
+        }
         had_msg = true;
         apply_msg(map, msg);
     }
-    (arrived, had_msg)
+    (arrived, had_msg, new_moves)
 }
 
 #[cfg(target_os = "linux")]
@@ -924,10 +939,10 @@ fn process_render_wake(
     // wakes retain their existing apply-then-tick ordering; pre-ticking those
     // could fire an old path's arrival waiter after a replacement is registered.
     let parked_wake = first_msg.is_some() || maintenance_timeout;
-    let (mut arrived, had_msg) =
+    let (mut arrived, had_msg, new_moves) =
         apply_messages_after_wake(map, first_msg, rx, parked_wake.then_some(elapsed_dt));
     if !parked_wake && (frame_tick_needed || had_msg) {
-        arrived.extend(map.tick_all(elapsed_dt.min(0.05)));
+        arrived.extend(map.tick_frame(elapsed_dt, &new_moves));
     }
     (arrived, had_msg)
 }
@@ -4752,6 +4767,28 @@ mod tests {
     }
 
     #[test]
+    fn delayed_frame_completes_the_elapsed_cursor_movement() {
+        let mut map = default_render_map();
+        let cursor = map.cursors.get_mut("default").unwrap();
+        cursor.core.pos = (20.0, 20.0);
+        cursor.core.placed = true;
+        cursor.apply_command(OverlayCommand::MoveTo {
+            x: 80.0,
+            y: 80.0,
+            end_heading_radians: 0.0,
+            target: None,
+        });
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (arrived, had_msg) = process_render_wake(&mut map, None, &rx, 1.0, false, true);
+        assert!(!had_msg);
+        assert_eq!(
+            arrived,
+            ["default"],
+            "a slow frame must not stretch the movement clock"
+        );
+    }
+
+    #[test]
     fn active_frame_replacement_does_not_return_stale_arrival() {
         let mut map = default_render_map();
         {
@@ -4788,7 +4825,7 @@ mod tests {
         assert!(had_msg);
         let cursor = &map.cursors["default"].core;
         let replacement = cursor.trajectory.as_ref().unwrap();
-        assert!(cursor.motion_t > 0.0);
+        assert_eq!(cursor.motion_t, 0.0);
         assert!(cursor.motion_t < replacement.arrival_t);
     }
 

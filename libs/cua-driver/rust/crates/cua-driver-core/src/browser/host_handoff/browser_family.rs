@@ -16,6 +16,13 @@ pub enum BrowserFamily {
 }
 
 impl BrowserFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Chromium => "chromium",
+        }
+    }
+
     pub(super) fn recovery_name(self) -> &'static str {
         match self {
             Self::Chrome => "chatgpt-handoff",
