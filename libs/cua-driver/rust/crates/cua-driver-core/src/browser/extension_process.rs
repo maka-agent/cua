@@ -71,7 +71,7 @@ impl ExtensionAdapterMode {
 }
 
 /// Selection cannot be constructed from tool/model JSON or an ambient origin.
-/// It retains the same installed configuration that extension startup verifies.
+/// It retains validated setup or discovered native-host configuration.
 pub struct ExtensionAdapterSelection {
     config: ExtensionProcessConfig,
     mode: ExtensionAdapterMode,
@@ -94,11 +94,11 @@ pub struct ExtensionAdapterSelectionError {
 }
 
 impl ExtensionAdapterSelection {
-    /// Load the sole validated entry beside this canonical installed executable.
+    /// Load the sole configured or discovered extension adapter.
     ///
-    /// The file ownership, ACL/mode, executable and selected adapter identity are
-    /// checked by the same parser used for extension startup. No search or fallback
-    /// selects a foreign extension. No file or browser configuration is written.
+    /// Explicit setup entries are validated before discovering an installed
+    /// ChatGPT extension allowed by its native-host registration. Discovery
+    /// changes no files or browser configuration.
     pub fn load_installed() -> Result<Self, ExtensionAdapterSelectionError> {
         let mut installed = load_installed_selections()?;
         if installed.selections.len() == 1 && installed.rejected.is_empty() {

@@ -183,7 +183,7 @@ pub(crate) struct RegistrationPlan {
     pub(crate) sidecar_json: String,
 }
 
-/// Maka installation data, written only by explicit connector setup.
+/// Connector selection retained by explicit setup or a handoff supervisor.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct InstalledHostConfig {

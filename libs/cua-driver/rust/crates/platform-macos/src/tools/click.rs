@@ -1045,9 +1045,8 @@ impl Tool for ClickTool {
             // has no live frame — see px_frame's module docs for why there is
             // no screen-absolute fallback.
             //
-            // win_local_x/y: window-local logical-pixel coords used when the
-            // Chromium recipe falls back to public PID posting. Its SkyLight
-            // route uses the translated screen coordinates instead.
+            // Both PID transports use window-local logical points for routing,
+            // while the event location remains screen-relative.
             let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
                 match super::px_frame::resolve_or_refuse(wid).await {
                     Ok(frame) => {

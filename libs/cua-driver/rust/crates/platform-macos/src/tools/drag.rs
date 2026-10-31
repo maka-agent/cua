@@ -475,6 +475,7 @@ impl Tool for DragTool {
                         (from_sx, from_sy),
                         (to_sx, to_sy),
                         wid,
+                        (from_sx - from_lx, from_sy - from_ly),
                         duration_ms,
                         steps,
                         &m,
