@@ -1211,6 +1211,9 @@ mod tests {
         }
 
         tokio::time::timeout(Duration::from_secs(10), async {
+            #[cfg(unix)]
+            let temporary = tempfile::Builder::new().prefix("cua-ipc-").tempdir_in("/tmp").unwrap();
+            #[cfg(not(unix))]
             let temporary = tempfile::tempdir().unwrap();
             let directory = temporary.path().canonicalize().unwrap();
             #[cfg(unix)]
