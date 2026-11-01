@@ -280,6 +280,8 @@ pub(crate) enum ControlRequest {
         tab_id: u64,
         #[serde(default, rename = "sessionOnly")]
         session_only: bool,
+        #[serde(default)]
+        takeover: bool,
     },
     MuteCreatedTab {
         id: u64,
@@ -3023,11 +3025,15 @@ impl ExtensionHostBroker {
             ControlRequest::PrepareUserTab {
                 tab_id,
                 session_only,
+                takeover,
                 ..
             } if tab_id <= 9_007_199_254_740_991 => {
                 let mut params = json!({"tabId":tab_id});
                 if session_only {
                     params["sessionOnly"] = json!(true);
+                }
+                if takeover {
+                    params["takeover"] = json!(true);
                 }
                 ("prepareUserTab", params, ControlKind::Other)
             }

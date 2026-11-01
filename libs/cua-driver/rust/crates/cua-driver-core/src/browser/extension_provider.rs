@@ -2126,6 +2126,11 @@ impl ExtensionBrowserProvider {
     pub fn is_closed(&self) -> bool {
         !self.inner.alive.load(Ordering::SeqCst)
     }
+    /// Identifies this IPC connection, including clones with different call contexts.
+    /// Reconnecting to the same native host creates a different binding.
+    pub fn binding_id(&self) -> uuid::Uuid {
+        self.inner.binding
+    }
     pub fn identity(&self) -> &ExtensionEndpointIdentity {
         &self.inner.identity
     }
