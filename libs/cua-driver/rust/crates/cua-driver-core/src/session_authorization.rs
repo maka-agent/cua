@@ -237,13 +237,13 @@ impl EffectiveAuthorizationContext {
         self.transport_session.as_deref()
     }
 
-    /// Lifecycle idle TTL selected by a trusted delegated-session host. An
-    /// ordinary compatibility context uses the product default instead.
+    /// Lifecycle selected by the immutable trusted-host context.
     #[doc(hidden)]
-    pub fn lifecycle_idle_ttl_override(&self) -> Option<Duration> {
-        (self.source == AuthorizationContextSource::TrustedHost)
-            .then_some(self.idle_ttl)
-            .flatten()
+    pub fn lifecycle_idle_ttl_override(&self) -> Option<crate::session::IdleLifetime> {
+        (self.source == AuthorizationContextSource::TrustedHost).then(|| match self.idle_ttl {
+            Some(duration) => crate::session::IdleLifetime::Timed(duration),
+            None => crate::session::IdleLifetime::HostOwned,
+        })
     }
 
     #[doc(hidden)]
@@ -323,6 +323,19 @@ impl EffectiveAuthorizationContext {
         }
         Ok(())
     }
+}
+
+/// Immutable session identity whose lifetime is owned by a trusted in-process host.
+pub struct HostSessionRequest {
+    pub public_session: String,
+    pub transport_session: String,
+    pub mode: PermissionMode,
+    pub capability_manifest: Option<Arc<SessionManifest>>,
+}
+
+enum SessionLifetime {
+    HostOwned,
+    Timed { ttl: Duration, idle_ttl: Duration },
 }
 
 pub struct DelegatedSessionRequest {
@@ -558,6 +571,41 @@ impl SessionAuthorizationRegistry {
         connection: &AuthenticatedActionConnection,
         request: DelegatedSessionRequest,
     ) -> Result<(), SessionAuthorizationError> {
+        let lifetime = SessionLifetime::Timed {
+            ttl: request.ttl,
+            idle_ttl: request.idle_ttl,
+        };
+        self.bind_session(
+            host,
+            connection,
+            HostSessionRequest {
+                public_session: request.public_session,
+                transport_session: request.transport_session,
+                mode: request.mode,
+                capability_manifest: request.capability_manifest,
+            },
+            lifetime,
+        )
+    }
+
+    /// Bind until the original host lease, connection, or runtime is revoked.
+    /// This requires in-process authority proofs unavailable to public protocols.
+    pub fn bind_host_session(
+        &self,
+        host: &TrustedHostLease,
+        connection: &AuthenticatedActionConnection,
+        request: HostSessionRequest,
+    ) -> Result<(), SessionAuthorizationError> {
+        self.bind_session(host, connection, request, SessionLifetime::HostOwned)
+    }
+
+    fn bind_session(
+        &self,
+        host: &TrustedHostLease,
+        connection: &AuthenticatedActionConnection,
+        request: HostSessionRequest,
+        lifetime: SessionLifetime,
+    ) -> Result<(), SessionAuthorizationError> {
         if !self.ceiling.delegation_enabled {
             return Err(SessionAuthorizationError::DelegationDisabled);
         }
@@ -575,20 +623,38 @@ impl SessionAuthorizationRegistry {
         if request.mode == PermissionMode::Unrestricted && !self.ceiling.unrestricted_acknowledged {
             return Err(SessionAuthorizationError::UnrestrictedNotAcknowledged);
         }
-        if request.ttl.is_zero()
-            || request.idle_ttl.is_zero()
-            || self
-                .ceiling
-                .max_session_ttl
-                .is_none_or(|maximum| request.ttl > maximum)
-            || self
-                .ceiling
-                .max_idle_ttl
-                .is_none_or(|maximum| request.idle_ttl > maximum)
-            || request.idle_ttl > request.ttl
-        {
-            return Err(SessionAuthorizationError::InvalidTtl);
-        }
+        let (expires_unix_ms, expires_at, idle_ttl) = match lifetime {
+            SessionLifetime::HostOwned => (None, None, None),
+            SessionLifetime::Timed { ttl, idle_ttl } => {
+                if ttl.is_zero()
+                    || idle_ttl.is_zero()
+                    || self
+                        .ceiling
+                        .max_session_ttl
+                        .is_none_or(|maximum| ttl > maximum)
+                    || self
+                        .ceiling
+                        .max_idle_ttl
+                        .is_none_or(|maximum| idle_ttl > maximum)
+                    || idle_ttl > ttl
+                {
+                    return Err(SessionAuthorizationError::InvalidTtl);
+                }
+                if u64::try_from(ttl.as_millis()).is_err()
+                    || u64::try_from(idle_ttl.as_millis()).is_err()
+                {
+                    return Err(SessionAuthorizationError::InvalidTtl);
+                }
+                let expires_at = Instant::now()
+                    .checked_add(ttl)
+                    .ok_or(SessionAuthorizationError::InvalidTtl)?;
+                (
+                    Some(now_unix_ms() + ttl.as_millis()),
+                    Some(expires_at),
+                    Some(idle_ttl),
+                )
+            }
+        };
         if request.mode == PermissionMode::Bounded && request.capability_manifest.is_none() {
             return Err(SessionAuthorizationError::MissingBoundedManifest);
         }
@@ -626,9 +692,9 @@ impl SessionAuthorizationRegistry {
             capability_manifest: request.capability_manifest,
             user_policy_sha256: self.ceiling.user_policy_sha256.clone(),
             managed_policy_sha256: self.ceiling.managed_policy_sha256.clone(),
-            expires_unix_ms: Some(now_unix_ms() + request.ttl.as_millis()),
-            expires_at: Some(Instant::now() + request.ttl),
-            idle_ttl: Some(request.idle_ttl),
+            expires_unix_ms,
+            expires_at,
+            idle_ttl,
             last_authorized_dispatch: Some(Arc::new(Mutex::new(Instant::now()))),
             idle_expired: Some(Arc::new(AtomicBool::new(false))),
             revoked: Arc::new(AtomicBool::new(false)),
@@ -970,6 +1036,38 @@ mod tests {
                 .bind_delegated_session(&host, &connection, request(PermissionMode::Standard))
                 .unwrap_err(),
             SessionAuthorizationError::ConnectionAlreadyBound
+        );
+    }
+
+    #[test]
+    fn host_session_outlives_timed_ceiling_but_still_revokes_with_its_host() {
+        let mut ceiling = SessionModeCeiling::delegated([PermissionMode::Standard], false);
+        ceiling.max_session_ttl = Some(Duration::from_millis(1));
+        ceiling.max_idle_ttl = Some(Duration::from_millis(1));
+        let registry = SessionAuthorizationRegistry::delegated_for_test(ceiling);
+        let (host, connection) = registry.trusted_pair_for_test(None);
+        registry
+            .bind_host_session(
+                &host,
+                &connection,
+                HostSessionRequest {
+                    public_session: "owned".into(),
+                    transport_session: "owned-transport".into(),
+                    mode: PermissionMode::Standard,
+                    capability_manifest: None,
+                },
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+        registry
+            .resolve_delegated(&connection, "owned", "owned-transport")
+            .unwrap();
+        registry.revoke_host(&host);
+        assert_eq!(
+            registry
+                .resolve_delegated(&connection, "owned", "owned-transport")
+                .unwrap_err(),
+            SessionAuthorizationError::UnknownConnection
         );
     }
 

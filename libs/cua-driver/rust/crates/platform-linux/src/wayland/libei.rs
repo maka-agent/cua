@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -62,8 +62,6 @@ pub enum KeyTransition {
     Press(u32),
     Release(u32),
 }
-
-const MAX_KEY_SEQUENCE_TRANSITIONS: usize = 64;
 
 /// EIS frame timestamps are CLOCK_MONOTONIC microseconds, not per-command
 /// sequence numbers. Mutter discards transactions carrying the old 0,1,2...
@@ -143,23 +141,25 @@ enum Cmd {
     Shutdown,
 }
 
-static TX: OnceLock<Sender<Cmd>> = OnceLock::new();
+struct Worker {
+    sender: Sender<Cmd>,
+    task: thread::JoinHandle<()>,
+}
 
-fn tx() -> anyhow::Result<&'static Sender<Cmd>> {
-    TX.get()
+static WORKER: Mutex<Option<Worker>> = Mutex::new(None);
+
+fn tx() -> anyhow::Result<Sender<Cmd>> {
+    WORKER
+        .lock()
+        .expect("libei worker lock poisoned")
+        .as_ref()
+        .map(|worker| worker.sender.clone())
         .ok_or_else(|| anyhow::anyhow!("libei worker not started; call ensure_started() first"))
 }
 
 fn wait_for_reply(rx: Receiver<anyhow::Result<()>>) -> anyhow::Result<()> {
-    rx.recv_timeout(std::time::Duration::from_secs(20))
-        .map_err(|error| match error {
-            crossbeam_channel::RecvTimeoutError::Timeout => anyhow::anyhow!(
-                "libei input backend did not become ready within 20s; the desktop portal may be waiting for Remote Desktop consent or its EIS session may be wedged"
-            ),
-            crossbeam_channel::RecvTimeoutError::Disconnected => {
-                anyhow::anyhow!("libei worker reply channel closed")
-            }
-        })?
+    rx.recv()
+        .map_err(|_| anyhow::anyhow!("libei worker reply channel closed"))?
 }
 
 fn restore_token_path() -> Option<PathBuf> {
@@ -209,34 +209,37 @@ fn write_restore_token(token: &str) -> anyhow::Result<()> {
     })
 }
 
-/// Spawn the libei worker thread (idempotent — safe to call from every
-/// MCP tool invocation; subsequent calls are no-ops).
+/// Start a worker, or replace one whose original thread has already ended.
 pub fn ensure_started() -> anyhow::Result<()> {
-    TX.get_or_init(|| {
-        let (tx, rx) = bounded::<Cmd>(64);
-        thread::Builder::new()
-            .name("cua-libei-worker".into())
-            .spawn(move || {
-                if let Err(e) = worker(rx) {
-                    tracing::warn!("cua-libei-worker exited with error: {e}");
-                }
-            })
-            .expect("spawn cua-libei-worker thread");
-        tx
-    });
+    let mut current = WORKER.lock().expect("libei worker lock poisoned");
+    if current
+        .as_ref()
+        .is_some_and(|worker| !worker.task.is_finished())
+    {
+        return Ok(());
+    }
+    if let Some(previous) = current.take() {
+        let _ = previous.task.join();
+    }
+    let (sender, receiver) = bounded::<Cmd>(64);
+    let task = thread::Builder::new()
+        .name("cua-libei-worker".into())
+        .spawn(move || {
+            if let Err(error) = worker(receiver) {
+                tracing::warn!(%error, "cua-libei-worker ended");
+            }
+        })?;
+    *current = Some(Worker { sender, task });
     Ok(())
 }
 
 fn wait_until_ready(interface: &'static str) -> anyhow::Result<()> {
     ensure_started()?;
-    let (tx_r, rx_r) = bounded(1);
+    let (reply, result) = bounded(1);
     tx()?
-        .send(Cmd::WaitReady {
-            interface,
-            reply: tx_r,
-        })
-        .map_err(|e| anyhow::anyhow!("libei worker channel closed: {e}"))?;
-    wait_for_reply(rx_r)
+        .send(Cmd::WaitReady { interface, reply })
+        .map_err(|error| anyhow::anyhow!("libei worker channel closed: {error}"))?;
+    wait_for_reply(result)
 }
 
 /// Negotiate a resumed absolute-pointer device without emitting input.
@@ -331,9 +334,8 @@ pub fn press_key(keycode: u32) -> anyhow::Result<()> {
 ///
 /// The worker emits every transition in one emulation session and frames each
 /// transition separately, allowing callers to hold modifiers while pressing a
-/// key. Requests are capped to keep the synchronous worker responsive.
+/// key.
 pub fn key_sequence(transitions: &[KeyTransition]) -> anyhow::Result<()> {
-    validate_key_sequence(transitions)?;
     if transitions.is_empty() {
         return Ok(());
     }
@@ -347,17 +349,6 @@ pub fn key_sequence(transitions: &[KeyTransition]) -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("libei worker channel closed: {e}"))?;
     wait_for_reply(rx_r)
-}
-
-fn validate_key_sequence(transitions: &[KeyTransition]) -> anyhow::Result<()> {
-    if transitions.len() > MAX_KEY_SEQUENCE_TRANSITIONS {
-        anyhow::bail!(
-            "libei key sequence has {} transitions; maximum is {}",
-            transitions.len(),
-            MAX_KEY_SEQUENCE_TRANSITIONS
-        );
-    }
-    Ok(())
 }
 
 fn emit_key_transitions(transitions: &[KeyTransition], mut emit: impl FnMut(KeyTransition, u64)) {
@@ -398,7 +389,7 @@ pub fn drag(
 
 /// Cleanly stop the worker thread.
 pub fn shutdown() {
-    if let Some(tx) = TX.get() {
+    if let Ok(tx) = tx() {
         let _ = tx.send(Cmd::Shutdown);
     }
 }
@@ -568,21 +559,13 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
 
     let mut state = EisState::default();
 
-    // Inbound commands can arrive before the EIS handshake has negotiated a
-    // usable input device — seat → device → interface → Resumed is async and
-    // only advances while `dispatch` runs, and the portal consent-and-connect
-    // path (#2105) returns before the device is live. Running a command against
-    // a not-yet-negotiated device fails with "no EIS device negotiated yet". So
-    // queue commands and run each only once `input_ready()`; fail any that wait
-    // longer than READY_TIMEOUT (handle_command then replies with the natural
-    // "no device" error) so a caller blocked on the reply never hangs forever.
-    let mut pending: Vec<(Cmd, std::time::Instant)> = Vec::new();
-    const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    // Keep each original command until its device is ready or the connection ends.
+    let mut pending: Vec<Cmd> = Vec::new();
 
     loop {
         match rx.try_recv() {
             Ok(Cmd::Shutdown) => break,
-            Ok(cmd) => pending.push((cmd, std::time::Instant::now())),
+            Ok(cmd) => pending.push(cmd),
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => break,
         }
@@ -591,35 +574,26 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
             .dispatch(Some(std::time::Duration::from_millis(20)), &mut state)
             .map_err(|e| anyhow::anyhow!("calloop dispatch failed: {e}"))?;
 
-        // Run each queued command once the device IT needs is negotiated; time
-        // stale ones out. Per-command (not one global gate) so a keyboard-only
-        // session doesn't make keyboard commands wait 20s for a pointer device.
+        if let Some(error) = state.failure.take() {
+            return Err(anyhow::anyhow!(error));
+        }
         if !pending.is_empty() {
             let mut still = Vec::with_capacity(pending.len());
-            for (cmd, queued) in pending.drain(..) {
-                if state.cmd_ready(&cmd) || queued.elapsed() >= READY_TIMEOUT {
+            for cmd in pending.drain(..) {
+                if state.cmd_ready(&cmd) {
                     state.handle_command(cmd);
                 } else {
-                    still.push((cmd, queued));
+                    still.push(cmd);
                 }
             }
             pending = still;
         }
 
-        state.pending_sync.retain(|_, (reply, sent)| {
-            if sent.elapsed() < std::time::Duration::from_secs(5) {
-                return true;
-            }
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "EIS did not acknowledge input within 5s; delivery is unknown"
-            )));
-            false
-        });
-
         // The handle_command path may have queued frame() requests; flush
         // them once per loop iteration so the EIS server sees them.
         if let Some(ctx) = state.context.as_ref() {
-            let _ = ctx.flush();
+            ctx.flush()
+                .map_err(|error| anyhow::anyhow!("EIS flush failed: {error}"))?;
         }
     }
 
@@ -630,7 +604,8 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
 struct EisState {
     context: Option<reis::ei::Context>,
     connection: Option<reis::ei::Connection>,
-    pending_sync: HashMap<reis::ei::Callback, (Sender<anyhow::Result<()>>, std::time::Instant)>,
+    pending_sync: HashMap<reis::ei::Callback, Sender<anyhow::Result<()>>>,
+    failure: Option<String>,
     seats: HashMap<reis::ei::Seat, SeatData>,
     devices: HashMap<reis::ei::Device, DeviceData>,
     sequence: u32,
@@ -700,17 +675,24 @@ impl EisState {
         if self.context.is_none() {
             self.context = Some(context.clone());
         }
-        if context.read().is_err() {
+        if let Err(error) = context.read() {
+            self.failure = Some(format!("EIS read failed: {error}"));
             return Ok(calloop::PostAction::Remove);
         }
         while let Some(result) = context.pending_event() {
             let request = match result {
-                PendingRequestResult::Request(r) => r,
-                _ => continue,
+                PendingRequestResult::Request(request) => request,
+                failure => {
+                    self.failure = Some(format!("EIS protocol error: {failure:?}"));
+                    return Ok(calloop::PostAction::Remove);
+                }
             };
             self.dispatch_eis_event(request);
         }
-        let _ = context.flush();
+        if let Err(error) = context.flush() {
+            self.failure = Some(format!("EIS flush failed: {error}"));
+            return Ok(calloop::PostAction::Remove);
+        }
         Ok(calloop::PostAction::Continue)
     }
 
@@ -747,7 +729,7 @@ impl EisState {
                 handshake.finish();
             }
             Event::Callback(callback, reis::ei::callback::Event::Done { .. }) => {
-                if let Some((reply, _)) = self.pending_sync.remove(&callback) {
+                if let Some(reply) = self.pending_sync.remove(&callback) {
                     let _ = reply.send(Ok(()));
                 }
             }
@@ -756,6 +738,14 @@ impl EisState {
                 match ev {
                     reis::ei::connection::Event::Seat { seat } => {
                         self.seats.insert(seat, SeatData::default());
+                    }
+                    reis::ei::connection::Event::Disconnected {
+                        reason,
+                        explanation,
+                        ..
+                    } => {
+                        self.failure =
+                            Some(format!("EIS disconnected: {reason:?}: {explanation:?}"));
                     }
                     // The EIS server pings to check liveness; failing to answer
                     // makes it drop the connection. Mirror reis's examples.
@@ -932,7 +922,7 @@ impl EisState {
     /// means a keyboard-only session doesn't stall keyboard commands waiting for
     /// an absolute-pointer device that never arrives — and vice versa. Commands
     /// run before their device exists fail with "no EIS device negotiated yet",
-    /// so `run_calloop` queues them until this holds (or READY_TIMEOUT elapses).
+    /// so `run_calloop` queues them until this holds (until the connection ends).
     fn cmd_ready(&self, cmd: &Cmd) -> bool {
         const DEVICE_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(200);
         if self
@@ -978,11 +968,11 @@ impl EisState {
                 // until EIS acknowledges all preceding input frames.
                 let callback = connection.sync(1);
                 if let Err(error) = context.flush() {
+                    self.failure = Some(format!("EIS flush failed: {error}"));
                     let _ = reply.send(Err(error.into()));
                     return;
                 }
-                self.pending_sync
-                    .insert(callback, (reply, std::time::Instant::now()));
+                self.pending_sync.insert(callback, reply);
             } else {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "EIS connection unavailable for input acknowledgement"
@@ -997,7 +987,7 @@ impl EisState {
         match cmd {
             Cmd::WaitReady { interface, .. } => {
                 self.device_with_interface(interface).ok_or_else(|| {
-                    anyhow::anyhow!("no resumed EIS {interface} device negotiated within 20s")
+                    anyhow::anyhow!("no resumed EIS {interface} device negotiated")
                 })?;
             }
             Cmd::Click { x, y, button, .. } => {
@@ -1386,21 +1376,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_sequence_accepts_empty_and_maximum_length_requests() {
-        assert!(validate_key_sequence(&[]).is_ok());
-
-        let transitions = vec![KeyTransition::Press(29); MAX_KEY_SEQUENCE_TRANSITIONS];
-        assert!(validate_key_sequence(&transitions).is_ok());
-    }
-
-    #[test]
-    fn key_sequence_rejects_requests_over_the_worker_bound() {
-        let transitions = vec![KeyTransition::Release(29); MAX_KEY_SEQUENCE_TRANSITIONS + 1];
-        let error = validate_key_sequence(&transitions).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "libei key sequence has 65 transitions; maximum is 64"
+    fn eis_eof_finishes_the_original_queued_command_without_dispatching_it() {
+        let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let context = reis::ei::Context::new(socket).unwrap();
+        let (commands, receiver) = bounded(1);
+        let (reply, original) = bounded(1);
+        commands.send(Cmd::PressKey { keycode: 29, reply }).unwrap();
+        drop(peer);
+        let (finished, completion) = bounded(1);
+        let task = std::thread::spawn(move || {
+            let _ = finished.send(run_calloop(context, receiver));
+        });
+        let result = completion.recv_timeout(std::time::Duration::from_secs(2));
+        if result.is_err() {
+            let _ = commands.send(Cmd::Shutdown);
+        }
+        task.join().unwrap();
+        assert!(result.expect("EIS EOF must end its worker").is_err());
+        assert!(
+            original.recv().is_err(),
+            "the original reply owner must end with its worker"
         );
     }
 

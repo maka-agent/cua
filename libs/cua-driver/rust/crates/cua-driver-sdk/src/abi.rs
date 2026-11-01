@@ -964,11 +964,15 @@ impl NativeRequest {
         match self {
             #[cfg(all(target_os = "linux", not(target_env = "musl")))]
             Self::Desktop { request, .. } => (
-                if matches!(request, platform_linux::input::native_desktop::NativeDesktopRequest::Window { .. }) {
+                if matches!(
+                    request,
+                    platform_linux::input::native_desktop::NativeDesktopRequest::Window { .. }
+                ) {
                     "linux_native_window"
                 } else {
                     "linux_native_desktop"
-                }, request.recording_input()
+                },
+                request.recording_input(),
             ),
             #[cfg(target_os = "macos")]
             Self::WindowCapture(prepared) => {
@@ -1527,8 +1531,8 @@ impl Drop for OperationGuard {
 }
 
 /// Safe Rust owner for the versioned native handle. All public embedded SDK
-/// operations pass through the exported C ABI even while the native core is
-/// statically linked into the same distribution.
+/// actions pass through the exported C ABI. Host-owned bindings are created
+/// by the in-process Rust host and cannot be minted by a public transport.
 pub(crate) struct NativeAbiDriver {
     handle: Mutex<*mut ffi::Handle>,
     runtime_scope_key: String,
@@ -1692,6 +1696,61 @@ impl NativeAbiDriver {
         let json = self.read_json(ffi::list_tools_json, "list native tools")?;
         serde_json::from_str(&json).map_err(|error| DriverError::Protocol {
             reason: format!("invalid native tools JSON: {error}"),
+        })
+    }
+
+    pub(crate) fn create_host_session(
+        &self,
+        options: crate::HostSessionOptions,
+    ) -> Result<NativeAbiSession, DriverError> {
+        if options.public_session.trim().is_empty() {
+            return Err(DriverError::Configuration {
+                reason: "public_session must not be empty".into(),
+            });
+        }
+        let capability_manifest = options
+            .capability_manifest_path
+            .as_deref()
+            .map(|path| {
+                cua_driver_core::session_manifest::load_manifest(std::path::Path::new(path))
+                    .map(Arc::new)
+                    .map_err(|error| DriverError::Configuration {
+                        reason: error.to_string(),
+                    })
+            })
+            .transpose()?;
+        let handle = self
+            .handle
+            .lock()
+            .expect("native runtime handle lock poisoned");
+        // SAFETY: this owner allocated the handle as CuaDriverHandle. The guard
+        // and &self keep it alive through this synchronous binding creation.
+        let driver =
+            unsafe { required_handle((*handle).cast::<CuaDriverHandle>()) }.map_err(|error| {
+                DriverError::Configuration {
+                    reason: error.message,
+                }
+            })?;
+        let mode = match options.mode {
+            crate::SessionPermissionMode::Standard => PermissionMode::Standard,
+            crate::SessionPermissionMode::Bounded => PermissionMode::Bounded,
+            crate::SessionPermissionMode::Unrestricted => PermissionMode::Unrestricted,
+        };
+        let session = driver
+            .runtime
+            .create_host_session(cua_driver_core::session_authorization::HostSessionRequest {
+                public_session: options.public_session,
+                transport_session: format!("direct-{}", uuid::Uuid::new_v4()),
+                mode,
+                capability_manifest,
+            })
+            .map_err(|error| DriverError::Configuration {
+                reason: error.to_string(),
+            })?;
+        Ok(NativeAbiSession {
+            handle: Mutex::new(
+                Box::into_raw(Box::new(CuaDriverSessionHandle { session })).cast::<ffi::Session>(),
+            ),
         })
     }
 
@@ -2335,20 +2394,31 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
 impl NativeAbiSession {
     pub(crate) async fn invoke_native_desktop(
-        &self, arguments: Value,
+        &self,
+        arguments: Value,
         owner: Arc<platform_linux::input::native_desktop::NativeDesktop>,
         request: platform_linux::input::native_desktop::NativeDesktopRequest,
     ) -> Result<Value, DriverError> {
         if arguments != request.arguments() {
-            return Err(DriverError::Protocol { reason: "native desktop arguments changed".into() });
+            return Err(DriverError::Protocol {
+                reason: "native desktop arguments changed".into(),
+            });
         }
-        let frame = if matches!(request, platform_linux::input::native_desktop::NativeDesktopRequest::Window { .. }) {
+        let frame = if matches!(
+            request,
+            platform_linux::input::native_desktop::NativeDesktopRequest::Window { .. }
+        ) {
             crate::runtime::CoordinateFrame::NativeWindow
         } else {
             crate::runtime::CoordinateFrame::Screenshot
         };
-        self.invoke_in_frame(request.tool_name(), arguments, frame,
-            Some(NativeRequest::Desktop { owner, request })).await
+        self.invoke_in_frame(
+            request.tool_name(),
+            arguments,
+            frame,
+            Some(NativeRequest::Desktop { owner, request }),
+        )
+        .await
     }
 }
 

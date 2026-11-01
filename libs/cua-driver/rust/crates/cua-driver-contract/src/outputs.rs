@@ -238,7 +238,8 @@ pub struct SessionOutput {
     pub cursor_visible: bool,
     pub recording_active: bool,
     pub idle_seconds: u64,
-    pub expires_in_seconds: u64,
+    #[schemars(required)]
+    pub expires_in_seconds: Option<u64>,
 }
 
 impl ToolOutput for SessionOutput {}

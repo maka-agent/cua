@@ -336,6 +336,25 @@ static NEXT_SESSION_REVIVE_HOOK_ID: AtomicU64 = AtomicU64::new(1);
 /// crash and inactivity fallback. `"default"` and empty ids are never tracked.
 static SESSION_ACTIVITY: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
+/// Select the runtime default, a delegated idle deadline, or the original host lifetime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum IdleLifetime {
+    #[default]
+    RuntimeDefault,
+    Timed(Duration),
+    HostOwned,
+}
+
+impl IdleLifetime {
+    fn resolve(self, default: Duration) -> Option<Duration> {
+        match self {
+            Self::RuntimeDefault => Some(default),
+            Self::Timed(duration) => Some(duration),
+            Self::HostOwned => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LifecycleRecord {
     public_label: Option<String>,
@@ -347,7 +366,7 @@ struct LifecycleRecord {
     /// Trusted host override. Ordinary sessions use the runtime sweep's
     /// default TTL so tests and process-level configuration can still supply
     /// that fallback.
-    idle_ttl: Option<Duration>,
+    idle_ttl: IdleLifetime,
     in_flight: usize,
     pending_end: Option<SessionEndReason>,
 }
@@ -369,8 +388,8 @@ pub struct LifecycleSessionSnapshot {
     pub ending: bool,
     pub started_for: Duration,
     pub idle: Duration,
-    pub idle_ttl: Duration,
-    pub expires_in: Duration,
+    pub idle_ttl: Option<Duration>,
+    pub expires_in: Option<Duration>,
 }
 
 /// RAII protection for one admitted session-requiring dispatch. Idle eviction
@@ -423,7 +442,7 @@ pub fn begin_session_dispatch(
         implicit,
         transport,
         client_kind,
-        None,
+        IdleLifetime::RuntimeDefault,
     )
 }
 
@@ -444,7 +463,28 @@ pub fn begin_session_dispatch_with_ttl(
         implicit,
         transport,
         client_kind,
-        Some(idle_ttl),
+        IdleLifetime::Timed(idle_ttl),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn begin_session_dispatch_with_policy(
+    session_id: &str,
+    public_label: Option<&str>,
+    owner_transport: &str,
+    implicit: bool,
+    transport: SessionTransport,
+    client_kind: SessionClientKind,
+    idle_ttl: IdleLifetime,
+) -> Result<SessionDispatchGuard, &'static str> {
+    begin_session_dispatch_inner(
+        session_id,
+        public_label,
+        owner_transport,
+        implicit,
+        transport,
+        client_kind,
+        idle_ttl,
     )
 }
 
@@ -456,7 +496,7 @@ fn begin_session_dispatch_inner(
     implicit: bool,
     transport: SessionTransport,
     client_kind: SessionClientKind,
-    idle_ttl: Option<Duration>,
+    idle_ttl: IdleLifetime,
 ) -> Result<SessionDispatchGuard, &'static str> {
     if !is_trackable(session_id) {
         return Err("session has ended");
@@ -510,7 +550,7 @@ fn begin_session_dispatch_inner(
         if record.pending_end.is_some() {
             return Err("session is ending");
         }
-        if idle_ttl.is_some() {
+        if idle_ttl != IdleLifetime::RuntimeDefault {
             record.idle_ttl = idle_ttl;
         }
         record.in_flight += 1;
@@ -550,7 +590,7 @@ pub fn activate_session(
         implicit,
         transport,
         client_kind,
-        None,
+        IdleLifetime::RuntimeDefault,
     )
 }
 
@@ -571,7 +611,7 @@ pub fn activate_session_with_ttl(
         implicit,
         transport,
         client_kind,
-        Some(idle_ttl),
+        IdleLifetime::Timed(idle_ttl),
     )
 }
 
@@ -583,7 +623,7 @@ fn activate_session_inner(
     implicit: bool,
     transport: SessionTransport,
     client_kind: SessionClientKind,
-    idle_ttl: Option<Duration>,
+    idle_ttl: IdleLifetime,
 ) -> Result<(), &'static str> {
     let now = Instant::now();
     {
@@ -595,7 +635,7 @@ fn activate_session_inner(
             if record.pending_end.is_some() {
                 return Err("session is ending");
             }
-            if idle_ttl.is_some() {
+            if idle_ttl != IdleLifetime::RuntimeDefault {
                 record.idle_ttl = idle_ttl;
             }
         } else {
@@ -637,7 +677,7 @@ pub fn activate_or_revive_session_for_owner(
     implicit: bool,
     transport: SessionTransport,
     client_kind: SessionClientKind,
-    idle_ttl: Option<Duration>,
+    idle_ttl: IdleLifetime,
 ) -> Result<bool, &'static str> {
     if !is_trackable(session_id) {
         return Err("session is not available to this transport");
@@ -684,7 +724,7 @@ pub fn activate_or_revive_session_for_owner(
             if record.owner_transport != owner_transport || record.pending_end.is_some() {
                 return Err("session is not available to this transport");
             }
-            if idle_ttl.is_some() {
+            if idle_ttl != IdleLifetime::RuntimeDefault {
                 record.idle_ttl = idle_ttl;
             }
         } else {
@@ -729,7 +769,7 @@ pub fn session_snapshot(
         return None;
     }
     let idle = session_idle_duration(session_id).unwrap_or_default();
-    let ttl = record.idle_ttl.unwrap_or(ttl);
+    let ttl = record.idle_ttl.resolve(ttl);
     Some(LifecycleSessionSnapshot {
         runtime_id: session_id.to_owned(),
         public_label: record.public_label.clone(),
@@ -741,7 +781,7 @@ pub fn session_snapshot(
         started_for: record.started_at.elapsed(),
         idle,
         idle_ttl: ttl,
-        expires_in: ttl.saturating_sub(idle),
+        expires_in: ttl.map(|ttl| ttl.saturating_sub(idle)),
     })
 }
 
@@ -831,7 +871,7 @@ pub fn list_session_snapshots_with_prefix(
         .into_iter()
         .map(|(_, runtime_id, record)| {
             let idle = session_idle_duration(&runtime_id).unwrap_or_default();
-            let idle_ttl = record.idle_ttl.unwrap_or(ttl);
+            let idle_ttl = record.idle_ttl.resolve(ttl);
             LifecycleSessionSnapshot {
                 runtime_id,
                 public_label: record.public_label,
@@ -843,7 +883,7 @@ pub fn list_session_snapshots_with_prefix(
                 started_for: record.started_at.elapsed(),
                 idle,
                 idle_ttl,
-                expires_in: idle_ttl.saturating_sub(idle),
+                expires_in: idle_ttl.map(|ttl| ttl.saturating_sub(idle)),
             }
         })
         .collect()
@@ -1782,7 +1822,10 @@ pub fn evict_idle(ttl: Duration) -> Vec<String> {
         map.iter()
             .filter(|(id, last)| {
                 let (in_flight, session_ttl) = lifecycle.get(*id).copied().unwrap_or_default();
-                now.duration_since(**last) >= session_ttl.unwrap_or(ttl) && in_flight == 0
+                session_ttl
+                    .resolve(ttl)
+                    .is_some_and(|ttl| now.duration_since(**last) >= ttl)
+                    && in_flight == 0
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -1809,7 +1852,9 @@ pub fn evict_idle_with_prefix(ttl: Duration, prefix: &str) -> Vec<String> {
             .filter(|(id, last)| {
                 let (in_flight, session_ttl) = lifecycle.get(*id).copied().unwrap_or_default();
                 id.starts_with(prefix)
-                    && now.duration_since(**last) >= session_ttl.unwrap_or(ttl)
+                    && session_ttl
+                        .resolve(ttl)
+                        .is_some_and(|ttl| now.duration_since(**last) >= ttl)
                     && in_flight == 0
             })
             .map(|(id, _)| id.clone())
@@ -2073,7 +2118,7 @@ mod tests {
             false,
             SessionTransport::McpHttp,
             SessionClientKind::Mcp,
-            None,
+            IdleLifetime::RuntimeDefault,
         )
         .is_err());
         assert!(is_session_ended(sid));
@@ -2086,7 +2131,7 @@ mod tests {
                 false,
                 SessionTransport::McpHttp,
                 SessionClientKind::Mcp,
-                None,
+                IdleLifetime::RuntimeDefault,
             ),
             Ok(true)
         );
@@ -2352,7 +2397,7 @@ mod tests {
         )
         .unwrap();
         let snapshot = session_snapshot(sid, owner, Duration::from_secs(3600)).unwrap();
-        assert!(snapshot.expires_in <= Duration::from_millis(1));
+        assert!(snapshot.expires_in.expect("timed session deadline") <= Duration::from_millis(1));
         let operator_snapshot = list_session_snapshots_with_prefix(
             "test-trusted-lifecycle-ttl-",
             Duration::from_secs(3600),
@@ -2360,7 +2405,12 @@ mod tests {
         .into_iter()
         .find(|snapshot| snapshot.runtime_id == sid)
         .unwrap();
-        assert!(operator_snapshot.expires_in <= Duration::from_millis(1));
+        assert!(
+            operator_snapshot
+                .expires_in
+                .expect("timed session deadline")
+                <= Duration::from_millis(1)
+        );
 
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(

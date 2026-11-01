@@ -992,7 +992,7 @@ fn isolated_session_lifecycle(
     .filter(|snapshot| !snapshot.ending)?;
     Some(json!({
         "owner": "session",
-        "idle_expires_in_seconds": snapshot.idle_ttl.as_secs(),
+        "idle_expires_in_seconds": snapshot.idle_ttl.map(|duration| duration.as_secs()),
         "process_ends_with_session": true,
         "profile_persists_after_session": mode == PrepareProfileMode::IsolatedNamed,
     }))

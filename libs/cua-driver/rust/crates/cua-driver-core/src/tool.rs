@@ -2516,7 +2516,7 @@ impl ToolRegistry {
                 let public_label = args.get("_public_session_label").and_then(Value::as_str);
                 let (transport, client_kind) = crate::session::infer_transport_metadata(owner);
                 let admitted = match context.lifecycle_idle_ttl_override() {
-                    Some(idle_ttl) => crate::session::begin_session_dispatch_with_ttl(
+                    Some(idle_ttl) => crate::session::begin_session_dispatch_with_policy(
                         session_id,
                         public_label,
                         owner,
@@ -3820,12 +3820,21 @@ fn namespace_runtime_args(
             );
         }
     }
-    if let Some(idle_ttl) = context.lifecycle_idle_ttl_override() {
-        let idle_ttl_ms = idle_ttl.as_millis().min(u64::MAX as u128) as u64;
-        arguments.insert(
-            "_session_idle_ttl_ms".to_owned(),
-            Value::Number(idle_ttl_ms.into()),
-        );
+    match context.lifecycle_idle_ttl_override() {
+        Some(crate::session::IdleLifetime::Timed(idle_ttl)) => {
+            let milliseconds = u64::try_from(idle_ttl.as_millis())
+                .expect("delegated TTL fits its configured ceiling");
+            arguments.insert(
+                "_session_idle_ttl_ms".to_owned(),
+                Value::Number(milliseconds.into()),
+            );
+        }
+        Some(crate::session::IdleLifetime::HostOwned) => {
+            arguments.insert("_session_idle_ttl_ms".to_owned(), Value::Null);
+        }
+        Some(crate::session::IdleLifetime::RuntimeDefault) | None => {
+            arguments.remove("_session_idle_ttl_ms");
+        }
     }
     // The registry is the first boundary shared by every transport and the
     // direct SDK. Transport adapters may already have injected `_session_id`,
