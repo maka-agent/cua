@@ -3425,12 +3425,28 @@ impl ExtensionBrowserProvider {
         &self,
         tab_id: u64,
     ) -> Result<ExtensionSessionPreparedTab, ExtensionProviderError> {
+        self.prepare_session_tab_with_takeover(tab_id, false).await
+    }
+    /// Explicitly take control of a user tab, ending an unowned old browser
+    /// session if necessary. Passive preparation never performs this handoff.
+    pub async fn take_over_session_tab(
+        &self,
+        tab_id: u64,
+    ) -> Result<ExtensionSessionPreparedTab, ExtensionProviderError> {
+        self.prepare_session_tab_with_takeover(tab_id, true).await
+    }
+    async fn prepare_session_tab_with_takeover(
+        &self,
+        tab_id: u64,
+        takeover: bool,
+    ) -> Result<ExtensionSessionPreparedTab, ExtensionProviderError> {
         self.require_session_tab_context()?;
+        let mut params = json!({"tabId":tab_id,"sessionOnly":true});
+        if takeover {
+            params["takeover"] = json!(true);
+        }
         let reply = self
-            .control(
-                ExtensionOperation::PrepareSessionTab { tab_id },
-                json!({"tabId":tab_id,"sessionOnly":true}),
-            )
+            .control(ExtensionOperation::PrepareSessionTab { tab_id }, params)
             .await?;
         let result = reply.outcome.into_result("prepareUserTab")?;
         session_prepared_tab(&result, tab_id, reply.id)
