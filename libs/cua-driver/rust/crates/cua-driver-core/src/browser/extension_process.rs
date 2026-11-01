@@ -1189,6 +1189,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_takeover_crosses_the_public_provider_ipc_and_broker_without_disconnect() {
+        use super::super::extension_provider::{ExtensionBrowserProvider, ExtensionProviderError};
+        use super::super::extension_wire::ExtensionWireContext;
+        use std::{io::Cursor, time::Duration};
+
+        async fn outgoing(
+            native: &mut mpsc::Receiver<super::super::extension_broker::ExtensionOutbound>,
+            broker: &BrokerHandle,
+        ) -> Value {
+            let queued = native.recv().await.expect("extension request");
+            let mut bytes = Vec::new();
+            if let Some(report) = queued.write_to(&mut bytes).unwrap() {
+                broker.write_report(report).await;
+            }
+            let raw =
+                extension_framing::read_frame(&mut Cursor::new(bytes), Direction::HostToChrome)
+                    .unwrap()
+                    .expect("written native frame");
+            serde_json::from_slice(&raw).unwrap()
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().canonicalize().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let directory = directory.join("ipc");
+            let origin = ExtensionOrigin::from_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+            let (broker, actor, mut native) = ExtensionHostBroker::channels(
+                origin.clone(), local_ipc::current_user_principal().unwrap(),
+            );
+            let actor = tokio::spawn(actor.run());
+            broker.extension_message(json!({
+                "kind":"hello","protocol":1,"extensionId":origin.id(),
+                "instanceId":"takeover-transport",
+                "capabilities":{"metadata":true,"sessionTabResolution":true,"sessionPreparation":"provider_session", "userTabsOrder":"provider","headerScope":"session","createdPresentationOwner":"provider","cursorPresentationOwner":"provider","cursorHideOwner":"unavailable","turnLifecycleOwner":"provider"}
+            })).await.unwrap();
+            assert_eq!(outgoing(&mut native, &broker).await["kind"], "bound");
+            let actual = broker.identity().await.unwrap();
+            let endpoint = PublishedEndpoint::publish(&directory, ExtensionEndpointIdentity {
+                adapter: CHATGPT_HOST_NAME.into(), extension_id: actual.extension_id,
+                instance_id: actual.instance_id, generation: actual.generation.clone(),
+                capabilities: actual.capabilities, host_pid: std::process::id(),
+            }).await.unwrap();
+            let descriptor = directory.join(format!("{}.json", actual.generation));
+            let endpoint = (endpoint, local_ipc::ValidatedExtensionEndpoint::load(&descriptor, CHATGPT_HOST_NAME).unwrap());
+            let (stop, stopped) = watch::channel(false);
+            let server = tokio::spawn(serve_until(endpoint.0, broker.clone(), stopped));
+            let provider = ExtensionBrowserProvider::connect(endpoint.1).await.unwrap();
+            let call = provider.with_wire_context(ExtensionWireContext::new(
+                "22222222-2222-4222-8222-222222222222", "takeover-transport-turn",
+            ).unwrap());
+            for explicit in [true, false] {
+                let request = async {
+                    if explicit { call.take_over_session_tab(11).await }
+                    else { call.prepare_session_tab(11).await }
+                };
+                let respond = async {
+                    let frame = outgoing(&mut native, &broker).await;
+                    assert_eq!(frame["method"], "prepareUserTab");
+                    assert_eq!(frame["params"]["tabId"], 11);
+                    assert_eq!(frame["params"]["sessionOnly"], true);
+                    assert_eq!(frame["params"]["takeover"], if explicit { json!(true) } else { Value::Null });
+                    broker.extension_message(json!({
+                        "kind":"response","protocol":1,"generation":actual.generation,
+                        "id":frame["id"],"result":{"sessionOnly":true,"tab":{"id":11,"title":"Inbox"}}
+                    })).await.unwrap();
+                    Ok::<(), ExtensionProviderError>(())
+                };
+                let (prepared, ()) = tokio::try_join!(request, respond).expect("public provider request must survive IPC decoding and forwarding");
+                assert_eq!(prepared.tab.id, 11);
+                assert!(!provider.is_closed(), "both calls reuse the same live IPC connection");
+            }
+            provider.close().await;
+            broker.extension_eof("transport fixture finished").await;
+            stop.send_replace(true);
+            server.await.unwrap().unwrap();
+            actor.await.unwrap();
+        }).await.expect("the original provider call must return through IPC");
+    }
+
+    #[tokio::test]
     async fn queued_cdp_receipt_keeps_budget_through_owner_fifo_projection() {
         let budget = super::super::broker_delivery::ByteBudget::new();
         let initial = budget.available_bytes();
