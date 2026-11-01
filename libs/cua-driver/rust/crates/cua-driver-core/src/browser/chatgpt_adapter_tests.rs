@@ -3598,3 +3598,296 @@ fn early_notifications_replay_past_old_count_and_size_quotas_in_order() {
         assert_eq!(adapter.early_budget.available_bytes(), available);
     }
 }
+
+fn foreign_claim(
+    adapter: &mut ChatgptWireAdapter,
+    request: &Value,
+    tab: u64,
+    old: &str,
+    now: Instant,
+) -> Vec<ExtensionWireAction> {
+    adapter.written_extension(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":format!("Tab {tab} is already part of browser session {old}")}}), now).unwrap()
+}
+
+#[test]
+fn explicit_takeover_finishes_the_old_session_then_claims_under_the_original_context() {
+    let (mut adapter, context, now) = boot();
+    let old = "33333333-3333-4333-8333-333333333333";
+    let claim = frame(
+        &adapter
+            .written_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":7,"sessionOnly":true,"takeover":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .unwrap(),
+    );
+    let inventory = frame(&foreign_claim(&mut adapter, &claim, 7, old, now));
+    assert_eq!(inventory["method"], "getTabs");
+    assert_eq!(inventory["params"]["session_id"], old);
+    assert_eq!(inventory["params"]["session_context"], "live");
+    assert_ne!(inventory["params"]["turn_id"], context.host_turn_id());
+    assert!(inventory["params"].get("request_headers").is_none());
+    let finish = frame(&reply(
+        &mut adapter,
+        &inventory,
+        json!([{"id":7},{"id":8}]),
+        now,
+    ));
+    assert_eq!(finish["method"], "finalizeTabs");
+    assert_eq!(finish["params"]["session_id"], old);
+    assert_eq!(finish["params"]["session_context"], "cached");
+    assert_eq!(finish["params"]["turn_id"], inventory["params"]["turn_id"]);
+    assert_eq!(
+        finish["params"]["keep"],
+        json!([{"tabId":7,"status":"deliverable"},{"tabId":8,"status":"deliverable"}])
+    );
+    let claimed = frame(&reply(&mut adapter, &finish, Value::Null, now));
+    assert_eq!(claimed["method"], "claimUserTab");
+    assert_eq!(claimed["params"]["tabId"], 7);
+    assert_eq!(claimed["params"]["session_id"], SID);
+    assert_eq!(claimed["params"]["turn_id"], context.host_turn_id());
+    let done = response(&reply(&mut adapter, &claimed, json!({"id":7}), now));
+    assert_eq!(done["result"]["tab"]["id"], 7);
+    assert_eq!(done["result"]["sessionOnly"], true);
+}
+
+#[test]
+fn passive_preparation_and_live_sessions_never_trigger_legacy_takeover() {
+    let old = "33333333-3333-4333-8333-333333333333";
+    for local in [false, true] {
+        let (mut adapter, context, now) = boot();
+        if local {
+            let old_context = ExtensionWireContext::new(old, "other-real-turn").unwrap();
+            let first = frame(
+                &adapter
+                    .written_semantic(
+                        semantic("1", "prepareUserTab", json!({"tabId":8,"sessionOnly":true})),
+                        Some(&old_context),
+                        now,
+                    )
+                    .unwrap(),
+            );
+            reply(&mut adapter, &first, json!({"id":8}), now);
+        }
+        let claim = frame(
+            &adapter
+                .written_semantic(
+                    semantic(
+                        "2",
+                        "prepareUserTab",
+                        json!({"tabId":7,"sessionOnly":true,"takeover":local}),
+                    ),
+                    Some(&context),
+                    now,
+                )
+                .unwrap(),
+        );
+        let rejected = foreign_claim(&mut adapter, &claim, 7, old, now);
+        assert!(rejected
+            .iter()
+            .all(|action| !matches!(action, ExtensionWireAction::ExtensionFrame { .. })));
+        assert!(response(&rejected).get("error").is_some());
+    }
+}
+
+#[test]
+fn failed_takeover_keeps_its_context_for_original_scope_cleanup() {
+    let (mut adapter, context, now) = boot();
+    let old = "33333333-3333-4333-8333-333333333333";
+    let claim = frame(
+        &adapter
+            .written_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":7,"sessionOnly":true,"takeover":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .unwrap(),
+    );
+    let inventory = frame(&foreign_claim(&mut adapter, &claim, 7, old, now));
+    let finish = frame(&reply(&mut adapter, &inventory, json!([{"id":7}]), now));
+    let rejected = adapter.written_extension(json!({"jsonrpc":"2.0","id":finish["id"],"error":{"code":1,"message":"failed cleanup"}}), now).unwrap();
+    assert_eq!(response(&rejected)["error"]["kind"], "outcome_unknown");
+    let retry = frame(
+        &adapter
+            .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .unwrap(),
+    );
+    assert_eq!(retry["params"]["session_id"], old);
+    assert_eq!(retry["params"]["turn_id"], inventory["params"]["turn_id"]);
+    assert_eq!(retry["params"]["session_context"], "live");
+    let retried = frame(&reply(&mut adapter, &retry, json!([{"id":7}]), now));
+    let own = frame(&reply(&mut adapter, &retried, Value::Null, now));
+    assert_eq!(own["method"], "turnEnded");
+    assert_eq!(own["params"]["session_id"], SID);
+    assert_eq!(own["params"]["turn_id"], context.host_turn_id());
+    assert_eq!(
+        response(&reply(&mut adapter, &own, Value::Null, now))["result"]["turnFinished"],
+        true
+    );
+}
+
+#[test]
+fn takeover_cancellation_finishes_cleanup_without_claiming_and_a_second_conflict_is_not_replayed() {
+    let old = "33333333-3333-4333-8333-333333333333";
+    for cancelled in [true, false] {
+        let (mut adapter, context, now) = boot();
+        let claim = frame(
+            &adapter
+                .written_semantic(
+                    semantic(
+                        "1",
+                        "prepareUserTab",
+                        json!({"tabId":7,"sessionOnly":true,"takeover":true}),
+                    ),
+                    Some(&context),
+                    now,
+                )
+                .unwrap(),
+        );
+        let inventory = frame(&foreign_claim(&mut adapter, &claim, 7, old, now));
+        if cancelled {
+            adapter.on_cancel("1");
+        }
+        let finish = frame(&reply(&mut adapter, &inventory, json!([{"id":7}]), now));
+        let actions = reply(&mut adapter, &finish, Value::Null, now);
+        let terminal = if cancelled {
+            actions
+        } else {
+            let once = frame(&actions);
+            foreign_claim(&mut adapter, &once, 7, old, now)
+        };
+        assert!(terminal
+            .iter()
+            .all(|action| !matches!(action, ExtensionWireAction::ExtensionFrame { .. })));
+        assert_eq!(response(&terminal)["error"]["kind"], "outcome_unknown");
+    }
+}
+
+#[test]
+fn a_failed_takeover_inventory_does_not_poison_the_original_session_activation() {
+    let (mut adapter, context, now) = boot();
+    let old = "33333333-3333-4333-8333-333333333333";
+    let claim = frame(
+        &adapter
+            .written_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":7,"sessionOnly":true,"takeover":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .unwrap(),
+    );
+    let inventory = frame(&foreign_claim(&mut adapter, &claim, 7, old, now));
+    let rejected = adapter.written_extension(json!({"jsonrpc":"2.0","id":inventory["id"],"error":{"code":1,"message":"getTabs failed"}}), now).unwrap();
+    assert_eq!(
+        response(&rejected)["error"]["details"]["takeover"]["sessionId"],
+        old
+    );
+    let retry = frame(
+        &adapter
+            .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .unwrap(),
+    );
+    assert_eq!(retry["params"]["session_id"], old);
+    assert_eq!(retry["params"]["turn_id"], inventory["params"]["turn_id"]);
+    let finish = frame(&reply(&mut adapter, &retry, json!([{"id":7}]), now));
+    let own = frame(&reply(&mut adapter, &finish, Value::Null, now));
+    assert_eq!(own["params"]["session_id"], SID);
+    assert_eq!(
+        response(&reply(&mut adapter, &own, Value::Null, now))["result"]["turnFinished"],
+        true
+    );
+}
+
+#[test]
+fn finish_during_takeover_keeps_one_cleanup_chain_and_prevents_reclaim() {
+    let (mut adapter, context, now) = boot();
+    let old = "33333333-3333-4333-8333-333333333333";
+    let claim = frame(
+        &adapter
+            .written_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":7,"sessionOnly":true,"takeover":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .unwrap(),
+    );
+    let inventory = frame(&foreign_claim(&mut adapter, &claim, 7, old, now));
+    let old_context = ExtensionWireContext::new(old, "concurrent-turn").unwrap();
+    assert!(
+        matches!(adapter.written_semantic(semantic("2", "inventory", json!({"sessionOnly":true,"knownTabIds":[]})), Some(&old_context), now), Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "session_takeover_pending")
+    );
+    assert!(matches!(
+        adapter.written_semantic(semantic("3", "finishTurn", json!({})), Some(&context), now),
+        Err(ExtensionWireError::LocalRefusal { code, .. }) if code == "cleanup_pending"
+    ));
+    let finish = frame(&reply(&mut adapter, &inventory, json!([{"id":7}]), now));
+    let cancelled = reply(&mut adapter, &finish, Value::Null, now);
+    assert_eq!(response(&cancelled)["error"]["kind"], "outcome_unknown");
+    assert!(cancelled
+        .iter()
+        .all(|action| !matches!(action, ExtensionWireAction::ExtensionFrame { .. })));
+    let own = frame(
+        &adapter
+            .written_semantic(semantic("4", "finishTurn", json!({})), Some(&context), now)
+            .unwrap(),
+    );
+    assert_eq!(own["method"], "turnEnded");
+    reply(&mut adapter, &own, Value::Null, now);
+}
+
+#[test]
+fn lost_finalize_ack_recovers_after_the_extension_has_already_cleared_its_active_turn() {
+    let (mut adapter, context, now) = boot();
+    let old = "33333333-3333-4333-8333-333333333333";
+    let claim = frame(
+        &adapter
+            .written_semantic(
+                semantic(
+                    "1",
+                    "prepareUserTab",
+                    json!({"tabId":7,"sessionOnly":true,"takeover":true}),
+                ),
+                Some(&context),
+                now,
+            )
+            .unwrap(),
+    );
+    let inventory = frame(&foreign_claim(&mut adapter, &claim, 7, old, now));
+    let _finish = frame(&reply(&mut adapter, &inventory, json!([{"id":7}]), now));
+    let expired = adapter.expire(now + DEADLINE + Duration::from_secs(1));
+    assert_eq!(response(&expired)["error"]["kind"], "outcome_unknown");
+    let retry = frame(
+        &adapter
+            .written_semantic(semantic("2", "finishTurn", json!({})), Some(&context), now)
+            .unwrap(),
+    );
+    // The extension has ended its turn, so cached getTabs would be refused.
+    // Re-activate the same cleanup context and observe its empty inventory.
+    assert_eq!(retry["params"]["session_context"], "live");
+    assert_eq!(retry["params"]["turn_id"], inventory["params"]["turn_id"]);
+    let finish = frame(&reply(&mut adapter, &retry, json!([]), now));
+    assert_eq!(finish["params"]["keep"], json!([]));
+    let own = frame(&reply(&mut adapter, &finish, Value::Null, now));
+    assert_eq!(own["method"], "turnEnded");
+    assert_eq!(
+        response(&reply(&mut adapter, &own, Value::Null, now))["result"]["turnFinished"],
+        true
+    );
+}

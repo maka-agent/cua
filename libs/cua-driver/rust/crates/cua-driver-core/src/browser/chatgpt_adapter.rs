@@ -137,6 +137,17 @@ enum PreparationPurpose {
 }
 
 #[derive(Clone, Debug)]
+enum TakeoverContinuation {
+    Claim {
+        tab: u64,
+        purpose: PreparationPurpose,
+    },
+    Finish {
+        keep: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug)]
 enum Stage {
     Bootstrap,
     UserHistory,
@@ -156,6 +167,14 @@ enum Stage {
     PrepareClaim {
         tab: u64,
         purpose: PreparationPurpose,
+    },
+    TakeoverInventory {
+        session: String,
+        resume: TakeoverContinuation,
+    },
+    TakeoverFinish {
+        session: String,
+        resume: TakeoverContinuation,
     },
     Create,
     ClaimForAttach(u64),
@@ -197,6 +216,32 @@ struct Task {
     activation_epoch: Option<u64>,
     write_phase: WritePhase,
     initial_attach: Option<u64>,
+    allow_takeover: bool,
+}
+
+impl Task {
+    fn taking_over(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::TakeoverInventory { .. } | Stage::TakeoverFinish { .. }
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Takeover {
+    call: Call,
+    session: String,
+    turn: String,
+}
+impl Takeover {
+    fn params(&self, fields: Value, cached: bool) -> Value {
+        let mut fields = fields;
+        fields["session_id"] = json!(self.session);
+        fields["turn_id"] = json!(self.turn);
+        fields["session_context"] = json!(if cached { "cached" } else { "live" });
+        fields
+    }
 }
 
 /// One extension-port generation; the host serializes all trait calls.
@@ -213,6 +258,7 @@ pub(crate) struct ChatgptWireAdapter {
     session_turns: HashMap<String, SessionTurn>,
     next_session_epoch: u64,
     attaching: HashMap<u64, Attaching>,
+    takeovers: HashMap<String, Takeover>,
     started: bool,
     ready: bool,
     ended: bool,
@@ -240,6 +286,7 @@ impl ChatgptWireAdapter {
             session_turns: HashMap::new(),
             next_session_epoch: 0,
             attaching: HashMap::new(),
+            takeovers: HashMap::new(),
             started: false,
             ready: false,
             ended: false,
@@ -256,7 +303,9 @@ impl ChatgptWireAdapter {
         now: Instant,
     ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
         if let Some(call) = task.call.as_ref() {
-            if activates_session(method) {
+            if task.taking_over() {
+                self.context(call)?;
+            } else if activates_session(method) {
                 let context = self.context(call)?;
                 if matches!(task.stage, Stage::SessionHeaders { active: false })
                     && self
@@ -382,6 +431,12 @@ impl ChatgptWireAdapter {
                 message: "Host session UUID must be standard hyphenated form".to_owned(),
             });
         }
+        if self.takeovers.contains_key(context.host_session_id()) {
+            return Err(ExtensionWireError::LocalRefusal {
+                code: "session_takeover_pending".into(),
+                message: "This browser session is owned by an in-flight takeover".into(),
+            });
+        }
         let foreign_claim = self
             .claims
             .values()
@@ -449,6 +504,78 @@ impl ChatgptWireAdapter {
         params.insert("turn_id".to_owned(), json!(context.host_turn_id()));
         params.insert("session_context".to_owned(), json!("live"));
         Ok(Value::Object(params))
+    }
+
+    fn has_session_custody(&self, session: &str) -> bool {
+        self.takeovers.contains_key(session)
+            || self
+                .session_turns
+                .get(session)
+                .is_some_and(|turn| turn.phase != TurnPhase::Finished)
+            || self.leases.values().any(|(_, owned)| owned == session)
+            || self.claims.values().any(|claim| claim.session == session)
+            || self
+                .attaching
+                .values()
+                .any(|claim| claim.session == session)
+            || self
+                .creations
+                .values()
+                .any(|creation| creation.session == session && !creation.finish_observed)
+            || self.tasks.values().any(|task| {
+                task.call.as_ref().is_some_and(|call| {
+                    call.context
+                        .as_ref()
+                        .is_some_and(|context| context.host_session_id() == session)
+                })
+            })
+    }
+
+    fn queue_original_finish(
+        &mut self,
+        task: Task,
+        keep: Option<Value>,
+        now: Instant,
+    ) -> Result<Vec<ExtensionWireAction>, ExtensionWireError> {
+        if let Some(call) = task.call.as_ref() {
+            if let Some((session, takeover)) = self.takeovers.iter().find(|(_, takeover)| {
+                takeover.call.owner == call.owner && takeover.call.context == call.context
+            }) {
+                let session = session.clone();
+                let mut in_flight = false;
+                for task in self.tasks.values_mut().filter(|task| matches!(
+                    &task.stage,
+                    Stage::TakeoverInventory { session: active, .. } | Stage::TakeoverFinish { session: active, .. } if active == &session
+                )) {
+                    if let Some(call) = task.call.as_mut() { call.cancelled = true; }
+                    in_flight = true;
+                }
+                if in_flight {
+                    return Ok(self.failure(
+                        call,
+                        "cleanup_pending",
+                        "The original takeover is still running; its cleanup was not duplicated",
+                        json!({"sessionId":session}),
+                    ));
+                }
+                let params = takeover.params(json!({}), false);
+                let mut task = task;
+                task.stage = Stage::TakeoverInventory {
+                    session: session.clone(),
+                    resume: TakeoverContinuation::Finish { keep: keep.clone() },
+                };
+                return self.queue(task, Method::GetTabs, params, now);
+            }
+        }
+        let call = task.call.as_ref().expect("original finish owner");
+        let (method, fields) = match &keep {
+            Some(keep) => (Method::FinalizeTabs, json!({"keep":keep})),
+            None => (Method::TurnEnded, json!({})),
+        };
+        let params = self.params(call, fields)?;
+        let mut task = task;
+        task.stage = Stage::Finish;
+        self.queue(task, method, params, now)
     }
 
     fn owned_claim(&self, call: &Call, token: &str) -> Result<Claim, ExtensionWireError> {
@@ -893,7 +1020,9 @@ impl ChatgptWireAdapter {
         let mut actions = match result {
             Ok(actions) => actions,
             Err(error) => {
-                if activates_session(method) || matches!(retained.stage, Stage::Finish) {
+                if !retained.taking_over()
+                    && (activates_session(method) || matches!(retained.stage, Stage::Finish))
+                {
                     self.uncertain_activation(
                         call,
                         retained.activation_epoch,
@@ -974,6 +1103,44 @@ impl ChatgptWireAdapter {
                 let Some(call) = task.call.clone() else {
                     return Err(ExtensionWireError::Protocol(error.to_string()));
                 };
+                if task.allow_takeover && !call.cancelled {
+                    if let (Stage::PrepareClaim { tab, .. }, RpcError::Remote(remote)) =
+                        (&task.stage, &error)
+                    {
+                        if remote.code == 1 {
+                            if let Some(session) = claim_conflict_session(*tab, &remote.message) {
+                                if session != self.context(&call)?.host_session_id()
+                                    && !self.has_session_custody(&session)
+                                {
+                                    let takeover = Takeover {
+                                        call: call.clone(),
+                                        session: session.clone(),
+                                        turn: uuid::Uuid::new_v4().to_string(),
+                                    };
+                                    let params = takeover.params(json!({}), false);
+                                    self.takeovers.insert(session.clone(), takeover);
+                                    let Stage::PrepareClaim { tab, purpose } = &task.stage else {
+                                        unreachable!()
+                                    };
+                                    let resume = TakeoverContinuation::Claim {
+                                        tab: *tab,
+                                        purpose: purpose.clone(),
+                                    };
+                                    task.allow_takeover = false;
+                                    task.stage = Stage::TakeoverInventory {
+                                        session: session.clone(),
+                                        resume,
+                                    };
+                                    let queued = self.queue(task, Method::GetTabs, params, now);
+                                    if queued.is_err() {
+                                        self.takeovers.remove(&session);
+                                    }
+                                    return queued;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Code1 merges Chatgpt validation, policy and Chrome failures.
                 // No synthetic raw CDP error or ChromeRejected marker is emitted.
                 let (kind, mut detail) = match &error {
@@ -1001,7 +1168,7 @@ impl ChatgptWireAdapter {
                         json!({"remoteMethod":completion.method.as_str(),"cause":error.to_string()}),
                     ),
                 };
-                if activates_session(completion.method) {
+                if !task.taking_over() && activates_session(completion.method) {
                     self.uncertain_activation(&call, task.activation_epoch, TurnPhase::Active);
                 }
                 if matches!(task.stage, Stage::Finish) {
@@ -1010,6 +1177,14 @@ impl ChatgptWireAdapter {
 
                 if let Some(custody) = self.partial_attachment(&task, &call) {
                     detail["custody"] = custody;
+                }
+                if let Stage::TakeoverInventory { session, .. }
+                | Stage::TakeoverFinish { session, .. } = &task.stage
+                {
+                    if let Some(takeover) = self.takeovers.get(session) {
+                        detail["takeover"] =
+                            json!({"sessionId":takeover.session,"turnId":takeover.turn});
+                    }
                 }
                 return Ok(self.failure(&call, kind, &error.to_string(), detail));
             }
@@ -1205,7 +1380,12 @@ impl ChatgptWireAdapter {
         if call.cancelled
             && !matches!(
                 task.stage,
-                Stage::Create | Stage::ObserveCreated(_) | Stage::NameSession | Stage::UserHistory
+                Stage::Create
+                    | Stage::ObserveCreated(_)
+                    | Stage::NameSession
+                    | Stage::UserHistory
+                    | Stage::TakeoverInventory { .. }
+                    | Stage::TakeoverFinish { .. }
             )
         {
             if let Some(custody) = self.partial_attachment(&task, &call) {
@@ -1259,6 +1439,30 @@ impl ChatgptWireAdapter {
                     format!("ChatGPT committed URL for raw tab {tab} is not a string"),
                 ))?;
                 Ok(self.success(&call, json!({"url":url,"sessionOnly":true,"committedUrlOnly":true})))
+            }
+            Stage::TakeoverInventory { session, resume } => {
+                let keep = project_inventory(value, InventorySource::ManagedSession)?
+                    .into_iter().map(|tab| json!({"tabId":tab["id"],"status":"deliverable"}))
+                    .collect::<Vec<_>>();
+                let retained = self.takeovers.get(&session).expect("owned takeover");
+                let params = retained.params(json!({"keep":keep}), true);
+                task.stage = Stage::TakeoverFinish { session, resume };
+                self.queue(task, Method::FinalizeTabs, params, now)
+            }
+            Stage::TakeoverFinish { session, resume } => {
+                self.takeovers.remove(&session).expect("owned takeover");
+                task.stage = Stage::Finish;
+                if call.cancelled {
+                    return Ok(self.failure(&call, "outcome_unknown", "Takeover cleanup completed after cancellation; the new tab claim was not sent", json!({"takeoverFinished":true})));
+                }
+                match resume {
+                    TakeoverContinuation::Claim { tab, purpose } => {
+                        let params = self.params(&call, json!({"tabId":tab}))?;
+                        task.stage = Stage::PrepareClaim { tab, purpose };
+                        self.queue(task, Method::ClaimUserTab, params, now)
+                    }
+                    TakeoverContinuation::Finish { keep } => self.queue_original_finish(task, keep, now),
+                }
             }
             Stage::PrepareBefore(tab) => {
                 let tabs = project_inventory(value, InventorySource::User)?;
@@ -1514,6 +1718,7 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
                 activation_epoch: None,
                 write_phase: WritePhase::Unwritten,
                 initial_attach: None,
+                allow_takeover: false,
             },
             Method::GetInfo,
             json!({}),
@@ -1586,8 +1791,11 @@ impl ExtensionWireAdapter for ChatgptWireAdapter {
             ));
         }
         task.write_phase = WritePhase::Started;
+
         if let Some(call) = task.call.as_ref() {
-            task.activation_epoch = if activates_session(method) {
+            task.activation_epoch = if task.taking_over() {
+                task.activation_epoch
+            } else if activates_session(method) {
                 Some(self.admit_activation(call))
             } else if matches!(task.stage, Stage::Finish) {
                 Some(self.admit_finish(call))
@@ -2654,10 +2862,16 @@ impl ChatgptWireAdapter {
             }
             "finishTurn"=>{
                 self.validate_finish(&call)?;
-                match fields.get("keep").filter(|value|!value.is_null()) {
-                    Some(keep)=>{if !keep.is_array(){return Err(ExtensionWireError::Protocol("Finish keep plan must be an array".to_owned()));}let params=self.params(&call,json!({"keep":keep}))?;(Stage::Finish,Method::FinalizeTabs,params)},
-                    None=>{let params=self.params(&call,json!({}))?;(Stage::Finish,Method::TurnEnded,params)}
+                let keep = fields.get("keep").filter(|keep| !keep.is_null()).cloned();
+                if keep.as_ref().is_some_and(|keep| !keep.is_array()) {
+                    return Err(ExtensionWireError::Protocol("Finish keep plan must be an array".to_owned()));
                 }
+                return self.queue_original_finish(Task {
+                    call: Some(call), stage: Stage::Finish,
+                    candidate_target: None, attach_acknowledged: false, finish_observed: false,
+                    activation_epoch: None, write_phase: WritePhase::Unwritten,
+                    initial_attach: None, allow_takeover: false,
+                }, keep, now);
             }
             "setSessionHeaders"|"clearSessionHeaders"=>{
                 let headers=if method=="clearSessionHeaders"{json!([])}else{fields.get("headers").cloned().ok_or_else(||ExtensionWireError::LocalRefusal {code:"invalid_request".to_owned(),message:"Session header policy is missing".to_owned()})?};
@@ -2701,12 +2915,22 @@ impl ChatgptWireAdapter {
                 activation_epoch: None,
                 write_phase: WritePhase::Unwritten,
                 initial_attach,
+                allow_takeover: method == "prepareUserTab"
+                    && fields["sessionOnly"] == true
+                    && fields["takeover"] == true,
             },
             extension,
             params,
             now,
         )
     }
+}
+
+fn claim_conflict_session(tab: u64, message: &str) -> Option<String> {
+    let session =
+        message.strip_prefix(&format!("Tab {tab} is already part of browser session "))?;
+    let id = uuid::Uuid::parse_str(session).ok()?;
+    (id.to_string() == session).then(|| session.to_owned())
 }
 
 fn activates_session(method: Method) -> bool {
@@ -2762,6 +2986,7 @@ mod passive_phase_tests {
                             activation_epoch: None,
                             write_phase: WritePhase::Unwritten,
                             initial_attach: None,
+                            allow_takeover: false,
                         },
                         Method::GetUserTabs,
                         json!({"headers":"HEADER_SENTINEL"}),
