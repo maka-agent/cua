@@ -68,11 +68,18 @@ fn owner_transport_of(args: &Value, session_id: &str) -> String {
         .to_owned()
 }
 
-fn lifecycle_idle_ttl_of(args: &Value) -> Option<std::time::Duration> {
-    args.get("_session_idle_ttl_ms")
-        .and_then(Value::as_u64)
-        .filter(|milliseconds| *milliseconds > 0)
-        .map(std::time::Duration::from_millis)
+fn lifecycle_idle_ttl_of(args: &Value) -> crate::session::IdleLifetime {
+    match args.get("_session_idle_ttl_ms") {
+        Some(Value::Null) => crate::session::IdleLifetime::HostOwned,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(|value| {
+                crate::session::IdleLifetime::Timed(std::time::Duration::from_millis(value))
+            })
+            .unwrap_or_default(),
+        None => crate::session::IdleLifetime::RuntimeDefault,
+    }
 }
 
 fn lifecycle_output(snapshot: crate::session::LifecycleSessionSnapshot) -> SessionOutput {
@@ -104,7 +111,7 @@ fn lifecycle_output(snapshot: crate::session::LifecycleSessionSnapshot) -> Sessi
         cursor_visible,
         recording_active,
         idle_seconds: snapshot.idle.as_secs(),
-        expires_in_seconds: snapshot.expires_in.as_secs(),
+        expires_in_seconds: snapshot.expires_in.map(|duration| duration.as_secs()),
     }
 }
 

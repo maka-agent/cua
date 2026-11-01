@@ -634,7 +634,7 @@ mod tests {
                 false,
                 SessionTransport::McpStdio,
                 SessionClientKind::Mcp,
-                None,
+                crate::session::IdleLifetime::RuntimeDefault,
             );
             let _ = observed.send((
                 owned,

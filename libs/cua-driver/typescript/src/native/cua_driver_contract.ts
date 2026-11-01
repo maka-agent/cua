@@ -3454,7 +3454,7 @@ export type SessionOutput = {
     cursorVisible: boolean,
     recordingActive: boolean,
     idleSeconds: bigint,
-    expiresInSeconds: bigint
+    expiresInSeconds?: bigint
 }
 
 /**
@@ -3486,7 +3486,7 @@ const FfiConverterTypeSessionOutput = (() => {
                 cursorVisible: FfiConverterBool.read(from),
                 recordingActive: FfiConverterBool.read(from),
                 idleSeconds: FfiConverterUInt64.read(from),
-                expiresInSeconds: FfiConverterUInt64.read(from)
+                expiresInSeconds: FfiConverterOptionalUInt64.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -3498,7 +3498,7 @@ const FfiConverterTypeSessionOutput = (() => {
             FfiConverterBool.write(value.cursorVisible, into);
             FfiConverterBool.write(value.recordingActive, into);
             FfiConverterUInt64.write(value.idleSeconds, into);
-            FfiConverterUInt64.write(value.expiresInSeconds, into);
+            FfiConverterOptionalUInt64.write(value.expiresInSeconds, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalString.allocationSize(value.session) +
@@ -3509,7 +3509,7 @@ const FfiConverterTypeSessionOutput = (() => {
              FfiConverterBool.allocationSize(value.cursorVisible) +
              FfiConverterBool.allocationSize(value.recordingActive) +
              FfiConverterUInt64.allocationSize(value.idleSeconds) +
-             FfiConverterUInt64.allocationSize(value.expiresInSeconds);
+             FfiConverterOptionalUInt64.allocationSize(value.expiresInSeconds);
 
         }
     };

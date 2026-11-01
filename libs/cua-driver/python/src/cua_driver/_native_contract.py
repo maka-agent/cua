@@ -4861,7 +4861,7 @@ class SessionOutput:
     """
     Content-free lifecycle state safe for an ordinary agent transport.
 """
-    def __init__(self, *, session:typing.Optional[str], implicit:bool, state:SessionLifecycleState, client_kind:SessionClientKindOutput, transport:SessionTransportOutput, cursor_visible:bool, recording_active:bool, idle_seconds:int, expires_in_seconds:int):
+    def __init__(self, *, session:typing.Optional[str], implicit:bool, state:SessionLifecycleState, client_kind:SessionClientKindOutput, transport:SessionTransportOutput, cursor_visible:bool, recording_active:bool, idle_seconds:int, expires_in_seconds:typing.Optional[int]):
         self.session = session
         self.implicit = implicit
         self.state = state
@@ -4910,7 +4910,7 @@ class _UniffiFfiConverterTypeSessionOutput(_UniffiConverterRustBuffer):
             cursor_visible=_UniffiFfiConverterBoolean.read(buf),
             recording_active=_UniffiFfiConverterBoolean.read(buf),
             idle_seconds=_UniffiFfiConverterUInt64.read(buf),
-            expires_in_seconds=_UniffiFfiConverterUInt64.read(buf),
+            expires_in_seconds=_UniffiFfiConverterOptionalUInt64.read(buf),
         )
 
     @staticmethod
@@ -4923,7 +4923,7 @@ class _UniffiFfiConverterTypeSessionOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.check_lower(value.cursor_visible)
         _UniffiFfiConverterBoolean.check_lower(value.recording_active)
         _UniffiFfiConverterUInt64.check_lower(value.idle_seconds)
-        _UniffiFfiConverterUInt64.check_lower(value.expires_in_seconds)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.expires_in_seconds)
 
     @staticmethod
     def write(value, buf):
@@ -4935,7 +4935,7 @@ class _UniffiFfiConverterTypeSessionOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.cursor_visible, buf)
         _UniffiFfiConverterBoolean.write(value.recording_active, buf)
         _UniffiFfiConverterUInt64.write(value.idle_seconds, buf)
-        _UniffiFfiConverterUInt64.write(value.expires_in_seconds, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.expires_in_seconds, buf)
 
 class _UniffiFfiConverterSequenceTypeSessionOutput(_UniffiConverterRustBuffer):
     @classmethod

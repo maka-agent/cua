@@ -388,7 +388,7 @@ impl SdkAdapter {
                 "recording_active": cua_driver_core::session::recording_active(&session.runtime_id),
                 "started_seconds_ago": session.started_for.as_secs(),
                 "idle_seconds": session.idle.as_secs(),
-                "expires_in_seconds": session.expires_in.as_secs(),
+                "expires_in_seconds": session.expires_in.map(|duration| duration.as_secs()),
             })
         })
         .collect::<Vec<_>>();

@@ -12,8 +12,8 @@ use cua_driver_core::{
     protocol::ToolResult as CoreToolResult,
     session_authorization::{
         AuthenticatedActionConnection, DelegatedSessionRequest, EffectiveAuthorizationContext,
-        SessionAuthorizationError, SessionAuthorizationRegistry, SessionModeCeiling,
-        TrustedHostLease,
+        HostSessionRequest, SessionAuthorizationError, SessionAuthorizationRegistry,
+        SessionModeCeiling, TrustedHostLease,
     },
     session_manifest::SessionManifest,
     tool::ToolRegistry,
@@ -745,6 +745,33 @@ impl DriverRuntime {
         let (host, connection) = self.authorization_registry.trusted_in_process_binding();
         self.authorization_registry
             .bind_delegated_session(&host, &connection, request)?;
+        let context = self.authorization_registry.resolve_delegated(
+            &connection,
+            &public_session,
+            &transport_session,
+        )?;
+        Ok(Arc::new(RuntimeSession {
+            runtime: self.clone(),
+            authorization_registry: self.authorization_registry.clone(),
+            host,
+            connection,
+            context,
+            public_session,
+        }))
+    }
+
+    pub(crate) fn create_host_session(
+        self: &Arc<Self>,
+        request: HostSessionRequest,
+    ) -> Result<Arc<RuntimeSession>, SessionAuthorizationError> {
+        if !self.is_running() {
+            return Err(SessionAuthorizationError::RuntimeUnavailable);
+        }
+        let public_session = request.public_session.clone();
+        let transport_session = request.transport_session.clone();
+        let (host, connection) = self.authorization_registry.trusted_in_process_binding();
+        self.authorization_registry
+            .bind_host_session(&host, &connection, request)?;
         let context = self.authorization_registry.resolve_delegated(
             &connection,
             &public_session,

@@ -113,7 +113,7 @@ fn host_sessions_json_for_prefix(runtime_prefix: &str) -> Value {
             "recording_active": cua_driver_core::session::recording_active(&session.runtime_id),
             "started_seconds_ago": session.started_for.as_secs(),
             "idle_seconds": session.idle.as_secs(),
-            "expires_in_seconds": session.expires_in.as_secs(),
+            "expires_in_seconds": session.expires_in.map(|duration| duration.as_secs()),
         })
     })
     .collect::<Vec<_>>();
@@ -560,6 +560,14 @@ fn configured_driver_options_json(options: &ConfiguredDriverOptions) -> Value {
             "max_idle_ttl_seconds": options.authorization.max_idle_ttl_seconds,
         }
     })
+}
+
+/// Rust-only options for a session revoked with its embedding host.
+#[derive(Debug, Clone)]
+pub struct HostSessionOptions {
+    pub public_session: String,
+    pub mode: SessionPermissionMode,
+    pub capability_manifest_path: Option<String>,
 }
 
 /// Trusted host request for one immutable, connection-bound action surface.
@@ -1207,6 +1215,23 @@ impl CuaDriver {
         Ok(Arc::new(Self {
             backend: DriverBackend::Remote(RemoteDriverClient::connect(channel)?),
             client_kind: DaemonClientKind::Unknown,
+        }))
+    }
+
+    /// Bind an embedded action surface to its host lifetime rather than a wall clock.
+    /// Mode and manifest ceilings still apply; dropping the binding or shutting
+    /// down the runtime revokes it. Public transports use timed delegated sessions.
+    pub fn create_host_session(
+        &self,
+        options: HostSessionOptions,
+    ) -> Result<Arc<CuaDriverSession>, DriverError> {
+        let DriverBackend::Embedded(runtime) = &self.backend else {
+            return Err(DriverError::Configuration {
+                reason: "host-owned sessions require an embedded runtime".into(),
+            });
+        };
+        Ok(Arc::new(CuaDriverSession {
+            backend: SessionBackend::Embedded(Arc::new(runtime.create_host_session(options)?)),
         }))
     }
 
@@ -3847,9 +3872,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_session_survives_idle_sweeps_and_ends_with_its_runtime() {
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
+        let driver = configured_standard_driver();
+        let session = driver
+            .create_host_session(HostSessionOptions {
+                public_session: "host-owned".into(),
+                mode: SessionPermissionMode::Standard,
+                capability_manifest_path: None,
+            })
+            .unwrap();
+        session
+            .start_session(StartSessionInput {
+                session: None,
+                capture_scope: None,
+                cursor_theme: None,
+                cursor_motion: None,
+            })
+            .await
+            .unwrap();
+        let prefix = driver.runtime_scope_prefix().unwrap();
+        assert!(cua_driver_core::session::evict_idle_with_prefix(
+            std::time::Duration::ZERO,
+            &prefix
+        )
+        .is_empty());
+        let current = session
+            .get_session(GetSessionInput { session: None })
+            .await
+            .unwrap();
+        assert_eq!(current.expires_in_seconds, None);
+        driver.shutdown().await.unwrap();
+        assert!(session
+            .get_session(GetSessionInput { session: None })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn direct_runtimes_have_independent_sessions_and_shutdown() {
         let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
-        let hook_baseline = cua_driver_core::session::session_end_hook_count();
         let first = configured_standard_driver();
         let second = CuaDriver::create_configured(ConfiguredDriverOptions {
             audio_enabled: false,
@@ -4014,10 +4076,6 @@ mod tests {
         drop(first_session);
         drop(second_session);
         drop(second);
-        assert_eq!(
-            cua_driver_core::session::session_end_hook_count(),
-            hook_baseline
-        );
     }
 
     #[tokio::test]

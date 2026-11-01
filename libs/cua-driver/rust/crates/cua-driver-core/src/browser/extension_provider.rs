@@ -2855,65 +2855,57 @@ impl ExtensionBrowserProvider {
     /// No extension command is replayed or consumed by this observation API.
     ///
     /// # Errors
-    /// A missing extension reply, transport loss or deadline returns Unknown. A
+    /// Transport loss or a recorded unresolved effect returns Unknown. A
     /// physical detach ACK and an empty control snapshot cannot replace this
     /// observation; an answered error still leaves Host effect outcome Unknown.
     pub async fn wait_claim_cdp_drained(
         &self,
         claim: &ExtensionPhysicalClaim,
-        timeout: std::time::Duration,
     ) -> Result<ExtensionClaimCdpDrainProof, ExtensionProviderError> {
         self.check_claim(claim)?;
         let mut notifications = self.subscribe_events();
-        let drain =
-            async {
-                loop {
-                    let snapshot = self.fence_claim_cdp(claim).await?;
-                    if snapshot.has_unknown() {
+        loop {
+            let snapshot = self.fence_claim_cdp(claim).await?;
+            if snapshot.has_unknown() {
+                return Err(unknown(
+                    "drainClaimCdp",
+                    "a fenced CDP request has an unresolved outcome",
+                ));
+            }
+            if snapshot.is_drained() {
+                return Ok(ExtensionClaimCdpDrainProof {
+                    binding: self.inner.binding,
+                    provider: snapshot.provider,
+                    claim: snapshot.claim,
+                    observation_id: snapshot.observation_id,
+                });
+            }
+            loop {
+                match notifications.recv().await {
+                    Ok(ExtensionProviderEvent::ClaimCdpProgress { claim: changed })
+                        if changed == claim.token =>
+                    {
+                        break;
+                    }
+                    Ok(ExtensionProviderEvent::GenerationClosed { reason }) => {
+                        return Err(unknown("drainClaimCdp", &reason));
+                    }
+                    Ok(ExtensionProviderEvent::ClaimUnavailable { claim: changed, .. })
+                        if changed == claim.token =>
+                    {
+                        break
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
                         return Err(unknown(
                             "drainClaimCdp",
-                            "a fenced CDP request has an unresolved outcome",
+                            "extension progress channel closed before CDP settlement",
                         ));
                     }
-                    if snapshot.is_drained() {
-                        return Ok(ExtensionClaimCdpDrainProof {
-                            binding: self.inner.binding,
-                            provider: snapshot.provider,
-                            claim: snapshot.claim,
-                            observation_id: snapshot.observation_id,
-                        });
-                    }
-                    loop {
-                        match notifications.recv().await {
-                            Ok(ExtensionProviderEvent::ClaimCdpProgress { claim: changed })
-                                if changed == claim.token =>
-                            {
-                                break;
-                            }
-                            Ok(ExtensionProviderEvent::GenerationClosed { reason }) => {
-                                return Err(unknown("drainClaimCdp", &reason));
-                            }
-                            Ok(ExtensionProviderEvent::ClaimUnavailable {
-                                claim: changed, ..
-                            }) if changed == claim.token => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => break,
-                            Err(broadcast::error::RecvError::Closed) => {
-                                return Err(unknown(
-                                    "drainClaimCdp",
-                                    "extension progress channel closed before CDP settlement",
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
+                    _ => {}
                 }
-            };
-        tokio::time::timeout(timeout, drain).await.map_err(|_| {
-            unknown(
-                "drainClaimCdp",
-                "claim extension invocations did not answer before the drain deadline",
-            )
-        })?
+            }
+        }
     }
 
     /// Retire local broker bookkeeping after the Host has applied cleanup effects.
@@ -8594,11 +8586,7 @@ mod tests {
         let waiting = {
             let provider = provider.clone();
             let claim = claim.clone();
-            tokio::spawn(async move {
-                provider
-                    .wait_claim_cdp_drained(&claim, std::time::Duration::from_secs(1))
-                    .await
-            })
+            tokio::spawn(async move { provider.wait_claim_cdp_drained(&claim).await })
         };
         let first = request(&mut server).await;
         assert_eq!(first["request"]["method"], "fenceCdp");
@@ -8634,11 +8622,7 @@ mod tests {
             let waiting = {
                 let provider = provider.clone();
                 let claim = claim.clone();
-                tokio::spawn(async move {
-                    provider
-                        .wait_claim_cdp_drained(&claim, std::time::Duration::from_secs(1))
-                        .await
-                })
+                tokio::spawn(async move { provider.wait_claim_cdp_drained(&claim).await })
             };
             let fence = request(&mut server).await;
             let reason =
@@ -8657,24 +8641,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn claim_drain_timeout_and_foreign_snapshot_refuse_without_detach() {
+    async fn claim_drain_foreign_snapshot_refuses_without_detach() {
         let (provider, mut server) = fixture();
-        let claim = attach_fixture(&provider, &mut server, 23, "drain-timeout").await;
-        let waiting = {
-            let provider = provider.clone();
-            let claim = claim.clone();
-            tokio::spawn(async move {
-                provider
-                    .wait_claim_cdp_drained(&claim, std::time::Duration::from_millis(100))
-                    .await
-            })
-        };
-        let fence = request(&mut server).await;
-        assert_eq!(fence["request"]["method"], "fenceCdp");
-        control_result(&mut server, fence["request"]["id"].as_u64().unwrap(), json!({"claim":"drain-timeout","generation":provider.identity().generation,"fenced":true,"pending":[{"route":7,"id":11,"wireContext":null,"unknownReason":null}]})).await;
-        assert!(
-            matches!(bounded(waiting).await.unwrap(), Err(ExtensionProviderError::OutcomeUnknown { reason, .. }) if reason == "claim extension invocations did not answer before the drain deadline")
-        );
+        let claim = attach_fixture(&provider, &mut server, 23, "drain-owned").await;
         let observing = {
             let provider = provider.clone();
             let claim = claim.clone();
@@ -8697,11 +8666,7 @@ mod tests {
         let call = {
             let provider = provider.clone();
             let claim = claim.clone();
-            tokio::spawn(async move {
-                provider
-                    .wait_claim_cdp_drained(&claim, std::time::Duration::from_secs(1))
-                    .await
-            })
+            tokio::spawn(async move { provider.wait_claim_cdp_drained(&claim).await })
         };
         let sent = request(server).await;
         assert_eq!(sent["request"]["method"], "fenceCdp");
