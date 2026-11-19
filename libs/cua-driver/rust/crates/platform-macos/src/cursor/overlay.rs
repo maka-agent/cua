@@ -1771,18 +1771,22 @@ mod tests {
         }
     }
 
+    fn surface(frame: ScreenFrame, backing_scale: f64) -> Surface {
+        Surface {
+            frame,
+            backing_scale,
+            layer_ptr: 0,
+            win_ptr: 0,
+            window_id: 0,
+            display_id: 0,
+        }
+    }
+
     fn empty_map() -> RenderMap {
         RenderMap::new(
             CursorConfig::default(),
             MacScreen {
-                surfaces: vec![Surface {
-                    frame: ScreenFrame::new(0.0, 0.0, 100.0, 100.0),
-                    backing_scale: 1.0,
-                    layer_ptr: 0,
-                    win_ptr: 0,
-                    window_id: 0,
-                    display_id: 0,
-                }],
+                surfaces: vec![surface(ScreenFrame::new(0.0, 0.0, 100.0, 100.0), 1.0)],
                 generation: 0,
             },
         )
@@ -1800,8 +1804,8 @@ mod tests {
             for scale in [1.0, 2.0] {
                 let mut map = empty_map();
                 placed(&mut map, "sessA").core.pos = (x + 150.0, y + 150.0);
-                let geometry = SurfaceGeometry::new(ScreenFrame::new(x, y, 400.0, 300.0), scale);
-                let tile = paint_tile_for(&map, geometry).expect("secondary display must paint");
+                let surface = surface(ScreenFrame::new(x, y, 400.0, 300.0), scale);
+                let tile = paint_tile_for(&map, &surface).expect("secondary display must paint");
                 assert!(tile.pixmap.pixels().iter().any(|p| p.alpha() > 0));
                 assert!(tile.frame[0] >= 0.0 && tile.frame[1] >= 0.0);
                 assert!(tile.frame[0] + tile.frame[2] <= 400.0);
@@ -1815,22 +1819,22 @@ mod tests {
     fn cross_display_art_paints_both_sides_and_clears_departed_display() {
         let mut map = empty_map();
         placed(&mut map, "sessA").core.pos = (-2.0, 50.0);
-        let left = SurfaceGeometry::new(ScreenFrame::new(-400.0, 0.0, 400.0, 300.0), 2.0);
-        let right = SurfaceGeometry::new(ScreenFrame::new(0.0, 0.0, 400.0, 300.0), 1.0);
-        for geometry in [left, right] {
-            let tile = paint_tile_for(&map, geometry).unwrap();
+        let left = surface(ScreenFrame::new(-400.0, 0.0, 400.0, 300.0), 2.0);
+        let right = surface(ScreenFrame::new(0.0, 0.0, 400.0, 300.0), 1.0);
+        for surface in [&left, &right] {
+            let tile = paint_tile_for(&map, surface).unwrap();
             assert!(
                 tile.pixmap.pixels().iter().any(|p| p.alpha() > 0),
                 "cursor crossing seam must not clip"
             );
         }
         map.cursors.get_mut("sessA").unwrap().core.pos = (200.0, 150.0);
-        assert!(paint_tile_for(&map, left).is_none());
-        assert!(paint_tile_for(&map, right).is_some());
+        assert!(paint_tile_for(&map, &left).is_none());
+        assert!(paint_tile_for(&map, &right).is_some());
     }
 
     /// The top-left corner of a tile's painted pixels, in global points.
-    fn painted_origin(tile: &PaintTile, geometry: SurfaceGeometry) -> (f64, f64) {
+    fn painted_origin(tile: &PaintTile, surface: &Surface) -> (f64, f64) {
         let width = tile.pixmap.width() as usize;
         let (col, row) = tile
             .pixmap
@@ -1854,31 +1858,32 @@ mod tests {
     /// and only the display holding the target paints it.
     #[test]
     fn cursor_lands_on_target_on_an_upper_left_mixed_scale_display() {
-        let primary = SurfaceGeometry::new(ScreenFrame::new(0.0, 0.0, 1728.0, 1117.0), 2.0);
-        let external =
-            SurfaceGeometry::new(ScreenFrame::new(-4333.0, -1440.0, 5120.0, 1440.0), 1.0);
-        let paint_at = |geometry: SurfaceGeometry, (x, y): (f64, f64)| {
+        let primary = surface(ScreenFrame::new(0.0, 0.0, 1728.0, 1117.0), 2.0);
+        let external = surface(ScreenFrame::new(-4333.0, -1440.0, 5120.0, 1440.0), 1.0);
+        let paint_at = |surface: &Surface, (x, y): (f64, f64)| {
             let mut map = empty_map();
             let core = &mut placed(&mut map, "sessA").core;
             core.pos = cursor_overlay::anchor_for_pointer(x, y, core.heading);
-            let tile = paint_tile_for(&map, geometry);
+            let tile = paint_tile_for(&map, surface);
             (map, tile)
         };
         for (target, owner, other) in [
-            ((800.0, 500.0), primary, external),
-            ((-2000.0, -700.0), external, primary),
-            ((-4000.0, -1400.0), external, primary),
+            ((800.0, 500.0), &primary, &external),
+            ((-2000.0, -700.0), &external, &primary),
+            ((-4000.0, -1400.0), &external, &primary),
         ] {
             let (map, tile) = paint_at(owner, target);
             assert!(paint_tile_for(&map, other).is_none(), "{target:?}");
             let tile = tile.expect("the display holding the target paints");
-            assert_eq!(tile.scale, owner.scale);
+            assert_eq!(tile.scale, owner.backing_scale);
             let painted = painted_origin(&tile, owner);
 
-            let reference =
-                SurfaceGeometry::new(ScreenFrame::new(0.0, 0.0, 400.0, 300.0), owner.scale);
-            let (_, ref_tile) = paint_at(reference, (200.0, 150.0));
-            let ref_painted = painted_origin(&ref_tile.unwrap(), reference);
+            let reference = surface(
+                ScreenFrame::new(0.0, 0.0, 400.0, 300.0),
+                owner.backing_scale,
+            );
+            let (_, ref_tile) = paint_at(&reference, (200.0, 150.0));
+            let ref_painted = painted_origin(&ref_tile.unwrap(), &reference);
             let expected = (
                 target.0 + ref_painted.0 - 200.0,
                 target.1 + ref_painted.1 - 150.0,
