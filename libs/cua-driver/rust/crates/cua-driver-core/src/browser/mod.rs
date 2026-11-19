@@ -69,6 +69,7 @@ mod js_string;
 pub use js_string::JsonStringLiteral;
 mod keyed_gates;
 mod local_ipc;
+pub mod managed_policy;
 #[cfg(test)]
 pub(crate) mod mock_cdp;
 mod motion_policy;
