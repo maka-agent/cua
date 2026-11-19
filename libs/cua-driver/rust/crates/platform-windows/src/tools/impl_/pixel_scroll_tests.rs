@@ -1,4 +1,8 @@
+use super::super::impl_::DriverConfig;
 use super::*;
+use crate::uia::Snapshots;
+use cursor_overlay::CursorRegistry;
+use std::sync::RwLock;
 
 fn tool() -> ScrollTool {
     ScrollTool {

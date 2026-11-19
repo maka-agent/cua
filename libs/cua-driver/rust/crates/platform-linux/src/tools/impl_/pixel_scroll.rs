@@ -4,12 +4,12 @@ use cua_driver_core::protocol::ToolResult;
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct PixelScroll {
+pub(in crate::tools) struct PixelScroll {
     pub detents: usize,
 }
 
 impl PixelScroll {
-    pub(super) fn from_arguments(args: &Value) -> Result<Option<Self>, ToolResult> {
+    pub(in crate::tools) fn from_arguments(args: &Value) -> Result<Option<Self>, ToolResult> {
         let Some(value) = args.get("pixels") else {
             return Ok(None);
         };

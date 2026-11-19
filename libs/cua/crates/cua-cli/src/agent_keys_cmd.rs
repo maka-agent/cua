@@ -1,5 +1,5 @@
 //! `cua agent keys`: the provider keys agents get, kept in the Keychain by
-//! the Cua daemon (what Cua Spaces → Settings → Connectors shows).
+//! the Cua daemon (what Cua Spaces → Settings → Connections shows).
 //!
 //! ```text
 //! cua agent keys                          # list (provider, variable, last 4, added)
@@ -122,6 +122,9 @@ fn lines(report: &serde_json::Value) -> Vec<String> {
             "Keys can't be saved here: {}.",
             report["unavailable"].as_str().unwrap_or("no Keychain")
         ));
+    }
+    if let Some(w) = report["insecure"].as_str() {
+        v.push(format!("Warning: {w}."));
     }
     let keys = report["keys"].as_array().cloned().unwrap_or_default();
     if keys.is_empty() {

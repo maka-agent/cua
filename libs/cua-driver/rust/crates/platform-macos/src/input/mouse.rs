@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Background mouse event synthesis via SLEventPostToPid (SkyLight SPI),
 //! with fallback to the public CGEvent::post_to_pid for older OS releases.
 //!
@@ -15,6 +18,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
+use cua_driver_core::security_prompt::PromptInput;
 use foreign_types::ForeignType;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +70,15 @@ fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
         PostRoute::PublicPid => event.post_to_pid(pid as libc::pid_t),
         PostRoute::Hid => event.post(core_graphics::event::CGEventTapLocation::HID),
     }
+}
+
+/// Move the hardware cursor to `point`.
+fn warp_cursor(point: CGPoint) -> Result<(), core_graphics::base::CGError> {
+    #[cfg(test)]
+    if post_sink::record_warp(point) {
+        return Ok(());
+    }
+    core_graphics::display::CGDisplay::warp_mouse_cursor_position(point)
 }
 
 #[derive(Clone, Copy)]
@@ -125,35 +138,44 @@ pub fn click_at_xy(
 /// Unlike the pid-routed `click_at_xy`, this honors the real foreground/Z order
 /// (it lands on whatever is visually on top at the point) — exactly the
 /// foreground, vision-driven model that complements the background contract.
-pub fn click_at_xy_desktop(x: f64, y: f64, count: usize, button: &str) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, &[], false)
+pub fn click_at_xy_desktop(
+    prompt: PromptInput,
+    x: f64,
+    y: f64,
+    count: usize,
+    button: &str,
+) -> anyhow::Result<()> {
+    click_at_xy_desktop_inner(prompt, x, y, count, button, &[], false)
 }
 
 /// Global HID click with physical modifier transitions. The caller must guard
 /// the exact foreground window because this transport has no pid addressing.
 pub fn click_at_xy_desktop_with_modifiers(
+    prompt: PromptInput,
     x: f64,
     y: f64,
     count: usize,
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, false)
+    click_at_xy_desktop_inner(prompt, x, y, count, button, modifiers, false)
 }
 
 /// Global HID modifier click that restores the user's hardware cursor after
 /// the event pair has been queued.
 pub fn click_at_xy_desktop_with_modifiers_preserving_cursor(
+    prompt: PromptInput,
     x: f64,
     y: f64,
     count: usize,
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, true)
+    click_at_xy_desktop_inner(prompt, x, y, count, button, modifiers, true)
 }
 
 fn click_at_xy_desktop_inner(
+    prompt: PromptInput,
     x: f64,
     y: f64,
     count: usize,
@@ -161,8 +183,7 @@ fn click_at_xy_desktop_inner(
     modifiers: &[&str],
     preserve_cursor: bool,
 ) -> anyhow::Result<()> {
-    use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
+    crate::security_prompt::refuse_point(prompt, x, y)?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let prior = if preserve_cursor {
@@ -197,7 +218,7 @@ fn click_at_xy_desktop_inner(
     // cursor, and AppKit hit-tests some clicks against the actual cursor
     // position, so without the warp the down/up can miss the target. Desktop
     // scope is the foreground modality, so moving the visible cursor is expected.
-    let _ = CGDisplay::warp_mouse_cursor_position(point);
+    let _ = warp_cursor(point);
     // Re-couple cursor + mouse-delta so the synthesized click hit-tests at the
     // warped point, not the pre-warp one.
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
@@ -215,8 +236,8 @@ fn click_at_xy_desktop_inner(
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
-            moved.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(12));
+            dispatch_mouse_event(PostRoute::Hid, 0, &moved);
+            std::thread::sleep(cua_driver_core::input_pacing::mouse_primer_settle());
         }
 
         for pair_index in 0..count.max(1) {
@@ -227,8 +248,8 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
-            down.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(28));
+            dispatch_mouse_event(PostRoute::Hid, 0, &down);
+            std::thread::sleep(cua_driver_core::input_pacing::click_gap());
             let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             up.set_flags(flags);
@@ -236,9 +257,9 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
-            up.post(CGEventTapLocation::HID);
+            dispatch_mouse_event(PostRoute::Hid, 0, &up);
             if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                std::thread::sleep(cua_driver_core::input_pacing::multi_click_gap());
             }
         }
         Ok(())
@@ -248,7 +269,7 @@ fn click_at_xy_desktop_inner(
     // exact foreground guard remains active around this entire helper.
     std::thread::sleep(std::time::Duration::from_millis(40));
     if let Some(prior) = prior {
-        let _ = CGDisplay::warp_mouse_cursor_position(prior);
+        let _ = warp_cursor(prior);
         unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     }
     result
@@ -262,9 +283,8 @@ fn click_at_xy_desktop_inner(
 /// hover-revealed controls stay hidden. Follow the warp with a `MouseMoved`
 /// at the same point through the HID tap, as a physical mouse would.
 pub fn move_cursor_desktop(x: f64, y: f64) -> anyhow::Result<()> {
-    use core_graphics::display::CGDisplay;
     let point = CGPoint::new(x, y);
-    CGDisplay::warp_mouse_cursor_position(point)
+    warp_cursor(point)
         .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     // Let WindowServer settle the warp first: a move posted in the same
@@ -293,20 +313,36 @@ fn post_pointer_moved(point: CGPoint) -> anyhow::Result<()> {
 /// global HID queue. Mirrors computer-server's pynput wheel behavior while
 /// preserving cua-driver's explicit direction/amount contract.
 pub fn scroll_wheel_desktop(
+    prompt: PromptInput,
     x: f64,
     y: f64,
     delta_y_per_tick: i32,
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
-    scroll_wheel_desktop_units(x, y, delta_y_per_tick, delta_x_per_tick, ticks, false)
+    scroll_wheel_desktop_units(
+        prompt,
+        x,
+        y,
+        delta_y_per_tick,
+        delta_x_per_tick,
+        ticks,
+        false,
+    )
 }
 
-pub fn scroll_pixels_desktop(x: f64, y: f64, delta_y: i32, delta_x: i32) -> anyhow::Result<()> {
-    scroll_wheel_desktop_units(x, y, delta_y, delta_x, 1, true)
+pub fn scroll_pixels_desktop(
+    prompt: PromptInput,
+    x: f64,
+    y: f64,
+    delta_y: i32,
+    delta_x: i32,
+) -> anyhow::Result<()> {
+    scroll_wheel_desktop_units(prompt, x, y, delta_y, delta_x, 1, true)
 }
 
 fn scroll_wheel_desktop_units(
+    prompt: PromptInput,
     x: f64,
     y: f64,
     delta_y_per_tick: i32,
@@ -314,8 +350,9 @@ fn scroll_wheel_desktop_units(
     ticks: usize,
     precise: bool,
 ) -> anyhow::Result<()> {
-    use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
+    use core_graphics::event::ScrollEventUnit;
 
+    crate::security_prompt::refuse_point(prompt, x, y)?;
     move_cursor_desktop(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     for _ in 0..ticks.max(1) {
@@ -348,7 +385,7 @@ fn scroll_wheel_desktop_units(
             return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
-        event.post(CGEventTapLocation::HID);
+        dispatch_mouse_event(PostRoute::Hid, 0, &event);
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
@@ -359,8 +396,12 @@ fn scroll_wheel_desktop_units(
 /// This is intentionally narrower than the public desktop click path. It is
 /// used only by approved, bounded setup flows after an accessibility element
 /// has proven the exact target point and window.
-pub fn click_at_xy_desktop_preserving_cursor(x: f64, y: f64) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, 1, "left", &[], true)
+pub fn click_at_xy_desktop_preserving_cursor(
+    prompt: PromptInput,
+    x: f64,
+    y: f64,
+) -> anyhow::Result<()> {
+    click_at_xy_desktop_inner(prompt, x, y, 1, "left", &[], true)
 }
 
 extern "C" {
@@ -455,7 +496,7 @@ fn click_at_xy_inner(
             click_group_id,
             post_mode,
         );
-        std::thread::sleep(std::time::Duration::from_millis(12));
+        std::thread::sleep(cua_driver_core::input_pacing::mouse_primer_settle());
 
         for pair_index in 0..count {
             let click_state = (pair_index + 1) as i64;
@@ -483,7 +524,7 @@ fn click_at_xy_inner(
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
             // tracking loop that polls for the matching mouseUp; too tight a
             // gap can race the loop's first poll and the click is dropped.
-            std::thread::sleep(std::time::Duration::from_millis(28));
+            std::thread::sleep(cua_driver_core::input_pacing::click_gap());
 
             let up = CGEvent::new_mouse_event(
                 source.clone(),
@@ -507,7 +548,7 @@ fn click_at_xy_inner(
             );
 
             if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                std::thread::sleep(cua_driver_core::input_pacing::multi_click_gap());
             }
         }
         Ok(())
@@ -704,6 +745,7 @@ pub fn click_at_xy_background(
 /// actual dispatched path rather than jumping to the endpoint after release.
 #[allow(clippy::too_many_arguments)]
 pub fn drag_at_xy_observed<F>(
+    prompt: PromptInput,
     pid: i32,
     from_x: f64,
     from_y: f64,
@@ -724,6 +766,7 @@ where
 {
     if foreground_hid {
         return drag_at_xy_window_foreground_observed(
+            prompt,
             pid,
             from_x,
             from_y,
@@ -743,33 +786,56 @@ where
     let wid = wid.ok_or_else(|| {
         anyhow::anyhow!("a background drag needs the exact target window (window_id)")
     })?;
+    let (local_x, local_y) = from_local
+        .ok_or_else(|| anyhow::anyhow!("a background drag needs its window-local start point"))?;
     drag_at_xy_background(
         pid,
         (from_x, from_y),
         (to_x, to_y),
         wid,
-        from_local
-            .map(|point| (from_x - point.0, from_y - point.1))
-            .ok_or_else(|| anyhow::anyhow!("a background drag needs window-local coordinates"))?,
+        (from_x - local_x, from_y - local_y),
         duration_ms,
         steps,
         modifiers,
         button,
         observe,
-        || true,
+        || false,
     )
     .map(|_| ())
+}
+
+/// A HID drag presses at its start and releases at its end; either landing
+/// on a prompt would answer it.
+fn refuse_drag_points(
+    prompt: PromptInput,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> Result<(), crate::security_prompt::PromptProtected> {
+    crate::security_prompt::refuse_point(prompt, from.0, from.1)?;
+    crate::security_prompt::refuse_point(prompt, to.0, to.1)
 }
 
 /// How a background drag gesture ended.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BackgroundDragOutcome {
-    /// Every planned event was posted and the release landed on the drop point.
+    /// No drag-and-drop session showed; every planned event was posted and
+    /// the release landed on the drop point.
     Completed,
-    /// The caller's `keep_going` check failed during the path; the release
-    /// was posted at once at this screen point instead of the drop point.
-    StoppedEarly { at: (f64, f64) },
+    /// A drag-and-drop session started during the path. The gesture went
+    /// straight to the drop point and held it there; `ended` says whether the
+    /// session closed (and so dropped there) before the hold ran out.
+    DragSession { ended: bool },
 }
+
+/// How long a background drag holds the drop point waiting for a
+/// drag-and-drop session to end, and how often it repeats the drag there.
+/// AppKit ends a session started by window-routed events on its own within a
+/// few hundred milliseconds, dropping at the last dragged point.
+const DRAG_SESSION_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+const DRAG_SESSION_TICK_MS: u64 = 16;
+/// How often a background drag looks for a drag-and-drop session while it
+/// waits between path steps.
+const DRAG_SESSION_POLL: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// Event kinds in the background drag plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -840,16 +906,19 @@ fn background_drag_plan(
 /// is posted to the process (SkyLight `SLEventPostToPid`, or the public
 /// per-pid API only when the SPI is absent), carries the exact window in the
 /// routing fields (f51/f91/f92), the target pid (f40) and one gesture ID
-/// (f58), and is stamped with its own location. The hardware pointer is never
+/// (f58), and is stamped with its own window-local location. The hardware pointer is never
 /// warped and nothing is posted to the global HID tap, so the user's pointer,
 /// frontmost app and window order stay as they were. The caller makes the
 /// window AppKit-key without raising it first
 /// ([`prepare_background_pixel_click`]).
 ///
-/// `keep_going` runs after each drag step; when it returns false the rest of
-/// the path is skipped and the release is posted at once where the gesture
-/// stands. The drag tool uses it to cut short a gesture that started a system
-/// drag-and-drop session, which macOS tracks with the hardware pointer.
+/// `session_open` runs after each drag step and reports whether a system
+/// drag-and-drop session is showing (the drag tool watches for its drag
+/// image). AppKit ends such a session on its own soon after it starts,
+/// dropping at the last point it was dragged to. So once a session shows, the
+/// rest of the path is skipped: the gesture moves straight to the drop point
+/// and repeats the drag there until the session ends or [`DRAG_SESSION_HOLD`]
+/// runs out, then releases at the drop point.
 #[allow(clippy::too_many_arguments)]
 pub fn drag_at_xy_background<F, G>(
     pid: i32,
@@ -862,7 +931,7 @@ pub fn drag_at_xy_background<F, G>(
     modifiers: &[&str],
     button: DragButton,
     mut observe: F,
-    mut keep_going: G,
+    mut session_open: G,
 ) -> anyhow::Result<BackgroundDragOutcome>
 where
     F: FnMut(f64, f64),
@@ -904,15 +973,10 @@ where
     let route = post_route(MousePostMode::SkyLightPreferred, skylight_available());
     let window_id = wid as i64;
 
-    let mut stopped_at: Option<(f64, f64)> = None;
-    let mut last_point = from;
-    for mut step in background_drag_plan(from, to, steps, duration_ms) {
-        if let Some(at) = stopped_at {
-            match step.kind {
-                Dragged => continue,
-                Up => step.point = at,
-                _ => {}
-            }
+    let mut session: Option<bool> = None;
+    for step in background_drag_plan(from, to, steps, duration_ms) {
+        if session.is_some() && step.kind == Dragged {
+            continue;
         }
         // The tracking move uses touch subtype; the gesture is a plain mouse
         // drag, matching foreground delivery.
@@ -922,43 +986,73 @@ where
             Dragged => (dragged_type, cg_button, button_number, 0),
             Up => (up_type, cg_button, button_number, 0),
         };
-        let point = CGPoint::new(step.point.0, step.point.1);
-        let event = CGEvent::new_mouse_event(source.clone(), event_type, point, event_button)
+        let post = |point: (f64, f64)| -> anyhow::Result<()> {
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                event_type,
+                CGPoint::new(point.0, point.1),
+                event_button,
+            )
             .map_err(|_| {
                 anyhow::anyhow!("background drag {:?} event creation failed", step.kind)
             })?;
-        let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        let set =
-            |field: u32, value: i64| crate::input::skylight::set_integer_field(ptr, field, value);
-        set(0, step.phase);
-        set(1, step.click_state);
-        set(3, event_button_number);
-        set(7, subtype);
-        set(40, pid as i64);
-        set(51, window_id);
-        set(91, window_id);
-        set(92, window_id);
-        set(58, gesture_id);
-        let window_point = (
-            step.point.0 - window_origin.0,
-            step.point.1 - window_origin.1,
-        );
-        crate::input::skylight::set_window_location(ptr, window_point.0, window_point.1);
-        set_explicit_flags(&event, flags);
-        dispatch_mouse_event(route, pid, &event);
+            let ptr = event.as_ptr() as *mut std::ffi::c_void;
+            let set = |field: u32, value: i64| {
+                crate::input::skylight::set_integer_field(ptr, field, value)
+            };
+            set(0, step.phase);
+            set(1, step.click_state);
+            set(3, event_button_number);
+            set(7, subtype);
+            set(40, pid as i64);
+            set(51, window_id);
+            set(91, window_id);
+            set(92, window_id);
+            set(58, gesture_id);
+            let (stamp_x, stamp_y) = (point.0 - window_origin.0, point.1 - window_origin.1);
+            crate::input::skylight::set_window_location(ptr, stamp_x, stamp_y);
+            set_explicit_flags(&event, flags);
+            dispatch_mouse_event(route, pid, &event);
+            Ok(())
+        };
+        post(step.point)?;
         if matches!(step.kind, Down | Dragged) {
             observe(step.point.0, step.point.1);
-            last_point = step.point;
         }
-        if step.delay_after_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
+        if step.kind != Dragged {
+            if step.delay_after_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
+            }
+            continue;
         }
-        if step.kind == Dragged && stopped_at.is_none() && !keep_going() {
-            stopped_at = Some(last_point);
+        // A session can start and end within one step's delay, dropping
+        // wherever the path stands then, so look for it in short slices.
+        let step_end =
+            std::time::Instant::now() + std::time::Duration::from_millis(step.delay_after_ms);
+        let mut open = session_open();
+        while !open && std::time::Instant::now() < step_end {
+            let left = step_end.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(left.min(DRAG_SESSION_POLL));
+            open = session_open();
+        }
+        if open {
+            // Hold the drop point until the session ends there.
+            observe(to.0, to.1);
+            let deadline = std::time::Instant::now() + DRAG_SESSION_HOLD;
+            let mut ended = false;
+            while std::time::Instant::now() < deadline {
+                post(to)?;
+                std::thread::sleep(std::time::Duration::from_millis(DRAG_SESSION_TICK_MS));
+                if !session_open() {
+                    ended = true;
+                    break;
+                }
+            }
+            session = Some(ended);
         }
     }
-    Ok(match stopped_at {
-        Some(at) => BackgroundDragOutcome::StoppedEarly { at },
+    Ok(match session {
+        Some(ended) => BackgroundDragOutcome::DragSession { ended },
         None => BackgroundDragOutcome::Completed,
     })
 }
@@ -999,6 +1093,7 @@ fn post_drag_mouse_event(
 
 #[allow(clippy::too_many_arguments)]
 fn drag_at_xy_window_foreground_observed<F>(
+    prompt: PromptInput,
     pid: i32,
     from_x: f64,
     from_y: f64,
@@ -1016,7 +1111,6 @@ fn drag_at_xy_window_foreground_observed<F>(
 where
     F: FnMut(f64, f64),
 {
-    use core_graphics::display::CGDisplay;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let (cg_button, down_type, dragged_type, up_type, button_number) = match button {
@@ -1055,6 +1149,7 @@ where
         duration_ms
     };
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
+    refuse_drag_points(prompt, (from_x, from_y), (to_x, to_y))?;
 
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for spec in events {
@@ -1077,12 +1172,12 @@ where
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
-                    let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
+                    let _ = warp_cursor(spec.point);
                     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
                 ForegroundDragEventKind::Dragged => {
-                    let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
+                    let _ = warp_cursor(spec.point);
                 }
                 ForegroundDragEventKind::Up => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1108,7 +1203,7 @@ where
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
-                    std::thread::sleep(std::time::Duration::from_millis(12));
+                    std::thread::sleep(cua_driver_core::input_pacing::mouse_primer_settle());
                 }
                 ForegroundDragEventKind::Down => {
                     observe(spec.point.x, spec.point.y);
@@ -1137,6 +1232,7 @@ where
 /// has already completed the drag.
 #[allow(clippy::too_many_arguments)]
 pub fn drag_at_xy_foreground_observed<F>(
+    prompt: PromptInput,
     from_x: f64,
     from_y: f64,
     to_x: f64,
@@ -1150,9 +1246,6 @@ pub fn drag_at_xy_foreground_observed<F>(
 where
     F: FnMut(f64, f64),
 {
-    use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
-
     let (cg_button, down_type, dragged_type, up_type) = match button {
         DragButton::Left => (
             CGMouseButton::Left,
@@ -1173,6 +1266,7 @@ where
             CGEventType::OtherMouseUp,
         ),
     };
+    refuse_drag_points(prompt, (from_x, from_y), (to_x, to_y))?;
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
     let steps = steps.max(1);
     let step_delay_ms = if steps > 1 {
@@ -1184,7 +1278,7 @@ where
     // Keep WindowServer's hardware cursor and event stream coupled. AppKit
     // hit-tests some pointer-capture surfaces against the actual cursor even
     // when the HID event carries an explicit location.
-    let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(from_x, from_y));
+    let _ = warp_cursor(CGPoint::new(from_x, from_y));
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     observe(from_x, from_y);
     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -1206,7 +1300,7 @@ where
                     anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
                 })?;
             event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
+            dispatch_mouse_event(PostRoute::Hid, 0, &event);
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
@@ -1412,7 +1506,7 @@ fn right_click_at_xy_inner(
         click_group_id,
         MousePostMode::SkyLightPreferred,
     );
-    std::thread::sleep(std::time::Duration::from_millis(12));
+    std::thread::sleep(cua_driver_core::input_pacing::mouse_primer_settle());
 
     let down = CGEvent::new_mouse_event(source.clone(), down_type, point, button)
         .map_err(|_| anyhow::anyhow!("mouse down failed"))?;
@@ -1428,7 +1522,7 @@ fn right_click_at_xy_inner(
         3,
         MousePostMode::SkyLightPreferred,
     );
-    std::thread::sleep(std::time::Duration::from_millis(28));
+    std::thread::sleep(cua_driver_core::input_pacing::click_gap());
 
     let up = CGEvent::new_mouse_event(source, up_type, point, button)
         .map_err(|_| anyhow::anyhow!("mouse up failed"))?;
@@ -1682,7 +1776,7 @@ fn scroll_wheel_at_xy_units(
         ),
         mode,
     );
-    std::thread::sleep(std::time::Duration::from_millis(12));
+    std::thread::sleep(cua_driver_core::input_pacing::mouse_primer_settle());
 
     for _ in 0..ticks.max(1) {
         // Fresh source per event, matching the click primitives.
@@ -1817,6 +1911,8 @@ mod post_sink {
     struct State {
         skylight_available: bool,
         posted: Vec<Posted>,
+        /// Hardware cursor warps, which a capture also swallows.
+        warps: usize,
         /// Modifier flags carried by each posted event, parallel to `posted`.
         modifiers: Vec<u64>,
         window_routing: Vec<[i64; 4]>,
@@ -1837,6 +1933,7 @@ mod post_sink {
                 *state.borrow_mut() = Some(State {
                     skylight_available,
                     posted: Vec::new(),
+                    warps: 0,
                     modifiers: Vec::new(),
                     window_routing: Vec::new(),
                     positions: Vec::new(),
@@ -1880,6 +1977,24 @@ mod post_sink {
     impl Drop for Capture {
         fn drop(&mut self) {
             STATE.with(|state| *state.borrow_mut() = None);
+        }
+    }
+
+    /// Record a cursor warp when a capture is active; returns whether it did.
+    pub(super) fn record_warp(_point: core_graphics::geometry::CGPoint) -> bool {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(state) = state.as_mut() else {
+                return false;
+            };
+            state.warps += 1;
+            true
+        })
+    }
+
+    impl Capture {
+        pub(super) fn warps(&self) -> usize {
+            STATE.with(|state| state.borrow().as_ref().map_or(0, |state| state.warps))
         }
     }
 
@@ -1978,13 +2093,21 @@ mod tests {
     }
 
     #[test]
-    fn background_click_keeps_screen_and_window_coordinates_separate() {
+    fn background_click_keeps_capture_screen_and_window_coordinates_separate() {
+        let frame = crate::tools::px_frame::WindowPxFrame {
+            bounds: crate::windows::WindowBounds {
+                x: 170.0,
+                y: 194.0,
+                width: 760.0,
+                height: 460.0,
+            },
+            scale: 2.0,
+        };
+        let (screen_x, screen_y, local_x, local_y) = frame.to_screen(788.0, 620.0);
         for available in [true, false] {
             let capture = Capture::start(available);
-            click_at_xy_background(1, 564.0, 504.0, 394.0, 310.0, 7, 1, &[]).unwrap();
-            let positions = capture.positions();
-            assert_eq!(positions[0], ([564.0, 504.0], [394.0, 310.0]));
-            assert_eq!(positions[1], ([564.0, 504.0], [394.0, 310.0]));
+            click_at_xy_background(1, screen_x, screen_y, local_x, local_y, 7, 1, &[]).unwrap();
+            assert_eq!(capture.positions(), [([564.0, 504.0], [394.0, 310.0]); 3]);
         }
     }
 
@@ -2257,7 +2380,7 @@ mod tests {
             &["shift"],
             DragButton::Left,
             |x, y| observed.push((x, y)),
-            || true,
+            || false,
         )
         .unwrap();
         let posted = capture.posted();
@@ -2312,7 +2435,7 @@ mod tests {
             &[],
             DragButton::Right,
             |_, _| {},
-            || true,
+            || false,
         )
         .unwrap();
         let posted = capture.posted();
@@ -2333,8 +2456,11 @@ mod tests {
         );
     }
 
+    /// A drag-and-drop session that shows after the second step: the path is
+    /// cut there, the drag moves straight to the drop point and repeats there
+    /// until the session ends, and the release goes out at the drop point.
     #[test]
-    fn background_drag_stopped_early_releases_where_it_stands() {
+    fn background_drag_session_holds_the_drop_point_until_it_ends() {
         let capture = Capture::start(true);
         let mut checks = 0;
         let outcome = drag_at_xy_background(
@@ -2350,35 +2476,228 @@ mod tests {
             |_, _| {},
             || {
                 checks += 1;
-                checks < 2
+                // Not open after step 1; open after step 2 and for two
+                // holds at the drop point; closed after the third.
+                (2..=4).contains(&checks)
             },
         )
         .unwrap();
-        assert_eq!(
-            outcome,
-            BackgroundDragOutcome::StoppedEarly { at: (50.0, 0.0) }
-        );
-        let events: Vec<_> = capture
-            .posted()
+        assert_eq!(outcome, BackgroundDragOutcome::DragSession { ended: true });
+        let gesture: Vec<_> = capture.posted()[1..]
             .iter()
             .map(|posted| posted.event.clone())
+            .zip(capture.positions()[1..].iter().map(|&(point, _)| point))
             .collect();
+        let at = |event: &str, x: f64| (event.to_owned(), [x, 0.0]);
         assert_eq!(
-            events[1..],
+            gesture,
             [
-                "LeftMouseDown",
-                "LeftMouseDragged",
-                "LeftMouseDragged",
-                "LeftMouseUp"
+                at("LeftMouseDown", 0.0),
+                at("LeftMouseDragged", 25.0),
+                at("LeftMouseDragged", 50.0),
+                at("LeftMouseDragged", 100.0),
+                at("LeftMouseDragged", 100.0),
+                at("LeftMouseDragged", 100.0),
+                at("LeftMouseUp", 100.0),
             ],
-            "no drag after the stop, and the release still goes out"
+            "the rest of the path is skipped and every later event is at the drop point"
         );
+    }
+
+    #[test]
+    fn background_drag_session_that_never_ends_reports_it() {
+        let capture = Capture::start(true);
+        let outcome = drag_at_xy_background(
+            42,
+            (0.0, 0.0),
+            (100.0, 0.0),
+            7,
+            (0.0, 0.0),
+            0,
+            2,
+            &[],
+            DragButton::Left,
+            |_, _| {},
+            || true,
+        )
+        .unwrap();
+        assert_eq!(outcome, BackgroundDragOutcome::DragSession { ended: false });
+        assert_eq!(capture.posted().last().unwrap().event, "LeftMouseUp");
+        assert_eq!(capture.positions().last().unwrap().0, [100.0, 0.0]);
+    }
+
+    /// Every global-HID pointer primitive checks for a security prompt before
+    /// its first warp or event. Removing one of those checks fails here.
+    #[test]
+    fn hid_pointer_primitives_send_nothing_onto_a_security_prompt() {
+        use crate::security_prompt::{fixture::PromptShown, PromptProtected};
+        type Primitive = fn(PromptInput) -> anyhow::Result<()>;
+        let primitives: [(&str, Primitive); 8] = [
+            ("click_at_xy_desktop", |prompt| {
+                click_at_xy_desktop(prompt, 5.0, 5.0, 1, "left")
+            }),
+            ("click_at_xy_desktop_with_modifiers", |prompt| {
+                click_at_xy_desktop_with_modifiers(prompt, 5.0, 5.0, 1, "right", &[])
+            }),
+            (
+                "click_at_xy_desktop_with_modifiers_preserving_cursor",
+                |prompt| {
+                    click_at_xy_desktop_with_modifiers_preserving_cursor(
+                        prompt,
+                        5.0,
+                        5.0,
+                        1,
+                        "middle",
+                        &[],
+                    )
+                },
+            ),
+            ("click_at_xy_desktop_preserving_cursor", |prompt| {
+                click_at_xy_desktop_preserving_cursor(prompt, 5.0, 5.0)
+            }),
+            ("scroll_wheel_desktop", |prompt| {
+                scroll_wheel_desktop(prompt, 5.0, 5.0, -12, 0, 1)
+            }),
+            ("scroll_pixels_desktop", |prompt| {
+                scroll_pixels_desktop(prompt, 5.0, 5.0, -37, 0)
+            }),
+            ("drag_at_xy_foreground_observed", |prompt| {
+                drag_at_xy_foreground_observed(
+                    prompt,
+                    5.0,
+                    5.0,
+                    6.0,
+                    6.0,
+                    0,
+                    1,
+                    &[],
+                    DragButton::Left,
+                    |_, _| {},
+                )
+            }),
+            ("drag_at_xy_observed (foreground HID)", |prompt| {
+                drag_at_xy_observed(
+                    prompt,
+                    1,
+                    5.0,
+                    5.0,
+                    6.0,
+                    6.0,
+                    None,
+                    None,
+                    Some(7),
+                    0,
+                    1,
+                    &[],
+                    DragButton::Left,
+                    true,
+                    |_, _| {},
+                )
+            }),
+        ];
+        let _prompt = PromptShown::start();
+        for (name, primitive) in primitives {
+            let capture = Capture::start(true);
+            let error = primitive(PromptInput::Refuse).expect_err(name);
+            assert_eq!(
+                error
+                    .downcast_ref::<PromptProtected>()
+                    .map(|p| p.owner.as_str()),
+                Some("SecurityAgent"),
+                "{name}: {error}"
+            );
+            assert!(capture.posted().is_empty(), "{name} posted onto the prompt");
+            assert_eq!(capture.warps(), 0, "{name} moved the cursor");
+            drop(capture);
+
+            // Unrestricted mode lifts the refusal: the same call goes out.
+            let capture = Capture::start(true);
+            primitive(PromptInput::Allow).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(
+                !capture.posted().is_empty(),
+                "{name} sent nothing when allowed"
+            );
+            assert!(
+                capture.posted().iter().all(|p| p.route == PostRoute::Hid),
+                "{name} left the HID queue"
+            );
+        }
+    }
+
+    /// A HID drag presses at its start and releases at its end: either one
+    /// on a prompt answers it, so each endpoint is checked on its own.
+    #[test]
+    fn a_hid_drag_is_refused_when_either_end_is_on_a_prompt() {
+        use crate::security_prompt::{fixture::PromptShown, PromptProtected};
+        // The prompt covers (100..200, 100..200); the other end is off it.
+        let _prompt = PromptShown::over((100.0, 100.0, 100.0, 100.0));
+        for (from, to) in [
+            ((150.0, 150.0), (10.0, 10.0)),
+            ((10.0, 10.0), (150.0, 150.0)),
+        ] {
+            for window_drag in [false, true] {
+                let capture = Capture::start(true);
+                let result = if window_drag {
+                    drag_at_xy_observed(
+                        PromptInput::Refuse,
+                        1,
+                        from.0,
+                        from.1,
+                        to.0,
+                        to.1,
+                        None,
+                        None,
+                        Some(7),
+                        0,
+                        1,
+                        &[],
+                        DragButton::Left,
+                        true,
+                        |_, _| {},
+                    )
+                } else {
+                    drag_at_xy_foreground_observed(
+                        PromptInput::Refuse,
+                        from.0,
+                        from.1,
+                        to.0,
+                        to.1,
+                        0,
+                        1,
+                        &[],
+                        DragButton::Left,
+                        |_, _| {},
+                    )
+                };
+                let error = result.expect_err("a drag onto or off a prompt is refused");
+                assert!(error.is::<PromptProtected>(), "{error}");
+                assert!(capture.posted().is_empty(), "{from:?}->{to:?} posted");
+                assert_eq!(capture.warps(), 0);
+            }
+        }
+        // Clear of the prompt at both ends, the drag goes out.
+        let capture = Capture::start(true);
+        drag_at_xy_foreground_observed(
+            PromptInput::Refuse,
+            10.0,
+            10.0,
+            20.0,
+            20.0,
+            0,
+            1,
+            &[],
+            DragButton::Left,
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(!capture.posted().is_empty());
     }
 
     #[test]
     fn window_less_background_drag_is_refused_before_posting() {
         let capture = Capture::start(true);
         let error = drag_at_xy_observed(
+            PromptInput::Refuse,
             42,
             0.0,
             0.0,

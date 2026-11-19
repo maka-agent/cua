@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Win32 agent-cursor overlay — transparent, click-through layered window.
 //!
 //! Design:
@@ -386,10 +389,10 @@ pub async fn animate_cursor_to_target(key: CursorKey, x: f64, y: f64, target: Op
 
     let should_animate = {
         let guard = RENDER.lock().unwrap();
-        matches!(
-            guard.as_ref().and_then(|m| m.cursors.get(&key)),
-            Some(rs) if rs.core.cfg.enabled && rs.core.placed
-        )
+        guard
+            .as_ref()
+            .and_then(|m| m.cursors.get(&key))
+            .is_some_and(|rs| rs.core.animates())
     };
     if !should_animate {
         return;
@@ -1739,11 +1742,14 @@ mod tests {
     }
 
     // Before the shared predicate, a landed Windows cursor dropped to the IDLE
-    // cadence for the whole idle-hide delay and its resting bob froze.
+    // cadence for the whole idle-hide delay and its resting bob froze. The bob
+    // is `cursor.float`, on by default.
     #[test]
     fn resting_cursor_keeps_the_active_cadence_for_its_bob() {
         let mut map = empty_map();
         map.seed_start_if_unplaced("sessA", 60.0, 60.0, map.platform.frame());
+        map.cursors.get_mut("sessA").unwrap().core.options_override =
+            Some(cursor_overlay::CursorOptions::default());
         apply_msg(&mut map, move_msg("sessA", 10.0, 10.0));
         settle(&mut map);
         let rs = &map.cursors["sessA"];

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::protocol::ToolResult;
-use crate::tool::{Tool, ToolDef, ToolRegistry};
+use crate::tool::{ProtectedResourceScopeError, Tool, ToolDef, ToolRegistry};
 
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const CHANNELS: u16 = 2;
@@ -671,7 +671,7 @@ impl Tool for StartAudio {
         &self,
         adapter: &str,
         _: &Value,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<Option<Value>, ProtectedResourceScopeError> {
         Ok(system_audio_scope(adapter))
     }
 }
@@ -719,7 +719,7 @@ impl Tool for StopAudio {
         &self,
         adapter: &str,
         _: &Value,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<Option<Value>, ProtectedResourceScopeError> {
         Ok(system_audio_scope(adapter))
     }
 }

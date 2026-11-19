@@ -10,7 +10,7 @@ use crate::input::native_window::{
     NativeWindowCancellation, NativeWindowError, NativeWindowInputRequest,
 };
 
-pub(super) async fn invoke(
+pub(in crate::tools) async fn invoke(
     tool: &str,
     args: Value,
     request: NativeWindowInputRequest,

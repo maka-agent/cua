@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! MSAA (Microsoft Active Accessibility) tree walker.
 //!
 //! Fallback for SAL/VCL window classes (LibreOffice, OpenOffice) where the
@@ -193,6 +196,7 @@ unsafe fn walk(
                 enabled: None,
                 focused: None,
                 selected: None,
+                is_password: None,
                 element_ptr: ptr,
                 center_x,
                 center_y,
@@ -214,6 +218,7 @@ unsafe fn walk(
                 enabled: None,
                 focused: None,
                 selected: None,
+                is_password: None,
                 element_ptr: ptr,
                 center_x: 0,
                 center_y: 0,

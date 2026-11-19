@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Public runtime facade for capture publication and capture-bound actions.
 //!
 //! [`CaptureService::publish`] retains the default one-shot, TTL-bound behavior.

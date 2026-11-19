@@ -62,11 +62,13 @@ impl FrozenWindowCapture {
         super::refuse_without_direct_capture_consent()?;
         // The Host owns the native work until it is Ready. A caller-visible
         // timeout cannot turn an outstanding SCK/ImageIO worker into settlement.
-        super::start_native_capture_worker(super::native_capture_gate(), move || {
-            self.capture_sck()
-        })?
-        .recv()
-        .map_err(|_| anyhow::anyhow!("ScreenCaptureKit worker ended without a result"))?
+        let (_, receiver) =
+            super::start_native_capture_worker(super::native_capture_gate(), move || {
+                self.capture_sck()
+            })?;
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("ScreenCaptureKit worker ended without a result"))?
     }
 
     fn capture_sck(self) -> anyhow::Result<FrozenWindowScreenshot> {

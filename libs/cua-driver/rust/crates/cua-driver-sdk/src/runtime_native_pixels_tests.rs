@@ -93,7 +93,7 @@ fn runtime() -> (Arc<DriverRuntime>, Arc<Mutex<Vec<Value>>>) {
             audio: None,
             authorization_registry,
             compatibility_context,
-            shutdown: AtomicBool::new(false),
+            admission: AtomicU8::new(Admission::Open as u8),
             last_activity: AtomicU64::new(now_unix_secs()),
             lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             lifecycle_maintenance: Mutex::new(None),

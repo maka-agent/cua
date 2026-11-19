@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Per-session capture/action scope policy.
 //!
 //! The policy is keyed exclusively by the public, caller-declared `session`
@@ -193,8 +196,6 @@ fn tool_scope(tool_name: &str, args: &Value) -> ToolScope {
             | "verify_state"
             | "get_accessibility_tree"
             | "get_app_state"
-            | "screenshot"
-            | "screenshot_compat"
             | "zoom"
             | "page"
     ) || tool_name == "get_browser_state"
@@ -339,11 +340,9 @@ mod tests {
 
         let auto_error = enforce_tool("get_desktop_state", &json!({"session": auto})).unwrap_err();
         assert_eq!(auto_error.code, "desktop_escalation_required");
-        assert!(
-            auto_error
-                .message
-                .contains("separate from the host lock-screen state")
-        );
+        assert!(auto_error
+            .message
+            .contains("separate from the host lock-screen state"));
         assert!(enforce_tool("get_desktop_state", &json!({"session": desktop})).is_ok());
         assert_eq!(
             enforce_tool("get_desktop_state", &json!({"session": window}))
@@ -471,13 +470,11 @@ mod tests {
         bind_session(&desktop, Some(CaptureScopePolicy::Desktop)).unwrap();
 
         for tool_name in ["mouse_button_down", "mouse_button_up"] {
-            assert!(
-                enforce_tool(
-                    tool_name,
-                    &json!({"session": window, "pid": 42, "window_id": 7, "x": 4, "y": 5})
-                )
-                .is_ok()
-            );
+            assert!(enforce_tool(
+                tool_name,
+                &json!({"session": window, "pid": 42, "window_id": 7, "x": 4, "y": 5})
+            )
+            .is_ok());
             assert_eq!(
                 enforce_tool(
                     tool_name,
@@ -531,20 +528,18 @@ mod tests {
             );
         }
         assert!(enforce_tool("mouse_button_up", &json!({"session": session})).is_ok());
-        assert!(
-            enforce_tool(
-                "mouse_button_up",
-                &json!({
-                    "session": session,
-                    "pid": null,
-                    "window_id": null,
-                    "x": null,
-                    "y": null,
-                    "from_zoom": null
-                })
-            )
-            .is_ok()
-        );
+        assert!(enforce_tool(
+            "mouse_button_up",
+            &json!({
+                "session": session,
+                "pid": null,
+                "window_id": null,
+                "x": null,
+                "y": null,
+                "from_zoom": null
+            })
+        )
+        .is_ok());
     }
 
     #[test]

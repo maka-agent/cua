@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-// Settings, Connectors: each coding app on this computer with one
+// Settings, Connections: each coding app on this computer with one
 // switch (`agents.setup`, `agents.connect` and `agents.disconnect`),
 // "Set up new apps automatically", and the sync that sets up a newly
 // installed app with a notice and Undo.
@@ -30,15 +30,41 @@ describe("configured agents without binary evidence", () => {
     const adapter: typeof demo = {
       ...demo,
       call: (async (op, args) => {
-        if (op === "agents.setup") return [{ agent: "claude-code", name: "Claude Code", installed: false, configured: true, detail: "skills and MCP configured", skillsInstalled: 1, skillsTotal: 1, mcpConfig: "C:/Users/test/.claude.json", skillsDir: "C:/Users/test/.claude/skills" }];
+        if (op === "agents.setup")
+          return [
+            {
+              agent: "claude-code",
+              name: "Claude Code",
+              installed: false,
+              configured: true,
+              detail: "skills and MCP configured",
+              skillsInstalled: 1,
+              skillsTotal: 1,
+              mcpConfig: "C:/Users/test/.claude.json",
+              skillsDir: "C:/Users/test/.claude/skills",
+            },
+          ];
         return demo.call(op, args);
       }) as typeof demo.call,
     };
-    const routeTree = createRootRoute({ component: () => dialog === "connect"
-      ? <ConnectAgentDialog open onOpenChange={() => {}} />
-      : <RunAgentDialog open onOpenChange={() => {}} space={{ id: "local:test", name: "Test Space", os: "windows", status: "running", detail: "", lastUsedAt: 0, scene: "blank" }} /> });
+    const routeTree = createRootRoute({
+      component: () =>
+        dialog === "connect" ? (
+          <ConnectAgentDialog open onOpenChange={() => {}} />
+        ) : (
+          <RunAgentDialog
+            open
+            onOpenChange={() => {}}
+            space={{ id: "local:test", name: "Test Space", os: "windows", status: "running", detail: "", lastUsedAt: 0, scene: "blank" }}
+          />
+        ),
+    });
     const router = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: ["/"] }) });
-    const mounted = render(<BridgeProvider adapter={adapter} core={noCore}><RouterProvider router={router} /></BridgeProvider>);
+    const mounted = render(
+      <BridgeProvider adapter={adapter} core={noCore}>
+        <RouterProvider router={router} />
+      </BridgeProvider>,
+    );
     if (dialog === "connect") {
       await waitFor(() => expect(document.querySelector("li")?.textContent).toContain("Set up"));
       // The file path stays out of the row; it is only in the closed Advanced section.
@@ -55,9 +81,9 @@ describe("configured agents without binary evidence", () => {
 
 const app = (id: string) => document.querySelector<HTMLElement>(`[data-connector-app="${id}"]`);
 
-describe.skipIf(!wasmBuilt)("Settings, Connectors", () => {
+describe.skipIf(!wasmBuilt)("Settings, Connections", () => {
   it("keeps Set up new apps automatically in the saved state", { timeout: 20_000 }, async () => {
-    await mountApp("/settings/connectors", { failsCreates: false, listsGhost: false });
+    await mountApp("/settings/connections", { failsCreates: false, listsGhost: false });
     await waitFor(() => expect(document.querySelector("[data-connected-auto]")).not.toBeNull(), { timeout: 8000 });
     expect(connectedAppsState().auto).toBeNull();
     fireEvent.click(document.querySelector("[data-connected-auto]")!);
@@ -80,10 +106,13 @@ describe.skipIf(!wasmBuilt)("a newly installed coding app", () => {
   });
 
   it("is left alone without a yes, and when it was turned off", { timeout: 20_000 }, async () => {
-    for (const state of [{ known: seen, off: [], auto: null }, { known: seen, off: ["hermes"], auto: true }]) {
+    for (const state of [
+      { known: seen, off: [], auto: null },
+      { known: seen, off: ["hermes"], auto: true },
+    ]) {
       cleanup();
       setConnectedAppsState(state);
-      const { router } = await mountApp("/settings/connectors", { failsCreates: false, listsGhost: false });
+      const { router } = await mountApp("/settings/connections", { failsCreates: false, listsGhost: false });
       await waitFor(() => expect(app("hermes")).not.toBeNull(), { timeout: 8000 });
       await router.load();
       expect(app("hermes")!.querySelector("[data-connector-connect]")).not.toBeNull();

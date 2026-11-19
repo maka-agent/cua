@@ -11,7 +11,10 @@ use crate::input::native_window::{
     NativeWindowOutcome, NativeWindowPhase, NativeWindowSetupFailure,
 };
 
-pub(super) async fn invoke(args: Value, request: NativeElementScrollRequest) -> ToolResult {
+pub(in crate::tools) async fn invoke(
+    args: Value,
+    request: NativeElementScrollRequest,
+) -> ToolResult {
     invoke_on_route(args, request, crate::wayland::is_wayland()).await
 }
 

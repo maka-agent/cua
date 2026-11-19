@@ -514,7 +514,14 @@ export type ActionResult = {
      * The call that moves the task forward, always safe to run as is (a read,
      * or a call that keeps the user's window where it is).
      */
-    nextCall?: ActionNextCall
+    nextCall?: ActionNextCall,
+    /**
+     * Present only when the `fast_path` config key is `on`: the check cost,
+     * the target class and the changed regions since the last read, as one
+     * JSON object. Absent when the flag is off, so default results are
+     * unchanged.
+     */
+    fastPath?: string
 }
 
 /**
@@ -546,7 +553,8 @@ const FfiConverterTypeActionResult = (() => {
                 summary: FfiConverterOptionalString.read(from),
                 error: FfiConverterOptionalTypeActionError.read(from),
                 hint: FfiConverterOptionalString.read(from),
-                nextCall: FfiConverterOptionalTypeActionNextCall.read(from)
+                nextCall: FfiConverterOptionalTypeActionNextCall.read(from),
+                fastPath: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -559,6 +567,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalTypeActionError.write(value.error, into);
             FfiConverterOptionalString.write(value.hint, into);
             FfiConverterOptionalTypeActionNextCall.write(value.nextCall, into);
+            FfiConverterOptionalString.write(value.fastPath, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -569,7 +578,8 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalString.allocationSize(value.summary) +
              FfiConverterOptionalTypeActionError.allocationSize(value.error) +
              FfiConverterOptionalString.allocationSize(value.hint) +
-             FfiConverterOptionalTypeActionNextCall.allocationSize(value.nextCall);
+             FfiConverterOptionalTypeActionNextCall.allocationSize(value.nextCall) +
+             FfiConverterOptionalString.allocationSize(value.fastPath);
 
         }
     };
@@ -1168,7 +1178,7 @@ export type ClipboardReadInput = {
     includeText: boolean,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -1281,7 +1291,7 @@ export type ClipboardWriteInput = {
     filePath?: string,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -2206,7 +2216,7 @@ export type DragInput = {
     scope?: DesktopScope,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string,
     durationMs?: bigint,
@@ -2723,7 +2733,7 @@ const FfiConverterTypeGetAgentCursorStateOutput = (() => {
 export type GetCursorPositionInput = {
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -2766,7 +2776,7 @@ const FfiConverterTypeGetCursorPositionInput = (() => {
 export type GetDesktopStateInput = {
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string,
     /**
@@ -2826,7 +2836,7 @@ const FfiConverterTypeGetDesktopStateInput = (() => {
 export type GetScreenSizeInput = {
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -3092,7 +3102,7 @@ export type HotkeyInput = {
     scope?: DesktopScope,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -3163,8 +3173,15 @@ export type InvokeMenuInput = {
      */
     path: Array<string>,
     /**
+     * `background` (default) never takes the user's keyboard or pointer and refuses with
+     * `background_unavailable` when the item can only be reached by opening a menu. `foreground`
+     * is the explicit escalation that may activate the window and open menus. Linux honors it;
+     * macOS and Windows accept it and keep their existing menu behavior.
+     */
+    deliveryMode?: InputDeliveryMode,
+    /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -3193,6 +3210,7 @@ const FfiConverterTypeInvokeMenuInput = (() => {
                 pid: FfiConverterUInt32.read(from),
                 windowId: FfiConverterUInt64.read(from),
                 path: FfiConverterSequenceString.read(from),
+                deliveryMode: FfiConverterOptionalTypeInputDeliveryMode.read(from),
                 session: FfiConverterOptionalString.read(from)
             };
         }
@@ -3200,12 +3218,14 @@ const FfiConverterTypeInvokeMenuInput = (() => {
             FfiConverterUInt32.write(value.pid, into);
             FfiConverterUInt64.write(value.windowId, into);
             FfiConverterSequenceString.write(value.path, into);
+            FfiConverterOptionalTypeInputDeliveryMode.write(value.deliveryMode, into);
             FfiConverterOptionalString.write(value.session, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterUInt32.allocationSize(value.pid) +
              FfiConverterUInt64.allocationSize(value.windowId) +
              FfiConverterSequenceString.allocationSize(value.path) +
+             FfiConverterOptionalTypeInputDeliveryMode.allocationSize(value.deliveryMode) +
              FfiConverterOptionalString.allocationSize(value.session);
 
         }
@@ -3803,7 +3823,7 @@ export type MoveCursorInput = {
     scope?: DesktopScope,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -4942,7 +4962,7 @@ export type PressKeyInput = {
     scope?: DesktopScope,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string,
     modifiers?: Array<string>
@@ -5074,7 +5094,7 @@ export type ScrollInput = {
     scope?: DesktopScope,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string,
     by?: ScrollBy,
@@ -5682,7 +5702,7 @@ export type SetWindowFrameInput = {
     height: number,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -6009,7 +6029,7 @@ export type TypeTextInput = {
     scope?: DesktopScope,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+     * accepts it.
      */
     session?: string
 }
@@ -6073,8 +6093,7 @@ export type VerifyStateInput = {
     expect: Array<StatePredicate>,
     /**
      * For multi-call work, prefer a short public session label and repeat it on every call that
-     * accepts it. Omit it to use the authenticated transport's implicit lifecycle session. This
-     * field never selects capture modality or authorization.
+     * accepts it. This field never selects capture modality or authorization.
      */
     session?: string,
     /**
@@ -6335,6 +6354,11 @@ export type WindowElement = {
     valueDescription?: string,
     enabled?: boolean,
     selected?: boolean,
+    /**
+     * Whether the element is a password field. Windows reports it from UIA
+     * `IsPassword`: `false` only on `Edit` controls, absent when unknown.
+     */
+    isPassword?: boolean,
     inWebContent?: boolean,
     actions?: Array<string>,
     parentIndex?: bigint,
@@ -6373,6 +6397,7 @@ const FfiConverterTypeWindowElement = (() => {
                 valueDescription: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
                 selected: FfiConverterOptionalBoolean.read(from),
+                isPassword: FfiConverterOptionalBoolean.read(from),
                 inWebContent: FfiConverterOptionalBoolean.read(from),
                 actions: FfiConverterOptionalSequenceString.read(from),
                 parentIndex: FfiConverterOptionalUInt64.read(from),
@@ -6391,6 +6416,7 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalString.write(value.valueDescription, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
             FfiConverterOptionalBoolean.write(value.selected, into);
+            FfiConverterOptionalBoolean.write(value.isPassword, into);
             FfiConverterOptionalBoolean.write(value.inWebContent, into);
             FfiConverterOptionalSequenceString.write(value.actions, into);
             FfiConverterOptionalUInt64.write(value.parentIndex, into);
@@ -6408,12 +6434,82 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +
              FfiConverterOptionalBoolean.allocationSize(value.selected) +
+             FfiConverterOptionalBoolean.allocationSize(value.isPassword) +
              FfiConverterOptionalBoolean.allocationSize(value.inWebContent) +
              FfiConverterOptionalSequenceString.allocationSize(value.actions) +
              FfiConverterOptionalUInt64.allocationSize(value.parentIndex) +
              FfiConverterOptionalTypeElementFrame.allocationSize(value.frame) +
              FfiConverterOptionalFloat64.allocationSize(value.min) +
              FfiConverterOptionalFloat64.allocationSize(value.max);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * A readable native row with no action handle: static text, a label, a
+ * read-only value. It comes from the same walk as `elements`, carries no
+ * `element_index` or `element_token`, and no action tool accepts it.
+ * `parent_index` names the nearest addressable ancestor in `elements`.
+ */
+export type WindowObservation = {
+    role: string,
+    depth: number,
+    label?: string,
+    value?: string,
+    frame?: ElementFrame,
+    parentIndex?: bigint,
+    inWebContent?: boolean
+}
+
+/**
+ * Generated factory for {@link WindowObservation} record objects.
+ */
+export const WindowObservation = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<WindowObservation, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<WindowObservation>,
+    });
+})();
+
+const FfiConverterTypeWindowObservation = (() => {
+    type TypeName = WindowObservation;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                role: FfiConverterString.read(from),
+                depth: FfiConverterUInt32.read(from),
+                label: FfiConverterOptionalString.read(from),
+                value: FfiConverterOptionalString.read(from),
+                frame: FfiConverterOptionalTypeElementFrame.read(from),
+                parentIndex: FfiConverterOptionalUInt64.read(from),
+                inWebContent: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.role, into);
+            FfiConverterUInt32.write(value.depth, into);
+            FfiConverterOptionalString.write(value.label, into);
+            FfiConverterOptionalString.write(value.value, into);
+            FfiConverterOptionalTypeElementFrame.write(value.frame, into);
+            FfiConverterOptionalUInt64.write(value.parentIndex, into);
+            FfiConverterOptionalBoolean.write(value.inWebContent, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.role) +
+             FfiConverterUInt32.allocationSize(value.depth) +
+             FfiConverterOptionalString.allocationSize(value.label) +
+             FfiConverterOptionalString.allocationSize(value.value) +
+             FfiConverterOptionalTypeElementFrame.allocationSize(value.frame) +
+             FfiConverterOptionalUInt64.allocationSize(value.parentIndex) +
+             FfiConverterOptionalBoolean.allocationSize(value.inWebContent);
 
         }
     };
@@ -6428,6 +6524,15 @@ export type WindowStateOutput = {
     windowTitle?: string,
     treeMarkdown?: string,
     elements?: Array<WindowElement>,
+    /**
+     * Display-only rows of the same walk. Absent means the platform did not
+     * observe them, never that the window has none.
+     */
+    observations?: Array<WindowObservation>,
+    /**
+     * True when `observations` stopped at its row cap.
+     */
+    observationsTruncated?: boolean,
     elementCount?: bigint,
     totalElementCount?: bigint,
     returnedElementCount?: bigint,
@@ -6501,6 +6606,8 @@ const FfiConverterTypeWindowStateOutput = (() => {
                 windowTitle: FfiConverterOptionalString.read(from),
                 treeMarkdown: FfiConverterOptionalString.read(from),
                 elements: FfiConverterOptionalSequenceTypeWindowElement.read(from),
+                observations: FfiConverterOptionalSequenceTypeWindowObservation.read(from),
+                observationsTruncated: FfiConverterOptionalBoolean.read(from),
                 elementCount: FfiConverterOptionalUInt64.read(from),
                 totalElementCount: FfiConverterOptionalUInt64.read(from),
                 returnedElementCount: FfiConverterOptionalUInt64.read(from),
@@ -6533,6 +6640,8 @@ const FfiConverterTypeWindowStateOutput = (() => {
             FfiConverterOptionalString.write(value.windowTitle, into);
             FfiConverterOptionalString.write(value.treeMarkdown, into);
             FfiConverterOptionalSequenceTypeWindowElement.write(value.elements, into);
+            FfiConverterOptionalSequenceTypeWindowObservation.write(value.observations, into);
+            FfiConverterOptionalBoolean.write(value.observationsTruncated, into);
             FfiConverterOptionalUInt64.write(value.elementCount, into);
             FfiConverterOptionalUInt64.write(value.totalElementCount, into);
             FfiConverterOptionalUInt64.write(value.returnedElementCount, into);
@@ -6564,6 +6673,8 @@ const FfiConverterTypeWindowStateOutput = (() => {
              FfiConverterOptionalString.allocationSize(value.windowTitle) +
              FfiConverterOptionalString.allocationSize(value.treeMarkdown) +
              FfiConverterOptionalSequenceTypeWindowElement.allocationSize(value.elements) +
+             FfiConverterOptionalSequenceTypeWindowObservation.allocationSize(value.observations) +
+             FfiConverterOptionalBoolean.allocationSize(value.observationsTruncated) +
              FfiConverterOptionalUInt64.allocationSize(value.elementCount) +
              FfiConverterOptionalUInt64.allocationSize(value.totalElementCount) +
              FfiConverterOptionalUInt64.allocationSize(value.returnedElementCount) +
@@ -6690,6 +6801,9 @@ const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 // FfiConverter for CursorPointOutput | undefined
 const FfiConverterOptionalTypeCursorPointOutput = new FfiConverterOptional(FfiConverterTypeCursorPointOutput);
 
+// FfiConverter for InputDeliveryMode | undefined
+const FfiConverterOptionalTypeInputDeliveryMode = new FfiConverterOptional(FfiConverterTypeInputDeliveryMode);
+
 // FfiConverter for Array<AppInfo>
 const FfiConverterSequenceTypeAppInfo = new FfiConverterArray(FfiConverterTypeAppInfo);
 
@@ -6764,6 +6878,12 @@ const FfiConverterSequenceTypeWindowElement = new FfiConverterArray(FfiConverter
 
 // FfiConverter for Array<WindowElement> | undefined
 const FfiConverterOptionalSequenceTypeWindowElement = new FfiConverterOptional(FfiConverterSequenceTypeWindowElement);
+
+// FfiConverter for Array<WindowObservation>
+const FfiConverterSequenceTypeWindowObservation = new FfiConverterArray(FfiConverterTypeWindowObservation);
+
+// FfiConverter for Array<WindowObservation> | undefined
+const FfiConverterOptionalSequenceTypeWindowObservation = new FfiConverterOptional(FfiConverterSequenceTypeWindowObservation);
 
 // FfiConverter for WindowBounds | undefined
 const FfiConverterOptionalTypeWindowBounds = new FfiConverterOptional(FfiConverterTypeWindowBounds);
@@ -6905,6 +7025,7 @@ export default Object.freeze({
     FfiConverterTypeWindowBounds,
     FfiConverterTypeWindowElement,
     FfiConverterTypeWindowInfo,
+    FfiConverterTypeWindowObservation,
     FfiConverterTypeWindowPredicate,
     FfiConverterTypeWindowStateOutput,
   }

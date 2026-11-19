@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
 
 //! Private platform-runtime composition behind the public SDK boundary.
 //!
@@ -10,6 +11,7 @@ use crate::{DriverActivityEvent, DriverActivityKind, DriverActivityObserver};
 use cua_driver_core::{
     authorization::PermissionMode,
     protocol::ToolResult as CoreToolResult,
+    recording::StopBy,
     session_authorization::{
         AuthenticatedActionConnection, DelegatedSessionRequest, EffectiveAuthorizationContext,
         HostSessionRequest, SessionAuthorizationError, SessionAuthorizationRegistry,
@@ -21,7 +23,7 @@ use cua_driver_core::{
 use cursor_overlay::CursorConfig;
 use serde_json::Value;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicU8, Ordering},
     Arc, Mutex,
 };
 
@@ -322,6 +324,9 @@ impl RuntimeSession {
         mut args: Value,
         frame: CoordinateFrame,
     ) -> Option<CoreToolResult> {
+        if let Some(refusal) = self.runtime.permissions_pending_refusal() {
+            return Some(refusal);
+        }
         cua_driver_core::tool_args::sanitize_reserved_args(&mut args);
         let Some(arguments) = args.as_object_mut() else {
             return Some(permission_denied_result(
@@ -388,12 +393,35 @@ impl Drop for RuntimeSession {
     }
 }
 
+/// Whether the runtime accepts tool calls. `Closed` is terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Admission {
+    Open = 0,
+    /// The host's permission gate has not confirmed its grants yet. Inventory
+    /// and lifecycle diagnostics stay reachable; no tool runs.
+    AwaitingPermissions = 1,
+    Closed = 2,
+}
+
+impl Admission {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Open,
+            1 => Self::AwaitingPermissions,
+            _ => Self::Closed,
+        }
+    }
+}
+
+const PERMISSIONS_PENDING: &str = "permissions_pending: macOS Accessibility or Screen Recording permission is still pending; no action started, retry after the permission gate completes";
+
 pub(crate) struct DriverRuntime {
     registry: Arc<ToolRegistry>,
     audio: Option<Arc<cua_driver_core::audio::AudioRecordings>>,
     authorization_registry: Arc<SessionAuthorizationRegistry>,
     compatibility_context: Arc<EffectiveAuthorizationContext>,
-    shutdown: AtomicBool,
+    admission: AtomicU8,
     last_activity: AtomicU64,
     /// Calls hold a read guard; shutdown takes the write guard after closing
     /// admission. Therefore shutdown is idempotent and does not return while a
@@ -493,7 +521,7 @@ impl DriverRuntime {
             audio,
             authorization_registry,
             compatibility_context,
-            shutdown: AtomicBool::new(false),
+            admission: AtomicU8::new(Admission::Open as u8),
             last_activity: AtomicU64::new(now_unix_secs()),
             lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             lifecycle_maintenance: Mutex::new(None),
@@ -504,8 +532,35 @@ impl DriverRuntime {
         Ok(runtime)
     }
 
+    fn admission(&self) -> Admission {
+        Admission::from_u8(self.admission.load(Ordering::Acquire))
+    }
+
     pub(crate) fn is_running(&self) -> bool {
-        !self.shutdown.load(Ordering::Acquire)
+        self.admission() != Admission::Closed
+    }
+
+    /// Hold or release tool calls for the host's permission gate. A closed
+    /// runtime stays closed.
+    pub(crate) fn set_awaiting_permissions(&self, awaiting: bool) {
+        let (from, to) = if awaiting {
+            (Admission::Open, Admission::AwaitingPermissions)
+        } else {
+            (Admission::AwaitingPermissions, Admission::Open)
+        };
+        let _ = self.admission.compare_exchange(
+            from as u8,
+            to as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// The refusal every tool call gets while the permission gate is pending.
+    /// It answers before any other refusal.
+    pub(crate) fn permissions_pending_refusal(&self) -> Option<CoreToolResult> {
+        (self.admission() == Admission::AwaitingPermissions)
+            .then(|| refusal_result("permissions_pending", PERMISSIONS_PENDING.to_owned()))
     }
 
     pub(crate) fn runtime_scope_key(&self) -> String {
@@ -513,7 +568,8 @@ impl DriverRuntime {
     }
 
     pub(crate) async fn shutdown(self: &Arc<Self>) -> Result<(), String> {
-        self.shutdown.store(true, Ordering::Release);
+        self.admission
+            .store(Admission::Closed as u8, Ordering::Release);
         let runtime = Arc::clone(self);
         let settlement = tokio::spawn(async move {
             let drained = Arc::clone(&runtime.lifecycle).write_owned().await;
@@ -572,7 +628,7 @@ impl DriverRuntime {
         cleanup.attempt(|| {
             self.registry
                 .recording
-                .stop_owner(None)
+                .stop(StopBy::Anyone)
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         });
@@ -641,6 +697,9 @@ impl DriverRuntime {
         context: Arc<EffectiveAuthorizationContext>,
         evidence: cua_driver_core::tool::TrustedInvocationEvidence,
     ) -> Option<CoreToolResult> {
+        if let Some(refusal) = self.permissions_pending_refusal() {
+            return Some(refusal);
+        }
         if !self.is_running() {
             return None;
         }
@@ -728,7 +787,8 @@ impl DriverRuntime {
             // `end_session` is a lifecycle boundary: do not report completion
             // until any recording owned by the session has finalized.
             let recording = self.registry.recording.clone();
-            let _ = tokio::task::spawn_blocking(move || recording.stop_owner(Some(&session))).await;
+            let _ =
+                tokio::task::spawn_blocking(move || recording.stop(StopBy::Owner(&session))).await;
         }
         Some(result)
     }
@@ -815,7 +875,10 @@ fn activity_lifecycle_event(
 
 impl Drop for DriverRuntime {
     fn drop(&mut self) {
-        let was_running = !self.shutdown.swap(true, Ordering::AcqRel);
+        let was_running = self
+            .admission
+            .swap(Admission::Closed as u8, Ordering::AcqRel)
+            != Admission::Closed as u8;
         let maintenance = self.stop_lifecycle_maintenance();
         self.authorization_registry.revoke_all();
         let runtime_scope = self.compatibility_context.runtime_scope_key();
@@ -842,17 +905,21 @@ impl Drop for DriverRuntime {
                 cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
                 cua_driver_core::snapshot_store::retire_runtime_scope(&runtime_scope);
                 if was_running {
-                    let _ = registry.recording.stop_owner(None);
+                    let _ = registry.recording.stop(StopBy::Anyone);
                 }
             });
     }
 }
 
 fn permission_denied_result(message: String) -> CoreToolResult {
+    refusal_result("permission_denied", message)
+}
+
+fn refusal_result(code: &str, message: String) -> CoreToolResult {
     CoreToolResult::error(message.clone()).with_structured(serde_json::json!({
         "status": "refused",
         "refusal": {
-            "code": "permission_denied",
+            "code": code,
             "message": message,
         }
     }))
@@ -911,9 +978,15 @@ fn spawn_lifecycle_maintenance(runtime: &Arc<DriverRuntime>) -> LifecycleMainten
             );
         }
         let idle = now_unix_secs().saturating_sub(runtime.last_activity.load(Ordering::Relaxed));
-        if idle >= recording_ttl && runtime.registry.recording.current_state().enabled {
+        if idle < recording_ttl {
+            continue;
+        }
+        if let Some(generation) = runtime.registry.recording.current_state().generation {
             tracing::warn!("recording idle {idle}s ≥ {recording_ttl}s TTL; auto-stopping");
-            let _ = runtime.registry.recording.stop_owner(None);
+            let _ = runtime
+                .registry
+                .recording
+                .stop(StopBy::Generation(generation));
         }
     });
     LifecycleMaintenance { shutdown, thread }
@@ -969,7 +1042,6 @@ fn register_audio(
 fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
     #[cfg(target_os = "macos")]
     let mut registry = {
-        configure_macos_runtime();
         platform_macos::register_tools_with_cursor_and_provider(
             options.authorization_host.clone(),
             options.cursor.clone(),
@@ -981,7 +1053,6 @@ fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
 
     #[cfg(target_os = "windows")]
     let mut registry = {
-        configure_windows_runtime();
         platform_windows::register_tools_with_cursor_and_provider(
             options.authorization_host.clone(),
             options.cursor.clone(),
@@ -1030,60 +1101,12 @@ fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
                 return Ok(());
             };
             recording
-                .stop_owner(Some(session))
+                .stop(StopBy::Owner(session))
                 .map_err(|error| error.to_string())
         },
     );
     registry.retain_session_end_hook(recording_session_end);
     registry
-}
-
-#[cfg(target_os = "macos")]
-fn configure_macos_runtime() {
-    cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
-        if let Some(window_id) = window_id {
-            platform_macos::capture::screenshot_window_bytes(window_id as u32).ok()
-        } else if let Some(pid) = pid {
-            platform_macos::windows::resolve_main_window_id(pid as i32)
-                .ok()
-                .and_then(|window_id| {
-                    platform_macos::capture::screenshot_window_bytes(window_id).ok()
-                })
-        } else {
-            platform_macos::capture::screenshot_display_bytes().ok()
-        }
-    });
-    cua_driver_core::recording::set_click_marker_fn(|png_bytes, x, y| {
-        platform_macos::capture::crosshair_png_bytes(png_bytes, x, y).ok()
-    });
-    cua_driver_core::recording::set_budgeted_ax_snapshot_fn(|window_id, pid, budget| {
-        platform_macos::recording_hooks::app_state_json_for(window_id, pid, budget)
-    });
-    cua_driver_core::recording::set_element_bounds_fn(|window_id, pid, index| {
-        platform_macos::recording_hooks::element_window_local_xy(window_id, pid, index)
-    });
-    cua_driver_core::video::set_video_backend_factory(Box::new(
-        platform_macos::video_sckit::SckitVideoBackendFactory,
-    ));
-}
-
-#[cfg(target_os = "windows")]
-fn configure_windows_runtime() {
-    cua_driver_core::recording::set_classified_screenshot_fn(|window_id, pid| {
-        platform_windows::recording_hooks::screenshot_for_recording(window_id, pid)
-    });
-    cua_driver_core::recording::set_click_marker_fn(|png_bytes, x, y| {
-        platform_windows::capture::crosshair_png_bytes(png_bytes, x, y).ok()
-    });
-    cua_driver_core::recording::set_budgeted_ax_snapshot_fn(|window_id, pid, budget| {
-        platform_windows::recording_hooks::app_state_json_for(window_id, pid, budget)
-    });
-    cua_driver_core::recording::set_element_bounds_fn(|window_id, pid, index| {
-        platform_windows::recording_hooks::element_window_local_xy(window_id, pid, index)
-    });
-    cua_driver_core::video::set_video_backend_factory(Box::new(
-        cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
-    ));
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -1097,27 +1120,6 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) {
                 tracing::warn!("could not activate the persistent AT-SPI listener: {error}");
             }
         }
-    }
-    cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
-        platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
-    });
-    cua_driver_core::recording::set_click_marker_fn(|png_bytes, x, y| {
-        platform_linux::capture::crosshair_png_bytes(png_bytes, x, y).ok()
-    });
-    cua_driver_core::recording::set_budgeted_ax_snapshot_fn(|window_id, pid, budget| {
-        platform_linux::recording_hooks::app_state_json_for(window_id, pid, budget)
-    });
-    cua_driver_core::recording::set_element_bounds_fn(|window_id, pid, index| {
-        platform_linux::recording_hooks::element_window_local_xy(window_id, pid, index)
-    });
-    if platform_linux::wayland::is_wayland() {
-        cua_driver_core::video::set_video_backend_factory(Box::new(
-            platform_linux::video_wayland::WfRecorderVideoBackendFactory,
-        ));
-    } else {
-        cua_driver_core::video::set_video_backend_factory(Box::new(
-            cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
-        ));
     }
 }
 
@@ -1468,6 +1470,34 @@ mod tests {
             .unwrap();
         assert!(cua_driver_core::session::is_session_ended(&internal));
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn awaiting_permissions_refuses_before_dispatch_and_never_reopens_a_closed_runtime() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+        let runtime = DriverRuntime::create(standard_options()).unwrap();
+        runtime.set_awaiting_permissions(true);
+        let pending = runtime
+            .invoke("get_config", serde_json::json!({}))
+            .await
+            .expect("an awaiting runtime answers");
+        assert_eq!(
+            pending
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/refusal/code")),
+            Some(&serde_json::json!("permissions_pending"))
+        );
+        assert!(runtime.is_running(), "awaiting is not closed");
+        assert!(runtime.tools_list().is_some(), "inventory stays reachable");
+
+        runtime.shutdown().await.unwrap();
+        runtime.set_awaiting_permissions(false);
+        assert!(!runtime.is_running());
+        assert!(runtime
+            .invoke("get_config", serde_json::json!({}))
+            .await
+            .is_none());
     }
 
     #[tokio::test]

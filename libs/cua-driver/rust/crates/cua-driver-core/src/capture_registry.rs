@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Bounded, immutable screenshot storage for later coordinate-bound actions.
 //!
 //! This registry deliberately does not store accessibility elements or mirror
@@ -948,13 +951,14 @@ impl CaptureRegistry {
         &self,
         request: CaptureActionRequest,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
-        self.admit_action_in_frame(request, None)
+        self.admit_action_in_frame(request, None, true)
     }
 
     fn admit_action_in_frame(
         &self,
         request: CaptureActionRequest,
         current_frame: Option<NativeWindowFrame>,
+        consume: bool,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
         // A one-point action is the same transaction with coincident endpoints.
         // Keep its public result and validation semantics unchanged.
@@ -967,6 +971,7 @@ impl CaptureRegistry {
                 to_y,
             },
             current_frame,
+            consume,
         )
         .map(|admission| admission.from)
     }
@@ -975,13 +980,14 @@ impl CaptureRegistry {
         &self,
         drag: CaptureDragRequest,
     ) -> Result<CaptureDragAdmission, CaptureActionError> {
-        self.admit_drag_in_frame(drag, None)
+        self.admit_drag_in_frame(drag, None, true)
     }
 
     fn admit_drag_in_frame(
         &self,
         drag: CaptureDragRequest,
         current_frame: Option<NativeWindowFrame>,
+        consume: bool,
     ) -> Result<CaptureDragAdmission, CaptureActionError> {
         let CaptureDragRequest {
             from: request,
@@ -1050,7 +1056,7 @@ impl CaptureRegistry {
             action_to_y,
         };
         // No endpoint can be admitted separately or consume on validation failure.
-        if capture.lifetime == CaptureLifetime::OneShot {
+        if consume && capture.lifetime == CaptureLifetime::OneShot {
             self.remove_capture(&mut inner, request.capture_id);
         }
         Ok(admission)
@@ -1423,7 +1429,7 @@ impl CaptureService {
         current_frame: NativeWindowFrame,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
         self.registry
-            .admit_action_in_frame(request, Some(current_frame))
+            .admit_action_in_frame(request, Some(current_frame), true)
     }
 
     /// Validate both endpoints together against one current full window frame.
@@ -1439,7 +1445,7 @@ impl CaptureService {
         current_frame: NativeWindowFrame,
     ) -> Result<CaptureDragAdmission, CaptureActionError> {
         self.registry
-            .admit_drag_in_frame(request, Some(current_frame))
+            .admit_drag_in_frame(request, Some(current_frame), true)
     }
 
     /// Retire only window observations of this exact binding, for example when
@@ -1458,6 +1464,17 @@ impl CaptureService {
     ) -> usize {
         self.registry
             .refresh_window_observation(binding, current_frame)
+    }
+
+    /// [`Self::admit_action`] that leaves the capture unspent. For an action
+    /// that may still be refused after its point is mapped (a background click
+    /// that finds no accessible control): the caller spends the capture with
+    /// `admit_action` only once the action is dispatched.
+    pub fn preview_action(
+        &self,
+        request: CaptureActionRequest,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.registry.admit_action_in_frame(request, None, false)
     }
 
     /// Predict, without consuming anything, whether a capture-bound action
@@ -1874,6 +1891,28 @@ mod tests {
                 NativeActionDimensions::new(4, 6).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn preview_leaves_the_capture_unspent_until_it_is_admitted() {
+        let service = CaptureService::new(config(2, 10_000)).unwrap();
+        let owner = service.binding("session-a", 1).unwrap();
+        let target = CaptureTarget::PrimaryDesktop;
+        let id = service
+            .publish(publication(png(2, 2, 1), target.clone(), "session-a", 1))
+            .unwrap();
+        let request = || action_request(id, owner.clone(), target.clone(), (2, 2));
+        // A previewed action that is then refused leaves the capture usable.
+        let previewed = service.preview_action(request()).unwrap();
+        service.preview_action(request()).unwrap();
+        // Admission spends it, exactly once.
+        let admitted = service.admit_action(request()).unwrap();
+        assert_eq!(
+            (previewed.action_x, previewed.action_y),
+            (admitted.action_x, admitted.action_y)
+        );
+        assert!(service.admit_action(request()).is_err());
+        assert!(service.preview_action(request()).is_err());
     }
 
     #[test]

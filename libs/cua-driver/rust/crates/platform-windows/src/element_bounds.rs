@@ -23,7 +23,7 @@ mod native {
         browser::platform::BrowserPlatform,
         element_token::ResolvedElement,
         protocol::{Content, ToolResult},
-        tool::{Tool, ToolDef},
+        tool::{ProtectedResourceScopeError, Tool, ToolDef},
         tool_args::ArgsExt,
     };
     use serde_json::{json, Value};
@@ -73,7 +73,7 @@ mod native {
             &self,
             adapter_id: &str,
             args: &Value,
-        ) -> Result<Option<Value>, String> {
+        ) -> Result<Option<Value>, ProtectedResourceScopeError> {
             if adapter_id != "private_observation" {
                 return Ok(None);
             }
@@ -97,14 +97,13 @@ mod native {
             {
                 ResolvedElement::Element { .. } => {}
                 ResolvedElement::None => {
-                    return Err("element_bounds requires an element_token".to_owned())
+                    return Err("element_bounds requires an element_token".into())
                 }
             }
             validate_window_owner(pid, window_id).await?;
             let fingerprint = crate::browser_platform::WindowsBrowserPlatform::default()
                 .process_fingerprint(i64::from(pid))
-                .await
-                .map_err(|error| error.message)?;
+                .await?;
             validate_window_owner(pid, window_id).await?;
             Ok(Some(json!({
                 "kind":"window",

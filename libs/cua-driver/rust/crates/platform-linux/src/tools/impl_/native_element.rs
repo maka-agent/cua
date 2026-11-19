@@ -12,7 +12,10 @@ use crate::input::native_element::{
 };
 use crate::input::native_window::NativeClickButton;
 
-pub(super) async fn invoke(args: Value, request: NativeElementClickRequest) -> ToolResult {
+pub(in crate::tools) async fn invoke(
+    args: Value,
+    request: NativeElementClickRequest,
+) -> ToolResult {
     invoke_on_route(args, request, crate::wayland::is_wayland()).await
 }
 

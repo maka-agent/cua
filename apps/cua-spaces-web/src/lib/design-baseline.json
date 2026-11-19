@@ -63,7 +63,7 @@
     "partial-line": 1
   },
   "components/machines/account-parts.tsx": {
-    "partial-line": 8,
+    "partial-line": 6,
     "outlined-box": 2
   },
   "components/markdown.tsx": {
@@ -74,12 +74,6 @@
   "components/new-space/connect-cloud-dialog.tsx": {
     "partial-line": 3,
     "outlined-box": 1
-  },
-  "components/settings/account-tab.tsx": {
-    "dot-chain": 1
-  },
-  "components/settings/notices-dialog.tsx": {
-    "dot-chain": 2
   },
   "components/settings/snippet.tsx": {
     "outlined-box": 1,
@@ -153,14 +147,8 @@
   "components/space-thread/thread-view.tsx": {
     "partial-line": 1
   },
-  "components/spaces/selection.tsx": {
-    "radius": 2
-  },
   "components/spaces/space-tile.tsx": {
     "radius": 3
-  },
-  "components/spaces/spaces-toolbar.tsx": {
-    "radius": 2
   },
   "components/tips.tsx": {
     "radius": 1
@@ -180,17 +168,6 @@
     "partial-line": 6,
     "dot-chain": 1
   },
-  "routes/machines/index.tsx": {
-    "outlined-box": 2,
-    "radius": 7,
-    "partial-line": 13
-  },
-  "routes/onboarding/index.tsx": {
-    "pill": 14,
-    "outlined-box": 7,
-    "partial-line": 2,
-    "radius": 5
-  },
   "routes/settings/about.tsx": {
     "partial-line": 1
   },
@@ -199,7 +176,7 @@
   },
   "routes/spaces/$spaceId.tsx": {
     "outlined-box": 3,
-    "radius": 3,
+    "radius": 2,
     "partial-line": 1
   }
 }

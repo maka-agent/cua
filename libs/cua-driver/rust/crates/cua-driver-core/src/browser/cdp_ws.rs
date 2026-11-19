@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Pooled CDP browser-endpoint client with a shared reply/event demultiplexer.
 //!
 //! v2 demultiplexer: a dedicated reader task owns the receive half of
@@ -34,6 +37,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Extension bridge calls remain bounded even after their outbound queue drains.
 const NATIVE_MAX_PENDING_CALLS: usize = 64;
 
+/// Upper bound for a first existing-profile dial, whose handshake the browser
+/// holds until its remote-debugging prompt is answered. Longer than the
+/// person-consent bound of `browser_prepare`, which cancels the dial first.
+const CONSENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// Connection-scoped command policy. Grant-owned personal-profile sockets
 /// always use the reviewed set below; callers cannot opt out or relax it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +59,7 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "DOM.focus",
     "DOM.getBoxModel",
     "DOM.getDocument",
+    "DOM.getNodeForLocation",
     "DOM.resolveNode",
     "DOM.scrollIntoViewIfNeeded",
     "DOM.setFileInputFiles",
@@ -138,6 +147,10 @@ pub struct CdpDialogState {
     pub generation: u64,
     pub kind: String,
     pub session_id: String,
+    /// The session that saw the dialog open detached while it was showing.
+    /// Chromium answers every other session `No dialog is showing`, so the
+    /// driver cannot resolve it, yet the page stays blocked until it closes.
+    pub detached: bool,
 }
 
 /// Closed metadata reads whose result may contain non-scalar JavaScript text.
@@ -175,20 +188,23 @@ enum ReplyRepresentation {
 enum ReplyPayload {
     Value(Value),
     MetadataJson(String),
+    Dialog(CdpDialogState),
 }
 
 impl ReplyPayload {
     fn into_value(self) -> anyhow::Result<Value> {
         match self {
             Self::Value(value) => Ok(value),
-            Self::MetadataJson(_) => anyhow::bail!("CDP reply representation changed"),
+            Self::MetadataJson(_) | Self::Dialog(_) => {
+                anyhow::bail!("CDP reply representation changed")
+            }
         }
     }
 
     fn into_metadata_json(self) -> anyhow::Result<String> {
         match self {
             Self::MetadataJson(json) => Ok(json),
-            Self::Value(_) => anyhow::bail!("CDP reply representation changed"),
+            Self::Value(_) | Self::Dialog(_) => anyhow::bail!("CDP reply representation changed"),
         }
     }
 }
@@ -341,6 +357,10 @@ struct Demux {
     subscribers: StdMutex<Vec<mpsc::UnboundedSender<CdpEvent>>>,
     session_targets: StdMutex<HashMap<String, String>>,
     dialogs: StdMutex<HashMap<String, CdpDialogState>>,
+    /// Target id -> the session holding its emulated media override. Chromium
+    /// keeps an `Emulation.*` override only while the session that set it
+    /// stays attached, so clearing it must reuse that session.
+    media_override_sessions: StdMutex<HashMap<String, String>>,
     next_dialog_generation: AtomicU64,
     closed: AtomicBool,
     extension_close: StdMutex<Option<oneshot::Sender<()>>>,
@@ -357,6 +377,7 @@ impl Demux {
             subscribers: StdMutex::new(Vec::new()),
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
+            media_override_sessions: StdMutex::new(HashMap::new()),
             next_dialog_generation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             extension_close: StdMutex::new(extension_close),
@@ -401,6 +422,7 @@ impl Demux {
         self.subscribers.lock().unwrap().clear();
         self.session_targets.lock().unwrap().clear();
         self.dialogs.lock().unwrap().clear();
+        self.media_override_sessions.lock().unwrap().clear();
     }
 }
 
@@ -455,6 +477,25 @@ fn route_value_message(
             params: v.get("params").cloned().unwrap_or(Value::Null),
             params_json,
         };
+        if event.method == "Target.detachedFromTarget" {
+            // A detached session reports nothing more and cannot resolve
+            // its dialog, but the page stays blocked. Keep the record,
+            // marked unresolvable, so callers fail fast; the next attach
+            // subscribes a new session whose close event clears it.
+            if let Some(session_id) = event.params.get("sessionId").and_then(Value::as_str) {
+                demux.session_targets.lock().unwrap().remove(session_id);
+                demux
+                    .media_override_sessions
+                    .lock()
+                    .unwrap()
+                    .retain(|_, owner| owner != session_id);
+                for dialog in demux.dialogs.lock().unwrap().values_mut() {
+                    if dialog.session_id == session_id {
+                        dialog.detached = true;
+                    }
+                }
+            }
+        }
         if let Some(session_id) = event.session_id.as_deref() {
             let target_id = demux
                 .session_targets
@@ -479,6 +520,7 @@ fn route_value_message(
                                 generation,
                                 kind: kind.to_owned(),
                                 session_id: session_id.to_owned(),
+                                detached: false,
                             },
                         );
                     }
@@ -808,15 +850,33 @@ pub(crate) enum ReplyDisposition {
     Observation,
 }
 
+struct CallReply<'a> {
+    disposition: ReplyDisposition,
+    representation: ReplyRepresentation,
+    timeout: Duration,
+    dialog_target: Option<&'a str>,
+}
+
+impl CallReply<'_> {
+    fn value(disposition: ReplyDisposition, timeout: Duration) -> Self {
+        Self {
+            disposition,
+            representation: ReplyRepresentation::Value,
+            timeout,
+            dialog_target: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PendingCallPhase {
     Sending,
     AwaitingReply(ReplyDisposition),
-    Replied,
+    Settled,
 }
 
 // A cancelled send may leave a partial frame, and an unanswered mutation may
-// have applied. Only a fully sent observation can abandon its reply safely.
+// have applied. Only reviewed commands can abandon a reply after the full send.
 struct PendingCall<'a> {
     connection: &'a CdpConnection,
     id: u64,
@@ -833,7 +893,7 @@ impl Drop for PendingCall<'_> {
             .remove(&self.id);
         if !matches!(
             self.phase,
-            PendingCallPhase::Replied
+            PendingCallPhase::Settled
                 | PendingCallPhase::AwaitingReply(ReplyDisposition::Observation)
         ) {
             self.connection.reader.abort();
@@ -850,6 +910,18 @@ impl CdpConnection {
     /// Reuse the shared event/session demultiplexer with a host's observation
     /// byte budget. The bound is enforced by the WebSocket before JSON parsing.
     pub async fn connect_bounded(ws_url: &str, max_message_bytes: usize) -> anyhow::Result<Self> {
+        Self::connect_with_budget(ws_url, max_message_bytes, CONNECT_TIMEOUT).await
+    }
+
+    async fn connect_within(ws_url: &str, timeout: Duration) -> anyhow::Result<Self> {
+        Self::connect_with_budget(ws_url, 64 * 1024 * 1024, timeout).await
+    }
+
+    async fn connect_with_budget(
+        ws_url: &str,
+        max_message_bytes: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         if max_message_bytes == 0 {
             anyhow::bail!("CDP message budget must be positive");
         }
@@ -859,7 +931,7 @@ impl CdpConnection {
             ..Default::default()
         };
         let (ws, _resp) = tokio::time::timeout(
-            CONNECT_TIMEOUT,
+            timeout,
             tokio_tungstenite::connect_async_with_config(ws_url, Some(config), false),
         )
         .await
@@ -951,6 +1023,36 @@ impl CdpConnection {
         }
     }
 
+    /// The session holding `target_id`'s emulated media override, if any.
+    pub fn media_override_session(&self, target_id: &str) -> Option<String> {
+        self.demux
+            .media_override_sessions
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()
+    }
+
+    /// Record `session_id` as the holder of `target_id`'s media override.
+    /// Record it before sending the override, so a detach that lands while
+    /// the command is in flight removes it again.
+    pub fn set_media_override_session(&self, target_id: &str, session_id: &str) {
+        self.demux
+            .media_override_sessions
+            .lock()
+            .unwrap()
+            .insert(target_id.to_owned(), session_id.to_owned());
+    }
+
+    /// Forget `session_id` as `target_id`'s holder, unless another session
+    /// took over.
+    pub fn clear_media_override_session(&self, target_id: &str, session_id: &str) {
+        let mut sessions = self.demux.media_override_sessions.lock().unwrap();
+        if sessions.get(target_id).map(String::as_str) == Some(session_id) {
+            sessions.remove(target_id);
+        }
+    }
+
     pub fn has_dialog_session(&self, target_id: &str) -> bool {
         self.demux
             .session_targets
@@ -985,12 +1087,69 @@ impl CdpConnection {
             session_id,
             method,
             params,
-            ReplyDisposition::Required,
             None,
-            ReplyRepresentation::Value,
+            CallReply::value(ReplyDisposition::Required, CALL_TIMEOUT),
         )
         .await?
         .into_value()
+    }
+
+    /// Issue a command with a caller-chosen deadline for send and reply.
+    /// Dialog subscription and disabling focus emulation may complete after
+    /// the deadline without repeating an input or changing page content.
+    pub async fn call_with_timeout(
+        &self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        let disposition = if method == "Page.enable"
+            || (method == "Emulation.setFocusEmulationEnabled"
+                && self.demux.pending_slots.is_none()
+                && params.get("enabled").and_then(Value::as_bool) == Some(false))
+        {
+            ReplyDisposition::Observation
+        } else {
+            ReplyDisposition::Required
+        };
+        self.call_with_reply_disposition(
+            session_id,
+            method,
+            params,
+            None,
+            CallReply::value(disposition, timeout),
+        )
+        .await?
+        .into_value()
+    }
+
+    /// A dialog may block its triggering command until the caller resolves it.
+    /// An exact target dialog can end the wait after a complete WebSocket send.
+    /// Extension transport commands still require their correlated settlement.
+    pub(crate) async fn call_until_dialog(
+        &self,
+        session_id: &str,
+        target_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<anyhow::Result<Value>, CdpDialogState> {
+        match self
+            .call_with_reply_disposition(
+                Some(session_id),
+                method,
+                params,
+                None,
+                CallReply {
+                    dialog_target: Some(target_id),
+                    ..CallReply::value(ReplyDisposition::Required, CALL_TIMEOUT)
+                },
+            )
+            .await
+        {
+            Ok(ReplyPayload::Dialog(dialog)) => Err(dialog),
+            reply => Ok(reply.and_then(ReplyPayload::into_value)),
+        }
     }
 
     /// Issue a known observation whose late reply can be discarded after its
@@ -1006,9 +1165,8 @@ impl CdpConnection {
             session_id,
             method,
             params,
-            ReplyDisposition::Observation,
             None,
-            ReplyRepresentation::Value,
+            CallReply::value(ReplyDisposition::Observation, CALL_TIMEOUT),
         )
         .await?
         .into_value()
@@ -1028,9 +1186,8 @@ impl CdpConnection {
             session_id,
             method,
             params,
-            ReplyDisposition::Required,
             Some(wire_context),
-            ReplyRepresentation::Value,
+            CallReply::value(ReplyDisposition::Required, CALL_TIMEOUT),
         )
         .await?
         .into_value()
@@ -1048,9 +1205,8 @@ impl CdpConnection {
             session_id,
             method,
             params,
-            ReplyDisposition::Observation,
             Some(wire_context),
-            ReplyRepresentation::Value,
+            CallReply::value(ReplyDisposition::Observation, CALL_TIMEOUT),
         )
         .await?
         .into_value()
@@ -1072,9 +1228,13 @@ impl CdpConnection {
             session_id,
             read.as_str(),
             params,
-            ReplyDisposition::Required,
             None,
-            ReplyRepresentation::MetadataJson,
+            CallReply {
+                disposition: ReplyDisposition::Required,
+                representation: ReplyRepresentation::MetadataJson,
+                timeout: CALL_TIMEOUT,
+                dialog_target: None,
+            },
         )
         .await?
         .into_metadata_json()
@@ -1096,9 +1256,13 @@ impl CdpConnection {
             session_id,
             read.as_str(),
             params,
-            ReplyDisposition::Observation,
             None,
-            ReplyRepresentation::MetadataJson,
+            CallReply {
+                disposition: ReplyDisposition::Observation,
+                representation: ReplyRepresentation::MetadataJson,
+                timeout: CALL_TIMEOUT,
+                dialog_target: None,
+            },
         )
         .await?
         .into_metadata_json()
@@ -1119,9 +1283,13 @@ impl CdpConnection {
             session_id,
             read.as_str(),
             params,
-            ReplyDisposition::Observation,
             Some(wire_context),
-            ReplyRepresentation::MetadataJson,
+            CallReply {
+                disposition: ReplyDisposition::Observation,
+                representation: ReplyRepresentation::MetadataJson,
+                timeout: CALL_TIMEOUT,
+                dialog_target: None,
+            },
         )
         .await?
         .into_metadata_json()
@@ -1132,10 +1300,16 @@ impl CdpConnection {
         session_id: Option<&str>,
         method: &str,
         params: Value,
-        reply_disposition: ReplyDisposition,
         wire_context: Option<&ExtensionWireContext>,
-        representation: ReplyRepresentation,
+        reply: CallReply<'_>,
     ) -> anyhow::Result<ReplyPayload> {
+        let CallReply {
+            disposition: reply_disposition,
+            representation,
+            timeout,
+            dialog_target,
+        } = reply;
+        let dialog_target = dialog_target.filter(|_| self.demux.pending_slots.is_none());
         let policy = self.method_policy();
         if !policy.allows(method) {
             anyhow::bail!(
@@ -1180,7 +1354,7 @@ impl CdpConnection {
         if let Some(sid) = session_id {
             msg["sessionId"] = Value::String(sid.to_owned());
         }
-        let outcome = tokio::time::timeout(CALL_TIMEOUT, async {
+        let outcome = tokio::time::timeout(timeout, async {
             {
                 let mut writer = self.writer.lock().await;
                 if self.is_closed() {
@@ -1192,12 +1366,28 @@ impl CdpConnection {
                     .map_err(|e| anyhow::anyhow!("CDP send failed during {method}: {e}"))?;
                 pending.phase = PendingCallPhase::AwaitingReply(reply_disposition);
             }
-            rx.await
-                .map_err(|_| anyhow::anyhow!("CDP socket closed during {method}"))
+            let reply = async {
+                rx.await
+                    .map_err(|_| anyhow::anyhow!("CDP socket closed during {method}"))
+            };
+            let Some(target_id) = dialog_target else {
+                return reply.await;
+            };
+            tokio::pin!(reply);
+            loop {
+                tokio::select! {
+                    result = &mut reply => return result,
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if let Some(dialog) = self.dialog_state(target_id) {
+                            return Ok(CallOutcome::Result(ReplyPayload::Dialog(dialog)));
+                        }
+                    }
+                }
+            }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("CDP {method} timed out after {CALL_TIMEOUT:?}"))??;
-        pending.phase = PendingCallPhase::Replied;
+        .map_err(|_| anyhow::anyhow!("CDP {method} timed out after {timeout:?}"))??;
+        pending.phase = PendingCallPhase::Settled;
         match outcome {
             CallOutcome::Result(v) => Ok(v),
             CallOutcome::TransportFailure(message) => {
@@ -1548,8 +1738,11 @@ impl CdpPool {
 
         // The WebSocket handshake can wait for browser-owned consent UI.
         // Never hold the entry mutex across that wait: other sessions keep
-        // using their sockets and revocation stays responsive.
-        let conn = Arc::new(CdpConnection::connect(ws_url).await?);
+        // using their sockets and revocation stays responsive. The browser
+        // answers the handshake only once its prompt is approved, so the dial
+        // must outlive a person's answer; `browser_prepare` bounds the wait.
+        let conn =
+            Arc::new(CdpConnection::connect_within(ws_url, CONSENT_HANDSHAKE_TIMEOUT).await?);
         conn.restrict_to_existing_profile();
         let mut conns = self.inner.conns.lock().await;
         self.inner.insert_shared(
@@ -2408,6 +2601,87 @@ mod tests {
         assert_eq!(dialog.session_id, "tab-session-a");
         assert!(!format!("{dialog:?}").contains("private"));
         conn.call(Some("tab-session-a"), "Dialog.close", json!({}))
+            .await
+            .unwrap();
+        assert!(conn.dialog_state("page-target").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_detached_session_stops_holding_its_media_override() {
+        let server = MockCdpServer::start(StdArc::new(|call| match call.method.as_str() {
+            "Target.detachFromTarget" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({ "sessionId": call.params["sessionId"], "targetId": "page-target" }),
+            }]),
+            _ => MockReply::ok(json!({})),
+        }))
+        .await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        conn.set_media_override_session("page-target", "tab-session-a");
+        conn.set_media_override_session("other-target", "tab-session-b");
+        conn.call(
+            None,
+            "Target.detachFromTarget",
+            json!({ "sessionId": "tab-session-a" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.media_override_session("page-target"), None);
+        assert_eq!(
+            conn.media_override_session("other-target").as_deref(),
+            Some("tab-session-b")
+        );
+        // A stale clear leaves a newer holder in place.
+        conn.set_media_override_session("page-target", "tab-session-c");
+        conn.clear_media_override_session("page-target", "tab-session-a");
+        assert_eq!(
+            conn.media_override_session("page-target").as_deref(),
+            Some("tab-session-c")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_dialog_session_marks_its_dialog_unresolvable() {
+        let server = MockCdpServer::start(StdArc::new(|call| match call.method.as_str() {
+            "Dialog.open" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Page.javascriptDialogOpening".into(),
+                session_id: call.session_id.clone(),
+                params: json!({ "type": "alert" }),
+            }]),
+            "Target.detachFromTarget" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({ "sessionId": call.params["sessionId"], "targetId": "page-target" }),
+            }]),
+            "Dialog.close" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Page.javascriptDialogClosed".into(),
+                session_id: call.session_id.clone(),
+                params: json!({}),
+            }]),
+            _ => MockReply::ok(json!({})),
+        }))
+        .await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        conn.register_dialog_session("tab-session-a", "page-target");
+        conn.call(Some("tab-session-a"), "Dialog.open", json!({}))
+            .await
+            .unwrap();
+        assert!(conn.dialog_state("page-target").is_some());
+        conn.call(
+            None,
+            "Target.detachFromTarget",
+            json!({ "sessionId": "tab-session-a" }),
+        )
+        .await
+        .unwrap();
+        // The page is still blocked, so the record stays, marked unresolvable.
+        let dialog = conn.dialog_state("page-target").expect("dialog kept");
+        assert!(dialog.detached);
+        assert!(!conn.has_dialog_session("page-target"));
+        // A new subscriber's close event clears it.
+        conn.register_dialog_session("tab-session-b", "page-target");
+        conn.call(Some("tab-session-b"), "Dialog.close", json!({}))
             .await
             .unwrap();
         assert!(conn.dialog_state("page-target").is_none());

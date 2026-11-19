@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! The one place that turns window-local screenshot pixels into screen
 //! coordinates for the pixel rungs (`click`, `double_click`, `right_click`,
 //! `drag`, `scroll`).
@@ -25,8 +28,8 @@ pub struct WindowPxFrame {
 
 impl WindowPxFrame {
     /// Window-local capture pixels → `(screen_x, screen_y, local_pt_x,
-    /// local_pt_y)`. Public PID event routes use the local-point pair for
-    /// `CGEventSetWindowLocation` on both the public and SkyLight PID routes.
+    /// local_pt_y)`. Background PID event routes stamp the local-point pair
+    /// with `CGEventSetWindowLocation`.
     pub fn to_screen(&self, cx: f64, cy: f64) -> (f64, f64, f64, f64) {
         let lx = cx / self.scale;
         let ly = cy / self.scale;
