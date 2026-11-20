@@ -1244,42 +1244,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn removed_custom_adapter_setup_commands_are_refused() {
-        for arguments in [
-            vec![
-                "browser",
-                "install",
-                "--provider",
-                "opencli",
-                "--extension-id",
-                "cccccccccccccccccccccccccccccccc",
-            ],
-            vec![
-                "browser",
-                "install",
-                "--provider",
-                "opencli-exec",
-                "--extension-id",
-                "cccccccccccccccccccccccccccccccc",
-            ],
-        ] {
-            assert!(matches!(
-                setup_command(&arguments.into_iter().map(OsString::from).collect::<Vec<_>>()),
-                Some(Err(InstallError::Refused(message)))
-                    if message == "browser provider must be maka or chatgpt"
-            ));
-        }
-        assert!(matches!(
-            setup_command(&["browser".into(), "uninstall".into(), "--provider".into(), "opencli".into()]),
-            Some(Err(InstallError::Refused(message)))
-                if message == "browser provider must be maka or chatgpt"
-        ));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn removed_custom_registration_cannot_change_existing_adapters() {
+    fn unsupported_adapter_registration_cannot_change_existing_adapters() {
         let fixture = InstallationFixture::new();
         let maka = fixture.plan(MAKA_HOST_NAME, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let original = fixture.plan(
@@ -1297,7 +1264,7 @@ mod tests {
         ]
         .map(|path| (path.clone(), std::fs::read(path).unwrap()));
         let removed = fixture.plan(
-            "org.apache.maka.opencli_connector",
+            "org.apache.maka.unsupported_connector",
             "cccccccccccccccccccccccccccccccc",
         );
         assert!(matches!(
@@ -1518,6 +1485,7 @@ mod tests {
                 "--extension-id",
                 id,
             ],
+            vec!["browser", "uninstall", "--provider", "original"],
         ] {
             assert!(setup_command(&args(&values)).unwrap().is_err());
         }

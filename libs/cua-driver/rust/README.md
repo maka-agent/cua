@@ -133,8 +133,8 @@ Regorus evaluates policies inside the daemon; no OPA service is required.
 The browser extension transport uses `Extension*` types and the
 `browser::extension_process` startup hook. Its provider selectors are `maka`
 (the default) and `chatgpt`; display names are Maka and ChatGPT. See
-[Browser extension providers](../docs/browser-extension-providers.md) for setup,
-protocol boundaries, and the stock OpenCLI compatibility limit.
+[Browser extension providers](../docs/browser-extension-providers.md) for setup
+and protocol boundaries.
 
 ## macOS focus primitives
 

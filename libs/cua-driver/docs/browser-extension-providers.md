@@ -32,6 +32,4 @@ The ChatGPT adapter keeps actual third-party response JSON intact, including
 `extension_message_budget`. Accepted effects retain their matched reply custody
 through cancellation and cleanup. Unknown operations must not be replayed.
 
-Stock OpenCLI integration is best-effort through its supported public surface.
-Unsupported operations require another configured provider; fallback is allowed
-only before dispatch. Use the Maka extension for managed browser sessions.
+Use the Maka extension for managed browser sessions.

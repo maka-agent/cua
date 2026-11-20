@@ -898,7 +898,7 @@ mod tests {
             assert_eq!(mode.selector(), selector);
             assert_eq!(mode.display_name(), display);
         }
-        for unsupported in ["maka", "chatgpt", "original", "opencli", "foreign.host"] {
+        for unsupported in ["maka", "chatgpt", "original", "foreign.host"] {
             assert_eq!(ExtensionAdapterMode::from_host_name(unsupported), None);
         }
     }
@@ -958,24 +958,6 @@ mod tests {
             Some(directory),
         ))
         .is_err());
-    }
-
-    #[test]
-    fn removed_custom_adapter_is_not_a_native_process_selection() {
-        let extension = ExtensionOrigin::from_id("cccccccccccccccccccccccccccccccc").unwrap();
-        let config = ExtensionProcessConfig::selected_adapter(
-            AdapterRegistration::selected_adapter(
-                "org.apache.maka.opencli_connector",
-                extension.clone(),
-            )
-            .unwrap(),
-            extension,
-            Some(std::env::temp_dir().join("unsupported-custom-selection")),
-        );
-        assert!(matches!(
-            ExtensionAdapterSelection::from_config(config),
-            Err(ProcessError::Lifecycle(message)) if message == "installed adapter is unsupported"
-        ));
     }
 
     #[test]

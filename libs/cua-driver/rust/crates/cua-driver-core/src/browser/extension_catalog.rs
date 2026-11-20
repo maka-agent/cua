@@ -553,9 +553,9 @@ mod tests {
     }
 
     #[test]
-    fn removed_custom_adapter_sidecar_is_not_a_supported_catalog_entry() {
+    fn unsupported_adapter_sidecar_is_not_a_supported_catalog_entry() {
         let fixture = Fixture::new();
-        let removed = fixture.config("org.apache.maka.opencli_connector", 'c');
+        let removed = fixture.config("org.apache.maka.unsupported_connector", 'c');
         let bytes = fixture.legacy(&removed);
         let catalog = load(&fixture.executable).unwrap();
         assert!(catalog.entries.is_empty());
