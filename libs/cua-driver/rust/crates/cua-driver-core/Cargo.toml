@@ -9,7 +9,7 @@ publish = false
 default = ["yaml", "rego", "script"]
 yaml = ["dep:regex"]
 rego = ["dep:regorus"]
-# `run_script` tool: an embedded QuickJS engine (rquickjs and quickjs-ng,
+# `run_script` tool: an embedded QuickJS engine (quickjs-jit and quickjs-ng,
 # both MIT). Compiled in by default on every platform, and the tool is
 # offered unless the operator turns it off at runtime. Without this feature
 # the tool is not offered at all.
@@ -65,7 +65,8 @@ hmac = { workspace = true }
 jsonschema = { version = "0.46", default-features = false }
 # Private per-request working directory for the optional perception worker.
 tempfile = "3"
-rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
+# Match NSH so the Maka desktop binary links a single QuickJS implementation.
+rquickjs = { package = "quickjs-jit", version = "=0.14.2", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
